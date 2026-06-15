@@ -1063,7 +1063,7 @@ CREATE TABLE IF NOT EXISTS repo_leases (
 pub mod integrator {
     use anyhow::{Context, Result};
     use serde::Deserialize;
-    use serde_json::json;
+    use serde_json::{json, Value as JsonValue};
     use std::ffi::OsStr;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -2146,17 +2146,117 @@ pub mod integrator {
 
     pub fn validation_command(repo_path: &Path) -> Result<Option<String>> {
         let config_path = repo_path.join(".threadmill.yml");
-        if !config_path.exists() {
+        if config_path.exists() {
+            let contents = fs::read_to_string(&config_path)
+                .with_context(|| format!("read {}", config_path.display()))?;
+            let parsed: ThreadmillConfig = serde_yaml::from_str(&contents)
+                .with_context(|| format!("parse {}", config_path.display()))?;
+            if let Some(command) = parsed
+                .integration
+                .and_then(|integration| integration.validation)
+                .and_then(|validation| validation.command)
+                .filter(|command| !command.trim().is_empty())
+            {
+                return Ok(Some(command));
+            }
+        }
+
+        Ok(default_validation_command(repo_path)?)
+    }
+
+    fn default_validation_command(repo_path: &Path) -> Result<Option<String>> {
+        if taskfile_has_validate(repo_path)? {
+            return Ok(Some("task validate".into()));
+        }
+        if makefile_has_validate(repo_path)? {
+            return Ok(Some("make validate".into()));
+        }
+        if repo_path.join("Cargo.toml").exists() {
+            return Ok(Some("cargo test".into()));
+        }
+        if let Some(command) = package_json_validation_command(repo_path)? {
+            return Ok(Some(command));
+        }
+        Ok(None)
+    }
+
+    fn taskfile_has_validate(repo_path: &Path) -> Result<bool> {
+        for name in [
+            "Taskfile.yml",
+            "Taskfile.yaml",
+            "Taskfile.dist.yml",
+            "Taskfile.dist.yaml",
+        ] {
+            let path = repo_path.join(name);
+            if path.exists() && yaml_has_top_level_task(&path, "validate")? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn makefile_has_validate(repo_path: &Path) -> Result<bool> {
+        for name in ["Makefile", "makefile", "GNUmakefile"] {
+            let path = repo_path.join(name);
+            if !path.exists() {
+                continue;
+            }
+            let contents =
+                fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+            if contents
+                .lines()
+                .any(|line| line.starts_with("validate:") || line.starts_with("validate::"))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn yaml_has_top_level_task(path: &Path, task_name: &str) -> Result<bool> {
+        let contents =
+            fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&contents).with_context(|| format!("parse {}", path.display()))?;
+        Ok(parsed
+            .get("tasks")
+            .and_then(|tasks| tasks.as_mapping())
+            .map(|tasks| tasks.contains_key(serde_yaml::Value::String(task_name.into())))
+            .unwrap_or(false))
+    }
+
+    fn package_json_validation_command(repo_path: &Path) -> Result<Option<String>> {
+        let path = repo_path.join("package.json");
+        if !path.exists() {
             return Ok(None);
         }
-        let contents = fs::read_to_string(&config_path)
-            .with_context(|| format!("read {}", config_path.display()))?;
-        let parsed: ThreadmillConfig = serde_yaml::from_str(&contents)
-            .with_context(|| format!("parse {}", config_path.display()))?;
-        Ok(parsed
-            .integration
-            .and_then(|integration| integration.validation)
-            .and_then(|validation| validation.command))
+        let contents =
+            fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let parsed: JsonValue =
+            serde_json::from_str(&contents).with_context(|| format!("parse {}", path.display()))?;
+        let scripts = parsed.get("scripts").and_then(JsonValue::as_object);
+        let Some(scripts) = scripts else {
+            return Ok(None);
+        };
+        if scripts.contains_key("validate") {
+            return Ok(Some(format!("{} run validate", package_manager(repo_path))));
+        }
+        if scripts.contains_key("test") {
+            return Ok(Some(format!("{} test", package_manager(repo_path))));
+        }
+        Ok(None)
+    }
+
+    fn package_manager(repo_path: &Path) -> &'static str {
+        if repo_path.join("bun.lock").exists() || repo_path.join("bun.lockb").exists() {
+            "bun"
+        } else if repo_path.join("pnpm-lock.yaml").exists() {
+            "pnpm"
+        } else if repo_path.join("yarn.lock").exists() {
+            "yarn"
+        } else {
+            "npm"
+        }
     }
 
     pub fn git<I, S>(cwd: &Path, args: I) -> Result<()>

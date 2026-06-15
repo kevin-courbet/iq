@@ -1,5 +1,5 @@
 use iq::core::{BlockedPhase, BlockedReason, QueueStatus};
-use iq::integrator::{git, git_output, Integrator, IntegratorOptions};
+use iq::integrator::{git, git_output, validation_command, Integrator, IntegratorOptions};
 use iq::sqlite::{EnqueueRequest, SqliteQueue};
 use std::fs;
 use std::path::Path;
@@ -104,6 +104,78 @@ fn missing_validation_configuration_blocks_during_validating_phase() {
     assert_eq!(item.status, QueueStatus::Blocked);
     assert_eq!(item.blocked_phase, Some(BlockedPhase::Validating));
     assert_eq!(item.blocked_reason, Some(BlockedReason::NeedsUserInput));
+}
+
+#[test]
+fn cargo_repo_without_threadmill_config_uses_cargo_test_default() {
+    let fixture = GitFixture::new(false);
+    fixture.create_cargo_project_on_main();
+    let source_head =
+        fixture.create_source_branch("agent/cargo-default", "feature.txt", "feature\n");
+    git(
+        &fixture.repo,
+        ["push", "-u", "origin", "agent/cargo-default"],
+    )
+    .unwrap();
+    let db = fixture.temp.path().join("queues.db");
+    let queue = SqliteQueue::open(&db).unwrap();
+    let repo_key = "fixture::main";
+    queue
+        .enqueue(EnqueueRequest {
+            repo_key: repo_key.into(),
+            repo_path: fixture.repo.to_string_lossy().to_string(),
+            source_branch: "agent/cargo-default".into(),
+            target_branch: "main".into(),
+            current_head_sha: source_head,
+            pr_url: None,
+            producer_metadata: serde_json::json!({"worker":"W001"}),
+        })
+        .unwrap();
+
+    let integrator = Integrator::new(IntegratorOptions {
+        repo_key: repo_key.into(),
+        repo_path: fixture.repo.clone(),
+        queue_db: db,
+        owner_id: "test-integrator".into(),
+        lease_ttl_seconds: 30,
+        base_remote: "origin".into(),
+        workspace_root: fixture.temp.path().join("workspaces"),
+    })
+    .unwrap();
+
+    let item = integrator.run_once().unwrap().unwrap();
+
+    assert_eq!(item.status, QueueStatus::Integrated);
+    let attempt = queue
+        .get_attempt(item.current_attempt_id.as_deref().unwrap())
+        .unwrap();
+    assert_eq!(attempt.validation_command.as_deref(), Some("cargo test"));
+}
+
+#[test]
+fn threadmill_config_validation_command_overrides_repo_default() {
+    let fixture = GitFixture::new(false);
+    fixture.create_cargo_project_on_main();
+    fixture.set_validation_command("test -f README.md");
+
+    let command = validation_command(&fixture.repo).unwrap();
+
+    assert_eq!(command.as_deref(), Some("test -f README.md"));
+}
+
+#[test]
+fn taskfile_validate_is_preferred_default_validation_command() {
+    let temp = tempdir().unwrap();
+    fs::write(
+        temp.path().join("Taskfile.yml"),
+        "version: '3'\ntasks:\n  validate:\n    cmds:\n      - cargo test\n",
+    )
+    .unwrap();
+    fs::write(temp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+
+    let command = validation_command(temp.path()).unwrap();
+
+    assert_eq!(command.as_deref(), Some("task validate"));
 }
 
 #[test]
@@ -806,6 +878,24 @@ impl GitFixture {
         .unwrap();
         git(&self.repo, ["add", ".threadmill.yml"]).unwrap();
         git(&self.repo, ["commit", "-m", "validation command"]).unwrap();
+        git(&self.repo, ["push", "origin", "main"]).unwrap();
+    }
+
+    fn create_cargo_project_on_main(&self) {
+        git(&self.repo, ["checkout", "main"]).unwrap();
+        fs::create_dir_all(self.repo.join("src")).unwrap();
+        fs::write(
+            self.repo.join("Cargo.toml"),
+            "[package]\nname = \"iq-demo-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            self.repo.join("src/lib.rs"),
+            "pub fn ok() -> bool { true }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn ok() { assert!(crate::ok()); }\n}\n",
+        )
+        .unwrap();
+        git(&self.repo, ["add", "Cargo.toml", "src/lib.rs"]).unwrap();
+        git(&self.repo, ["commit", "-m", "cargo project"]).unwrap();
         git(&self.repo, ["push", "origin", "main"]).unwrap();
     }
 
