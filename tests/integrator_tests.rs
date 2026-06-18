@@ -156,11 +156,11 @@ fn cargo_repo_without_threadmill_config_uses_cargo_test_default() {
 fn threadmill_config_validation_command_overrides_repo_default() {
     let fixture = GitFixture::new(false);
     fixture.create_cargo_project_on_main();
-    fixture.set_validation_command("test -f README.md");
+    fixture.set_validation_command("git diff --check");
 
     let command = validation_command(&fixture.repo).unwrap();
 
-    assert_eq!(command.as_deref(), Some("test -f README.md"));
+    assert_eq!(command.as_deref(), Some("git diff --check"));
 }
 
 #[test]
@@ -182,7 +182,7 @@ fn taskfile_validate_is_preferred_default_validation_command() {
 fn integrator_refuses_to_transition_after_lease_owner_changes() {
     let fixture = GitFixture::new(false);
     let db = fixture.temp.path().join("queues.db");
-    fixture.set_validation_command("test -f README.md");
+    fixture.set_validation_command("git diff --check");
     let source_head = fixture.create_source_branch("agent/stale-owner", "feature.txt", "feature\n");
     git(&fixture.repo, ["push", "-u", "origin", "agent/stale-owner"]).unwrap();
     let queue = SqliteQueue::open(&db).unwrap();
@@ -845,7 +845,7 @@ impl GitFixture {
         if include_validation {
             fs::write(
                 repo.join(".threadmill.yml"),
-                "integration:\n  validation:\n    command: test -f README.md\n",
+                "integration:\n  validation:\n    command: git diff --check\n",
             )
             .unwrap();
         }
@@ -891,7 +891,7 @@ impl GitFixture {
         .unwrap();
         fs::write(
             self.repo.join("src/lib.rs"),
-            "pub fn ok() -> bool { true }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn ok() { assert!(crate::ok()); }\n}\n",
+            "pub fn fixture_value() -> &'static str { \"iq-demo-fixture\" }\n",
         )
         .unwrap();
         git(&self.repo, ["add", "Cargo.toml", "src/lib.rs"]).unwrap();
