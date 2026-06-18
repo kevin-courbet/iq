@@ -840,6 +840,9 @@ impl GitFixture {
         .unwrap();
         git(&repo, ["config", "user.email", "iq@example.test"]).unwrap();
         git(&repo, ["config", "user.name", "IQ Test"]).unwrap();
+        let hooks = temp.path().join("empty-hooks");
+        fs::create_dir(&hooks).unwrap();
+        git(&repo, ["config", "core.hooksPath", hooks.to_str().unwrap()]).unwrap();
         git(&repo, ["checkout", "-b", "main"]).unwrap();
         fs::write(repo.join("README.md"), "base\n").unwrap();
         if include_validation {
