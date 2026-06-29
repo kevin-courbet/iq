@@ -1574,7 +1574,7 @@ pub mod integrator {
                         &item.id,
                         BlockedPhase::Validating,
                         BlockedReason::NeedsUserInput,
-                        "missing integration.validation.command in .threadmill.yml",
+                        "missing integration validation command",
                     )?;
                     return self.queue.get_item(&item.id);
                 }
@@ -2130,7 +2130,7 @@ pub mod integrator {
     }
 
     #[derive(Debug, Deserialize)]
-    struct ThreadmillConfig {
+    struct IqConfig {
         integration: Option<IntegrationConfig>,
     }
 
@@ -2145,11 +2145,11 @@ pub mod integrator {
     }
 
     pub fn validation_command(repo_path: &Path) -> Result<Option<String>> {
-        let config_path = repo_path.join(".threadmill.yml");
+        let config_path = repo_path.join(".iq/config.json");
         if config_path.exists() {
             let contents = fs::read_to_string(&config_path)
                 .with_context(|| format!("read {}", config_path.display()))?;
-            let parsed: ThreadmillConfig = serde_yaml::from_str(&contents)
+            let parsed: IqConfig = serde_json::from_str(&contents)
                 .with_context(|| format!("parse {}", config_path.display()))?;
             if let Some(command) = parsed
                 .integration

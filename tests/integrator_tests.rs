@@ -107,7 +107,7 @@ fn missing_validation_configuration_blocks_during_validating_phase() {
 }
 
 #[test]
-fn cargo_repo_without_threadmill_config_uses_cargo_test_default() {
+fn cargo_repo_without_iq_config_uses_cargo_test_default() {
     let fixture = GitFixture::new(false);
     fixture.create_cargo_project_on_main();
     let source_head =
@@ -153,7 +153,7 @@ fn cargo_repo_without_threadmill_config_uses_cargo_test_default() {
 }
 
 #[test]
-fn threadmill_config_validation_command_overrides_repo_default() {
+fn iq_config_validation_command_overrides_repo_default() {
     let fixture = GitFixture::new(false);
     fixture.create_cargo_project_on_main();
     fixture.set_validation_command("git diff --check");
@@ -846,9 +846,10 @@ impl GitFixture {
         git(&repo, ["checkout", "-b", "main"]).unwrap();
         fs::write(repo.join("README.md"), "base\n").unwrap();
         if include_validation {
+            fs::create_dir_all(repo.join(".iq")).unwrap();
             fs::write(
-                repo.join(".threadmill.yml"),
-                "integration:\n  validation:\n    command: git diff --check\n",
+                repo.join(".iq/config.json"),
+                r#"{"integration":{"validation":{"command":"git diff --check"}}}"#,
             )
             .unwrap();
         }
@@ -874,12 +875,13 @@ impl GitFixture {
 
     fn set_validation_command(&self, command: &str) {
         git(&self.repo, ["checkout", "main"]).unwrap();
+        fs::create_dir_all(self.repo.join(".iq")).unwrap();
         fs::write(
-            self.repo.join(".threadmill.yml"),
-            format!("integration:\n  validation:\n    command: {command}\n"),
+            self.repo.join(".iq/config.json"),
+            format!(r#"{{"integration":{{"validation":{{"command":"{command}"}}}}}}"#),
         )
         .unwrap();
-        git(&self.repo, ["add", ".threadmill.yml"]).unwrap();
+        git(&self.repo, ["add", ".iq/config.json"]).unwrap();
         git(&self.repo, ["commit", "-m", "validation command"]).unwrap();
         git(&self.repo, ["push", "origin", "main"]).unwrap();
     }
@@ -918,8 +920,8 @@ impl GitFixture {
 
     fn create_unpublished_target_deleting_validation(&self, branch: &str) -> String {
         git(&self.repo, ["checkout", "-b", branch, "main"]).unwrap();
-        fs::remove_file(self.repo.join(".threadmill.yml")).unwrap();
-        git(&self.repo, ["add", ".threadmill.yml"]).unwrap();
+        fs::remove_file(self.repo.join(".iq/config.json")).unwrap();
+        git(&self.repo, ["add", ".iq/config.json"]).unwrap();
         git(&self.repo, ["commit", "-m", "remove validation config"]).unwrap();
         let sha = git_output(&self.repo, ["rev-parse", "HEAD"]).unwrap();
         git(
