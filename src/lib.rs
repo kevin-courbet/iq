@@ -55,15 +55,24 @@ pub mod core {
             let allowed = matches!(
                 (current, target),
                 (QueueStatus::Ready, QueueStatus::Merging)
+                    | (QueueStatus::Ready, QueueStatus::Blocked)
                     | (QueueStatus::Merging, QueueStatus::Merged)
                     | (QueueStatus::Merging, QueueStatus::Blocked)
                     | (QueueStatus::Merged, QueueStatus::Validating)
+                    | (QueueStatus::Merged, QueueStatus::Blocked)
                     | (QueueStatus::Validating, QueueStatus::Validated)
                     | (QueueStatus::Validating, QueueStatus::Blocked)
                     | (QueueStatus::Validated, QueueStatus::Integrating)
+                    | (QueueStatus::Validated, QueueStatus::Blocked)
                     | (QueueStatus::Integrating, QueueStatus::Integrated)
                     | (QueueStatus::Integrating, QueueStatus::Blocked)
-                    | (_, QueueStatus::Cancelled)
+                    | (QueueStatus::Ready, QueueStatus::Cancelled)
+                    | (QueueStatus::Merging, QueueStatus::Cancelled)
+                    | (QueueStatus::Merged, QueueStatus::Cancelled)
+                    | (QueueStatus::Validating, QueueStatus::Cancelled)
+                    | (QueueStatus::Validated, QueueStatus::Cancelled)
+                    | (QueueStatus::Integrating, QueueStatus::Cancelled)
+                    | (QueueStatus::Blocked, QueueStatus::Cancelled)
             );
 
             if allowed {
@@ -156,7 +165,7 @@ pub mod core {
 pub mod sqlite {
     use anyhow::{Context, Result};
     use chrono::{Duration, Utc};
-    use rusqlite::{params, Connection, OptionalExtension, Row};
+    use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
     use serde::{Deserialize, Serialize};
     use serde_json::Value;
     use std::path::{Path, PathBuf};
@@ -196,6 +205,7 @@ pub mod sqlite {
         pub landed_commit_sha: Option<String>,
         pub producer_metadata: Value,
         pub validation_evidence: Value,
+        pub landing_fenced: bool,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -207,6 +217,7 @@ pub mod sqlite {
         pub status: String,
         pub question: String,
         pub answer: Option<String>,
+        pub options: Vec<String>,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -264,6 +275,19 @@ pub mod sqlite {
             conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.pragma_update(None, "foreign_keys", "ON")?;
             conn.execute_batch(SCHEMA)?;
+            let has_landing_fence = {
+                let mut statement = conn.prepare("PRAGMA table_info(queue_items)")?;
+                let columns = statement
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                columns.iter().any(|column| column == "landing_fenced")
+            };
+            if !has_landing_fence {
+                conn.execute(
+                    "ALTER TABLE queue_items ADD COLUMN landing_fenced INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
             Ok(queue)
         }
 
@@ -271,42 +295,32 @@ pub mod sqlite {
             let conn = Connection::open(&self.path)
                 .with_context(|| format!("open queue db {}", self.path.display()))?;
             conn.pragma_update(None, "foreign_keys", "ON")?;
+            conn.busy_timeout(std::time::Duration::from_millis(200))?;
             Ok(conn)
         }
 
         pub fn enqueue(&self, request: EnqueueRequest) -> Result<QueueItem> {
-            let conn = self.connect()?;
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let now = now();
-            let existing: Option<String> = conn
+            let existing: Option<(String, String, Option<String>)> = tx
                 .query_row(
-                    "SELECT id FROM queue_items WHERE repo_key=?1 AND source_branch=?2 AND target_branch=?3 AND status NOT IN ('integrated','cancelled')",
+                    "SELECT id,current_head_sha,pr_url FROM queue_items WHERE repo_key=?1 AND source_branch=?2 AND target_branch=?3 AND status NOT IN ('integrated','cancelled')",
                     params![request.repo_key, request.source_branch, request.target_branch],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?;
 
-            let item_id = if let Some(id) = existing {
-                conn.execute(
-                    "UPDATE queue_items SET repo_path=?1,current_head_sha=?2,pr_url=?3,producer_metadata_json=?4,updated_at=?5 WHERE id=?6",
-                    params![
-                        request.repo_path,
-                        request.current_head_sha,
-                        request.pr_url,
-                        request.producer_metadata.to_string(),
-                        now,
-                        id,
-                    ],
-                )?;
-                self.record_event_with_conn(
-                    &conn,
-                    &id,
-                    "item_reworked",
-                    "source branch/head updated",
-                )?;
+            let item_id = if let Some((id, current_head_sha, pr_url)) = existing {
+                if current_head_sha != request.current_head_sha || pr_url != request.pr_url {
+                    anyhow::bail!(
+                        "active queue item {id} already tracks {current_head_sha}; update blocked agent work through requeue instead of enqueue"
+                    );
+                }
                 id
             } else {
                 let id = Uuid::new_v4().to_string();
-                conn.execute(
+                tx.execute(
                     "INSERT INTO queue_items (id,repo_key,repo_path,source_branch,target_branch,pr_url,producer_metadata_json,validation_evidence_json,status,current_head_sha,created_at,updated_at)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,'{}','ready',?8,?9,?9)",
                     params![
@@ -321,10 +335,10 @@ pub mod sqlite {
                         now,
                     ],
                 )?;
-                self.record_event_with_conn(&conn, &id, "item_enqueued", "item enqueued")?;
+                Self::record_event_tx(&tx, &id, "item_enqueued", "item enqueued")?;
                 id
             };
-
+            tx.commit()?;
             self.get_item(&item_id)
         }
 
@@ -360,7 +374,7 @@ pub mod sqlite {
 
         pub fn claim_next_ready(&self, repo_key: &str) -> Result<Option<(QueueItem, Attempt)>> {
             let mut conn = self.connect()?;
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let item: Option<QueueItem> = tx
                 .query_row(
                     "SELECT * FROM queue_items WHERE repo_key=?1 AND status NOT IN ('integrated','cancelled') ORDER BY created_at ASC, id ASC LIMIT 1",
@@ -388,7 +402,7 @@ pub mod sqlite {
                 params![attempt_id, item.id, attempt_number, item.current_head_sha, now],
             )?;
             tx.execute(
-                "UPDATE queue_items SET status='merging',current_attempt_id=?1,blocked_phase=NULL,blocked_reason=NULL,blocked_message=NULL,prompt_id=NULL,updated_at=?2 WHERE id=?3",
+                "UPDATE queue_items SET status='merging',current_attempt_id=?1,landing_fenced=0,blocked_phase=NULL,blocked_reason=NULL,blocked_message=NULL,prompt_id=NULL,updated_at=?2 WHERE id=?3",
                 params![attempt_id, now, item.id],
             )?;
             Self::record_event_tx(
@@ -415,21 +429,34 @@ pub mod sqlite {
         }
 
         pub fn transition_item(&self, item_id: &str, target: QueueStatus) -> Result<QueueItem> {
-            let item = self.get_item(item_id)?;
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let item = tx
+                .query_row(
+                    "SELECT * FROM queue_items WHERE id=?1",
+                    params![item_id],
+                    map_item,
+                )
+                .with_context(|| format!("queue item not found: {item_id}"))?;
             StateMachine
                 .transition(item.status, target)
                 .map_err(anyhow::Error::msg)?;
-            let conn = self.connect()?;
-            conn.execute(
+            if target == QueueStatus::Cancelled && item.landing_fenced {
+                anyhow::bail!(
+                    "item {item_id} has crossed the landing fence and cannot be cancelled"
+                );
+            }
+            tx.execute(
                 "UPDATE queue_items SET status=?1,updated_at=?2 WHERE id=?3",
                 params![target.to_string(), now(), item_id],
             )?;
-            self.record_event_with_conn(
-                &conn,
+            Self::record_event_tx(
+                &tx,
                 item_id,
                 "item_transitioned",
                 &format!("transitioned to {target}"),
             )?;
+            tx.commit()?;
             self.get_item(item_id)
         }
 
@@ -440,34 +467,73 @@ pub mod sqlite {
             reason: BlockedReason,
             message: &str,
         ) -> Result<String> {
-            let item = self.get_item(item_id)?;
-            let expected_status: QueueStatus = phase.into();
-            if item.status != expected_status {
-                StateMachine
-                    .transition(item.status, QueueStatus::Blocked)
-                    .map_err(anyhow::Error::msg)?;
+            self.block_item_from_status(item_id, phase.into(), phase, reason, message)
+        }
+
+        pub(crate) fn block_integrating_recovery(
+            &self,
+            item_id: &str,
+            phase: BlockedPhase,
+            reason: BlockedReason,
+            message: &str,
+        ) -> Result<String> {
+            if !matches!(phase, BlockedPhase::Merging | BlockedPhase::Validating) {
+                anyhow::bail!("integrating recovery may only resume merging or validating");
             }
-            let conn = self.connect()?;
+            self.block_item_from_status(item_id, QueueStatus::Integrating, phase, reason, message)
+        }
+
+        fn block_item_from_status(
+            &self,
+            item_id: &str,
+            expected_status: QueueStatus,
+            phase: BlockedPhase,
+            reason: BlockedReason,
+            message: &str,
+        ) -> Result<String> {
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let item = tx
+                .query_row(
+                    "SELECT * FROM queue_items WHERE id=?1",
+                    params![item_id],
+                    map_item,
+                )
+                .with_context(|| format!("queue item not found: {item_id}"))?;
+            if item.status != expected_status {
+                anyhow::bail!(
+                    "item {item_id} in status {} cannot block in {phase}",
+                    item.status
+                );
+            }
+            let timestamp = now();
             let prompt_id = if reason == BlockedReason::NeedsUserInput {
                 let prompt_id = Uuid::new_v4().to_string();
-                conn.execute(
-                    "INSERT INTO prompts (id,item_id,attempt_id,blocked_phase,status,question,created_by,created_at) VALUES (?1,?2,?3,?4,'open',?5,'integrator',?6)",
-                    params![prompt_id, item_id, item.current_attempt_id, phase.to_string(), message, now()],
+                let options = if phase == BlockedPhase::Merging {
+                    vec!["accept-current", "use source", "use target"]
+                } else {
+                    Vec::new()
+                };
+                let options_json = serde_json::to_string(&options)?;
+                tx.execute(
+                    "INSERT INTO prompts (id,item_id,attempt_id,blocked_phase,status,question,options_json,allow_freeform,created_by,created_at) VALUES (?1,?2,?3,?4,'open',?5,?6,?7,'integrator',?8)",
+                    params![prompt_id, item_id, item.current_attempt_id, phase.to_string(), message, options_json, options.is_empty(), timestamp],
                 )?;
                 Some(prompt_id)
             } else {
                 None
             };
-            conn.execute(
+            tx.execute(
                 "UPDATE queue_items SET status='blocked',blocked_phase=?1,blocked_reason=?2,blocked_message=?3,prompt_id=?4,updated_at=?5 WHERE id=?6",
-                params![phase.to_string(), reason.to_string(), message, prompt_id, now(), item_id],
+                params![phase.to_string(), reason.to_string(), message, prompt_id, timestamp, item_id],
             )?;
-            self.record_event_with_conn(
-                &conn,
+            Self::record_event_tx(
+                &tx,
                 item_id,
                 "item_blocked",
                 &format!("{phase}/{reason}: {message}"),
             )?;
+            tx.commit()?;
             Ok(prompt_id.unwrap_or_default())
         }
 
@@ -477,12 +543,41 @@ pub mod sqlite {
             answer: &str,
             answered_by: &str,
         ) -> Result<QueueItem> {
-            let conn = self.connect()?;
-            let prompt = self.get_prompt(prompt_id)?;
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let prompt = tx
+                .query_row(
+                    "SELECT id,item_id,attempt_id,blocked_phase,status,question,answer,options_json FROM prompts WHERE id=?1",
+                    params![prompt_id],
+                    map_prompt,
+                )
+                .with_context(|| format!("prompt not found: {prompt_id}"))?;
             if prompt.status != "open" {
                 anyhow::bail!("prompt {prompt_id} is not open")
             }
-            let item = self.get_item(&prompt.item_id)?;
+            let answer = answer.trim();
+            let answered_by = answered_by.trim();
+            if answer.is_empty() || answered_by.is_empty() {
+                anyhow::bail!("prompt answer and answered_by must not be blank");
+            }
+            if !prompt.options.is_empty()
+                && !prompt
+                    .options
+                    .iter()
+                    .any(|option| option.eq_ignore_ascii_case(answer))
+            {
+                anyhow::bail!(
+                    "unsupported answer for prompt {prompt_id}; choose {}",
+                    prompt.options.join(", ")
+                );
+            }
+            let item = tx
+                .query_row(
+                    "SELECT * FROM queue_items WHERE id=?1",
+                    params![prompt.item_id],
+                    map_item,
+                )
+                .with_context(|| format!("queue item not found: {}", prompt.item_id))?;
             if item.status != QueueStatus::Blocked
                 || item.blocked_reason != Some(BlockedReason::NeedsUserInput)
             {
@@ -498,45 +593,58 @@ pub mod sqlite {
                     prompt_id: Some(prompt_id.to_string()),
                 })
                 .map_err(anyhow::Error::msg)?;
-            conn.execute(
+            let timestamp = now();
+            tx.execute(
                 "UPDATE prompts SET status='answered',answer=?1,answered_by=?2,answered_at=?3 WHERE id=?4",
-                params![answer, answered_by, now(), prompt_id],
+                params![answer, answered_by, timestamp, prompt_id],
             )?;
-            conn.execute(
+            tx.execute(
                 "UPDATE queue_items SET status=?1,blocked_phase=NULL,blocked_reason=NULL,blocked_message=NULL,prompt_id=NULL,updated_at=?2 WHERE id=?3",
-                params![resume.to_string(), now(), item.id],
+                params![resume.to_string(), timestamp, item.id],
             )?;
-            self.record_event_with_conn(&conn, &item.id, "user_answered", answer)?;
+            Self::record_event_tx(&tx, &item.id, "user_answered", answer)?;
+            tx.commit()?;
             self.get_item(&item.id)
         }
 
         pub fn requeue_agent_fix(&self, item_id: &str, new_head: &str) -> Result<QueueItem> {
-            let item = self.get_item(item_id)?;
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let item = tx
+                .query_row(
+                    "SELECT * FROM queue_items WHERE id=?1",
+                    params![item_id],
+                    map_item,
+                )
+                .with_context(|| format!("queue item not found: {item_id}"))?;
             if item.status != QueueStatus::Blocked
                 || item.blocked_reason != Some(BlockedReason::NeedsAgentFix)
             {
                 anyhow::bail!("item {item_id} is not blocked for agent fix")
             }
-            let conn = self.connect()?;
-            conn.execute(
+            tx.execute(
                 "UPDATE prompts SET status='superseded' WHERE item_id=?1 AND status='open'",
                 params![item_id],
             )?;
-            conn.execute(
-                "UPDATE queue_items SET status='ready',current_head_sha=?1,blocked_phase=NULL,blocked_reason=NULL,blocked_message=NULL,prompt_id=NULL,updated_at=?2 WHERE id=?3",
+            tx.execute(
+                "UPDATE queue_items SET status='ready',current_head_sha=?1,landing_fenced=0,blocked_phase=NULL,blocked_reason=NULL,blocked_message=NULL,prompt_id=NULL,updated_at=?2 WHERE id=?3",
                 params![new_head, now(), item_id],
             )?;
-            self.record_event_with_conn(
-                &conn,
-                item_id,
-                "agent_requeued",
-                "agent fix marked ready",
-            )?;
+            Self::record_event_tx(&tx, item_id, "agent_requeued", "agent fix marked ready")?;
+            tx.commit()?;
             self.get_item(item_id)
         }
 
         pub fn retry_blocked(&self, item_id: &str) -> Result<QueueItem> {
-            let item = self.get_item(item_id)?;
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let item = tx
+                .query_row(
+                    "SELECT * FROM queue_items WHERE id=?1",
+                    params![item_id],
+                    map_item,
+                )
+                .with_context(|| format!("queue item not found: {item_id}"))?;
             if item.status != QueueStatus::Blocked {
                 anyhow::bail!("item {item_id} is not blocked")
             }
@@ -559,32 +667,34 @@ pub mod sqlite {
                 | BlockedReason::Provider => {}
             }
             let resume: QueueStatus = phase.into();
-            let conn = self.connect()?;
-            conn.execute(
+            tx.execute(
                 "UPDATE queue_items SET status=?1,blocked_phase=NULL,blocked_reason=NULL,blocked_message=NULL,prompt_id=NULL,updated_at=?2 WHERE id=?3",
                 params![resume.to_string(), now(), item_id],
             )?;
-            self.record_event_with_conn(
-                &conn,
+            Self::record_event_tx(
+                &tx,
                 item_id,
                 "item_retried",
                 &format!("retrying {phase} after {reason} block"),
             )?;
+            tx.commit()?;
             self.get_item(item_id)
         }
 
         pub fn update_current_head(&self, item_id: &str, new_head: &str) -> Result<QueueItem> {
-            let conn = self.connect()?;
-            conn.execute(
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
                 "UPDATE queue_items SET current_head_sha=?1,updated_at=?2 WHERE id=?3",
                 params![new_head, now(), item_id],
             )?;
-            self.record_event_with_conn(
-                &conn,
+            Self::record_event_tx(
+                &tx,
                 item_id,
                 "source_head_updated",
                 &format!("source head updated to {new_head}"),
             )?;
+            tx.commit()?;
             self.get_item(item_id)
         }
 
@@ -595,7 +705,7 @@ pub mod sqlite {
             ttl_seconds: i64,
         ) -> Result<bool> {
             let mut conn = self.connect()?;
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let current: Option<(String, String)> = tx
                 .query_row(
                     "SELECT owner_id,expires_at FROM repo_leases WHERE repo_key=?1",
@@ -673,35 +783,18 @@ pub mod sqlite {
         ) -> Result<Option<Prompt>> {
             let conn = self.connect()?;
             let mut sql = String::from(
-                "SELECT id,item_id,attempt_id,blocked_phase,status,question,answer FROM prompts WHERE item_id=?1 AND status='answered'",
+                "SELECT id,item_id,attempt_id,blocked_phase,status,question,answer,options_json FROM prompts WHERE item_id=?1 AND status='answered'",
             );
             if attempt_id.is_some() {
                 sql.push_str(" AND attempt_id=?2");
             }
             sql.push_str(" ORDER BY answered_at DESC LIMIT 1");
-            let map = |row: &Row<'_>| {
-                let phase: String = row.get(3)?;
-                Ok(Prompt {
-                    id: row.get(0)?,
-                    item_id: row.get(1)?,
-                    attempt_id: row.get(2)?,
-                    blocked_phase: BlockedPhase::from_str(&phase).map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            3,
-                            rusqlite::types::Type::Text,
-                            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-                        )
-                    })?,
-                    status: row.get(4)?,
-                    question: row.get(5)?,
-                    answer: row.get(6)?,
-                })
-            };
             if let Some(attempt_id) = attempt_id {
-                conn.query_row(&sql, params![item_id, attempt_id], map)
+                conn.query_row(&sql, params![item_id, attempt_id], map_prompt)
                     .optional()
             } else {
-                conn.query_row(&sql, params![item_id], map).optional()
+                conn.query_row(&sql, params![item_id], map_prompt)
+                    .optional()
             }
             .with_context(|| format!("read latest answered prompt for item {item_id}"))
         }
@@ -709,27 +802,10 @@ pub mod sqlite {
         pub fn prompts_for_item(&self, item_id: &str) -> Result<Vec<Prompt>> {
             let conn = self.connect()?;
             let mut stmt = conn.prepare(
-                "SELECT id,item_id,attempt_id,blocked_phase,status,question,answer FROM prompts WHERE item_id=?1 ORDER BY created_at ASC",
+                "SELECT id,item_id,attempt_id,blocked_phase,status,question,answer,options_json FROM prompts WHERE item_id=?1 ORDER BY created_at ASC",
             )?;
             let prompts = stmt
-                .query_map(params![item_id], |row| {
-                    let phase: String = row.get(3)?;
-                    Ok(Prompt {
-                        id: row.get(0)?,
-                        item_id: row.get(1)?,
-                        attempt_id: row.get(2)?,
-                        blocked_phase: BlockedPhase::from_str(&phase).map_err(|e| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                3,
-                                rusqlite::types::Type::Text,
-                                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-                            )
-                        })?,
-                        status: row.get(4)?,
-                        question: row.get(5)?,
-                        answer: row.get(6)?,
-                    })
-                })?
+                .query_map(params![item_id], map_prompt)?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(prompts)
         }
@@ -791,28 +867,95 @@ pub mod sqlite {
             Ok(())
         }
 
+        pub fn update_attempt_revalidation(
+            &self,
+            attempt_id: &str,
+            target_base_sha: &str,
+            command: &str,
+            exit_code: i64,
+            log_path: &str,
+            validated_commit_sha: Option<&str>,
+        ) -> Result<()> {
+            let conn = self.connect()?;
+            conn.execute(
+                "UPDATE integration_attempts SET target_base_sha=?1,validation_command=?2,validation_exit_code=?3,validation_log_path=?4,validated_commit_sha=?5 WHERE id=?6",
+                params![target_base_sha, command, exit_code, log_path, validated_commit_sha, attempt_id],
+            )?;
+            Ok(())
+        }
+
         pub fn mark_integrated(
             &self,
             item_id: &str,
             attempt_id: &str,
             landed_commit_sha: &str,
         ) -> Result<QueueItem> {
-            let conn = self.connect()?;
-            conn.execute(
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let item: (String, Option<String>, bool) = tx
+                .query_row(
+                    "SELECT status,current_attempt_id,landing_fenced FROM queue_items WHERE id=?1",
+                    params![item_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .with_context(|| format!("queue item not found: {item_id}"))?;
+            if item.0 != QueueStatus::Integrating.to_string()
+                || item.1.as_deref() != Some(attempt_id)
+                || !item.2
+            {
+                anyhow::bail!(
+                    "item {item_id} is no longer integrating attempt {attempt_id}; refusing to mark landed"
+                );
+            }
+            tx.execute(
                 "UPDATE integration_attempts SET landed_commit_sha=?1,result='integrated',finished_at=?2 WHERE id=?3",
                 params![landed_commit_sha, now(), attempt_id],
             )?;
-            conn.execute(
+            tx.execute(
                 "UPDATE queue_items SET status='integrated',landed_commit_sha=?1,updated_at=?2 WHERE id=?3",
                 params![landed_commit_sha, now(), item_id],
             )?;
-            self.record_event_with_conn(
-                &conn,
+            Self::record_event_tx(
+                &tx,
                 item_id,
                 "integrated",
                 &format!("landed {landed_commit_sha}"),
             )?;
+            tx.commit()?;
             self.get_item(item_id)
+        }
+
+        pub fn begin_landing(&self, item_id: &str, attempt_id: &str) -> Result<()> {
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let item: (String, Option<String>, bool) = tx
+                .query_row(
+                    "SELECT status,current_attempt_id,landing_fenced FROM queue_items WHERE id=?1",
+                    params![item_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .with_context(|| format!("queue item not found: {item_id}"))?;
+            if item.0 != QueueStatus::Integrating.to_string()
+                || item.1.as_deref() != Some(attempt_id)
+            {
+                anyhow::bail!(
+                    "item {item_id} is no longer integrating attempt {attempt_id}; refusing target mutation"
+                );
+            }
+            if !item.2 {
+                tx.execute(
+                    "UPDATE queue_items SET landing_fenced=1,updated_at=?1 WHERE id=?2",
+                    params![now(), item_id],
+                )?;
+                Self::record_event_tx(
+                    &tx,
+                    item_id,
+                    "landing_fenced",
+                    "target mutation authorized; cancellation is now closed",
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
         }
 
         pub fn set_workspace_path(&self, item_id: &str, path: &str) -> Result<()> {
@@ -851,20 +994,9 @@ pub mod sqlite {
         pub fn get_prompt(&self, prompt_id: &str) -> Result<Prompt> {
             let conn = self.connect()?;
             conn.query_row(
-                "SELECT id,item_id,attempt_id,blocked_phase,status,question,answer FROM prompts WHERE id=?1",
+                "SELECT id,item_id,attempt_id,blocked_phase,status,question,answer,options_json FROM prompts WHERE id=?1",
                 params![prompt_id],
-                |row| {
-                    let phase: String = row.get(3)?;
-                    Ok(Prompt {
-                        id: row.get(0)?,
-                        item_id: row.get(1)?,
-                        attempt_id: row.get(2)?,
-                        blocked_phase: BlockedPhase::from_str(&phase).map_err(|e| rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e))))?,
-                        status: row.get(4)?,
-                        question: row.get(5)?,
-                        answer: row.get(6)?,
-                    })
-                },
+                map_prompt,
             ).with_context(|| format!("prompt not found: {prompt_id}"))
         }
 
@@ -905,6 +1037,33 @@ pub mod sqlite {
         }
     }
 
+    fn map_prompt(row: &Row<'_>) -> rusqlite::Result<Prompt> {
+        let phase: String = row.get(3)?;
+        Ok(Prompt {
+            id: row.get(0)?,
+            item_id: row.get(1)?,
+            attempt_id: row.get(2)?,
+            blocked_phase: BlockedPhase::from_str(&phase).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+                )
+            })?,
+            status: row.get(4)?,
+            question: row.get(5)?,
+            answer: row.get(6)?,
+            options: row
+                .get::<_, Option<String>>(7)?
+                .map(|value| {
+                    serde_json::from_str(&value)
+                        .map_err(|error| map_json_error("options_json", error))
+                })
+                .transpose()?
+                .unwrap_or_default(),
+        })
+    }
+
     fn map_item(row: &Row<'_>) -> rusqlite::Result<QueueItem> {
         let status: String = row.get("status")?;
         let blocked_phase: Option<String> = row.get("blocked_phase")?;
@@ -941,6 +1100,7 @@ pub mod sqlite {
             landed_commit_sha: row.get("landed_commit_sha")?,
             producer_metadata: parse_json_value(row, "producer_metadata_json")?,
             validation_evidence,
+            landing_fenced: row.get("landing_fenced")?,
         })
     }
 
@@ -1001,6 +1161,7 @@ CREATE TABLE IF NOT EXISTS queue_items (
   target_sha TEXT,
   source_sha TEXT,
   landed_commit_sha TEXT,
+  landing_fenced INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -1064,13 +1225,17 @@ pub mod integrator {
     use anyhow::{Context, Result};
     use serde::Deserialize;
     use serde_json::{json, Value as JsonValue};
+    use std::collections::VecDeque;
     use std::ffi::OsStr;
     use std::fs;
+    use std::io::{Read, Write};
+    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Output};
+    use std::process::{Command, ExitStatus, Output, Stdio};
     use std::sync::mpsc;
     use std::thread::{self, JoinHandle};
     use std::time::Duration as StdDuration;
+    use wait_timeout::ChildExt;
 
     use crate::core::{BlockedPhase, BlockedReason, QueueStatus};
     use crate::sqlite::{Attempt, QueueItem, SqliteQueue};
@@ -1086,9 +1251,49 @@ pub mod integrator {
         pub workspace_root: PathBuf,
     }
 
+    #[derive(Clone, Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct SignoffPolicy {
+        pub command: String,
+        pub repository: String,
+        pub required_contexts: Vec<String>,
+        pub trusted_creator: String,
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct IntegrationPolicy {
+        pub validation_command: Option<String>,
+        pub signoff: Option<SignoffPolicy>,
+    }
+
     pub struct Integrator {
         queue: SqliteQueue,
         options: IntegratorOptions,
+        policy: IntegrationPolicy,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct GitHubCommitStatus {
+        context: String,
+        state: String,
+        creator: Option<GitHubStatusCreator>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct GitHubStatusCreator {
+        login: String,
+    }
+
+    enum SignoffGate {
+        Pass,
+        Pending(String),
+        Fail(String),
+        Untrusted(String),
+    }
+
+    enum SignoffQueryError {
+        Credentials(String),
+        Provider(String),
     }
 
     struct LeaseHeartbeat {
@@ -1141,9 +1346,59 @@ pub mod integrator {
 
     impl Integrator {
         pub fn new(options: IntegratorOptions) -> Result<Self> {
+            let policy = IntegrationPolicy {
+                validation_command: validation_command(&options.repo_path)?,
+                signoff: None,
+            };
+            Self::new_with_policy(options, policy)
+        }
+
+        pub fn new_with_policy(
+            mut options: IntegratorOptions,
+            mut policy: IntegrationPolicy,
+        ) -> Result<Self> {
+            options.repo_path = options.repo_path.canonicalize().with_context(|| {
+                format!(
+                    "resolve configured repository {}",
+                    options.repo_path.display()
+                )
+            })?;
+            if options.repo_key.rsplit_once("::").is_none() {
+                anyhow::bail!("repo_key must use <repository>::<target> scope");
+            }
+            policy.validation_command = policy
+                .validation_command
+                .map(|command| command.trim().to_string())
+                .filter(|command| !command.is_empty());
+            if let Some(signoff) = policy.signoff.as_mut() {
+                signoff.command = signoff.command.trim().to_string();
+                signoff.repository = signoff.repository.trim().to_string();
+                signoff.trusted_creator = signoff.trusted_creator.trim().to_string();
+                signoff.required_contexts = signoff
+                    .required_contexts
+                    .iter()
+                    .map(|context| context.trim().to_string())
+                    .filter(|context| !context.is_empty())
+                    .fold(Vec::new(), |mut contexts, context| {
+                        if !contexts.contains(&context) {
+                            contexts.push(context);
+                        }
+                        contexts
+                    });
+                if signoff.command.is_empty()
+                    || signoff.repository.is_empty()
+                    || signoff.trusted_creator.is_empty()
+                    || signoff.required_contexts.is_empty()
+                {
+                    anyhow::bail!(
+                        "signoff policy requires command, repository, trusted_creator, and required_contexts"
+                    );
+                }
+            }
             Ok(Self {
                 queue: SqliteQueue::open(&options.queue_db)?,
                 options,
+                policy,
             })
         }
 
@@ -1158,6 +1413,9 @@ pub mod integrator {
             let Some(active) = self.queue.oldest_active_item(&self.options.repo_key)? else {
                 return Ok(None);
             };
+            if let Some(blocked) = self.enforce_item_boundary(&active)? {
+                return Ok(Some(blocked));
+            }
             if active.status == QueueStatus::Blocked {
                 return Ok(Some(active));
             }
@@ -1200,6 +1458,9 @@ pub mod integrator {
                     self.options.repo_key
                 );
             }
+            if let Some(blocked) = self.enforce_item_boundary(&item)? {
+                return Ok(blocked);
+            }
             let attempt_id = item
                 .current_attempt_id
                 .as_deref()
@@ -1207,8 +1468,21 @@ pub mod integrator {
             let attempt = self.queue.get_attempt(attempt_id)?;
             match item.status {
                 QueueStatus::Merging => {
-                    let item =
-                        self.with_lease_heartbeat("merging", || self.resume_merge(item, &attempt))?;
+                    let has_conflict_prompt = self
+                        .queue
+                        .prompts_for_item(&item.id)?
+                        .into_iter()
+                        .any(|prompt| {
+                            prompt.attempt_id.as_deref() == Some(attempt.id.as_str())
+                                && prompt.blocked_phase == BlockedPhase::Merging
+                        });
+                    let item = self.with_lease_heartbeat("merging", || {
+                        if has_conflict_prompt {
+                            self.resume_merge(item, &attempt)
+                        } else {
+                            self.merge_item(item, &attempt)
+                        }
+                    })?;
                     if item.status == QueueStatus::Blocked {
                         return Ok(item);
                     }
@@ -1366,10 +1640,7 @@ pub mod integrator {
             }
 
             let workspace = self.workspace_path(&item);
-            if workspace.exists() {
-                fs::remove_dir_all(&workspace)
-                    .with_context(|| format!("remove stale workspace {}", workspace.display()))?;
-            }
+            self.remove_stale_workspace(&workspace)?;
             fs::create_dir_all(&self.options.workspace_root)?;
             git(
                 &self.options.repo_path,
@@ -1416,8 +1687,12 @@ pub mod integrator {
                 return self.queue.get_item(&item.id);
             }
 
+            let merge_in_progress =
+                git_status(&workspace, ["rev-parse", "--verify", "MERGE_HEAD"])?
+                    .status
+                    .success();
             let diff = git_status(&workspace, ["diff", "--cached", "--quiet"])?;
-            if !diff.status.success() {
+            if merge_in_progress || !diff.status.success() {
                 git(
                     &workspace,
                     ["commit", "-m", &format!("Integrate queue item {}", item.id)],
@@ -1434,8 +1709,7 @@ pub mod integrator {
                 .queue
                 .prompts_for_item(&item.id)?
                 .into_iter()
-                .filter(|prompt| prompt.attempt_id.as_deref() == Some(attempt.id.as_str()))
-                .last()
+                .rfind(|prompt| prompt.attempt_id.as_deref() == Some(attempt.id.as_str()))
                 .with_context(|| {
                     format!(
                         "item {} cannot resume merge without a prompt for attempt {}",
@@ -1511,9 +1785,27 @@ pub mod integrator {
                 )?;
                 return self.queue.get_item(&item.id);
             }
-            git(&workspace, ["add", "-A"])?;
+            let resolved_paths = item
+                .conflict
+                .as_ref()
+                .and_then(|conflict| conflict.get("files"))
+                .and_then(|files| files.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|path| path.as_str())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if !resolved_paths.is_empty() {
+                let mut args = vec!["add".to_string(), "--".to_string()];
+                args.extend(resolved_paths);
+                git(&workspace, args)?;
+            }
             let staged = git_status(&workspace, ["diff", "--cached", "--quiet"])?;
-            if !staged.status.success() {
+            let merge_in_progress =
+                git_status(&workspace, ["rev-parse", "--verify", "MERGE_HEAD"])?
+                    .status
+                    .success();
+            if merge_in_progress || !staged.status.success() {
                 git(
                     &workspace,
                     ["commit", "-m", &format!("Resolve queue item {}", item.id)],
@@ -1566,10 +1858,14 @@ pub mod integrator {
                 .as_ref()
                 .map(PathBuf::from)
                 .context("item missing integration workspace path")?;
-            let command = match validation_command(&workspace)? {
+            if item.status == QueueStatus::Merged {
+                self.transition_item_owned(&item.id, QueueStatus::Validating)?;
+            } else if item.status != QueueStatus::Validating {
+                anyhow::bail!("item {} in status {} cannot validate", item.id, item.status);
+            }
+            let command = match self.policy.validation_command.clone() {
                 Some(command) => command,
                 None => {
-                    self.transition_item_owned(&item.id, QueueStatus::Validating)?;
                     self.block_item_owned(
                         &item.id,
                         BlockedPhase::Validating,
@@ -1579,24 +1875,38 @@ pub mod integrator {
                     return self.queue.get_item(&item.id);
                 }
             };
-            self.transition_item_owned(&item.id, QueueStatus::Validating)?;
-            let log_dir = workspace.join(".iq");
+            if let Some(dirty) = workspace_dirty(&workspace)? {
+                self.block_item_owned(
+                    &item.id,
+                    BlockedPhase::Validating,
+                    BlockedReason::NeedsAgentFix,
+                    &format!("candidate is dirty before validation: {dirty}"),
+                )?;
+                return self.queue.get_item(&item.id);
+            }
+            let log_dir = self.evidence_dir(&item, attempt);
             fs::create_dir_all(&log_dir)?;
             let log_path = log_dir.join("validation.log");
-            let output = Command::new("sh")
-                .arg("-lc")
-                .arg(&command)
-                .current_dir(&workspace)
-                .output()
-                .with_context(|| format!("run validation command: {command}"))?;
-            let log = format!(
-                "$ {command}\n\n--- stdout ---\n{}\n--- stderr ---\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            fs::write(&log_path, log)?;
-            let exit_code = output.status.code().unwrap_or(-1) as i64;
-            if !output.status.success() {
+            let status = match run_evidence_command(
+                &command,
+                &workspace,
+                &log_path,
+                &[],
+                StdDuration::from_secs(2 * 60 * 60),
+            ) {
+                Ok(status) => status,
+                Err(error) => {
+                    self.block_item_owned(
+                        &item.id,
+                        BlockedPhase::Validating,
+                        BlockedReason::Infra,
+                        &format!("validation command could not complete: {error}"),
+                    )?;
+                    return self.queue.get_item(&item.id);
+                }
+            };
+            let exit_code = status.code().unwrap_or(-1) as i64;
+            if !status.success() {
                 self.ensure_repo_lease()?;
                 self.queue.update_attempt_validation(
                     &attempt.id,
@@ -1609,7 +1919,24 @@ pub mod integrator {
                     &item.id,
                     BlockedPhase::Validating,
                     BlockedReason::NeedsAgentFix,
-                    "validation command failed",
+                    &format!("validation command failed; inspect {}", log_path.display()),
+                )?;
+                return self.queue.get_item(&item.id);
+            }
+            if let Some(dirty) = workspace_dirty(&workspace)? {
+                self.ensure_repo_lease()?;
+                self.queue.update_attempt_validation(
+                    &attempt.id,
+                    &command,
+                    exit_code,
+                    &log_path.to_string_lossy(),
+                    None,
+                )?;
+                self.block_item_owned(
+                    &item.id,
+                    BlockedPhase::Validating,
+                    BlockedReason::NeedsAgentFix,
+                    &format!("validation modified candidate worktree: {dirty}"),
                 )?;
                 return self.queue.get_item(&item.id);
             }
@@ -1626,9 +1953,22 @@ pub mod integrator {
         }
 
         fn integrate_item(&self, item: QueueItem, attempt: &Attempt) -> Result<QueueItem> {
-            self.transition_item_owned(&item.id, QueueStatus::Integrating)?;
+            if let Some(blocked) = self.enforce_item_boundary(&item)? {
+                return Ok(blocked);
+            }
+            if item.status == QueueStatus::Validated {
+                self.transition_item_owned(&item.id, QueueStatus::Integrating)?;
+            } else if item.status != QueueStatus::Integrating {
+                anyhow::bail!(
+                    "item {} in status {} cannot integrate",
+                    item.id,
+                    item.status
+                );
+            }
             if let Some(pr_url) = item.pr_url.clone() {
-                return self.integrate_provider_item(item, attempt, &pr_url);
+                if self.policy.signoff.is_none() {
+                    return self.integrate_provider_item(item, attempt, &pr_url);
+                }
             }
             let workspace = item
                 .integration_workspace_path
@@ -1679,8 +2019,83 @@ pub mod integrator {
                 }
             }
             let landed_sha = git_output(&workspace, ["rev-parse", "HEAD"])?;
-            let push_ref = format!("HEAD:refs/heads/{}", item.target_branch);
-            if let Err(error) = git(&workspace, ["push", &self.options.base_remote, &push_ref]) {
+            if let Err(error) = self.verify_candidate_graph(&item, attempt, &workspace) {
+                return self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::NeedsAgentFix,
+                    &format!("candidate graph is invalid before signoff: {error}"),
+                );
+            }
+            if let Some(signoff) = &self.policy.signoff {
+                if let Some(blocked) =
+                    self.sign_candidate(&item, attempt, &workspace, &landed_sha, signoff)?
+                {
+                    return Ok(blocked);
+                }
+                if let Err(error) = self.fetch_target(&item) {
+                    return self.block_and_get(
+                        &item.id,
+                        BlockedPhase::Integrating,
+                        BlockedReason::Infra,
+                        &format!("failed to fetch target after signoff: {error}"),
+                    );
+                }
+                let target_after_signoff =
+                    git_output(&self.options.repo_path, ["rev-parse", &remote_ref])?;
+                if target_after_signoff != remote_sha {
+                    self.queue.record_event(
+                        &item.id,
+                        "target_moved_after_signoff",
+                        &format!(
+                            "target moved from {remote_sha} to {target_after_signoff}; rebuilding and resigning candidate"
+                        ),
+                    )?;
+                    if let Some(blocked) = self.merge_moved_base(
+                        &item,
+                        &workspace,
+                        &target_after_signoff,
+                        "target branch moved after signoff",
+                    )? {
+                        return Ok(blocked);
+                    }
+                    if let Some(blocked) = self.revalidate_moved_base(
+                        &item,
+                        attempt,
+                        &workspace,
+                        &target_after_signoff,
+                        "target moved after signoff",
+                    )? {
+                        return Ok(blocked);
+                    }
+                    return self.queue.get_item(&item.id);
+                }
+            }
+            if let Err(error) = self.verify_candidate_graph(&item, attempt, &workspace) {
+                return self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::NeedsAgentFix,
+                    &format!("candidate graph is invalid before target push: {error}"),
+                );
+            }
+            if let Some(dirty) = workspace_dirty(&workspace)? {
+                return self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::NeedsAgentFix,
+                    &format!("candidate is dirty before target push: {dirty}"),
+                );
+            }
+            self.ensure_repo_lease()?;
+            self.queue.begin_landing(&item.id, &attempt.id)?;
+            let target_ref = format!("refs/heads/{}", item.target_branch);
+            let push_ref = format!("HEAD:{target_ref}");
+            let lease = format!("--force-with-lease={target_ref}:{remote_sha}");
+            if let Err(error) = git(
+                &workspace,
+                ["push", lease.as_str(), &self.options.base_remote, &push_ref],
+            ) {
                 return self.block_and_get(
                     &item.id,
                     BlockedPhase::Integrating,
@@ -1709,7 +2124,314 @@ pub mod integrator {
                     ),
                 );
             }
+            if let Err(error) = git(
+                &self.options.repo_path,
+                [
+                    "merge-base",
+                    "--is-ancestor",
+                    item.current_head_sha.as_str(),
+                    &remote_ref,
+                ],
+            ) {
+                return self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::Infra,
+                    &format!(
+                        "remote target does not contain queued source commit {}: {error}",
+                        item.current_head_sha
+                    ),
+                );
+            }
             self.mark_integrated_owned(&item.id, &attempt.id, &landed_sha)
+        }
+
+        fn sign_candidate(
+            &self,
+            item: &QueueItem,
+            attempt: &Attempt,
+            workspace: &Path,
+            candidate_sha: &str,
+            policy: &SignoffPolicy,
+        ) -> Result<Option<QueueItem>> {
+            if let Some(dirty) = workspace_dirty(workspace)? {
+                return Ok(Some(self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::NeedsAgentFix,
+                    &format!("candidate is dirty before signoff: {dirty}"),
+                )?));
+            }
+            let candidate_branch = format!("iq/candidates/{}", item.id);
+            git(workspace, ["switch", "-C", &candidate_branch])?;
+            let candidate_push_ref = format!("HEAD:refs/heads/{candidate_branch}");
+            if let Err(error) = git(
+                workspace,
+                [
+                    "push",
+                    "--force",
+                    "--set-upstream",
+                    &self.options.base_remote,
+                    &candidate_push_ref,
+                ],
+            ) {
+                return Ok(Some(self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::Infra,
+                    &format!("failed to push signoff candidate {candidate_sha}: {error}"),
+                )?));
+            }
+            let remote_candidate = git_output(
+                workspace,
+                [
+                    "ls-remote",
+                    "--heads",
+                    &self.options.base_remote,
+                    &format!("refs/heads/{candidate_branch}"),
+                ],
+            )?
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+            if remote_candidate != candidate_sha {
+                return Ok(Some(self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::Infra,
+                    &format!(
+                        "remote candidate branch resolved to {remote_candidate}, expected {candidate_sha}"
+                    ),
+                )?));
+            }
+            self.queue.record_event(
+                &item.id,
+                "candidate_pushed",
+                &format!("pushed {candidate_sha} to {candidate_branch}"),
+            )?;
+
+            let log_dir = self.evidence_dir(item, attempt);
+            fs::create_dir_all(&log_dir)?;
+            let log_path = log_dir.join("signoff.log");
+            let status = run_evidence_command(
+                &policy.command,
+                workspace,
+                &log_path,
+                &[
+                    ("IQ_CANDIDATE_SHA", candidate_sha),
+                    ("IQ_ITEM_ID", &item.id),
+                ],
+                StdDuration::from_secs(3 * 60 * 60),
+            );
+            let status = match status {
+                Ok(status) => status,
+                Err(error) => {
+                    return Ok(Some(self.block_and_get(
+                        &item.id,
+                        BlockedPhase::Integrating,
+                        BlockedReason::Infra,
+                        &format!("signoff command could not complete: {error}"),
+                    )?));
+                }
+            };
+            if !status.success() {
+                let reason = match status.code() {
+                    None | Some(70) => BlockedReason::Infra,
+                    Some(75) => BlockedReason::Provider,
+                    Some(77) => BlockedReason::Credentials,
+                    Some(_) => BlockedReason::NeedsAgentFix,
+                };
+                return Ok(Some(self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    reason,
+                    &format!(
+                        "signoff command failed for {candidate_sha}; inspect {}",
+                        log_path.display()
+                    ),
+                )?));
+            }
+            if let Some(dirty) = workspace_dirty(workspace)? {
+                return Ok(Some(self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::NeedsAgentFix,
+                    &format!("signoff modified candidate worktree: {dirty}"),
+                )?));
+            }
+            let head_after = git_output(workspace, ["rev-parse", "HEAD"])?;
+            if head_after != candidate_sha {
+                return Ok(Some(self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::Infra,
+                    &format!("candidate changed during signoff: {candidate_sha} -> {head_after}"),
+                )?));
+            }
+
+            match self.github_signoff_gate(candidate_sha, policy) {
+                Ok(SignoffGate::Pass) => {
+                    self.queue.record_event(
+                        &item.id,
+                        "signoff_verified",
+                        &format!(
+                            "verified {} on {candidate_sha}",
+                            policy.required_contexts.join(", ")
+                        ),
+                    )?;
+                    Ok(None)
+                }
+                Ok(SignoffGate::Pending(message)) => Ok(Some(self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::Dependency,
+                    &message,
+                )?)),
+                Ok(SignoffGate::Fail(message)) => Ok(Some(self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::NeedsAgentFix,
+                    &message,
+                )?)),
+                Ok(SignoffGate::Untrusted(message)) => Ok(Some(self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::Credentials,
+                    &message,
+                )?)),
+                Err(SignoffQueryError::Credentials(error)) => Ok(Some(self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::Credentials,
+                    &format!("failed to verify signoff statuses for {candidate_sha}: {error}"),
+                )?)),
+                Err(SignoffQueryError::Provider(error)) => Ok(Some(self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::Provider,
+                    &format!("failed to verify signoff statuses for {candidate_sha}: {error}"),
+                )?)),
+            }
+        }
+
+        fn github_signoff_gate(
+            &self,
+            candidate_sha: &str,
+            policy: &SignoffPolicy,
+        ) -> std::result::Result<SignoffGate, SignoffQueryError> {
+            let gh = std::env::var("IQ_GITHUB_CLI").unwrap_or_else(|_| "gh".into());
+            let endpoint = format!(
+                "repos/{}/commits/{candidate_sha}/statuses",
+                policy.repository
+            );
+            let output =
+                command_output_timeout(&gh, ["api", endpoint.as_str()], StdDuration::from_secs(60))
+                    .map_err(|error| {
+                        SignoffQueryError::Provider(format!(
+                            "failed to run {gh} api for {candidate_sha}: {error}"
+                        ))
+                    })?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let normalized = stderr.to_ascii_lowercase();
+                let message = format!("gh status query failed: {stderr}");
+                if normalized.contains("http 401")
+                    || normalized.contains("http 403")
+                    || normalized.contains("authentication")
+                    || normalized.contains("not logged")
+                {
+                    return Err(SignoffQueryError::Credentials(message));
+                }
+                return Err(SignoffQueryError::Provider(message));
+            }
+            let statuses: Vec<GitHubCommitStatus> = serde_json::from_slice(&output.stdout)
+                .map_err(|error| {
+                    SignoffQueryError::Provider(format!(
+                        "parse GitHub commit statuses JSON: {error}"
+                    ))
+                })?;
+            for required in &policy.required_contexts {
+                // GitHub's commit-statuses endpoint returns newest statuses first.
+                let latest = statuses.iter().find(|status| status.context == *required);
+                let Some(status) = latest else {
+                    return Ok(SignoffGate::Pending(format!(
+                        "required status {required} is missing on {candidate_sha}"
+                    )));
+                };
+                let creator = status
+                    .creator
+                    .as_ref()
+                    .map(|creator| creator.login.as_str());
+                if creator != Some(policy.trusted_creator.as_str()) {
+                    return Ok(SignoffGate::Untrusted(format!(
+                        "required status {required} on {candidate_sha} was created by {}, expected {}",
+                        creator.unwrap_or("unknown"),
+                        policy.trusted_creator
+                    )));
+                }
+                match status.state.as_str() {
+                    "success" => {}
+                    "pending" => {
+                        return Ok(SignoffGate::Pending(format!(
+                            "required status {required} is pending on {candidate_sha}"
+                        )))
+                    }
+                    state => {
+                        return Ok(SignoffGate::Fail(format!(
+                            "required status {required} is {state} on {candidate_sha}"
+                        )))
+                    }
+                }
+            }
+            Ok(SignoffGate::Pass)
+        }
+
+        fn verify_candidate_graph(
+            &self,
+            item: &QueueItem,
+            attempt: &Attempt,
+            workspace: &Path,
+        ) -> Result<()> {
+            let current_attempt = self.queue.get_attempt(&attempt.id)?;
+            let head = git_output(workspace, ["rev-parse", "HEAD"])?;
+            let validated = current_attempt
+                .validated_commit_sha
+                .context("attempt has no validated candidate SHA")?;
+            if head != validated {
+                anyhow::bail!("workspace HEAD {head} differs from validated SHA {validated}");
+            }
+            git(
+                workspace,
+                [
+                    "merge-base",
+                    "--is-ancestor",
+                    item.current_head_sha.as_str(),
+                    head.as_str(),
+                ],
+            )
+            .with_context(|| {
+                format!(
+                    "validated candidate {head} does not contain queued source {}",
+                    item.current_head_sha
+                )
+            })?;
+            let target_base = current_attempt
+                .target_base_sha
+                .context("attempt has no target base SHA")?;
+            git(
+                workspace,
+                [
+                    "merge-base",
+                    "--is-ancestor",
+                    target_base.as_str(),
+                    head.as_str(),
+                ],
+            )
+            .with_context(|| {
+                format!("validated candidate {head} does not contain target base {target_base}")
+            })?;
+            Ok(())
         }
 
         fn merge_moved_base(
@@ -1719,9 +2441,19 @@ pub mod integrator {
             moved_base_sha: &str,
             summary_prefix: &str,
         ) -> Result<Option<QueueItem>> {
-            let source_sha = git_output(workspace, ["rev-parse", "HEAD"])
-                .unwrap_or_else(|_| item.current_head_sha.clone());
-            let merge = git_status(workspace, ["merge", "--no-edit", moved_base_sha])?;
+            let source_sha = match git_output(workspace, ["rev-parse", "HEAD"]) {
+                Ok(sha) => sha,
+                Err(error) => {
+                    return Ok(Some(self.block_and_get(
+                        &item.id,
+                        BlockedPhase::Integrating,
+                        BlockedReason::Infra,
+                        &format!("cannot resolve candidate before moved-base merge: {error}"),
+                    )?));
+                }
+            };
+            git(workspace, ["reset", "--hard", moved_base_sha])?;
+            let merge = git_status(workspace, ["merge", "--no-edit", &source_sha])?;
             if merge.status.success() {
                 self.ensure_repo_lease()?;
                 return Ok(None);
@@ -1764,9 +2496,9 @@ pub mod integrator {
             moved_base_sha: &str,
             label: &str,
         ) -> Result<Option<QueueItem>> {
-            let command = match validation_command(workspace) {
-                Ok(Some(command)) => command,
-                Ok(None) => {
+            let command = match self.policy.validation_command.clone() {
+                Some(command) => command,
+                None => {
                     return Ok(Some(self.block_and_get(
                         &item.id,
                         BlockedPhase::Validating,
@@ -1774,26 +2506,27 @@ pub mod integrator {
                         &format!("missing integration.validation.command after {label}"),
                     )?));
                 }
-                Err(error) => {
-                    return Ok(Some(self.block_and_get(
-                        &item.id,
-                        BlockedPhase::Validating,
-                        BlockedReason::Infra,
-                        &format!("failed to read validation command after {label}: {error}"),
-                    )?));
-                }
             };
-            let log_dir = workspace.join(".iq");
+            let log_dir = self.evidence_dir(item, attempt);
             fs::create_dir_all(&log_dir)?;
-            let safe_label = label.replace(' ', "-").replace('/', "-");
+            let safe_label = label.replace([' ', '/'], "-");
             let log_path = log_dir.join(format!("revalidation-after-{safe_label}.log"));
-            let output = match Command::new("sh")
-                .arg("-lc")
-                .arg(&command)
-                .current_dir(workspace)
-                .output()
-            {
-                Ok(output) => output,
+            if let Some(dirty) = workspace_dirty(workspace)? {
+                return Ok(Some(self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Validating,
+                    BlockedReason::NeedsAgentFix,
+                    &format!("candidate is dirty before revalidation after {label}: {dirty}"),
+                )?));
+            }
+            let status = match run_evidence_command(
+                &command,
+                workspace,
+                &log_path,
+                &[],
+                StdDuration::from_secs(2 * 60 * 60),
+            ) {
+                Ok(status) => status,
                 Err(error) => {
                     return Ok(Some(self.block_and_get(
                         &item.id,
@@ -1803,34 +2536,49 @@ pub mod integrator {
                     )?));
                 }
             };
-            let log = format!(
-                "$ {command}\n\n--- stdout ---\n{}\n--- stderr ---\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            fs::write(&log_path, log)?;
-            let exit_code = output.status.code().unwrap_or(-1) as i64;
-            let validated_sha = if output.status.success() {
-                git_output(workspace, ["rev-parse", "HEAD"]).ok()
+            let exit_code = status.code().unwrap_or(-1) as i64;
+            let dirty = workspace_dirty(workspace)?;
+            let validated_sha = if status.success() && dirty.is_none() {
+                match git_output(workspace, ["rev-parse", "HEAD"]) {
+                    Ok(sha) => Some(sha),
+                    Err(error) => {
+                        return Ok(Some(self.block_and_get(
+                            &item.id,
+                            BlockedPhase::Validating,
+                            BlockedReason::Infra,
+                            &format!("cannot resolve candidate after revalidation: {error}"),
+                        )?));
+                    }
+                }
             } else {
                 None
             };
             self.ensure_repo_lease()?;
-            self.queue
-                .update_attempt_base(&attempt.id, moved_base_sha)?;
-            self.queue.update_attempt_validation(
+            self.queue.update_attempt_revalidation(
                 &attempt.id,
+                moved_base_sha,
                 &command,
                 exit_code,
                 &log_path.to_string_lossy(),
                 validated_sha.as_deref(),
             )?;
-            if !output.status.success() {
+            if !status.success() {
                 return Ok(Some(self.block_and_get(
                     &item.id,
                     BlockedPhase::Validating,
                     BlockedReason::NeedsAgentFix,
-                    &format!("validation failed after {label}"),
+                    &format!(
+                        "validation failed after {label}; inspect {}",
+                        log_path.display()
+                    ),
+                )?));
+            }
+            if let Some(dirty) = dirty {
+                return Ok(Some(self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Validating,
+                    BlockedReason::NeedsAgentFix,
+                    &format!("revalidation after {label} modified candidate worktree: {dirty}"),
                 )?));
             }
             Ok(None)
@@ -1843,7 +2591,16 @@ pub mod integrator {
             reason: BlockedReason,
             message: &str,
         ) -> Result<QueueItem> {
-            self.block_item_owned(item_id, phase, reason, message)?;
+            let item = self.queue.get_item(item_id)?;
+            if item.status == QueueStatus::Integrating
+                && matches!(phase, BlockedPhase::Merging | BlockedPhase::Validating)
+            {
+                self.ensure_repo_lease()?;
+                self.queue
+                    .block_integrating_recovery(item_id, phase, reason, message)?;
+            } else {
+                self.block_item_owned(item_id, phase, reason, message)?;
+            }
             self.queue.get_item(item_id)
         }
 
@@ -1936,7 +2693,9 @@ pub mod integrator {
                 }
             }
 
-            let merge_result = match provider.merge(pr_url) {
+            self.ensure_repo_lease()?;
+            self.queue.begin_landing(&item.id, &attempt.id)?;
+            let merge_result = match provider.merge(pr_url, &item.current_head_sha) {
                 Ok(result) => result,
                 Err(error) => {
                     self.block_item_owned(
@@ -1960,9 +2719,14 @@ pub mod integrator {
                 "refs/remotes/{}/{}",
                 self.options.base_remote, item.target_branch
             );
-            let landed_sha = merge_result
-                .landed_sha
-                .unwrap_or_else(|| item.current_head_sha.clone());
+            let Some(landed_sha) = merge_result.landed_sha else {
+                return self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::Provider,
+                    "provider merge did not report the exact landed commit SHA",
+                );
+            };
             if let Err(error) = git(
                 &self.options.repo_path,
                 ["merge-base", "--is-ancestor", &landed_sha, &remote_ref],
@@ -2117,6 +2881,85 @@ pub mod integrator {
             let safe_id = item.id.replace('/', "-");
             self.options.workspace_root.join(safe_id)
         }
+
+        fn enforce_item_boundary(&self, item: &QueueItem) -> Result<Option<QueueItem>> {
+            let queued_repo = Path::new(&item.repo_path)
+                .canonicalize()
+                .with_context(|| format!("resolve queued repository path {}", item.repo_path))?;
+            let expected_target = self
+                .options
+                .repo_key
+                .rsplit_once("::")
+                .map(|(_, target)| target)
+                .context("configured repo_key has no target scope")?;
+            if queued_repo == self.options.repo_path && item.target_branch == expected_target {
+                return Ok(None);
+            }
+            let phase = match item.status {
+                QueueStatus::Ready => {
+                    self.transition_item_owned(&item.id, QueueStatus::Merging)?;
+                    BlockedPhase::Merging
+                }
+                QueueStatus::Merging => BlockedPhase::Merging,
+                QueueStatus::Merged => {
+                    self.transition_item_owned(&item.id, QueueStatus::Validating)?;
+                    BlockedPhase::Validating
+                }
+                QueueStatus::Validating => BlockedPhase::Validating,
+                QueueStatus::Validated => {
+                    self.transition_item_owned(&item.id, QueueStatus::Integrating)?;
+                    BlockedPhase::Integrating
+                }
+                QueueStatus::Integrating => BlockedPhase::Integrating,
+                _ => anyhow::bail!(
+                    "item {} in status {} cannot be checked against host policy",
+                    item.id,
+                    item.status
+                ),
+            };
+            self.block_item_owned(
+                &item.id,
+                phase,
+                BlockedReason::NeedsAgentFix,
+                &format!(
+                    "queued repository/target {}::{} does not match host policy {}::{}; cancel and enqueue on the correct queue",
+                    queued_repo.display(),
+                    item.target_branch,
+                    self.options.repo_path.display(),
+                    expected_target
+                ),
+            )?;
+            self.queue.get_item(&item.id).map(Some)
+        }
+
+        fn remove_stale_workspace(&self, workspace: &Path) -> Result<()> {
+            let registered =
+                git_output(&self.options.repo_path, ["worktree", "list", "--porcelain"])?
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("worktree "))
+                    .map(Path::new)
+                    .any(|path| path == workspace);
+            if registered {
+                git(
+                    &self.options.repo_path,
+                    ["worktree", "remove", "--force", path_arg(workspace)],
+                )?;
+            } else if workspace.exists() {
+                fs::remove_dir_all(workspace)
+                    .with_context(|| format!("remove stale workspace {}", workspace.display()))?;
+            }
+            git(&self.options.repo_path, ["worktree", "prune"])
+        }
+
+        fn evidence_dir(&self, item: &QueueItem, attempt: &Attempt) -> PathBuf {
+            let safe_item = item.id.replace('/', "-");
+            let safe_attempt = attempt.id.replace('/', "-");
+            self.options
+                .workspace_root
+                .join(".evidence")
+                .join(safe_item)
+                .join(safe_attempt)
+        }
     }
 
     #[derive(Clone, Debug, serde::Serialize)]
@@ -2161,7 +3004,7 @@ pub mod integrator {
             }
         }
 
-        Ok(default_validation_command(repo_path)?)
+        default_validation_command(repo_path)
     }
 
     fn default_validation_command(repo_path: &Path) -> Result<Option<String>> {
@@ -2292,6 +3135,206 @@ pub mod integrator {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
+    fn command_output_timeout<I, S>(program: &str, args: I, timeout: StdDuration) -> Result<Output>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut process = Command::new(program);
+        process
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let mut child = process.spawn().with_context(|| format!("run {program}"))?;
+        let process_group = -(child.id() as i32);
+        let stdout = child.stdout.take().context("capture command stdout")?;
+        let stderr = child.stderr.take().context("capture command stderr")?;
+        let stdout_thread = thread::spawn(move || capture_memory_bounded(stdout));
+        let stderr_thread = thread::spawn(move || capture_memory_bounded(stderr));
+        let status = match child.wait_timeout(timeout)? {
+            Some(status) => status,
+            None => {
+                unsafe {
+                    libc::kill(process_group, libc::SIGTERM);
+                }
+                match child.wait_timeout(StdDuration::from_secs(5))? {
+                    Some(_) => {
+                        anyhow::bail!("{program} timed out after {} seconds", timeout.as_secs())
+                    }
+                    None => {
+                        unsafe {
+                            libc::kill(process_group, libc::SIGKILL);
+                        }
+                        child.wait()?;
+                        anyhow::bail!("{program} timed out after {} seconds", timeout.as_secs())
+                    }
+                }
+            }
+        };
+        unsafe {
+            libc::kill(process_group, libc::SIGKILL);
+        }
+        let stdout = stdout_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("stdout capture thread panicked"))??;
+        let stderr = stderr_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("stderr capture thread panicked"))??;
+        Ok(Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
+    fn capture_memory_bounded(mut input: impl Read) -> Result<Vec<u8>> {
+        const MAX_BYTES: usize = 1024 * 1024;
+        let mut output = Vec::new();
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let count = input.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            let remaining = MAX_BYTES.saturating_sub(output.len());
+            output.extend_from_slice(&buffer[..remaining.min(count)]);
+        }
+        Ok(output)
+    }
+
+    fn run_evidence_command(
+        command: &str,
+        cwd: &Path,
+        log_path: &Path,
+        environment: &[(&str, &str)],
+        timeout: StdDuration,
+    ) -> Result<ExitStatus> {
+        let stdout_path = log_path.with_extension("stdout.tmp");
+        let stderr_path = log_path.with_extension("stderr.tmp");
+        let mut process = Command::new("sh");
+        process
+            .arg("-lc")
+            .arg(command)
+            .current_dir(cwd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        process.process_group(0);
+        for (key, value) in environment {
+            process.env(key, value);
+        }
+        let mut child = process
+            .spawn()
+            .with_context(|| format!("run evidence command: {command}"))?;
+        let process_group = -(child.id() as i32);
+        let stdout = child.stdout.take().context("capture command stdout")?;
+        let stderr = child.stderr.take().context("capture command stderr")?;
+        let stdout_capture = stdout_path.clone();
+        let stderr_capture = stderr_path.clone();
+        let stdout_thread = thread::spawn(move || capture_bounded(stdout, &stdout_capture));
+        let stderr_thread = thread::spawn(move || capture_bounded(stderr, &stderr_capture));
+        let mut timed_out = false;
+        let status = match child
+            .wait_timeout(timeout)
+            .with_context(|| format!("wait for evidence command: {command}"))?
+        {
+            Some(status) => status,
+            None => {
+                timed_out = true;
+                unsafe {
+                    libc::kill(process_group, libc::SIGTERM);
+                }
+                match child.wait_timeout(StdDuration::from_secs(5))? {
+                    Some(status) => status,
+                    None => {
+                        unsafe {
+                            libc::kill(process_group, libc::SIGKILL);
+                        }
+                        child.wait()?
+                    }
+                }
+            }
+        };
+        unsafe {
+            libc::kill(process_group, libc::SIGKILL);
+        }
+        stdout_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("stdout capture thread panicked"))??;
+        stderr_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("stderr capture thread panicked"))??;
+
+        let mut log = fs::File::create(log_path)
+            .with_context(|| format!("create evidence log {}", log_path.display()))?;
+        writeln!(log, "$ {command}\n\n--- stdout ---")?;
+        let mut stdout_file = fs::File::open(&stdout_path)?;
+        std::io::copy(&mut stdout_file, &mut log)?;
+        writeln!(log, "\n--- stderr ---")?;
+        let mut stderr_file = fs::File::open(&stderr_path)?;
+        std::io::copy(&mut stderr_file, &mut log)?;
+        fs::remove_file(stdout_path)?;
+        fs::remove_file(stderr_path)?;
+        if timed_out {
+            anyhow::bail!(
+                "command timed out after {} seconds; inspect {}",
+                timeout.as_secs(),
+                log_path.display()
+            );
+        }
+        Ok(status)
+    }
+
+    fn capture_bounded(mut input: impl Read, path: &Path) -> Result<()> {
+        const HEAD_BYTES: usize = 2 * 1024 * 1024;
+        const TAIL_BYTES: usize = 2 * 1024 * 1024;
+        let mut output = fs::File::create(path)?;
+        let mut buffer = [0_u8; 8192];
+        let mut head_written = 0_usize;
+        let mut tail = VecDeque::with_capacity(TAIL_BYTES);
+        let mut total = 0_usize;
+        loop {
+            let count = input.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            total = total.saturating_add(count);
+            let head_remaining = HEAD_BYTES.saturating_sub(head_written);
+            let head_count = head_remaining.min(count);
+            if head_count > 0 {
+                output.write_all(&buffer[..head_count])?;
+                head_written += head_count;
+            }
+            for byte in &buffer[head_count..count] {
+                if tail.len() == TAIL_BYTES {
+                    tail.pop_front();
+                }
+                tail.push_back(*byte);
+            }
+        }
+        let retained = head_written + tail.len();
+        if total > retained {
+            writeln!(
+                output,
+                "\n[IQ omitted {} middle output bytes]\n",
+                total - retained
+            )?;
+        }
+        let (first, second) = tail.as_slices();
+        output.write_all(first)?;
+        output.write_all(second)?;
+        Ok(())
+    }
+
+    fn workspace_dirty(workspace: &Path) -> Result<Option<String>> {
+        let status = git_output(workspace, ["status", "--porcelain"])?;
+        if status.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(status.lines().take(20).collect::<Vec<_>>().join("; ")))
+        }
+    }
+
     pub fn git_status<I, S>(cwd: &Path, args: I) -> Result<Output>
     where
         I: IntoIterator<Item = S>,
@@ -2352,14 +3395,14 @@ pub mod providers {
     pub trait ProviderAdapter {
         fn kind(&self) -> ProviderKind;
         fn snapshot(&self, url: &str) -> Result<ProviderSnapshot>;
-        fn merge(&self, url: &str) -> Result<ProviderMergeResult>;
+        fn merge(&self, url: &str, expected_head_sha: &str) -> Result<ProviderMergeResult>;
     }
 
     pub fn provider_for_url(url: &str) -> Result<Box<dyn ProviderAdapter>> {
         if url.contains("/pull/") || url.contains("github.com") {
-            Ok(Box::new(GitHubProvider::default()))
+            Ok(Box::new(GitHubProvider))
         } else if url.contains("/merge_requests/") || url.contains("gitlab") {
-            Ok(Box::new(GitLabProvider::default()))
+            Ok(Box::new(GitLabProvider))
         } else {
             anyhow::bail!("unsupported PR/MR provider URL: {url}")
         }
@@ -2394,10 +3437,17 @@ pub mod providers {
             })
         }
 
-        fn merge(&self, url: &str) -> Result<ProviderMergeResult> {
+        fn merge(&self, url: &str, expected_head_sha: &str) -> Result<ProviderMergeResult> {
             provider_command(
                 std::env::var("IQ_GITHUB_CLI").unwrap_or_else(|_| "gh".into()),
-                ["pr", "merge", url, "--merge"],
+                [
+                    "pr",
+                    "merge",
+                    url,
+                    "--merge",
+                    "--match-head-commit",
+                    expected_head_sha,
+                ],
             )?;
             let landed_sha = github_landed_sha(url).unwrap_or(None);
             Ok(ProviderMergeResult { landed_sha })
@@ -2432,10 +3482,10 @@ pub mod providers {
             })
         }
 
-        fn merge(&self, url: &str) -> Result<ProviderMergeResult> {
+        fn merge(&self, url: &str, expected_head_sha: &str) -> Result<ProviderMergeResult> {
             provider_command(
                 std::env::var("IQ_GITLAB_CLI").unwrap_or_else(|_| "glab".into()),
-                ["mr", "merge", url, "--yes"],
+                ["mr", "merge", url, "--yes", "--sha", expected_head_sha],
             )?;
             let landed_sha = gitlab_landed_sha(url).unwrap_or(None);
             Ok(ProviderMergeResult { landed_sha })

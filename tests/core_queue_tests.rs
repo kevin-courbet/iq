@@ -55,7 +55,7 @@ fn state_machine_rejects_invalid_transition_and_resumes_by_block_reason() {
 }
 
 #[test]
-fn sqlite_requeues_same_item_instead_of_creating_duplicate() {
+fn sqlite_enqueue_is_idempotent_but_rejects_active_head_changes() {
     let temp = tempdir().unwrap();
     let queue = SqliteQueue::open(&temp.path().join("queues.db")).unwrap();
 
@@ -70,27 +70,30 @@ fn sqlite_requeues_same_item_instead_of_creating_duplicate() {
             producer_metadata: serde_json::json!({"worker":"W001"}),
         })
         .unwrap();
-    let updated = queue
+    let repeated = queue
         .enqueue(EnqueueRequest {
-            current_head_sha: "222".into(),
-            ..EnqueueRequest {
-                repo_key: "repo::main".into(),
-                repo_path: "/repo".into(),
-                source_branch: "agent/one".into(),
-                target_branch: "main".into(),
-                current_head_sha: "ignored".into(),
-                pr_url: Some("https://github.com/org/repo/pull/7".into()),
-                producer_metadata: serde_json::json!({"worker":"W001","attempt":2}),
-            }
+            repo_key: "repo::main".into(),
+            repo_path: "/repo".into(),
+            source_branch: "agent/one".into(),
+            target_branch: "main".into(),
+            current_head_sha: "111".into(),
+            pr_url: None,
+            producer_metadata: serde_json::json!({"worker":"W001"}),
         })
         .unwrap();
+    let changed = queue.enqueue(EnqueueRequest {
+        repo_key: "repo::main".into(),
+        repo_path: "/repo".into(),
+        source_branch: "agent/one".into(),
+        target_branch: "main".into(),
+        current_head_sha: "222".into(),
+        pr_url: None,
+        producer_metadata: serde_json::json!({"worker":"W001","attempt":2}),
+    });
 
-    assert_eq!(first.id, updated.id);
-    assert_eq!(updated.current_head_sha, "222");
-    assert_eq!(
-        updated.pr_url.as_deref(),
-        Some("https://github.com/org/repo/pull/7")
-    );
+    assert_eq!(first.id, repeated.id);
+    assert!(changed.is_err());
+    assert_eq!(queue.get_item(&first.id).unwrap().current_head_sha, "111");
     assert_eq!(queue.list_items().unwrap().len(), 1);
 }
 

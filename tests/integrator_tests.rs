@@ -546,6 +546,11 @@ fn pr_backed_conflict_resolution_pushes_source_branch_before_provider_merge() {
         format!(
             r#"#!/bin/sh
 if [ "$1 $2" = "pr view" ]; then
+  if [ "$5" = "mergeCommit" ]; then
+    landed=$(git --git-dir={remote} rev-parse refs/heads/main)
+    printf '{{"mergeCommit":{{"oid":"%s"}}}}' "$landed"
+    exit 0
+  fi
   head=$(git --git-dir={remote} rev-parse refs/heads/agent/pr-conflict)
   base=$(git --git-dir={remote} rev-parse refs/heads/main)
   printf '{{"headRefOid":"%s","baseRefOid":"%s","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","statusCheckRollup":[{{"status":"COMPLETED","conclusion":"SUCCESS"}}]}}' "$head" "$base"
@@ -899,7 +904,12 @@ impl GitFixture {
             "pub fn fixture_value() -> &'static str { \"iq-demo-fixture\" }\n",
         )
         .unwrap();
-        git(&self.repo, ["add", "Cargo.toml", "src/lib.rs"]).unwrap();
+        fs::write(self.repo.join(".gitignore"), "/target\n/Cargo.lock\n").unwrap();
+        git(
+            &self.repo,
+            ["add", "Cargo.toml", "src/lib.rs", ".gitignore"],
+        )
+        .unwrap();
         git(&self.repo, ["commit", "-m", "cargo project"]).unwrap();
         git(&self.repo, ["push", "origin", "main"]).unwrap();
     }
