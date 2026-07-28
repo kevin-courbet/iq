@@ -493,6 +493,31 @@ pub mod sqlite {
             self.get_item(item_id)
         }
 
+        pub(crate) fn authorize_execution_start(
+            &self,
+            item_id: &str,
+            attempt_id: &str,
+            expected_status: QueueStatus,
+            release_gate: impl FnOnce() -> Result<()>,
+        ) -> Result<bool> {
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let (status, current_attempt_id): (String, Option<String>) = tx
+                .query_row(
+                    "SELECT status,current_attempt_id FROM queue_items WHERE id=?1",
+                    params![item_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .with_context(|| format!("queue item not found: {item_id}"))?;
+            let authorized = status == expected_status.to_string()
+                && current_attempt_id.as_deref() == Some(attempt_id);
+            if authorized {
+                release_gate()?;
+            }
+            tx.commit()?;
+            Ok(authorized)
+        }
+
         pub fn block_item(
             &self,
             item_id: &str,
@@ -845,6 +870,31 @@ pub mod sqlite {
         pub fn record_event(&self, item_id: &str, event_type: &str, message: &str) -> Result<()> {
             let conn = self.connect()?;
             self.record_event_with_conn(&conn, item_id, event_type, message)
+        }
+
+        pub(crate) fn record_event_if_status(
+            &self,
+            item_id: &str,
+            expected_status: QueueStatus,
+            event_type: &str,
+            message: &str,
+        ) -> Result<bool> {
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let status: String = tx
+                .query_row(
+                    "SELECT status FROM queue_items WHERE id=?1",
+                    params![item_id],
+                    |row| row.get(0),
+                )
+                .with_context(|| format!("queue item not found: {item_id}"))?;
+            if status != expected_status.to_string() {
+                tx.commit()?;
+                return Ok(false);
+            }
+            Self::record_event_tx(&tx, item_id, event_type, message)?;
+            tx.commit()?;
+            Ok(true)
         }
 
         pub fn events(&self, item_id: &str) -> Result<Vec<QueueEvent>> {
@@ -1621,7 +1671,7 @@ pub mod integrator {
     use std::process::{Command, ExitStatus, Output, Stdio};
     use std::sync::mpsc;
     use std::thread::{self, JoinHandle};
-    use std::time::Duration as StdDuration;
+    use std::time::{Duration as StdDuration, Instant};
     use wait_timeout::ChildExt;
 
     use crate::core::{BlockedPhase, BlockedReason, QueueStatus};
@@ -1681,6 +1731,18 @@ pub mod integrator {
     enum SignoffQueryError {
         Credentials(String),
         Provider(String),
+        Cancelled,
+    }
+
+    enum EvidenceCommandOutcome {
+        Exited(ExitStatus),
+        Cancelled(Option<ExitStatus>),
+        TimedOut(ExitStatus),
+    }
+
+    enum CommandOutputOutcome {
+        Exited(Output),
+        Cancelled,
     }
 
     struct LeaseHeartbeat {
@@ -1813,12 +1875,12 @@ pub mod integrator {
                 return Ok(None);
             };
             let item = self.with_lease_heartbeat("merging", || self.merge_item(item, &attempt))?;
-            if item.status == QueueStatus::Blocked {
+            if matches!(item.status, QueueStatus::Blocked | QueueStatus::Cancelled) {
                 return Ok(Some(item));
             }
             let item =
                 self.with_lease_heartbeat("validating", || self.validate_item(item, &attempt))?;
-            if item.status == QueueStatus::Blocked {
+            if matches!(item.status, QueueStatus::Blocked | QueueStatus::Cancelled) {
                 return Ok(Some(item));
             }
             let item =
@@ -1885,13 +1947,13 @@ pub mod integrator {
                             self.merge_item(item, &attempt)
                         }
                     })?;
-                    if item.status == QueueStatus::Blocked {
+                    if matches!(item.status, QueueStatus::Blocked | QueueStatus::Cancelled) {
                         return Ok(item);
                     }
                     let item = self.with_lease_heartbeat("validating", || {
                         self.validate_item(item, &attempt)
                     })?;
-                    if item.status == QueueStatus::Blocked {
+                    if matches!(item.status, QueueStatus::Blocked | QueueStatus::Cancelled) {
                         return Ok(item);
                     }
                     self.with_lease_heartbeat("integrating", || self.integrate_item(item, &attempt))
@@ -1900,7 +1962,7 @@ pub mod integrator {
                     let item = self.with_lease_heartbeat("validating", || {
                         self.validate_item(item, &attempt)
                     })?;
-                    if item.status == QueueStatus::Blocked {
+                    if matches!(item.status, QueueStatus::Blocked | QueueStatus::Cancelled) {
                         return Ok(item);
                     }
                     self.with_lease_heartbeat("integrating", || self.integrate_item(item, &attempt))
@@ -1909,7 +1971,7 @@ pub mod integrator {
                     let item = self.with_lease_heartbeat("validating", || {
                         self.validate_item(item, &attempt)
                     })?;
-                    if item.status == QueueStatus::Blocked {
+                    if matches!(item.status, QueueStatus::Blocked | QueueStatus::Cancelled) {
                         return Ok(item);
                     }
                     self.with_lease_heartbeat("integrating", || self.integrate_item(item, &attempt))
@@ -1966,7 +2028,56 @@ pub mod integrator {
 
         fn transition_item_owned(&self, item_id: &str, target: QueueStatus) -> Result<QueueItem> {
             self.ensure_repo_lease()?;
-            self.queue.transition_item(item_id, target)
+            match self.queue.transition_item(item_id, target) {
+                Ok(item) => Ok(item),
+                Err(error) => {
+                    let current = self.queue.get_item(item_id)?;
+                    if current.status == QueueStatus::Cancelled {
+                        Ok(current)
+                    } else {
+                        Err(error)
+                    }
+                }
+            }
+        }
+
+        fn item_cancelled(&self, item_id: &str) -> Result<bool> {
+            Ok(self.queue.get_item(item_id)?.status == QueueStatus::Cancelled)
+        }
+
+        fn cancelled_item(&self, item_id: &str) -> Result<Option<QueueItem>> {
+            let item = self.queue.get_item(item_id)?;
+            Ok((item.status == QueueStatus::Cancelled).then_some(item))
+        }
+
+        fn authorize_execution_start(
+            &self,
+            item_id: &str,
+            attempt_id: &str,
+            expected_status: QueueStatus,
+            release_gate: impl FnOnce() -> Result<()>,
+        ) -> Result<bool> {
+            self.ensure_repo_lease()?;
+            self.queue
+                .authorize_execution_start(item_id, attempt_id, expected_status, release_gate)
+        }
+
+        fn begin_landing_owned(
+            &self,
+            item_id: &str,
+            attempt_id: &str,
+        ) -> Result<Option<QueueItem>> {
+            self.ensure_repo_lease()?;
+            match self.queue.begin_landing(item_id, attempt_id) {
+                Ok(()) => Ok(None),
+                Err(error) => {
+                    if let Some(cancelled) = self.cancelled_item(item_id)? {
+                        Ok(Some(cancelled))
+                    } else {
+                        Err(error)
+                    }
+                }
+            }
         }
 
         fn block_item_owned(
@@ -2279,54 +2390,112 @@ pub mod integrator {
                 .as_ref()
                 .map(PathBuf::from)
                 .context("item missing integration workspace path")?;
-            if item.status == QueueStatus::Merged {
-                self.transition_item_owned(&item.id, QueueStatus::Validating)?;
+            let item = if item.status == QueueStatus::Merged {
+                self.transition_item_owned(&item.id, QueueStatus::Validating)?
             } else if item.status != QueueStatus::Validating {
                 anyhow::bail!("item {} in status {} cannot validate", item.id, item.status);
+            } else {
+                item
+            };
+            if item.status == QueueStatus::Cancelled {
+                return Ok(item);
             }
             let command = match self.policy.validation_command.clone() {
                 Some(command) => command,
                 None => {
-                    self.block_item_owned(
+                    return self.block_and_get(
                         &item.id,
                         BlockedPhase::Validating,
                         BlockedReason::NeedsUserInput,
                         "missing integration validation command",
-                    )?;
-                    return self.queue.get_item(&item.id);
+                    );
                 }
             };
             if let Some(dirty) = workspace_dirty(&workspace)? {
-                self.block_item_owned(
+                return self.block_and_get(
                     &item.id,
                     BlockedPhase::Validating,
                     BlockedReason::NeedsAgentFix,
                     &format!("candidate is dirty before validation: {dirty}"),
-                )?;
-                return self.queue.get_item(&item.id);
+                );
             }
             let log_dir = self.evidence_dir(&item, attempt);
             fs::create_dir_all(&log_dir)?;
             let log_path = log_dir.join("validation.log");
-            let status = match run_evidence_command(
+            let outcome = match run_evidence_command(
                 &command,
                 &workspace,
                 &log_path,
                 &[],
                 StdDuration::from_secs(2 * 60 * 60),
+                |gate| {
+                    self.authorize_execution_start(
+                        &item.id,
+                        &attempt.id,
+                        QueueStatus::Validating,
+                        || {
+                            gate.write_all(b"run\n")
+                                .context("release command admission gate")
+                        },
+                    )
+                },
+                || self.item_cancelled(&item.id),
             ) {
-                Ok(status) => status,
+                Ok(outcome) => outcome,
                 Err(error) => {
-                    self.block_item_owned(
+                    return self.block_and_get(
                         &item.id,
                         BlockedPhase::Validating,
                         BlockedReason::Infra,
                         &format!("validation command could not complete: {error}"),
+                    );
+                }
+            };
+            let status = match outcome {
+                EvidenceCommandOutcome::Exited(status) => status,
+                EvidenceCommandOutcome::Cancelled(status) => {
+                    self.ensure_repo_lease()?;
+                    self.queue.update_attempt_validation(
+                        &attempt.id,
+                        &command,
+                        status.and_then(|status| status.code()).unwrap_or(-1) as i64,
+                        &log_path.to_string_lossy(),
+                        None,
                     )?;
                     return self.queue.get_item(&item.id);
                 }
+                EvidenceCommandOutcome::TimedOut(status) => {
+                    self.ensure_repo_lease()?;
+                    self.queue.update_attempt_validation(
+                        &attempt.id,
+                        &command,
+                        status.code().unwrap_or(-1) as i64,
+                        &log_path.to_string_lossy(),
+                        None,
+                    )?;
+                    return self.block_and_get(
+                        &item.id,
+                        BlockedPhase::Validating,
+                        BlockedReason::Infra,
+                        &format!(
+                            "validation command timed out; inspect {}",
+                            log_path.display()
+                        ),
+                    );
+                }
             };
             let exit_code = status.code().unwrap_or(-1) as i64;
+            if self.item_cancelled(&item.id)? {
+                self.ensure_repo_lease()?;
+                self.queue.update_attempt_validation(
+                    &attempt.id,
+                    &command,
+                    exit_code,
+                    &log_path.to_string_lossy(),
+                    None,
+                )?;
+                return self.queue.get_item(&item.id);
+            }
             if !status.success() {
                 self.ensure_repo_lease()?;
                 self.queue.update_attempt_validation(
@@ -2336,13 +2505,12 @@ pub mod integrator {
                     &log_path.to_string_lossy(),
                     None,
                 )?;
-                self.block_item_owned(
+                return self.block_and_get(
                     &item.id,
                     BlockedPhase::Validating,
                     BlockedReason::NeedsAgentFix,
                     &format!("validation command failed; inspect {}", log_path.display()),
-                )?;
-                return self.queue.get_item(&item.id);
+                );
             }
             if let Some(dirty) = workspace_dirty(&workspace)? {
                 self.ensure_repo_lease()?;
@@ -2353,13 +2521,12 @@ pub mod integrator {
                     &log_path.to_string_lossy(),
                     None,
                 )?;
-                self.block_item_owned(
+                return self.block_and_get(
                     &item.id,
                     BlockedPhase::Validating,
                     BlockedReason::NeedsAgentFix,
                     &format!("validation modified candidate worktree: {dirty}"),
-                )?;
-                return self.queue.get_item(&item.id);
+                );
             }
             let validated_sha = git_output(&workspace, ["rev-parse", "HEAD"])?;
             self.ensure_repo_lease()?;
@@ -2377,14 +2544,19 @@ pub mod integrator {
             if let Some(blocked) = self.enforce_item_boundary(&item)? {
                 return Ok(blocked);
             }
-            if item.status == QueueStatus::Validated {
-                self.transition_item_owned(&item.id, QueueStatus::Integrating)?;
+            let item = if item.status == QueueStatus::Validated {
+                self.transition_item_owned(&item.id, QueueStatus::Integrating)?
             } else if item.status != QueueStatus::Integrating {
                 anyhow::bail!(
                     "item {} in status {} cannot integrate",
                     item.id,
                     item.status
                 );
+            } else {
+                item
+            };
+            if item.status == QueueStatus::Cancelled {
+                return Ok(item);
             }
             if let Some(pr_url) = item.pr_url.clone() {
                 if self.policy.signoff.is_none() {
@@ -2438,6 +2610,9 @@ pub mod integrator {
                 )? {
                     return Ok(blocked);
                 }
+                if let Some(cancelled) = self.cancelled_item(&item.id)? {
+                    return Ok(cancelled);
+                }
             }
             let landed_sha = git_output(&workspace, ["rev-parse", "HEAD"])?;
             if let Err(error) = self.verify_candidate_graph(&item, attempt, &workspace) {
@@ -2449,10 +2624,16 @@ pub mod integrator {
                 );
             }
             if let Some(signoff) = &self.policy.signoff {
+                if let Some(cancelled) = self.cancelled_item(&item.id)? {
+                    return Ok(cancelled);
+                }
                 if let Some(blocked) =
                     self.sign_candidate(&item, attempt, &workspace, &landed_sha, signoff)?
                 {
                     return Ok(blocked);
+                }
+                if let Some(cancelled) = self.cancelled_item(&item.id)? {
+                    return Ok(cancelled);
                 }
                 if let Err(error) = self.fetch_target(&item) {
                     return self.block_and_get(
@@ -2489,8 +2670,14 @@ pub mod integrator {
                     )? {
                         return Ok(blocked);
                     }
+                    if let Some(cancelled) = self.cancelled_item(&item.id)? {
+                        return Ok(cancelled);
+                    }
                     return self.queue.get_item(&item.id);
                 }
+            }
+            if let Some(cancelled) = self.cancelled_item(&item.id)? {
+                return Ok(cancelled);
             }
             if let Err(error) = self.verify_candidate_graph(&item, attempt, &workspace) {
                 return self.block_and_get(
@@ -2508,8 +2695,9 @@ pub mod integrator {
                     &format!("candidate is dirty before target push: {dirty}"),
                 );
             }
-            self.ensure_repo_lease()?;
-            self.queue.begin_landing(&item.id, &attempt.id)?;
+            if let Some(cancelled) = self.begin_landing_owned(&item.id, &attempt.id)? {
+                return Ok(cancelled);
+            }
             let target_ref = format!("refs/heads/{}", item.target_branch);
             let push_ref = format!("HEAD:{target_ref}");
             let lease = format!("--force-with-lease={target_ref}:{remote_sha}");
@@ -2575,6 +2763,9 @@ pub mod integrator {
             candidate_sha: &str,
             policy: &SignoffPolicy,
         ) -> Result<Option<QueueItem>> {
+            if let Some(cancelled) = self.cancelled_item(&item.id)? {
+                return Ok(Some(cancelled));
+            }
             if let Some(dirty) = workspace_dirty(workspace)? {
                 return Ok(Some(self.block_and_get(
                     &item.id,
@@ -2635,7 +2826,7 @@ pub mod integrator {
             let log_dir = self.evidence_dir(item, attempt);
             fs::create_dir_all(&log_dir)?;
             let log_path = log_dir.join("signoff.log");
-            let status = run_evidence_command(
+            let outcome = run_evidence_command(
                 &policy.command,
                 workspace,
                 &log_path,
@@ -2644,9 +2835,21 @@ pub mod integrator {
                     ("IQ_ITEM_ID", &item.id),
                 ],
                 StdDuration::from_secs(3 * 60 * 60),
+                |gate| {
+                    self.authorize_execution_start(
+                        &item.id,
+                        &attempt.id,
+                        QueueStatus::Integrating,
+                        || {
+                            gate.write_all(b"run\n")
+                                .context("release command admission gate")
+                        },
+                    )
+                },
+                || self.item_cancelled(&item.id),
             );
-            let status = match status {
-                Ok(status) => status,
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
                 Err(error) => {
                     return Ok(Some(self.block_and_get(
                         &item.id,
@@ -2656,6 +2859,23 @@ pub mod integrator {
                     )?));
                 }
             };
+            let status = match outcome {
+                EvidenceCommandOutcome::Exited(status) => status,
+                EvidenceCommandOutcome::Cancelled(_) => {
+                    return Ok(Some(self.queue.get_item(&item.id)?));
+                }
+                EvidenceCommandOutcome::TimedOut(_) => {
+                    return Ok(Some(self.block_and_get(
+                        &item.id,
+                        BlockedPhase::Integrating,
+                        BlockedReason::Infra,
+                        &format!("signoff command timed out; inspect {}", log_path.display()),
+                    )?));
+                }
+            };
+            if self.item_cancelled(&item.id)? {
+                return Ok(Some(self.queue.get_item(&item.id)?));
+            }
             if !status.success() {
                 let reason = match status.code() {
                     None | Some(70) => BlockedReason::Infra,
@@ -2691,16 +2911,25 @@ pub mod integrator {
                 )?));
             }
 
-            match self.github_signoff_gate(candidate_sha, policy) {
+            match self.github_signoff_gate(&item.id, &attempt.id, candidate_sha, policy) {
                 Ok(SignoffGate::Pass) => {
-                    self.queue.record_event(
+                    if !self.queue.record_event_if_status(
                         &item.id,
+                        QueueStatus::Integrating,
                         "signoff_verified",
                         &format!(
                             "verified {} on {candidate_sha}",
                             policy.required_contexts.join(", ")
                         ),
-                    )?;
+                    )? {
+                        if let Some(cancelled) = self.cancelled_item(&item.id)? {
+                            return Ok(Some(cancelled));
+                        }
+                        anyhow::bail!(
+                            "item {} left integrating before signoff verification",
+                            item.id
+                        );
+                    }
                     Ok(None)
                 }
                 Ok(SignoffGate::Pending(message)) => Ok(Some(self.block_and_get(
@@ -2733,11 +2962,14 @@ pub mod integrator {
                     BlockedReason::Provider,
                     &format!("failed to verify signoff statuses for {candidate_sha}: {error}"),
                 )?)),
+                Err(SignoffQueryError::Cancelled) => Ok(Some(self.queue.get_item(&item.id)?)),
             }
         }
 
         fn github_signoff_gate(
             &self,
+            item_id: &str,
+            attempt_id: &str,
             candidate_sha: &str,
             policy: &SignoffPolicy,
         ) -> std::result::Result<SignoffGate, SignoffQueryError> {
@@ -2746,13 +2978,32 @@ pub mod integrator {
                 "repos/{}/commits/{candidate_sha}/statuses",
                 policy.repository
             );
-            let output =
-                command_output_timeout(&gh, ["api", endpoint.as_str()], StdDuration::from_secs(60))
-                    .map_err(|error| {
-                        SignoffQueryError::Provider(format!(
-                            "failed to run {gh} api for {candidate_sha}: {error}"
-                        ))
-                    })?;
+            let output = command_output_timeout(
+                &gh,
+                ["api", endpoint.as_str()],
+                StdDuration::from_secs(60),
+                |gate| {
+                    self.authorize_execution_start(
+                        item_id,
+                        attempt_id,
+                        QueueStatus::Integrating,
+                        || {
+                            gate.write_all(b"run\n")
+                                .context("release command admission gate")
+                        },
+                    )
+                },
+                || self.item_cancelled(item_id),
+            )
+            .map_err(|error| {
+                SignoffQueryError::Provider(format!(
+                    "failed to run {gh} api for {candidate_sha}: {error}"
+                ))
+            })?;
+            let output = match output {
+                CommandOutputOutcome::Exited(output) => output,
+                CommandOutputOutcome::Cancelled => return Err(SignoffQueryError::Cancelled),
+            };
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
                 let normalized = stderr.to_ascii_lowercase();
@@ -2940,14 +3191,26 @@ pub mod integrator {
                     &format!("candidate is dirty before revalidation after {label}: {dirty}"),
                 )?));
             }
-            let status = match run_evidence_command(
+            let outcome = match run_evidence_command(
                 &command,
                 workspace,
                 &log_path,
                 &[],
                 StdDuration::from_secs(2 * 60 * 60),
+                |gate| {
+                    self.authorize_execution_start(
+                        &item.id,
+                        &attempt.id,
+                        QueueStatus::Integrating,
+                        || {
+                            gate.write_all(b"run\n")
+                                .context("release command admission gate")
+                        },
+                    )
+                },
+                || self.item_cancelled(&item.id),
             ) {
-                Ok(status) => status,
+                Ok(outcome) => outcome,
                 Err(error) => {
                     return Ok(Some(self.block_and_get(
                         &item.id,
@@ -2957,7 +3220,54 @@ pub mod integrator {
                     )?));
                 }
             };
+            let status = match outcome {
+                EvidenceCommandOutcome::Exited(status) => status,
+                EvidenceCommandOutcome::Cancelled(status) => {
+                    self.ensure_repo_lease()?;
+                    self.queue.update_attempt_revalidation(
+                        &attempt.id,
+                        moved_base_sha,
+                        &command,
+                        status.and_then(|status| status.code()).unwrap_or(-1) as i64,
+                        &log_path.to_string_lossy(),
+                        None,
+                    )?;
+                    return Ok(Some(self.queue.get_item(&item.id)?));
+                }
+                EvidenceCommandOutcome::TimedOut(status) => {
+                    self.ensure_repo_lease()?;
+                    self.queue.update_attempt_revalidation(
+                        &attempt.id,
+                        moved_base_sha,
+                        &command,
+                        status.code().unwrap_or(-1) as i64,
+                        &log_path.to_string_lossy(),
+                        None,
+                    )?;
+                    return Ok(Some(self.block_and_get(
+                        &item.id,
+                        BlockedPhase::Validating,
+                        BlockedReason::Infra,
+                        &format!(
+                            "validation timed out after {label}; inspect {}",
+                            log_path.display()
+                        ),
+                    )?));
+                }
+            };
             let exit_code = status.code().unwrap_or(-1) as i64;
+            if self.item_cancelled(&item.id)? {
+                self.ensure_repo_lease()?;
+                self.queue.update_attempt_revalidation(
+                    &attempt.id,
+                    moved_base_sha,
+                    &command,
+                    exit_code,
+                    &log_path.to_string_lossy(),
+                    None,
+                )?;
+                return Ok(Some(self.queue.get_item(&item.id)?));
+            }
             let dirty = workspace_dirty(workspace)?;
             let validated_sha = if status.success() && dirty.is_none() {
                 match git_output(workspace, ["rev-parse", "HEAD"]) {
@@ -3013,14 +3323,24 @@ pub mod integrator {
             message: &str,
         ) -> Result<QueueItem> {
             let item = self.queue.get_item(item_id)?;
-            if item.status == QueueStatus::Integrating
+            if item.status == QueueStatus::Cancelled {
+                return Ok(item);
+            }
+            let result = if item.status == QueueStatus::Integrating
                 && matches!(phase, BlockedPhase::Merging | BlockedPhase::Validating)
             {
                 self.ensure_repo_lease()?;
                 self.queue
-                    .block_integrating_recovery(item_id, phase, reason, message)?;
+                    .block_integrating_recovery(item_id, phase, reason, message)
             } else {
-                self.block_item_owned(item_id, phase, reason, message)?;
+                self.block_item_owned(item_id, phase, reason, message)
+            };
+            if let Err(error) = result {
+                let current = self.queue.get_item(item_id)?;
+                if current.status == QueueStatus::Cancelled {
+                    return Ok(current);
+                }
+                return Err(error);
             }
             self.queue.get_item(item_id)
         }
@@ -3112,10 +3432,14 @@ pub mod integrator {
                 )? {
                     return Ok(blocked);
                 }
+                if let Some(cancelled) = self.cancelled_item(&item.id)? {
+                    return Ok(cancelled);
+                }
             }
 
-            self.ensure_repo_lease()?;
-            self.queue.begin_landing(&item.id, &attempt.id)?;
+            if let Some(cancelled) = self.begin_landing_owned(&item.id, &attempt.id)? {
+                return Ok(cancelled);
+            }
             let merge_result = match provider.merge(pr_url, &item.current_head_sha) {
                 Ok(result) => result,
                 Err(error) => {
@@ -3581,57 +3905,81 @@ pub mod integrator {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    fn command_output_timeout<I, S>(program: &str, args: I, timeout: StdDuration) -> Result<Output>
+    fn command_output_timeout<I, S>(
+        program: &str,
+        args: I,
+        timeout: StdDuration,
+        authorize_start: impl FnOnce(&mut dyn Write) -> Result<bool>,
+        mut is_cancelled: impl FnMut() -> Result<bool>,
+    ) -> Result<CommandOutputOutcome>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let mut process = Command::new(program);
-        process
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
-        let mut child = process.spawn().with_context(|| format!("run {program}"))?;
-        let process_group = -(child.id() as i32);
+        const POLL_INTERVAL: StdDuration = StdDuration::from_millis(10);
+        const CANCELLATION_GRACE: StdDuration = StdDuration::from_millis(50);
+        const TIMEOUT_GRACE: StdDuration = StdDuration::from_secs(5);
+
+        let mut process = gated_process(program, args);
+        process.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let Some((mut child, process_group)) =
+            spawn_authorized(process, authorize_start, &format!("run {program}"))?
+        else {
+            return Ok(CommandOutputOutcome::Cancelled);
+        };
         let stdout = child.stdout.take().context("capture command stdout")?;
         let stderr = child.stderr.take().context("capture command stderr")?;
         let stdout_thread = thread::spawn(move || capture_memory_bounded(stdout));
         let stderr_thread = thread::spawn(move || capture_memory_bounded(stderr));
-        let status = match child.wait_timeout(timeout)? {
-            Some(status) => status,
-            None => {
-                unsafe {
-                    libc::kill(process_group, libc::SIGTERM);
+        let deadline = Instant::now() + timeout;
+        let mut timed_out = false;
+        let mut cancelled = false;
+        let mut cancellation_error = None;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            match is_cancelled() {
+                Ok(true) => {
+                    cancelled = true;
+                    break terminate_process_group(&mut child, process_group, CANCELLATION_GRACE)?;
                 }
-                match child.wait_timeout(StdDuration::from_secs(5))? {
-                    Some(_) => {
-                        anyhow::bail!("{program} timed out after {} seconds", timeout.as_secs())
-                    }
-                    None => {
-                        unsafe {
-                            libc::kill(process_group, libc::SIGKILL);
-                        }
-                        child.wait()?;
-                        anyhow::bail!("{program} timed out after {} seconds", timeout.as_secs())
-                    }
+                Ok(false) => {}
+                Err(error) => {
+                    cancellation_error = Some(error);
+                    break terminate_process_group(&mut child, process_group, CANCELLATION_GRACE)?;
                 }
             }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                timed_out = true;
+                break terminate_process_group(&mut child, process_group, TIMEOUT_GRACE)?;
+            }
+            if let Some(status) = child.wait_timeout(POLL_INTERVAL.min(remaining))? {
+                break status;
+            }
         };
-        unsafe {
-            libc::kill(process_group, libc::SIGKILL);
-        }
+        signal_process_group(process_group, libc::SIGKILL)?;
         let stdout = stdout_thread
             .join()
             .map_err(|_| anyhow::anyhow!("stdout capture thread panicked"))??;
         let stderr = stderr_thread
             .join()
             .map_err(|_| anyhow::anyhow!("stderr capture thread panicked"))??;
-        Ok(Output {
+        if let Some(error) = cancellation_error {
+            return Err(error).context("check command cancellation");
+        }
+        if cancelled || is_cancelled()? {
+            return Ok(CommandOutputOutcome::Cancelled);
+        }
+        if timed_out {
+            anyhow::bail!("{program} timed out after {} seconds", timeout.as_secs());
+        }
+        Ok(CommandOutputOutcome::Exited(Output {
             status,
             stdout,
             stderr,
-        })
+        }))
     }
 
     fn capture_memory_bounded(mut input: impl Read) -> Result<Vec<u8>> {
@@ -3655,55 +4003,75 @@ pub mod integrator {
         log_path: &Path,
         environment: &[(&str, &str)],
         timeout: StdDuration,
-    ) -> Result<ExitStatus> {
+        authorize_start: impl FnOnce(&mut dyn Write) -> Result<bool>,
+        mut is_cancelled: impl FnMut() -> Result<bool>,
+    ) -> Result<EvidenceCommandOutcome> {
+        const POLL_INTERVAL: StdDuration = StdDuration::from_millis(10);
+        const CANCELLATION_GRACE: StdDuration = StdDuration::from_millis(50);
+        const TIMEOUT_GRACE: StdDuration = StdDuration::from_secs(5);
+
         let stdout_path = log_path.with_extension("stdout.tmp");
         let stderr_path = log_path.with_extension("stderr.tmp");
-        let mut process = Command::new("sh");
+        let mut process = gated_process("sh", ["-lc", command]);
         process
-            .arg("-lc")
-            .arg(command)
             .current_dir(cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        process.process_group(0);
         for (key, value) in environment {
             process.env(key, value);
         }
-        let mut child = process
-            .spawn()
-            .with_context(|| format!("run evidence command: {command}"))?;
-        let process_group = -(child.id() as i32);
+        let Some((mut child, process_group)) = spawn_authorized(
+            process,
+            authorize_start,
+            &format!("run evidence command: {command}"),
+        )?
+        else {
+            let mut log = fs::File::create(log_path)
+                .with_context(|| format!("create evidence log {}", log_path.display()))?;
+            writeln!(log, "$ {command}\n\n[IQ cancelled before command start]")?;
+            return Ok(EvidenceCommandOutcome::Cancelled(None));
+        };
         let stdout = child.stdout.take().context("capture command stdout")?;
         let stderr = child.stderr.take().context("capture command stderr")?;
         let stdout_capture = stdout_path.clone();
         let stderr_capture = stderr_path.clone();
         let stdout_thread = thread::spawn(move || capture_bounded(stdout, &stdout_capture));
         let stderr_thread = thread::spawn(move || capture_bounded(stderr, &stderr_capture));
+        let deadline = Instant::now() + timeout;
         let mut timed_out = false;
-        let status = match child
-            .wait_timeout(timeout)
-            .with_context(|| format!("wait for evidence command: {command}"))?
-        {
-            Some(status) => status,
-            None => {
-                timed_out = true;
-                unsafe {
-                    libc::kill(process_group, libc::SIGTERM);
+        let mut cancelled = false;
+        let mut cancellation_error = None;
+        let status = loop {
+            if let Some(status) = child
+                .try_wait()
+                .with_context(|| format!("poll evidence command: {command}"))?
+            {
+                break status;
+            }
+            match is_cancelled() {
+                Ok(true) => {
+                    cancelled = true;
+                    break terminate_process_group(&mut child, process_group, CANCELLATION_GRACE)?;
                 }
-                match child.wait_timeout(StdDuration::from_secs(5))? {
-                    Some(status) => status,
-                    None => {
-                        unsafe {
-                            libc::kill(process_group, libc::SIGKILL);
-                        }
-                        child.wait()?
-                    }
+                Ok(false) => {}
+                Err(error) => {
+                    cancellation_error = Some(error);
+                    break terminate_process_group(&mut child, process_group, CANCELLATION_GRACE)?;
                 }
             }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                timed_out = true;
+                break terminate_process_group(&mut child, process_group, TIMEOUT_GRACE)?;
+            }
+            if let Some(status) = child
+                .wait_timeout(POLL_INTERVAL.min(remaining))
+                .with_context(|| format!("wait for evidence command: {command}"))?
+            {
+                break status;
+            }
         };
-        unsafe {
-            libc::kill(process_group, libc::SIGKILL);
-        }
+        signal_process_group(process_group, libc::SIGKILL)?;
         stdout_thread
             .join()
             .map_err(|_| anyhow::anyhow!("stdout capture thread panicked"))??;
@@ -3719,16 +4087,97 @@ pub mod integrator {
         writeln!(log, "\n--- stderr ---")?;
         let mut stderr_file = fs::File::open(&stderr_path)?;
         std::io::copy(&mut stderr_file, &mut log)?;
+        cancelled = cancelled || is_cancelled()?;
+        if cancelled {
+            writeln!(log, "\n[IQ cancelled command]")?;
+        }
         fs::remove_file(stdout_path)?;
         fs::remove_file(stderr_path)?;
-        if timed_out {
-            anyhow::bail!(
-                "command timed out after {} seconds; inspect {}",
-                timeout.as_secs(),
-                log_path.display()
-            );
+        if let Some(error) = cancellation_error {
+            return Err(error).context("check evidence command cancellation");
         }
-        Ok(status)
+        if cancelled {
+            return Ok(EvidenceCommandOutcome::Cancelled(Some(status)));
+        }
+        if timed_out {
+            return Ok(EvidenceCommandOutcome::TimedOut(status));
+        }
+        Ok(EvidenceCommandOutcome::Exited(status))
+    }
+
+    fn gated_process<I, S>(program: &str, args: I) -> Command
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut process = Command::new("sh");
+        process
+            .arg("-c")
+            .arg("IFS= read -r gate && [ \"$gate\" = run ] || exit 125\nexec \"$@\"")
+            .arg("iq-command-gate")
+            .arg(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .process_group(0);
+        process
+    }
+
+    fn spawn_authorized(
+        mut process: Command,
+        authorize_start: impl FnOnce(&mut dyn Write) -> Result<bool>,
+        description: &str,
+    ) -> Result<Option<(std::process::Child, i32)>> {
+        const CANCELLATION_GRACE: StdDuration = StdDuration::from_millis(50);
+
+        let mut child = process.spawn().with_context(|| description.to_string())?;
+        let process_group = -(child.id() as i32);
+        let mut gate = match child.stdin.take() {
+            Some(gate) => gate,
+            None => {
+                terminate_process_group(&mut child, process_group, CANCELLATION_GRACE)?;
+                anyhow::bail!("capture command admission gate");
+            }
+        };
+        let authorized = match authorize_start(&mut gate) {
+            Ok(authorized) => authorized,
+            Err(error) => {
+                drop(gate);
+                terminate_process_group(&mut child, process_group, CANCELLATION_GRACE)?;
+                return Err(error).context("authorize command start");
+            }
+        };
+        if !authorized {
+            drop(gate);
+            terminate_process_group(&mut child, process_group, CANCELLATION_GRACE)?;
+            return Ok(None);
+        }
+        drop(gate);
+        Ok(Some((child, process_group)))
+    }
+
+    fn terminate_process_group(
+        child: &mut std::process::Child,
+        process_group: i32,
+        grace: StdDuration,
+    ) -> Result<ExitStatus> {
+        signal_process_group(process_group, libc::SIGTERM)?;
+        if let Some(status) = child.wait_timeout(grace)? {
+            return Ok(status);
+        }
+        signal_process_group(process_group, libc::SIGKILL)?;
+        child.wait().context("reap terminated command")
+    }
+
+    fn signal_process_group(process_group: i32, signal: i32) -> Result<()> {
+        if unsafe { libc::kill(process_group, signal) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(error).context("signal command process group")
+        }
     }
 
     fn capture_bounded(mut input: impl Read, path: &Path) -> Result<()> {
