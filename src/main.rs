@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use iq::communication::{build_transports, CommunicationConfig, DecisionCommunicator};
 use iq::integrator::{
     validation_command, IntegrationPolicy, Integrator, IntegratorOptions, SignoffPolicy,
 };
@@ -548,6 +549,17 @@ fn run_doctor(config_path: &std::path::Path) -> Result<()> {
                 );
             }
         }
+        let communication_transport_count = if let Some(communication) = &repo.communication {
+            let transports = build_transports(&communication.transports)?;
+            for transport in &transports {
+                transport.verify().with_context(|| {
+                    format!("verify communication transport {}", transport.id())
+                })?;
+            }
+            transports.len()
+        } else {
+            0
+        };
         results.push(json!({
             "repo_key": repo.repo_key.unwrap_or_else(|| default_repo_key(&repo.repo_path, target)),
             "repo_path": repo.repo_path,
@@ -555,6 +567,7 @@ fn run_doctor(config_path: &std::path::Path) -> Result<()> {
             "remote": remote,
             "validation_command": validation,
             "signoff_required": repo.signoff.is_some(),
+            "communication_transports": communication_transport_count,
         }));
     }
     print_json(&results)
@@ -899,6 +912,7 @@ struct DaemonRepoConfig {
     workspace_root: Option<PathBuf>,
     validation_command: Option<String>,
     signoff: Option<SignoffPolicy>,
+    communication: Option<CommunicationConfig>,
 }
 
 fn run_daemon_config(
@@ -910,37 +924,77 @@ fn run_daemon_config(
     interval_seconds: u64,
 ) -> Result<()> {
     let config = read_daemon_config(config_path)?;
-    let mut integrators = Vec::new();
+    let mut runners = Vec::new();
     for repo in config.repos {
         let target = repo.target.unwrap_or_else(|| "main".into());
         let validation_command = match repo.validation_command {
-            Some(command) => Some(command),
-            None => validation_command(&repo.repo_path)?,
+            Some(command) if !command.trim().is_empty() => command,
+            Some(_) => anyhow::bail!("validation_command must not be blank"),
+            None => validation_command(&repo.repo_path)?
+                .context("daemon repository has no configured or derivable validation command")?,
         };
+        let repo_key = repo
+            .repo_key
+            .clone()
+            .unwrap_or_else(|| default_repo_key(&repo.repo_path, &target));
         let options = integrator_options(
             db_path.clone(),
             repo.repo_path,
-            repo.repo_key,
+            Some(repo_key.clone()),
             &target,
             repo.remote.unwrap_or_else(|| "origin".into()),
             repo.workspace_root,
             owner.clone(),
         );
-        integrators.push(Integrator::new_with_policy(
+        let integrator = Integrator::new_with_policy(
             options,
             IntegrationPolicy {
-                validation_command,
+                validation_command: Some(validation_command),
                 signoff: repo.signoff,
             },
-        )?);
+        )?;
+        let communicator = repo
+            .communication
+            .map(|communication| {
+                DecisionCommunicator::new(
+                    &db_path,
+                    repo_key,
+                    build_transports(&communication.transports)?,
+                )
+            })
+            .transpose()?;
+        runners.push((integrator, communicator));
+    }
+    for (_, communicator) in &runners {
+        if let Some(communicator) = communicator {
+            communicator.verify()?;
+        }
     }
     if let Some(path) = ready_file.as_deref() {
         write_ready_file(path)?;
     }
     loop {
         let mut results = Vec::new();
-        for integrator in &integrators {
-            results.push(integrator.run_once()?);
+        for (integrator, communicator) in &runners {
+            let mut result = integrator.run_once()?;
+            if let Some(communicator) = communicator {
+                if let Some(cycle) = integrator.with_repo_lease(|| communicator.sync())? {
+                    for error in cycle.errors {
+                        eprintln!("{error}");
+                    }
+                    if cycle.applied_responses > 0 {
+                        result = integrator.run_once()?;
+                        if let Some(followup) =
+                            integrator.with_repo_lease(|| communicator.sync())?
+                        {
+                            for error in followup.errors {
+                                eprintln!("{error}");
+                            }
+                        }
+                    }
+                }
+            }
+            results.push(result);
         }
         if once {
             print_json(&results)?;
