@@ -1,3 +1,5 @@
+pub mod communication;
+
 pub mod core {
     use serde::{Deserialize, Serialize};
     use std::fmt;
@@ -218,6 +220,31 @@ pub mod sqlite {
         pub question: String,
         pub answer: Option<String>,
         pub options: Vec<String>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct CommunicationBinding {
+        pub id: String,
+        pub repo_key: String,
+        pub item_id: String,
+        pub transport_id: String,
+        pub transport_kind: String,
+        pub endpoint_fingerprint: String,
+        pub marker: String,
+        pub external_ref: Option<Value>,
+        pub external_url: Option<String>,
+        pub status: String,
+        pub last_error: Option<String>,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum CommunicationResponseDisposition {
+        Applied,
+        Duplicate,
+        Stale,
+        Invalid,
+        Unauthorized,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -446,6 +473,12 @@ pub mod sqlite {
                     "item {item_id} has crossed the landing fence and cannot be cancelled"
                 );
             }
+            if target == QueueStatus::Cancelled {
+                tx.execute(
+                    "UPDATE prompts SET status='cancelled' WHERE item_id=?1 AND status='open'",
+                    params![item_id],
+                )?;
+            }
             tx.execute(
                 "UPDATE queue_items SET status=?1,updated_at=?2 WHERE id=?3",
                 params![target.to_string(), now(), item_id],
@@ -510,7 +543,7 @@ pub mod sqlite {
             let prompt_id = if reason == BlockedReason::NeedsUserInput {
                 let prompt_id = Uuid::new_v4().to_string();
                 let options = if phase == BlockedPhase::Merging {
-                    vec!["accept-current", "use source", "use target"]
+                    vec!["use source", "use target"]
                 } else {
                     Vec::new()
                 };
@@ -603,6 +636,61 @@ pub mod sqlite {
                 params![resume.to_string(), timestamp, item.id],
             )?;
             Self::record_event_tx(&tx, &item.id, "user_answered", answer)?;
+            tx.commit()?;
+            self.get_item(&item.id)
+        }
+
+        pub(crate) fn accept_current_merge_resolution(
+            &self,
+            item_id: &str,
+            answered_by: &str,
+        ) -> Result<QueueItem> {
+            let answered_by = answered_by.trim();
+            if answered_by.is_empty() {
+                anyhow::bail!("merge recovery actor must not be blank");
+            }
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let item = tx
+                .query_row(
+                    "SELECT * FROM queue_items WHERE id=?1",
+                    params![item_id],
+                    map_item,
+                )
+                .with_context(|| format!("queue item not found: {item_id}"))?;
+            if item.status != QueueStatus::Blocked
+                || item.blocked_phase != Some(BlockedPhase::Merging)
+                || item.blocked_reason != Some(BlockedReason::NeedsUserInput)
+            {
+                anyhow::bail!("item {item_id} is not blocked for merge resolution");
+            }
+            let prompt_id = item
+                .prompt_id()
+                .context("blocked merge item has no current prompt")?;
+            let prompt = tx.query_row(
+                "SELECT id,item_id,attempt_id,blocked_phase,status,question,answer,options_json FROM prompts WHERE id=?1",
+                params![prompt_id],
+                map_prompt,
+            )?;
+            if prompt.status != "open"
+                || prompt.item_id != item.id
+                || prompt.blocked_phase != BlockedPhase::Merging
+            {
+                anyhow::bail!(
+                    "merge recovery prompt {} is not current and open",
+                    prompt.id
+                );
+            }
+            let timestamp = now();
+            tx.execute(
+                "UPDATE prompts SET status='answered',answer='accept-current',answered_by=?1,answered_at=?2 WHERE id=?3",
+                params![answered_by, timestamp, prompt.id],
+            )?;
+            tx.execute(
+                "UPDATE queue_items SET status='merging',blocked_phase=NULL,blocked_reason=NULL,blocked_message=NULL,prompt_id=NULL,updated_at=?1 WHERE id=?2",
+                params![timestamp, item.id],
+            )?;
+            Self::record_event_tx(&tx, &item.id, "user_answered", "accept-current")?;
             tx.commit()?;
             self.get_item(&item.id)
         }
@@ -808,6 +896,237 @@ pub mod sqlite {
                 .query_map(params![item_id], map_prompt)?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(prompts)
+        }
+
+        pub fn communication_bindings(&self, repo_key: &str) -> Result<Vec<CommunicationBinding>> {
+            let conn = self.connect()?;
+            let mut stmt = conn.prepare(
+                "SELECT * FROM communication_bindings WHERE repo_key=?1 ORDER BY created_at ASC",
+            )?;
+            let bindings = stmt
+                .query_map(params![repo_key], map_communication_binding)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(bindings)
+        }
+
+        pub fn communication_binding(
+            &self,
+            item_id: &str,
+            transport_id: &str,
+        ) -> Result<Option<CommunicationBinding>> {
+            let conn = self.connect()?;
+            conn.query_row(
+                "SELECT * FROM communication_bindings WHERE item_id=?1 AND transport_id=?2",
+                params![item_id, transport_id],
+                map_communication_binding,
+            )
+            .optional()
+            .context("read communication binding")
+        }
+
+        pub fn reserve_communication_binding(
+            &self,
+            repo_key: &str,
+            item_id: &str,
+            transport_id: &str,
+            transport_kind: &str,
+            endpoint_fingerprint: &str,
+        ) -> Result<CommunicationBinding> {
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let existing = tx
+                .query_row(
+                    "SELECT * FROM communication_bindings WHERE item_id=?1 AND transport_id=?2",
+                    params![item_id, transport_id],
+                    map_communication_binding,
+                )
+                .optional()?;
+            let id = if let Some(binding) = existing {
+                if binding.repo_key != repo_key
+                    || binding.transport_kind != transport_kind
+                    || binding.endpoint_fingerprint != endpoint_fingerprint
+                {
+                    anyhow::bail!(
+                        "communication transport {transport_id} changed identity while item {item_id} has a live binding"
+                    );
+                }
+                binding.id
+            } else {
+                let id = Uuid::new_v4().to_string();
+                let marker = format!("iq:binding:{id}");
+                let timestamp = now();
+                tx.execute(
+                    "INSERT INTO communication_bindings (id,repo_key,item_id,transport_id,transport_kind,endpoint_fingerprint,marker,status,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,'pending_create',?8,?8)",
+                    params![id, repo_key, item_id, transport_id, transport_kind, endpoint_fingerprint, marker, timestamp],
+                )?;
+                id
+            };
+            tx.commit()?;
+            self.communication_binding(item_id, transport_id)?
+                .with_context(|| {
+                    format!("communication binding disappeared after reservation: {id}")
+                })
+        }
+
+        pub fn activate_communication_binding(
+            &self,
+            binding_id: &str,
+            external_ref: &Value,
+            external_url: &str,
+        ) -> Result<()> {
+            let conn = self.connect()?;
+            let changed = conn.execute(
+                "UPDATE communication_bindings SET external_ref_json=?1,external_url=?2,status='active',last_error=NULL,updated_at=?3 WHERE id=?4",
+                params![external_ref.to_string(), external_url, now(), binding_id],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("communication binding not found: {binding_id}");
+            }
+            Ok(())
+        }
+
+        pub fn set_communication_binding_status(
+            &self,
+            binding_id: &str,
+            status: &str,
+        ) -> Result<()> {
+            let conn = self.connect()?;
+            let changed = conn.execute(
+                "UPDATE communication_bindings SET status=?1,last_error=NULL,updated_at=?2 WHERE id=?3",
+                params![status, now(), binding_id],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("communication binding not found: {binding_id}");
+            }
+            Ok(())
+        }
+
+        pub fn record_communication_error(&self, binding_id: &str, error: &str) -> Result<()> {
+            let conn = self.connect()?;
+            let changed = conn.execute(
+                "UPDATE communication_bindings SET last_error=?1,updated_at=?2 WHERE id=?3",
+                params![error, now(), binding_id],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("communication binding not found: {binding_id}");
+            }
+            Ok(())
+        }
+
+        pub fn clear_communication_error(&self, binding_id: &str) -> Result<()> {
+            let conn = self.connect()?;
+            let changed = conn.execute(
+                "UPDATE communication_bindings SET last_error=NULL,updated_at=?1 WHERE id=?2",
+                params![now(), binding_id],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("communication binding not found: {binding_id}");
+            }
+            Ok(())
+        }
+
+        pub fn apply_communication_response(
+            &self,
+            binding_id: &str,
+            external_response_id: &str,
+            prompt_id: &str,
+            answer: &str,
+            actor: &str,
+            authorized: bool,
+        ) -> Result<CommunicationResponseDisposition> {
+            let external_response_id = external_response_id.trim();
+            if external_response_id.is_empty() {
+                anyhow::bail!("communication response requires a stable external identity");
+            }
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let seen: Option<String> = tx
+                .query_row(
+                    "SELECT disposition FROM communication_response_receipts WHERE binding_id=?1 AND external_response_id=?2",
+                    params![binding_id, external_response_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if seen.is_some() {
+                tx.commit()?;
+                return Ok(CommunicationResponseDisposition::Duplicate);
+            }
+
+            let binding_item_id: String = tx
+                .query_row(
+                    "SELECT item_id FROM communication_bindings WHERE id=?1",
+                    params![binding_id],
+                    |row| row.get(0),
+                )
+                .with_context(|| format!("communication binding not found: {binding_id}"))?;
+
+            let answer = answer.trim();
+            let actor = actor.trim();
+            let prompt = tx
+                .query_row(
+                    "SELECT id,item_id,attempt_id,blocked_phase,status,question,answer,options_json FROM prompts WHERE id=?1",
+                    params![prompt_id],
+                    map_prompt,
+                )
+                .optional()?;
+            let disposition = if !authorized || actor.is_empty() {
+                CommunicationResponseDisposition::Unauthorized
+            } else if answer.is_empty() {
+                CommunicationResponseDisposition::Invalid
+            } else if let Some(prompt) = prompt {
+                let item = tx
+                    .query_row(
+                        "SELECT * FROM queue_items WHERE id=?1",
+                        params![prompt.item_id],
+                        map_item,
+                    )
+                    .optional()?;
+                let answer_supported = !prompt.options.is_empty()
+                    && prompt
+                        .options
+                        .iter()
+                        .any(|option| option.eq_ignore_ascii_case(answer));
+                if prompt.item_id != binding_item_id
+                    || prompt.status != "open"
+                    || item.as_ref().is_none_or(|item| {
+                        item.status != QueueStatus::Blocked
+                            || item.blocked_reason != Some(BlockedReason::NeedsUserInput)
+                            || item.prompt_id().as_deref() != Some(prompt_id)
+                    })
+                {
+                    CommunicationResponseDisposition::Stale
+                } else if !answer_supported {
+                    CommunicationResponseDisposition::Invalid
+                } else {
+                    let item = item.expect("checked above");
+                    let resume = StateMachine
+                        .resume_target(&BlockedState {
+                            phase: prompt.blocked_phase,
+                            reason: BlockedReason::NeedsUserInput,
+                            prompt_id: Some(prompt_id.to_string()),
+                        })
+                        .map_err(anyhow::Error::msg)?;
+                    let timestamp = now();
+                    tx.execute(
+                        "UPDATE prompts SET status='answered',answer=?1,answered_by=?2,answered_at=?3 WHERE id=?4",
+                        params![answer, actor, timestamp, prompt_id],
+                    )?;
+                    tx.execute(
+                        "UPDATE queue_items SET status=?1,blocked_phase=NULL,blocked_reason=NULL,blocked_message=NULL,prompt_id=NULL,updated_at=?2 WHERE id=?3",
+                        params![resume.to_string(), timestamp, item.id],
+                    )?;
+                    Self::record_event_tx(&tx, &item.id, "user_answered", answer)?;
+                    CommunicationResponseDisposition::Applied
+                }
+            } else {
+                CommunicationResponseDisposition::Stale
+            };
+            tx.execute(
+                "INSERT INTO communication_response_receipts (binding_id,external_response_id,prompt_id,answer,actor,disposition,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![binding_id, external_response_id, prompt_id, answer, actor, communication_disposition_text(disposition), now()],
+            )?;
+            tx.commit()?;
+            Ok(disposition)
         }
 
         pub fn get_attempt(&self, attempt_id: &str) -> Result<Attempt> {
@@ -1039,6 +1358,18 @@ pub mod sqlite {
 
     fn map_prompt(row: &Row<'_>) -> rusqlite::Result<Prompt> {
         let phase: String = row.get(3)?;
+        let status: String = row.get(4)?;
+        let answer: Option<String> = row.get(6)?;
+        if status == "answered" && answer.is_none() {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Null,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "answered prompt has no answer",
+                )),
+            ));
+        }
         Ok(Prompt {
             id: row.get(0)?,
             item_id: row.get(1)?,
@@ -1050,9 +1381,9 @@ pub mod sqlite {
                     Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
                 )
             })?,
-            status: row.get(4)?,
+            status,
             question: row.get(5)?,
-            answer: row.get(6)?,
+            answer,
             options: row
                 .get::<_, Option<String>>(7)?
                 .map(|value| {
@@ -1062,6 +1393,34 @@ pub mod sqlite {
                 .transpose()?
                 .unwrap_or_default(),
         })
+    }
+
+    fn map_communication_binding(row: &Row<'_>) -> rusqlite::Result<CommunicationBinding> {
+        Ok(CommunicationBinding {
+            id: row.get("id")?,
+            repo_key: row.get("repo_key")?,
+            item_id: row.get("item_id")?,
+            transport_id: row.get("transport_id")?,
+            transport_kind: row.get("transport_kind")?,
+            endpoint_fingerprint: row.get("endpoint_fingerprint")?,
+            marker: row.get("marker")?,
+            external_ref: parse_json_option(row, "external_ref_json")?,
+            external_url: row.get("external_url")?,
+            status: row.get("status")?,
+            last_error: row.get("last_error")?,
+        })
+    }
+
+    fn communication_disposition_text(
+        disposition: CommunicationResponseDisposition,
+    ) -> &'static str {
+        match disposition {
+            CommunicationResponseDisposition::Applied => "applied",
+            CommunicationResponseDisposition::Duplicate => "duplicate",
+            CommunicationResponseDisposition::Stale => "stale",
+            CommunicationResponseDisposition::Invalid => "invalid",
+            CommunicationResponseDisposition::Unauthorized => "unauthorized",
+        }
     }
 
     fn map_item(row: &Row<'_>) -> rusqlite::Result<QueueItem> {
@@ -1212,6 +1571,34 @@ CREATE TABLE IF NOT EXISTS prompts (
   answered_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS communication_bindings (
+  id TEXT PRIMARY KEY,
+  repo_key TEXT NOT NULL,
+  item_id TEXT NOT NULL REFERENCES queue_items(id) ON DELETE CASCADE,
+  transport_id TEXT NOT NULL,
+  transport_kind TEXT NOT NULL,
+  endpoint_fingerprint TEXT NOT NULL,
+  marker TEXT NOT NULL UNIQUE,
+  external_ref_json TEXT,
+  external_url TEXT,
+  status TEXT NOT NULL,
+  last_error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(item_id, transport_id)
+);
+
+CREATE TABLE IF NOT EXISTS communication_response_receipts (
+  binding_id TEXT NOT NULL REFERENCES communication_bindings(id) ON DELETE CASCADE,
+  external_response_id TEXT NOT NULL,
+  prompt_id TEXT NOT NULL,
+  answer TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  disposition TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(binding_id, external_response_id)
+);
+
 CREATE TABLE IF NOT EXISTS repo_leases (
   repo_key TEXT PRIMARY KEY,
   owner_id TEXT NOT NULL,
@@ -1226,7 +1613,7 @@ pub mod integrator {
     use serde::Deserialize;
     use serde_json::{json, Value as JsonValue};
     use std::collections::VecDeque;
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::io::{Read, Write};
     use std::os::unix::process::CommandExt;
@@ -1437,6 +1824,21 @@ pub mod integrator {
             let item =
                 self.with_lease_heartbeat("integrating", || self.integrate_item(item, &attempt))?;
             Ok(Some(item))
+        }
+
+        pub fn with_repo_lease<T>(
+            &self,
+            operation: impl FnOnce() -> Result<T>,
+        ) -> Result<Option<T>> {
+            if !self.queue.acquire_repo_lease(
+                &self.options.repo_key,
+                &self.options.owner_id,
+                self.options.lease_ttl_seconds,
+            )? {
+                return Ok(None);
+            }
+            self.with_lease_heartbeat("communication", operation)
+                .map(Some)
         }
 
         pub fn resume_item(&self, item_id: &str) -> Result<QueueItem> {
@@ -1785,21 +2187,6 @@ pub mod integrator {
                 )?;
                 return self.queue.get_item(&item.id);
             }
-            let resolved_paths = item
-                .conflict
-                .as_ref()
-                .and_then(|conflict| conflict.get("files"))
-                .and_then(|files| files.as_array())
-                .into_iter()
-                .flatten()
-                .filter_map(|path| path.as_str())
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            if !resolved_paths.is_empty() {
-                let mut args = vec!["add".to_string(), "--".to_string()];
-                args.extend(resolved_paths);
-                git(&workspace, args)?;
-            }
             let staged = git_status(&workspace, ["diff", "--cached", "--quiet"])?;
             let merge_in_progress =
                 git_status(&workspace, ["rev-parse", "--verify", "MERGE_HEAD"])?
@@ -1837,17 +2224,51 @@ pub mod integrator {
             if conflicts.is_empty() {
                 return Ok(());
             }
-            let checkout_arg = match normalized.as_str() {
-                "use source" | "source" | "theirs" | "accept-theirs" => "--theirs",
-                "use target" | "target" | "ours" | "accept-ours" => "--ours",
+            let (checkout_arg, stage) = match normalized.as_str() {
+                "use source" | "source" | "theirs" | "accept-theirs" => ("--theirs", 3),
+                "use target" | "target" | "ours" | "accept-ours" => ("--ours", 2),
                 _ => anyhow::bail!(
                     "unsupported merge answer for item {}: {answer}; use accept-current, use source, or use target",
                     item.id
                 ),
             };
             for file in &conflicts {
-                git(workspace, ["checkout", checkout_arg, "--", file.as_str()])?;
-                git(workspace, ["add", "--", file.as_str()])?;
+                let selected_stage = format!(":{stage}:{file}");
+                if git_status(workspace, ["cat-file", "-e", selected_stage.as_str()])?
+                    .status
+                    .success()
+                {
+                    git(workspace, ["checkout", checkout_arg, "--", file.as_str()])?;
+                    git(workspace, ["add", "--", file.as_str()])?;
+                } else {
+                    let relative = Path::new(file);
+                    if !relative
+                        .components()
+                        .all(|component| matches!(component, std::path::Component::Normal(_)))
+                    {
+                        anyhow::bail!("merge conflict path is not checkout-relative: {file}");
+                    }
+                    let selected_path = workspace.join(relative);
+                    if let Ok(metadata) = fs::symlink_metadata(&selected_path) {
+                        if metadata.is_dir() {
+                            fs::remove_dir_all(&selected_path)?;
+                        } else {
+                            fs::remove_file(&selected_path)?;
+                        }
+                    }
+                    git(
+                        workspace,
+                        ["update-index", "--force-remove", "--", file.as_str()],
+                    )?;
+                }
+            }
+            let unresolved = conflict_files(workspace)?;
+            if !unresolved.is_empty() {
+                anyhow::bail!(
+                    "merge answer for item {} left unresolved paths: {}",
+                    item.id,
+                    unresolved.join(", ")
+                );
             }
             Ok(())
         }
@@ -2825,11 +3246,26 @@ pub mod integrator {
                 );
             }
             let item = self.queue.get_item(item_id)?;
+            let workspace = item
+                .integration_workspace_path
+                .as_ref()
+                .map(PathBuf::from)
+                .context("item missing integration workspace path")?;
+            let unresolved = conflict_files(&workspace)?;
+            if !unresolved.is_empty() {
+                anyhow::bail!(
+                    "cannot accept merge workspace with unresolved paths: {}",
+                    unresolved.join(", ")
+                );
+            }
             let attempt_id = item
                 .current_attempt_id
                 .as_deref()
                 .context("item has no current attempt")?;
             let attempt = self.queue.get_attempt(attempt_id)?;
+            let item = self
+                .queue
+                .accept_current_merge_resolution(item_id, &self.options.owner_id)?;
             self.with_lease_heartbeat("merging", || {
                 self.resume_merge_with_answer(item, &attempt, "accept-current")
             })
@@ -3107,12 +3543,17 @@ pub mod integrator {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let output = git_status(cwd, args)?;
+        let args = args
+            .into_iter()
+            .map(|argument| argument.as_ref().to_os_string())
+            .collect::<Vec<OsString>>();
+        let output = git_status(cwd, &args)?;
         if output.status.success() {
             Ok(())
         } else {
             anyhow::bail!(
-                "git failed in {}: {}",
+                "git {:?} failed in {}: {}",
+                args,
                 cwd.display(),
                 String::from_utf8_lossy(&output.stderr)
             )
@@ -3124,10 +3565,15 @@ pub mod integrator {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let output = git_status(cwd, args)?;
+        let args = args
+            .into_iter()
+            .map(|argument| argument.as_ref().to_os_string())
+            .collect::<Vec<OsString>>();
+        let output = git_status(cwd, &args)?;
         if !output.status.success() {
             anyhow::bail!(
-                "git failed in {}: {}",
+                "git {:?} failed in {}: {}",
+                args,
                 cwd.display(),
                 String::from_utf8_lossy(&output.stderr)
             );
@@ -3659,7 +4105,10 @@ pub mod issue_backends {
     use anyhow::{Context, Result};
     use serde::Deserialize;
     use std::collections::HashSet;
-    use std::process::Command;
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+    use wait_timeout::ChildExt;
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct IssueProjection {
@@ -3685,6 +4134,8 @@ pub mod issue_backends {
             projection: &IssueProjection,
         ) -> Result<IssueSyncResult>;
         fn ingest_prompt_answers(&self, target: &IssueSyncTarget) -> Result<Vec<PromptAnswer>>;
+        fn close(&self, target: &IssueSyncTarget) -> Result<()>;
+        fn verify_destination(&self, repo: &str) -> Result<()>;
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -3701,6 +4152,7 @@ pub mod issue_backends {
 
     #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
     pub struct PromptAnswer {
+        pub external_response_id: Option<String>,
         pub prompt_id: String,
         pub answer: String,
         pub answered_by: Option<String>,
@@ -3762,10 +4214,35 @@ pub mod issue_backends {
                 ));
             }
             for prompt in prompts {
-                comments.push(format!(
-                    "<!-- iq:prompt:{} -->\n**Prompt ({})**: {}\n\nAnswer with `iq answer {}` or reply referencing prompt `{}`.",
-                    prompt.id, prompt.blocked_phase, prompt.question, prompt.id, prompt.id
-                ));
+                if prompt.status == "open" && !prompt.options.is_empty() {
+                    let options = prompt
+                        .options
+                        .iter()
+                        .filter(|option| option.as_str() != "accept-current")
+                        .map(|option| format!("- `iq answer {} {option}`", prompt.id))
+                        .collect::<Vec<_>>();
+                    if !options.is_empty() {
+                        comments.push(format!(
+                            "<!-- iq:prompt:{} -->\n**Decision required ({})**: {}\n\nReply with exactly one allowed answer:\n{}",
+                            prompt.id,
+                            prompt.blocked_phase,
+                            prompt.question,
+                            options.join("\n")
+                        ));
+                    }
+                } else if prompt.status == "answered" {
+                    if let Some(answer) = prompt.answer.as_deref() {
+                        comments.push(format!(
+                            "<!-- iq:prompt-status:{}:answered -->\n**Decision accepted**: `{answer}`. IQ resumed `{}` automatically.",
+                            prompt.id, prompt.blocked_phase
+                        ));
+                    } else {
+                        comments.push(format!(
+                            "<!-- iq:prompt-status:{}:invalid -->\n**IQ state error**: answered prompt has no recorded answer.",
+                            prompt.id
+                        ));
+                    }
+                }
             }
             IssueProjection {
                 title: format!(
@@ -3803,22 +4280,34 @@ pub mod issue_backends {
                     &existing.comments,
                 )?;
                 issue.clone()
-            } else {
-                let output = command_output(
+            } else if let Some(issue) = find_github_issue(&program, target, projection)? {
+                let existing = github_issue_view(&program, target, &issue)?;
+                let label_update = ManagedLabelUpdate::new(&existing.labels, &projection.labels);
+                github_issue_edit(&program, target, &issue, projection, &label_update)?;
+                sync_missing_github_comments(
                     &program,
-                    [
-                        "issue",
-                        "create",
-                        "--repo",
-                        &target.repo,
-                        "--title",
-                        &projection.title,
-                        "--body",
-                        &projection.body,
-                        "--label",
-                        &projection.labels.join(","),
-                    ],
+                    target,
+                    &issue,
+                    projection,
+                    &existing.comments,
                 )?;
+                issue
+            } else {
+                let mut args = vec![
+                    "issue".to_string(),
+                    "create".to_string(),
+                    "--repo".to_string(),
+                    target.repo.clone(),
+                    "--title".to_string(),
+                    projection.title.clone(),
+                    "--body".to_string(),
+                    projection.body.clone(),
+                ];
+                if !projection.labels.is_empty() {
+                    args.push("--label".to_string());
+                    args.push(projection.labels.join(","));
+                }
+                let output = command_output(&program, args)?;
                 let issue =
                     parse_issue_number(&output).context("parse GitHub created issue number")?;
                 sync_missing_github_comments(&program, target, &issue, projection, &[])?;
@@ -3852,6 +4341,31 @@ pub mod issue_backends {
                 serde_json::from_value(value).context("parse gh issue comments")?;
             Ok(extract_prompt_answers(view.comments))
         }
+
+        fn close(&self, target: &IssueSyncTarget) -> Result<()> {
+            let issue = target
+                .issue
+                .as_deref()
+                .context("GitHub issue number required")?;
+            let program = std::env::var("IQ_GITHUB_CLI").unwrap_or_else(|_| "gh".into());
+            command_ok(
+                &program,
+                [
+                    "issue",
+                    "close",
+                    issue,
+                    "--repo",
+                    &target.repo,
+                    "--reason",
+                    "completed",
+                ],
+            )
+        }
+
+        fn verify_destination(&self, repo: &str) -> Result<()> {
+            let program = std::env::var("IQ_GITHUB_CLI").unwrap_or_else(|_| "gh".into());
+            command_ok(&program, ["repo", "view", repo, "--json", "nameWithOwner"])
+        }
     }
 
     struct GitLabIssueBackend;
@@ -3875,22 +4389,34 @@ pub mod issue_backends {
                     &existing.comments,
                 )?;
                 issue.clone()
-            } else {
-                let output = command_output(
+            } else if let Some(issue) = find_gitlab_issue(&program, target, projection)? {
+                let existing = gitlab_issue_view(&program, target, &issue)?;
+                let label_update = ManagedLabelUpdate::new(&existing.labels, &projection.labels);
+                gitlab_issue_update(&program, target, &issue, projection, &label_update)?;
+                sync_missing_gitlab_comments(
                     &program,
-                    [
-                        "issue",
-                        "create",
-                        "--repo",
-                        &target.repo,
-                        "--title",
-                        &projection.title,
-                        "--description",
-                        &projection.body,
-                        "--label",
-                        &projection.labels.join(","),
-                    ],
+                    target,
+                    &issue,
+                    projection,
+                    &existing.comments,
                 )?;
+                issue
+            } else {
+                let mut args = vec![
+                    "issue".to_string(),
+                    "create".to_string(),
+                    "--repo".to_string(),
+                    target.repo.clone(),
+                    "--title".to_string(),
+                    projection.title.clone(),
+                    "--description".to_string(),
+                    projection.body.clone(),
+                ];
+                if !projection.labels.is_empty() {
+                    args.push("--label".to_string());
+                    args.push(projection.labels.join(","));
+                }
+                let output = command_output(&program, args)?;
                 let issue =
                     parse_issue_number(&output).context("parse GitLab created issue number")?;
                 sync_missing_gitlab_comments(&program, target, &issue, projection, &[])?;
@@ -3908,22 +4434,171 @@ pub mod issue_backends {
                 .as_deref()
                 .context("GitLab issue number required")?;
             let program = std::env::var("IQ_GITLAB_CLI").unwrap_or_else(|_| "glab".into());
-            let value = command_json(
-                &program,
+            Ok(extract_prompt_answers(gitlab_issue_notes(
+                &program, target, issue,
+            )?))
+        }
+
+        fn close(&self, target: &IssueSyncTarget) -> Result<()> {
+            let issue = target
+                .issue
+                .as_deref()
+                .context("GitLab issue number required")?;
+            let program = std::env::var("IQ_GITLAB_CLI").unwrap_or_else(|_| "glab".into());
+            command_ok(&program, ["issue", "close", issue, "--repo", &target.repo])
+        }
+
+        fn verify_destination(&self, repo: &str) -> Result<()> {
+            let program = std::env::var("IQ_GITLAB_CLI").unwrap_or_else(|_| "glab".into());
+            command_ok(&program, ["repo", "view", repo, "--output", "json"])
+        }
+    }
+
+    fn find_github_issue(
+        program: &str,
+        target: &IssueSyncTarget,
+        projection: &IssueProjection,
+    ) -> Result<Option<String>> {
+        let marker = projection_identity_marker(&projection.body)
+            .context("issue projection is missing a stable IQ marker")?;
+        if marker.starts_with("iq:binding:") {
+            let output = command_output(
+                program,
                 [
-                    "issue",
-                    "view",
-                    issue,
-                    "--repo",
-                    &target.repo,
-                    "--output",
-                    "json",
+                    "api",
+                    &format!("repos/{}/issues", target.repo),
+                    "--method",
+                    "GET",
+                    "--raw-field",
+                    "state=all",
+                    "--raw-field",
+                    "per_page=100",
+                    "--paginate",
+                    "--slurp",
                 ],
             )?;
-            let view: CommentView =
-                serde_json::from_value(value).context("parse glab issue comments")?;
-            Ok(extract_prompt_answers(view.comments))
+            let pages: Vec<Vec<ListedIssue>> =
+                serde_json::from_str(&output).context("parse paginated GitHub issue inventory")?;
+            return find_exact_issue_candidates(
+                pages.into_iter().flatten().collect(),
+                &marker,
+                "GitHub",
+            );
         }
+        let output = command_output(
+            program,
+            [
+                "issue",
+                "list",
+                "--repo",
+                &target.repo,
+                "--state",
+                "all",
+                "--search",
+                &format!("\"{marker}\" in:body"),
+                "--json",
+                "number,url,body",
+                "--limit",
+                "10",
+            ],
+        )?;
+        find_exact_issue(&output, &marker, "GitHub")
+    }
+
+    fn find_gitlab_issue(
+        program: &str,
+        target: &IssueSyncTarget,
+        projection: &IssueProjection,
+    ) -> Result<Option<String>> {
+        let marker = projection_identity_marker(&projection.body)
+            .context("issue projection is missing a stable IQ marker")?;
+        if marker.starts_with("iq:binding:") {
+            let output = command_output(
+                program,
+                [
+                    "api",
+                    &format!("projects/{}/issues", percent_encode_path(&target.repo)),
+                    "--paginate",
+                ],
+            )?;
+            return find_exact_issue(&output, &marker, "GitLab");
+        }
+        let output = command_output(
+            program,
+            [
+                "issue",
+                "list",
+                "--repo",
+                &target.repo,
+                "--all",
+                "--search",
+                &marker,
+                "--in",
+                "description",
+                "--output",
+                "json",
+            ],
+        )?;
+        find_exact_issue(&output, &marker, "GitLab")
+    }
+
+    fn find_exact_issue(output: &str, marker: &str, provider: &str) -> Result<Option<String>> {
+        if output.trim().is_empty() {
+            return Ok(None);
+        }
+        let candidates: Vec<ListedIssue> = serde_json::from_str(output)
+            .with_context(|| format!("parse {provider} issue search"))?;
+        find_exact_issue_candidates(candidates, marker, provider)
+    }
+
+    fn find_exact_issue_candidates(
+        candidates: Vec<ListedIssue>,
+        marker: &str,
+        provider: &str,
+    ) -> Result<Option<String>> {
+        let exact = candidates
+            .into_iter()
+            .filter(|candidate| {
+                candidate
+                    .body
+                    .as_deref()
+                    .is_some_and(|body| body.contains(marker))
+            })
+            .filter_map(|candidate| {
+                candidate
+                    .number
+                    .or(candidate.iid)
+                    .map(|number| number.to_string())
+            })
+            .collect::<Vec<_>>();
+        match exact.as_slice() {
+            [] => Ok(None),
+            [issue] => Ok(Some(issue.clone())),
+            _ => anyhow::bail!("multiple {provider} issues contain IQ marker {marker}"),
+        }
+    }
+
+    fn percent_encode_path(value: &str) -> String {
+        value
+            .bytes()
+            .flat_map(|byte| match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    vec![byte as char]
+                }
+                other => format!("%{other:02X}").chars().collect(),
+            })
+            .collect()
+    }
+
+    fn projection_identity_marker(body: &str) -> Option<String> {
+        body.lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("<!-- iq:binding:")
+                    .and_then(|tail| tail.strip_suffix(" -->"))
+                    .map(|id| format!("iq:binding:{id}"))
+            })
+            .or_else(|| issue_marker(body))
     }
 
     fn github_issue_edit(
@@ -3992,7 +4667,32 @@ pub mod issue_backends {
                 "json",
             ],
         )?;
-        serde_json::from_value(value).context("parse glab issue view")
+        let mut view: IssueView = serde_json::from_value(value).context("parse glab issue view")?;
+        let mut notes = gitlab_issue_notes(program, target, issue)?;
+        view.comments.append(&mut notes);
+        Ok(view)
+    }
+
+    fn gitlab_issue_notes(
+        program: &str,
+        target: &IssueSyncTarget,
+        issue: &str,
+    ) -> Result<Vec<IssueComment>> {
+        let output = command_output(
+            program,
+            [
+                "api",
+                &format!(
+                    "projects/{}/issues/{issue}/notes",
+                    percent_encode_path(&target.repo)
+                ),
+                "--paginate",
+            ],
+        )?;
+        if output.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        serde_json::from_str(&output).context("parse paginated GitLab issue notes")
     }
 
     fn gitlab_issue_update(
@@ -4128,6 +4828,16 @@ pub mod issue_backends {
     }
 
     #[derive(Debug, Deserialize)]
+    struct ListedIssue {
+        #[serde(default)]
+        number: Option<u64>,
+        #[serde(default)]
+        iid: Option<u64>,
+        #[serde(default, alias = "description")]
+        body: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
     #[serde(untagged)]
     enum IssueLabel {
         Named { name: String },
@@ -4151,6 +4861,8 @@ pub mod issue_backends {
 
     #[derive(Debug, Deserialize)]
     struct IssueComment {
+        #[serde(default)]
+        id: Option<serde_json::Value>,
         #[serde(default, alias = "body")]
         body: String,
         #[serde(default)]
@@ -4169,12 +4881,21 @@ pub mod issue_backends {
             .filter_map(|comment| {
                 let (prompt_id, answer) = parse_prompt_answer(&comment.body)?;
                 Some(PromptAnswer {
+                    external_response_id: comment.id.as_ref().and_then(json_identity),
                     prompt_id,
                     answer,
                     answered_by: comment.author.and_then(|author| author.login),
                 })
             })
             .collect()
+    }
+
+    fn json_identity(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::String(value) if !value.trim().is_empty() => Some(value.clone()),
+            serde_json::Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        }
     }
 
     fn parse_prompt_answer(body: &str) -> Option<(String, String)> {
@@ -4227,17 +4948,47 @@ pub mod issue_backends {
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
-        let output = Command::new(program)
+        let mut child = Command::new(program)
             .args(args)
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .with_context(|| format!("run issue CLI {program}"))?;
-        if !output.status.success() {
+        let stdout = child.stdout.take().context("capture issue CLI stdout")?;
+        let stderr = child.stderr.take().context("capture issue CLI stderr")?;
+        let stdout_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = std::io::BufReader::new(stdout).read_to_end(&mut bytes);
+            (result, bytes)
+        });
+        let stderr_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = std::io::BufReader::new(stderr).read_to_end(&mut bytes);
+            (result, bytes)
+        });
+        let status = match child.wait_timeout(Duration::from_secs(30))? {
+            Some(status) => status,
+            None => {
+                child.kill()?;
+                child.wait()?;
+                anyhow::bail!("issue CLI {program} timed out after 30 seconds");
+            }
+        };
+        let (stdout_result, stdout) = stdout_reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("issue CLI stdout reader panicked"))?;
+        stdout_result?;
+        let (stderr_result, stderr) = stderr_reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("issue CLI stderr reader panicked"))?;
+        stderr_result?;
+        if !status.success() {
             anyhow::bail!(
                 "issue CLI {program} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&stderr)
             );
         }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        Ok(String::from_utf8_lossy(&stdout).trim().to_string())
     }
 
     fn command_ok<I, S>(program: &str, args: I) -> Result<()>
