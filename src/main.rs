@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 
 #[derive(Parser, Debug)]
-#[command(name = "iq", version, about = "Threadmill integration queue")]
+#[command(name = "iq", version, about = "Durable repository integration queue")]
 struct Cli {
     #[arg(long, global = true)]
     queue_db: Option<PathBuf>,

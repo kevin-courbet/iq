@@ -2,6 +2,9 @@
 name = "iq"
 version = "0.1.0"
 edition = "2021"
+description = "Durable repository integration queue"
+license = "MIT"
+repository = "https://github.com/kevin-courbet/iq"
 
 [[bin]]
 name = "iq"
