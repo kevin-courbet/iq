@@ -2,13 +2,14 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use iq::communication::{build_transports, CommunicationConfig, DecisionCommunicator};
 use iq::integrator::{
-    validation_command, IntegrationPolicy, Integrator, IntegratorOptions, SignoffPolicy,
+    validation_command, workspace_status, IntegrationPolicy, Integrator, IntegratorOptions,
+    SignoffPolicy,
 };
 use iq::issue_backends::{
     issue_adapter_for_provider, IssueBackendAdapter, IssueProvider, IssueSyncTarget,
     MarkdownIssueBackend,
 };
-use iq::sqlite::{Attempt, EnqueueRequest, QueueItem, SqliteQueue};
+use iq::sqlite::{Attempt, EnqueueRequest, QueueItem, SqliteQueue, SqliteQueueReader};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
@@ -279,7 +280,7 @@ fn main() -> Result<()> {
             print_json(&item)?;
         }
         Command::List => {
-            let queue = SqliteQueue::open(&db_path)?;
+            let queue = SqliteQueueReader::open(&db_path)?;
             print_json(&queue.list_items()?)?;
         }
         Command::Answer {
@@ -311,11 +312,11 @@ fn main() -> Result<()> {
             print_json(&queue.retry_blocked(&item)?)?;
         }
         Command::Events { item } => {
-            let queue = SqliteQueue::open(&db_path)?;
+            let queue = SqliteQueueReader::open(&db_path)?;
             print_json(&queue.events(&item)?)?;
         }
         Command::Attempt { item } => {
-            let queue = SqliteQueue::open(&db_path)?;
+            let queue = SqliteQueueReader::open(&db_path)?;
             let queued = queue.get_item(&item)?;
             let attempt_id = queued
                 .current_attempt_id
@@ -327,7 +328,7 @@ fn main() -> Result<()> {
             workspace_root,
             phase,
         } => {
-            let queue = SqliteQueue::open(&db_path)?;
+            let queue = SqliteQueueReader::open(&db_path)?;
             let queued = queue.get_item(&item)?;
             print_json(&read_evidence(&queue, &queued, &workspace_root, phase)?)?;
         }
@@ -335,20 +336,13 @@ fn main() -> Result<()> {
             WorkspaceCommand::Status {
                 repo_path,
                 repo_key,
-                remote,
-                workspace_root,
-                owner,
+                remote: _,
+                workspace_root: _,
+                owner: _,
             } => {
-                let integrator = Integrator::new(integrator_options(
-                    db_path,
-                    repo_path,
-                    repo_key,
-                    "main",
-                    remote,
-                    workspace_root,
-                    owner,
-                ))?;
-                print_json(&integrator.workspace_status()?)?;
+                let repo_key = repo_key.unwrap_or_else(|| default_repo_key(&repo_path, "main"));
+                let queue = SqliteQueueReader::open(&db_path)?;
+                print_json(&workspace_status(&queue, &repo_key)?)?;
             }
             WorkspaceCommand::AcceptCurrent {
                 item,
@@ -395,7 +389,7 @@ fn main() -> Result<()> {
                 repo,
                 issue,
             } => {
-                let queue = SqliteQueue::open(&db_path)?;
+                let queue = SqliteQueueReader::open(&db_path)?;
                 let item_row = queue.get_item(&item)?;
                 let events = queue.events(&item)?;
                 let prompts = queue.prompts_for_item(&item)?;
@@ -585,7 +579,6 @@ fn run_remote_exec(
         .context("remote-exec requires SSH_ORIGINAL_COMMAND")?;
     let args = shell_words::split(&original).context("parse SSH_ORIGINAL_COMMAND")?;
     let command = RemoteCli::try_parse_from(args).context("parse permitted remote IQ command")?;
-    let queue = SqliteQueue::open(&db_path)?;
     match command.command {
         RemoteCommand::Enqueue {
             source,
@@ -593,6 +586,7 @@ fn run_remote_exec(
             pr_url,
             producer,
         } => {
+            let queue = SqliteQueue::open(&db_path)?;
             validate_branch_handoff(&repo_path, &remote, &source, &target, &head)?;
             let item = queue.enqueue(EnqueueRequest {
                 repo_key,
@@ -606,6 +600,7 @@ fn run_remote_exec(
             print_json(&item)?;
         }
         RemoteCommand::List => {
+            let queue = SqliteQueueReader::open(&db_path)?;
             let items = queue
                 .list_items()?
                 .into_iter()
@@ -614,10 +609,12 @@ fn run_remote_exec(
             print_json(&items)?;
         }
         RemoteCommand::Events { item } => {
+            let queue = SqliteQueueReader::open(&db_path)?;
             require_remote_item(&queue, &item, &repo_key)?;
             print_json(&queue.events(&item)?)?;
         }
         RemoteCommand::Attempt { item } => {
+            let queue = SqliteQueueReader::open(&db_path)?;
             let queued = require_remote_item(&queue, &item, &repo_key)?;
             let attempt_id = queued
                 .current_attempt_id
@@ -625,11 +622,14 @@ fn run_remote_exec(
             print_json(&queue.get_attempt(&attempt_id)?)?;
         }
         RemoteCommand::Evidence { item, phase } => {
+            let queue = SqliteQueueReader::open(&db_path)?;
             let queued = require_remote_item(&queue, &item, &repo_key)?;
             print_json(&read_evidence(&queue, &queued, &workspace_root, phase)?)?;
         }
         RemoteCommand::Requeue { item, head } => {
-            let queued = require_remote_item(&queue, &item, &repo_key)?;
+            let queue = SqliteQueue::open(&db_path)?;
+            let queued = queue.get_item(&item)?;
+            require_remote_item_scope(&queued, &repo_key)?;
             validate_branch_handoff(
                 &repo_path,
                 &remote,
@@ -640,7 +640,9 @@ fn run_remote_exec(
             print_json(&queue.requeue_agent_fix(&item, &head)?)?;
         }
         RemoteCommand::Retry { item } => {
-            require_remote_item(&queue, &item, &repo_key)?;
+            let queue = SqliteQueue::open(&db_path)?;
+            let queued = queue.get_item(&item)?;
+            require_remote_item_scope(&queued, &repo_key)?;
             print_json(&queue.retry_blocked(&item)?)?;
         }
     }
@@ -648,18 +650,24 @@ fn run_remote_exec(
 }
 
 fn require_remote_item(
-    queue: &SqliteQueue,
+    queue: &SqliteQueueReader,
     item_id: &str,
     repo_key: &str,
 ) -> Result<iq::sqlite::QueueItem> {
     let item = queue.get_item(item_id)?;
+    require_remote_item_scope(&item, repo_key)?;
+    Ok(item)
+}
+
+fn require_remote_item_scope(item: &QueueItem, repo_key: &str) -> Result<()> {
     if item.repo_key != repo_key {
         anyhow::bail!(
-            "item {item_id} belongs to repo queue {}, not {repo_key}",
+            "item {} belongs to repo queue {}, not {repo_key}",
+            item.id,
             item.repo_key
         );
     }
-    Ok(item)
+    Ok(())
 }
 
 fn validate_branch_handoff(
@@ -743,7 +751,7 @@ fn default_repo_key(repo_path: &std::path::Path, target: &str) -> String {
 }
 
 fn read_evidence(
-    queue: &SqliteQueue,
+    queue: &SqliteQueueReader,
     item: &QueueItem,
     workspace_root: &std::path::Path,
     phase: EvidencePhaseArg,
@@ -958,14 +966,14 @@ fn run_daemon_config(
             .map(|communication| {
                 DecisionCommunicator::new(
                     &db_path,
-                    repo_key,
+                    repo_key.clone(),
                     build_transports(&communication.transports)?,
                 )
             })
             .transpose()?;
-        runners.push((integrator, communicator));
+        runners.push((repo_key, integrator, communicator));
     }
-    for (_, communicator) in &runners {
+    for (_, _, communicator) in &runners {
         if let Some(communicator) = communicator {
             communicator.verify()?;
         }
@@ -975,26 +983,38 @@ fn run_daemon_config(
     }
     loop {
         let mut results = Vec::new();
-        for (integrator, communicator) in &runners {
-            let mut result = integrator.run_once()?;
-            if let Some(communicator) = communicator {
-                if let Some(cycle) = integrator.with_repo_lease(|| communicator.sync())? {
-                    for error in cycle.errors {
-                        eprintln!("{error}");
-                    }
-                    if cycle.applied_responses > 0 {
-                        result = integrator.run_once()?;
-                        if let Some(followup) =
-                            integrator.with_repo_lease(|| communicator.sync())?
-                        {
-                            for error in followup.errors {
-                                eprintln!("{error}");
+        for (repo_key, integrator, communicator) in &runners {
+            let cycle = || -> Result<Option<QueueItem>> {
+                let mut result = integrator.run_once()?;
+                if let Some(communicator) = communicator {
+                    if let Some(cycle) = integrator.with_repo_lease(|| communicator.sync())? {
+                        for error in cycle.errors {
+                            eprintln!("{error}");
+                        }
+                        if cycle.applied_responses > 0 {
+                            result = integrator.run_once()?;
+                            if let Some(followup) =
+                                integrator.with_repo_lease(|| communicator.sync())?
+                            {
+                                for error in followup.errors {
+                                    eprintln!("{error}");
+                                }
                             }
                         }
                     }
                 }
+                Ok(result)
+            };
+            match cycle() {
+                Ok(result) => results.push(result),
+                Err(error) if once => {
+                    return Err(error).with_context(|| format!("run repo queue {repo_key}"));
+                }
+                Err(error) => {
+                    eprintln!("repo queue {repo_key} cycle failed: {error:#}");
+                    results.push(None);
+                }
             }
-            results.push(result);
         }
         if once {
             print_json(&results)?;

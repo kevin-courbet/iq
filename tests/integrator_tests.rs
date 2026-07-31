@@ -546,9 +546,10 @@ fn pr_backed_conflict_resolution_pushes_source_branch_before_provider_merge() {
         format!(
             r#"#!/bin/sh
 if [ "$1 $2" = "pr view" ]; then
-  if [ "$5" = "mergeCommit" ]; then
+  if [ "$5" = "headRefOid,mergeCommit" ]; then
     landed=$(git --git-dir={remote} rev-parse refs/heads/main)
-    printf '{{"mergeCommit":{{"oid":"%s"}}}}' "$landed"
+    head=$(git --git-dir={remote} rev-parse refs/heads/agent/pr-conflict)
+    printf '{{"headRefOid":"%s","mergeCommit":{{"oid":"%s"}}}}' "$head" "$landed"
     exit 0
   fi
   head=$(git --git-dir={remote} rev-parse refs/heads/agent/pr-conflict)

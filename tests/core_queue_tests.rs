@@ -299,8 +299,11 @@ fn sqlite_repo_lease_owner_check_rejects_stale_integrator() {
     assert!(queue
         .acquire_repo_lease("renewed::main", "owner-a", -1)
         .unwrap());
-    assert!(queue
+    assert!(!queue
         .ensure_repo_lease_owner("renewed::main", "owner-a", 60)
+        .unwrap());
+    assert!(queue
+        .acquire_repo_lease("renewed::main", "owner-a", 60)
         .unwrap());
     assert!(!queue
         .acquire_repo_lease("renewed::main", "owner-b", 60)

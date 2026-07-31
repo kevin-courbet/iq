@@ -166,8 +166,11 @@ pub mod core {
 
 pub mod sqlite {
     use anyhow::{Context, Result};
-    use chrono::{Duration, Utc};
-    use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
+    use chrono::{DateTime, Duration, Utc};
+    use rusqlite::{
+        params, Connection, Error as SqliteError, OpenFlags, OptionalExtension, Row,
+        TransactionBehavior,
+    };
     use serde::{Deserialize, Serialize};
     use serde_json::Value;
     use std::path::{Path, PathBuf};
@@ -271,12 +274,28 @@ pub mod sqlite {
         pub validation_log_path: Option<String>,
     }
 
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) enum ExecutionAuthority {
+        Active,
+        Cancelled,
+        Lost(String),
+    }
+
     #[derive(Clone)]
     pub struct SqliteQueue {
         path: PathBuf,
     }
 
+    #[derive(Clone)]
+    pub struct SqliteQueueReader {
+        path: PathBuf,
+    }
+
     impl SqliteQueue {
+        const MIGRATION_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        const WRITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+        const AUTHORITY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+
         pub fn default_db_path() -> PathBuf {
             if cfg!(target_os = "macos") {
                 let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -298,32 +317,49 @@ pub mod sqlite {
             let queue = Self {
                 path: path.to_path_buf(),
             };
-            let conn = queue.connect()?;
+            let mut conn = Connection::open_with_flags(
+                &queue.path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+            )
+            .with_context(|| format!("open queue db {}", queue.path.display()))?;
+            conn.busy_timeout(Self::MIGRATION_BUSY_TIMEOUT)?;
             conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.pragma_update(None, "foreign_keys", "ON")?;
-            conn.execute_batch(SCHEMA)?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(SCHEMA)?;
             let has_landing_fence = {
-                let mut statement = conn.prepare("PRAGMA table_info(queue_items)")?;
+                let mut statement = tx.prepare("PRAGMA table_info(queue_items)")?;
                 let columns = statement
                     .query_map([], |row| row.get::<_, String>(1))?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
                 columns.iter().any(|column| column == "landing_fenced")
             };
             if !has_landing_fence {
-                conn.execute(
+                tx.execute(
                     "ALTER TABLE queue_items ADD COLUMN landing_fenced INTEGER NOT NULL DEFAULT 0",
                     [],
                 )?;
             }
+            tx.commit()?;
             Ok(queue)
         }
 
         fn connect(&self) -> Result<Connection> {
-            let conn = Connection::open(&self.path)
+            let conn = Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_WRITE)
                 .with_context(|| format!("open queue db {}", self.path.display()))?;
             conn.pragma_update(None, "foreign_keys", "ON")?;
-            conn.busy_timeout(std::time::Duration::from_millis(200))?;
+            conn.busy_timeout(Self::WRITE_BUSY_TIMEOUT)?;
             Ok(conn)
+        }
+
+        fn connect_read_only(&self) -> Result<Connection> {
+            self.reader().connect(SqliteQueueReader::BUSY_TIMEOUT)
+        }
+
+        pub(crate) fn reader(&self) -> SqliteQueueReader {
+            SqliteQueueReader {
+                path: self.path.clone(),
+            }
         }
 
         pub fn enqueue(&self, request: EnqueueRequest) -> Result<QueueItem> {
@@ -370,26 +406,29 @@ pub mod sqlite {
         }
 
         pub fn list_items(&self) -> Result<Vec<QueueItem>> {
-            let conn = self.connect()?;
-            let mut stmt = conn.prepare("SELECT * FROM queue_items ORDER BY created_at ASC")?;
-            let items = stmt
-                .query_map([], map_item)?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            Ok(items)
+            self.reader().list_items()
         }
 
         pub fn get_item(&self, item_id: &str) -> Result<QueueItem> {
-            let conn = self.connect()?;
-            conn.query_row(
-                "SELECT * FROM queue_items WHERE id=?1",
-                params![item_id],
-                map_item,
+            self.reader().get_item(item_id)
+        }
+
+        pub(crate) fn execution_authority(
+            &self,
+            item_id: &str,
+            repo_key: &str,
+            owner_id: &str,
+        ) -> Result<ExecutionAuthority> {
+            self.reader().execution_authority(
+                item_id,
+                repo_key,
+                owner_id,
+                Self::AUTHORITY_READ_TIMEOUT,
             )
-            .with_context(|| format!("queue item not found: {item_id}"))
         }
 
         pub fn oldest_active_item(&self, repo_key: &str) -> Result<Option<QueueItem>> {
-            let conn = self.connect()?;
+            let conn = self.connect_read_only()?;
             conn.query_row(
                 "SELECT * FROM queue_items WHERE repo_key=?1 AND status NOT IN ('integrated','cancelled') ORDER BY created_at ASC, id ASC LIMIT 1",
                 params![repo_key],
@@ -445,7 +484,7 @@ pub mod sqlite {
         }
 
         pub fn next_resumable_active_item(&self, repo_key: &str) -> Result<Option<QueueItem>> {
-            let conn = self.connect()?;
+            let conn = self.connect_read_only()?;
             conn.query_row(
                 "SELECT * FROM queue_items WHERE repo_key=?1 AND status IN ('merging','merged','validating','validated','integrating') ORDER BY created_at ASC LIMIT 1",
                 params![repo_key],
@@ -458,13 +497,15 @@ pub mod sqlite {
         pub fn transition_item(&self, item_id: &str, target: QueueStatus) -> Result<QueueItem> {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let item = tx
-                .query_row(
+            let item = required_row(
+                tx.query_row(
                     "SELECT * FROM queue_items WHERE id=?1",
                     params![item_id],
                     map_item,
-                )
-                .with_context(|| format!("queue item not found: {item_id}"))?;
+                ),
+                "queue item",
+                item_id,
+            )?;
             StateMachine
                 .transition(item.status, target)
                 .map_err(anyhow::Error::msg)?;
@@ -502,13 +543,15 @@ pub mod sqlite {
         ) -> Result<bool> {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let (status, current_attempt_id): (String, Option<String>) = tx
-                .query_row(
+            let (status, current_attempt_id): (String, Option<String>) = required_row(
+                tx.query_row(
                     "SELECT status,current_attempt_id FROM queue_items WHERE id=?1",
                     params![item_id],
                     |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .with_context(|| format!("queue item not found: {item_id}"))?;
+                ),
+                "queue item",
+                item_id,
+            )?;
             let authorized = status == expected_status.to_string()
                 && current_attempt_id.as_deref() == Some(attempt_id);
             if authorized {
@@ -551,13 +594,15 @@ pub mod sqlite {
         ) -> Result<String> {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let item = tx
-                .query_row(
+            let item = required_row(
+                tx.query_row(
                     "SELECT * FROM queue_items WHERE id=?1",
                     params![item_id],
                     map_item,
-                )
-                .with_context(|| format!("queue item not found: {item_id}"))?;
+                ),
+                "queue item",
+                item_id,
+            )?;
             if item.status != expected_status {
                 anyhow::bail!(
                     "item {item_id} in status {} cannot block in {phase}",
@@ -603,13 +648,15 @@ pub mod sqlite {
         ) -> Result<QueueItem> {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let prompt = tx
-                .query_row(
+            let prompt = required_row(
+                tx.query_row(
                     "SELECT id,item_id,attempt_id,blocked_phase,status,question,answer,options_json FROM prompts WHERE id=?1",
                     params![prompt_id],
                     map_prompt,
-                )
-                .with_context(|| format!("prompt not found: {prompt_id}"))?;
+                ),
+                "prompt",
+                prompt_id,
+            )?;
             if prompt.status != "open" {
                 anyhow::bail!("prompt {prompt_id} is not open")
             }
@@ -629,13 +676,15 @@ pub mod sqlite {
                     prompt.options.join(", ")
                 );
             }
-            let item = tx
-                .query_row(
+            let item = required_row(
+                tx.query_row(
                     "SELECT * FROM queue_items WHERE id=?1",
                     params![prompt.item_id],
                     map_item,
-                )
-                .with_context(|| format!("queue item not found: {}", prompt.item_id))?;
+                ),
+                "queue item",
+                &prompt.item_id,
+            )?;
             if item.status != QueueStatus::Blocked
                 || item.blocked_reason != Some(BlockedReason::NeedsUserInput)
             {
@@ -676,13 +725,15 @@ pub mod sqlite {
             }
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let item = tx
-                .query_row(
+            let item = required_row(
+                tx.query_row(
                     "SELECT * FROM queue_items WHERE id=?1",
                     params![item_id],
                     map_item,
-                )
-                .with_context(|| format!("queue item not found: {item_id}"))?;
+                ),
+                "queue item",
+                item_id,
+            )?;
             if item.status != QueueStatus::Blocked
                 || item.blocked_phase != Some(BlockedPhase::Merging)
                 || item.blocked_reason != Some(BlockedReason::NeedsUserInput)
@@ -723,13 +774,15 @@ pub mod sqlite {
         pub fn requeue_agent_fix(&self, item_id: &str, new_head: &str) -> Result<QueueItem> {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let item = tx
-                .query_row(
+            let item = required_row(
+                tx.query_row(
                     "SELECT * FROM queue_items WHERE id=?1",
                     params![item_id],
                     map_item,
-                )
-                .with_context(|| format!("queue item not found: {item_id}"))?;
+                ),
+                "queue item",
+                item_id,
+            )?;
             if item.status != QueueStatus::Blocked
                 || item.blocked_reason != Some(BlockedReason::NeedsAgentFix)
             {
@@ -751,13 +804,15 @@ pub mod sqlite {
         pub fn retry_blocked(&self, item_id: &str) -> Result<QueueItem> {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let item = tx
-                .query_row(
+            let item = required_row(
+                tx.query_row(
                     "SELECT * FROM queue_items WHERE id=?1",
                     params![item_id],
                     map_item,
-                )
-                .with_context(|| format!("queue item not found: {item_id}"))?;
+                ),
+                "queue item",
+                item_id,
+            )?;
             if item.status != QueueStatus::Blocked {
                 anyhow::bail!("item {item_id} is not blocked")
             }
@@ -850,11 +905,14 @@ pub mod sqlite {
             owner_id: &str,
             ttl_seconds: i64,
         ) -> Result<bool> {
-            let conn = self.connect()?;
-            let changed = conn.execute(
-                "UPDATE repo_leases SET heartbeat_at=?1,expires_at=?2 WHERE repo_key=?3 AND owner_id=?4",
-                params![now(), (Utc::now() + Duration::seconds(ttl_seconds)).to_rfc3339(), repo_key, owner_id],
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current_time = now();
+            let changed = tx.execute(
+                "UPDATE repo_leases SET heartbeat_at=?1,expires_at=?2 WHERE repo_key=?3 AND owner_id=?4 AND expires_at>?1",
+                params![current_time, (Utc::now() + Duration::seconds(ttl_seconds)).to_rfc3339(), repo_key, owner_id],
             )?;
+            tx.commit()?;
             Ok(changed == 1)
         }
 
@@ -881,13 +939,15 @@ pub mod sqlite {
         ) -> Result<bool> {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let status: String = tx
-                .query_row(
+            let status: String = required_row(
+                tx.query_row(
                     "SELECT status FROM queue_items WHERE id=?1",
                     params![item_id],
                     |row| row.get(0),
-                )
-                .with_context(|| format!("queue item not found: {item_id}"))?;
+                ),
+                "queue item",
+                item_id,
+            )?;
             if status != expected_status.to_string() {
                 tx.commit()?;
                 return Ok(false);
@@ -898,20 +958,7 @@ pub mod sqlite {
         }
 
         pub fn events(&self, item_id: &str) -> Result<Vec<QueueEvent>> {
-            let conn = self.connect()?;
-            let mut stmt = conn.prepare("SELECT id,item_id,event_type,message,created_at FROM queue_events WHERE item_id=?1 ORDER BY created_at ASC")?;
-            let events = stmt
-                .query_map(params![item_id], |row| {
-                    Ok(QueueEvent {
-                        id: row.get(0)?,
-                        item_id: row.get(1)?,
-                        event_type: row.get(2)?,
-                        message: row.get(3)?,
-                        created_at: row.get(4)?,
-                    })
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            Ok(events)
+            self.reader().events(item_id)
         }
 
         pub fn latest_answered_prompt(
@@ -919,7 +966,7 @@ pub mod sqlite {
             item_id: &str,
             attempt_id: Option<&str>,
         ) -> Result<Option<Prompt>> {
-            let conn = self.connect()?;
+            let conn = self.connect_read_only()?;
             let mut sql = String::from(
                 "SELECT id,item_id,attempt_id,blocked_phase,status,question,answer,options_json FROM prompts WHERE item_id=?1 AND status='answered'",
             );
@@ -938,18 +985,11 @@ pub mod sqlite {
         }
 
         pub fn prompts_for_item(&self, item_id: &str) -> Result<Vec<Prompt>> {
-            let conn = self.connect()?;
-            let mut stmt = conn.prepare(
-                "SELECT id,item_id,attempt_id,blocked_phase,status,question,answer,options_json FROM prompts WHERE item_id=?1 ORDER BY created_at ASC",
-            )?;
-            let prompts = stmt
-                .query_map(params![item_id], map_prompt)?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            Ok(prompts)
+            self.reader().prompts_for_item(item_id)
         }
 
         pub fn communication_bindings(&self, repo_key: &str) -> Result<Vec<CommunicationBinding>> {
-            let conn = self.connect()?;
+            let conn = self.connect_read_only()?;
             let mut stmt = conn.prepare(
                 "SELECT * FROM communication_bindings WHERE repo_key=?1 ORDER BY created_at ASC",
             )?;
@@ -964,7 +1004,7 @@ pub mod sqlite {
             item_id: &str,
             transport_id: &str,
         ) -> Result<Option<CommunicationBinding>> {
-            let conn = self.connect()?;
+            let conn = self.connect_read_only()?;
             conn.query_row(
                 "SELECT * FROM communication_bindings WHERE item_id=?1 AND transport_id=?2",
                 params![item_id, transport_id],
@@ -1102,13 +1142,15 @@ pub mod sqlite {
                 return Ok(CommunicationResponseDisposition::Duplicate);
             }
 
-            let binding_item_id: String = tx
-                .query_row(
+            let binding_item_id: String = required_row(
+                tx.query_row(
                     "SELECT item_id FROM communication_bindings WHERE id=?1",
                     params![binding_id],
                     |row| row.get(0),
-                )
-                .with_context(|| format!("communication binding not found: {binding_id}"))?;
+                ),
+                "communication binding",
+                binding_id,
+            )?;
 
             let answer = answer.trim();
             let actor = actor.trim();
@@ -1180,26 +1222,7 @@ pub mod sqlite {
         }
 
         pub fn get_attempt(&self, attempt_id: &str) -> Result<Attempt> {
-            let conn = self.connect()?;
-            conn.query_row(
-                "SELECT id,item_id,attempt_number,source_head_sha,target_base_sha,merge_commit_sha,validated_commit_sha,landed_commit_sha,validation_command,validation_exit_code,validation_log_path FROM integration_attempts WHERE id=?1",
-                params![attempt_id],
-                |row| {
-                    Ok(Attempt {
-                        id: row.get(0)?,
-                        item_id: row.get(1)?,
-                        attempt_number: row.get(2)?,
-                        source_head_sha: row.get(3)?,
-                        target_base_sha: row.get(4)?,
-                        merge_commit_sha: row.get(5)?,
-                        validated_commit_sha: row.get(6)?,
-                        landed_commit_sha: row.get(7)?,
-                        validation_command: row.get(8)?,
-                        validation_exit_code: row.get(9)?,
-                        validation_log_path: row.get(10)?,
-                    })
-                },
-            ).with_context(|| format!("attempt not found: {attempt_id}"))
+            self.reader().get_attempt(attempt_id)
         }
 
         pub fn update_attempt_base(&self, attempt_id: &str, target_base_sha: &str) -> Result<()> {
@@ -1261,13 +1284,15 @@ pub mod sqlite {
         ) -> Result<QueueItem> {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let item: (String, Option<String>, bool) = tx
-                .query_row(
+            let item: (String, Option<String>, bool) = required_row(
+                tx.query_row(
                     "SELECT status,current_attempt_id,landing_fenced FROM queue_items WHERE id=?1",
                     params![item_id],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .with_context(|| format!("queue item not found: {item_id}"))?;
+                ),
+                "queue item",
+                item_id,
+            )?;
             if item.0 != QueueStatus::Integrating.to_string()
                 || item.1.as_deref() != Some(attempt_id)
                 || !item.2
@@ -1297,13 +1322,15 @@ pub mod sqlite {
         pub fn begin_landing(&self, item_id: &str, attempt_id: &str) -> Result<()> {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let item: (String, Option<String>, bool) = tx
-                .query_row(
+            let item: (String, Option<String>, bool) = required_row(
+                tx.query_row(
                     "SELECT status,current_attempt_id,landing_fenced FROM queue_items WHERE id=?1",
                     params![item_id],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .with_context(|| format!("queue item not found: {item_id}"))?;
+                ),
+                "queue item",
+                item_id,
+            )?;
             if item.0 != QueueStatus::Integrating.to_string()
                 || item.1.as_deref() != Some(attempt_id)
             {
@@ -1361,12 +1388,7 @@ pub mod sqlite {
         }
 
         pub fn get_prompt(&self, prompt_id: &str) -> Result<Prompt> {
-            let conn = self.connect()?;
-            conn.query_row(
-                "SELECT id,item_id,attempt_id,blocked_phase,status,question,answer,options_json FROM prompts WHERE id=?1",
-                params![prompt_id],
-                map_prompt,
-            ).with_context(|| format!("prompt not found: {prompt_id}"))
+            self.reader().get_prompt(prompt_id)
         }
 
         fn record_event_with_conn(
@@ -1394,6 +1416,201 @@ pub mod sqlite {
                 params![Uuid::new_v4().to_string(), item_id, event_type, message, now()],
             )?;
             Ok(())
+        }
+    }
+
+    impl SqliteQueueReader {
+        const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        const COMMAND_AUTHORITY_RESERVE: Duration = Duration::seconds(1);
+
+        pub fn open(path: &Path) -> Result<Self> {
+            let reader = Self {
+                path: path.to_path_buf(),
+            };
+            let conn = reader
+                .connect(Self::BUSY_TIMEOUT)
+                .with_context(|| format!("open existing queue db {}", path.display()))?;
+            let has_landing_fence = {
+                let mut statement = conn.prepare("PRAGMA table_info(queue_items)")?;
+                let columns = statement
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                columns.iter().any(|column| column == "landing_fenced")
+            };
+            if !has_landing_fence {
+                anyhow::bail!(
+                    "queue database migration required; restart the IQ daemon before using read-only commands"
+                );
+            }
+            Ok(reader)
+        }
+
+        fn connect(&self, timeout: std::time::Duration) -> Result<Connection> {
+            let conn = Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .with_context(|| format!("open queue db for reading {}", self.path.display()))?;
+            conn.busy_timeout(timeout)?;
+            conn.pragma_update(None, "query_only", "ON")?;
+            Ok(conn)
+        }
+
+        pub fn list_items(&self) -> Result<Vec<QueueItem>> {
+            let conn = self.connect(Self::BUSY_TIMEOUT)?;
+            let mut stmt = conn.prepare("SELECT * FROM queue_items ORDER BY created_at ASC")?;
+            let items = stmt
+                .query_map([], map_item)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(items)
+        }
+
+        pub fn get_item(&self, item_id: &str) -> Result<QueueItem> {
+            let conn = self.connect(Self::BUSY_TIMEOUT)?;
+            required_row(
+                conn.query_row(
+                    "SELECT * FROM queue_items WHERE id=?1",
+                    params![item_id],
+                    map_item,
+                ),
+                "queue item",
+                item_id,
+            )
+        }
+
+        fn execution_authority(
+            &self,
+            item_id: &str,
+            repo_key: &str,
+            owner_id: &str,
+            timeout: std::time::Duration,
+        ) -> Result<ExecutionAuthority> {
+            let conn = self.connect(timeout)?;
+            let authority: Option<(
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+            )> = conn
+                .query_row(
+                    "SELECT q.status,q.repo_key,l.owner_id,l.expires_at FROM queue_items q LEFT JOIN repo_leases l ON l.repo_key=q.repo_key WHERE q.id=?1",
+                    params![item_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            let Some((status, stored_repo_key, lease_owner, lease_expires)) = authority else {
+                return Ok(ExecutionAuthority::Lost(format!(
+                    "queue item {item_id} no longer exists"
+                )));
+            };
+            if stored_repo_key != repo_key {
+                return Ok(ExecutionAuthority::Lost(format!(
+                    "item {item_id} belongs to repo queue {stored_repo_key}, not {repo_key}"
+                )));
+            }
+            if lease_owner.as_deref() != Some(owner_id) {
+                return Ok(ExecutionAuthority::Lost(format!(
+                    "repo queue {repo_key} lease is no longer owned by {owner_id}"
+                )));
+            }
+            let Some(lease_expires) = lease_expires else {
+                return Ok(ExecutionAuthority::Lost(format!(
+                    "repo queue {repo_key} lease has no expiry"
+                )));
+            };
+            let lease_expires = match DateTime::parse_from_rfc3339(&lease_expires) {
+                Ok(expires) => expires.with_timezone(&Utc),
+                Err(error) => {
+                    return Ok(ExecutionAuthority::Lost(format!(
+                        "repo queue {repo_key} lease expiry is invalid: {error}"
+                    )));
+                }
+            };
+            if lease_expires <= Utc::now() + Self::COMMAND_AUTHORITY_RESERVE {
+                return Ok(ExecutionAuthority::Lost(format!(
+                    "repo queue {repo_key} lease cannot cover the next command authority check"
+                )));
+            }
+            match QueueStatus::from_str(&status) {
+                Ok(QueueStatus::Cancelled) => Ok(ExecutionAuthority::Cancelled),
+                Ok(_) => Ok(ExecutionAuthority::Active),
+                Err(error) => Ok(ExecutionAuthority::Lost(format!(
+                    "queue item {item_id} has invalid status: {error}"
+                ))),
+            }
+        }
+
+        pub fn events(&self, item_id: &str) -> Result<Vec<QueueEvent>> {
+            let conn = self.connect(Self::BUSY_TIMEOUT)?;
+            let mut stmt = conn.prepare("SELECT id,item_id,event_type,message,created_at FROM queue_events WHERE item_id=?1 ORDER BY created_at ASC")?;
+            let events = stmt
+                .query_map(params![item_id], |row| {
+                    Ok(QueueEvent {
+                        id: row.get(0)?,
+                        item_id: row.get(1)?,
+                        event_type: row.get(2)?,
+                        message: row.get(3)?,
+                        created_at: row.get(4)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(events)
+        }
+
+        pub fn prompts_for_item(&self, item_id: &str) -> Result<Vec<Prompt>> {
+            let conn = self.connect(Self::BUSY_TIMEOUT)?;
+            let mut stmt = conn.prepare(
+                "SELECT id,item_id,attempt_id,blocked_phase,status,question,answer,options_json FROM prompts WHERE item_id=?1 ORDER BY created_at ASC",
+            )?;
+            let prompts = stmt
+                .query_map(params![item_id], map_prompt)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(prompts)
+        }
+
+        pub fn get_attempt(&self, attempt_id: &str) -> Result<Attempt> {
+            let conn = self.connect(Self::BUSY_TIMEOUT)?;
+            required_row(
+                conn.query_row(
+                    "SELECT id,item_id,attempt_number,source_head_sha,target_base_sha,merge_commit_sha,validated_commit_sha,landed_commit_sha,validation_command,validation_exit_code,validation_log_path FROM integration_attempts WHERE id=?1",
+                    params![attempt_id],
+                    |row| {
+                        Ok(Attempt {
+                            id: row.get(0)?,
+                            item_id: row.get(1)?,
+                            attempt_number: row.get(2)?,
+                            source_head_sha: row.get(3)?,
+                            target_base_sha: row.get(4)?,
+                            merge_commit_sha: row.get(5)?,
+                            validated_commit_sha: row.get(6)?,
+                            landed_commit_sha: row.get(7)?,
+                            validation_command: row.get(8)?,
+                            validation_exit_code: row.get(9)?,
+                            validation_log_path: row.get(10)?,
+                        })
+                    },
+                ),
+                "attempt",
+                attempt_id,
+            )
+        }
+
+        pub fn get_prompt(&self, prompt_id: &str) -> Result<Prompt> {
+            let conn = self.connect(Self::BUSY_TIMEOUT)?;
+            required_row(
+                conn.query_row(
+                    "SELECT id,item_id,attempt_id,blocked_phase,status,question,answer,options_json FROM prompts WHERE id=?1",
+                    params![prompt_id],
+                    map_prompt,
+                ),
+                "prompt",
+                prompt_id,
+            )
+        }
+    }
+
+    fn required_row<T>(result: rusqlite::Result<T>, entity: &str, id: &str) -> Result<T> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(SqliteError::QueryReturnedNoRows) => anyhow::bail!("{entity} not found: {id}"),
+            Err(error) => Err(error).with_context(|| format!("read {entity} {id}")),
         }
     }
 
@@ -1672,10 +1889,11 @@ pub mod integrator {
     use std::sync::mpsc;
     use std::thread::{self, JoinHandle};
     use std::time::{Duration as StdDuration, Instant};
+    use uuid::Uuid;
     use wait_timeout::ChildExt;
 
     use crate::core::{BlockedPhase, BlockedReason, QueueStatus};
-    use crate::sqlite::{Attempt, QueueItem, SqliteQueue};
+    use crate::sqlite::{Attempt, ExecutionAuthority, QueueItem, SqliteQueue, SqliteQueueReader};
 
     #[derive(Clone, Debug)]
     pub struct IntegratorOptions {
@@ -1707,6 +1925,7 @@ pub mod integrator {
         queue: SqliteQueue,
         options: IntegratorOptions,
         policy: IntegrationPolicy,
+        lease_owner_id: String,
     }
 
     #[derive(Debug, Deserialize)]
@@ -1761,12 +1980,36 @@ pub mod integrator {
             };
             let handle = thread::spawn(move || {
                 let _ = ready_tx.send(());
+                let lease_ttl = StdDuration::from_secs(ttl_seconds.max(1) as u64);
+                let mut lease_deadline = Instant::now() + lease_ttl;
+                let mut next_interval = interval;
                 loop {
-                    match stop_rx.recv_timeout(interval) {
+                    match stop_rx.recv_timeout(next_interval) {
                         Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => {
-                            if !queue.heartbeat_repo_lease(&repo_key, &owner_id, ttl_seconds)? {
-                                anyhow::bail!("repo queue {repo_key} lease lost during heartbeat");
+                            match queue.heartbeat_repo_lease(&repo_key, &owner_id, ttl_seconds) {
+                                Ok(true) => {
+                                    lease_deadline = Instant::now() + lease_ttl;
+                                    next_interval = interval;
+                                }
+                                Ok(false) => {
+                                    anyhow::bail!(
+                                        "repo queue {repo_key} lease lost during heartbeat"
+                                    );
+                                }
+                                Err(error) => {
+                                    if Instant::now() >= lease_deadline {
+                                        return Err(error).context(format!(
+                                            "repo queue {repo_key} heartbeat unavailable until lease expiry"
+                                        ));
+                                    }
+                                    eprintln!(
+                                        "repo queue {repo_key} heartbeat unavailable; retrying: {error:#}"
+                                    );
+                                    next_interval = StdDuration::from_secs(1).min(
+                                        lease_deadline.saturating_duration_since(Instant::now()),
+                                    );
+                                }
                             }
                         }
                     }
@@ -1844,17 +2087,19 @@ pub mod integrator {
                     );
                 }
             }
+            let lease_owner_id = format!("{}:{}", options.owner_id, Uuid::new_v4());
             Ok(Self {
                 queue: SqliteQueue::open(&options.queue_db)?,
                 options,
                 policy,
+                lease_owner_id,
             })
         }
 
         pub fn run_once(&self) -> Result<Option<QueueItem>> {
             if !self.queue.acquire_repo_lease(
                 &self.options.repo_key,
-                &self.options.owner_id,
+                &self.lease_owner_id,
                 self.options.lease_ttl_seconds,
             )? {
                 return Ok(None);
@@ -1894,7 +2139,7 @@ pub mod integrator {
         ) -> Result<Option<T>> {
             if !self.queue.acquire_repo_lease(
                 &self.options.repo_key,
-                &self.options.owner_id,
+                &self.lease_owner_id,
                 self.options.lease_ttl_seconds,
             )? {
                 return Ok(None);
@@ -1906,7 +2151,7 @@ pub mod integrator {
         pub fn resume_item(&self, item_id: &str) -> Result<QueueItem> {
             if !self.queue.acquire_repo_lease(
                 &self.options.repo_key,
-                &self.options.owner_id,
+                &self.lease_owner_id,
                 self.options.lease_ttl_seconds,
             )? {
                 anyhow::bail!(
@@ -1992,7 +2237,7 @@ pub mod integrator {
         fn ensure_repo_lease(&self) -> Result<()> {
             if self.queue.ensure_repo_lease_owner(
                 &self.options.repo_key,
-                &self.options.owner_id,
+                &self.lease_owner_id,
                 self.options.lease_ttl_seconds,
             )? {
                 Ok(())
@@ -2000,7 +2245,7 @@ pub mod integrator {
                 anyhow::bail!(
                     "repo queue {} lease is no longer owned by {}",
                     self.options.repo_key,
-                    self.options.owner_id
+                    self.lease_owner_id
                 )
             }
         }
@@ -2014,7 +2259,7 @@ pub mod integrator {
             let guard = LeaseHeartbeat::start(
                 self.queue.clone(),
                 self.options.repo_key.clone(),
-                self.options.owner_id.clone(),
+                self.lease_owner_id.clone(),
                 self.options.lease_ttl_seconds,
             );
             let result = operation();
@@ -2041,8 +2286,59 @@ pub mod integrator {
             }
         }
 
+        fn execution_authority(&self, item_id: &str) -> Result<ExecutionAuthority> {
+            self.queue
+                .execution_authority(item_id, &self.options.repo_key, &self.lease_owner_id)
+        }
+
         fn item_cancelled(&self, item_id: &str) -> Result<bool> {
-            Ok(self.queue.get_item(item_id)?.status == QueueStatus::Cancelled)
+            match self.execution_authority(item_id)? {
+                ExecutionAuthority::Active => Ok(false),
+                ExecutionAuthority::Cancelled => Ok(true),
+                ExecutionAuthority::Lost(message) => anyhow::bail!(message),
+            }
+        }
+
+        fn run_supervised_landing_command<I, S>(
+            &self,
+            item_id: &str,
+            attempt_id: &str,
+            program: &str,
+            args: I,
+            cwd: Option<&Path>,
+        ) -> Result<Output>
+        where
+            I: IntoIterator<Item = S>,
+            S: AsRef<OsStr>,
+        {
+            let outcome = command_output_timeout(
+                program,
+                args,
+                cwd,
+                StdDuration::from_secs(20),
+                |gate| {
+                    self.authorize_execution_start(
+                        item_id,
+                        attempt_id,
+                        QueueStatus::Integrating,
+                        || {
+                            gate.write_all(b"run\n")
+                                .context("release landing command admission gate")
+                        },
+                    )
+                },
+                || self.execution_authority(item_id),
+            )?;
+            match outcome {
+                CommandOutputOutcome::Exited(output) if output.status.success() => Ok(output),
+                CommandOutputOutcome::Exited(output) => anyhow::bail!(
+                    "{program} landing command failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+                CommandOutputOutcome::Cancelled => {
+                    anyhow::bail!("{program} landing command lost execution authority")
+                }
+            }
         }
 
         fn cancelled_item(&self, item_id: &str) -> Result<Option<QueueItem>> {
@@ -2439,7 +2735,7 @@ pub mod integrator {
                         },
                     )
                 },
-                || self.item_cancelled(&item.id),
+                || self.execution_authority(&item.id),
             ) {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -2568,7 +2864,12 @@ pub mod integrator {
                 .as_ref()
                 .map(PathBuf::from)
                 .context("item missing integration workspace path")?;
-            if let Err(error) = self.fetch_target(&item) {
+            let fetch_result = if item.landing_fenced {
+                self.fetch_target_supervised(&item, attempt)
+            } else {
+                self.fetch_target(&item)
+            };
+            if let Err(error) = fetch_result {
                 return self.block_and_get(
                     &item.id,
                     BlockedPhase::Integrating,
@@ -2591,6 +2892,28 @@ pub mod integrator {
                     );
                 }
             };
+            if item.landing_fenced {
+                let fenced_candidate = attempt
+                    .validated_commit_sha
+                    .as_deref()
+                    .context("fenced landing attempt has no validated commit SHA")?;
+                let candidate_landed =
+                    git_is_ancestor(&self.options.repo_path, fenced_candidate, &remote_ref)?;
+                let source_landed = git_is_ancestor(
+                    &self.options.repo_path,
+                    item.current_head_sha.as_str(),
+                    &remote_ref,
+                )?;
+                if candidate_landed && source_landed {
+                    return self.mark_integrated_owned(&item.id, &attempt.id, fenced_candidate);
+                }
+                return self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::Infra,
+                    "fenced direct landing remains unresolved; retry to reconcile remote target state",
+                );
+            }
             let attempt_base = self.queue.get_attempt(&attempt.id)?.target_base_sha;
             if attempt_base.as_deref() != Some(remote_sha.as_str()) {
                 if let Some(blocked) = self.merge_moved_base(
@@ -2701,23 +3024,27 @@ pub mod integrator {
             let target_ref = format!("refs/heads/{}", item.target_branch);
             let push_ref = format!("HEAD:{target_ref}");
             let lease = format!("--force-with-lease={target_ref}:{remote_sha}");
-            if let Err(error) = git(
-                &workspace,
-                ["push", lease.as_str(), &self.options.base_remote, &push_ref],
-            ) {
+            let landing_error = self
+                .run_supervised_landing_command(
+                    &item.id,
+                    &attempt.id,
+                    "git",
+                    ["push", lease.as_str(), &self.options.base_remote, &push_ref],
+                    Some(&workspace),
+                )
+                .err();
+            self.ensure_repo_lease()?;
+            if let Err(error) = self.fetch_target_supervised(&item, attempt) {
                 return self.block_and_get(
                     &item.id,
                     BlockedPhase::Integrating,
                     BlockedReason::Infra,
-                    &format!("failed to push direct landing commit {landed_sha}: {error}"),
-                );
-            }
-            if let Err(error) = self.fetch_target(&item) {
-                return self.block_and_get(
-                    &item.id,
-                    BlockedPhase::Integrating,
-                    BlockedReason::Infra,
-                    &format!("failed to fetch target after direct landing push: {error}"),
+                    &match landing_error {
+                        Some(landing_error) => format!(
+                            "direct landing outcome is unknown after {landing_error}; failed to fetch target for reconciliation: {error}"
+                        ),
+                        None => format!("failed to fetch target after direct landing push: {error}"),
+                    },
                 );
             }
             if let Err(error) = git(
@@ -2728,9 +3055,14 @@ pub mod integrator {
                     &item.id,
                     BlockedPhase::Integrating,
                     BlockedReason::Infra,
-                    &format!(
-                        "remote target does not contain direct-landed commit {landed_sha}: {error}"
-                    ),
+                    &match landing_error {
+                        Some(landing_error) => format!(
+                            "direct landing failed or remained unconfirmed for {landed_sha}: {landing_error}; remote reconciliation: {error}"
+                        ),
+                        None => format!(
+                            "remote target does not contain direct-landed commit {landed_sha}: {error}"
+                        ),
+                    },
                 );
             }
             if let Err(error) = git(
@@ -2846,7 +3178,7 @@ pub mod integrator {
                         },
                     )
                 },
-                || self.item_cancelled(&item.id),
+                || self.execution_authority(&item.id),
             );
             let outcome = match outcome {
                 Ok(outcome) => outcome,
@@ -2981,6 +3313,7 @@ pub mod integrator {
             let output = command_output_timeout(
                 &gh,
                 ["api", endpoint.as_str()],
+                None,
                 StdDuration::from_secs(60),
                 |gate| {
                     self.authorize_execution_start(
@@ -2993,7 +3326,7 @@ pub mod integrator {
                         },
                     )
                 },
-                || self.item_cancelled(item_id),
+                || self.execution_authority(item_id),
             )
             .map_err(|error| {
                 SignoffQueryError::Provider(format!(
@@ -3208,7 +3541,7 @@ pub mod integrator {
                         },
                     )
                 },
-                || self.item_cancelled(&item.id),
+                || self.execution_authority(&item.id),
             ) {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -3352,6 +3685,27 @@ pub mod integrator {
             pr_url: &str,
         ) -> Result<QueueItem> {
             let provider = crate::providers::provider_for_url(pr_url)?;
+            if item.landing_fenced {
+                match self.reconcile_provider_landing(&item, attempt, provider.as_ref(), pr_url) {
+                    Ok(Some(integrated)) => return Ok(integrated),
+                    Ok(None) => {
+                        return self.block_and_get(
+                            &item.id,
+                            BlockedPhase::Integrating,
+                            BlockedReason::Provider,
+                            "fenced provider landing remains unresolved; retry after the provider reaches a terminal state",
+                        );
+                    }
+                    Err(error) => {
+                        return self.block_and_get(
+                            &item.id,
+                            BlockedPhase::Integrating,
+                            BlockedReason::Provider,
+                            &format!("failed to reconcile fenced provider landing: {error}"),
+                        );
+                    }
+                }
+            }
             match self.push_provider_resolution_branch_if_needed(&item) {
                 Ok(Some(updated)) => item = updated,
                 Ok(None) => {}
@@ -3440,53 +3794,120 @@ pub mod integrator {
             if let Some(cancelled) = self.begin_landing_owned(&item.id, &attempt.id)? {
                 return Ok(cancelled);
             }
-            let merge_result = match provider.merge(pr_url, &item.current_head_sha) {
-                Ok(result) => result,
-                Err(error) => {
-                    self.block_item_owned(
-                        &item.id,
-                        BlockedPhase::Integrating,
-                        BlockedReason::Provider,
-                        &format!("provider merge failed: {error}"),
-                    )?;
-                    return self.queue.get_item(&item.id);
-                }
-            };
-            if let Err(error) = self.fetch_target(&item) {
-                return self.block_and_get(
+            let merge_command = provider.merge_command(pr_url, &item.current_head_sha);
+            let merge_error = self
+                .run_supervised_landing_command(
+                    &item.id,
+                    &attempt.id,
+                    &merge_command.program,
+                    &merge_command.args,
+                    None,
+                )
+                .err();
+            match self.reconcile_provider_landing(&item, attempt, provider.as_ref(), pr_url) {
+                Ok(Some(integrated)) => Ok(integrated),
+                Ok(None) => self.block_and_get(
                     &item.id,
                     BlockedPhase::Integrating,
                     BlockedReason::Provider,
-                    &format!("failed to fetch target after provider merge: {error}"),
+                    &match merge_error {
+                        Some(error) => {
+                            format!("provider merge failed or remained unconfirmed: {error}")
+                        }
+                        None => "provider merge did not report the exact landed commit SHA".into(),
+                    },
+                ),
+                Err(error) => self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::Provider,
+                    &match merge_error {
+                        Some(merge_error) => format!(
+                            "provider merge outcome is unknown after {merge_error}; reconciliation failed: {error}"
+                        ),
+                        None => format!("failed to reconcile provider merge: {error}"),
+                    },
+                ),
+            }
+        }
+
+        fn reconcile_provider_landing(
+            &self,
+            item: &QueueItem,
+            attempt: &Attempt,
+            provider: &dyn crate::providers::ProviderAdapter,
+            pr_url: &str,
+        ) -> Result<Option<QueueItem>> {
+            self.ensure_repo_lease()?;
+            let Some(landing) = provider
+                .landing(pr_url)
+                .context("query exact provider landing revision")?
+            else {
+                return Ok(None);
+            };
+            if landing.head_sha != item.current_head_sha {
+                anyhow::bail!(
+                    "provider landed head {}, expected queued head {}",
+                    landing.head_sha,
+                    item.current_head_sha
                 );
             }
+            self.fetch_target_supervised(item, attempt)
+                .context("fetch target while reconciling provider landing")?;
             let remote_ref = format!(
                 "refs/remotes/{}/{}",
                 self.options.base_remote, item.target_branch
             );
-            let Some(landed_sha) = merge_result.landed_sha else {
-                return self.block_and_get(
-                    &item.id,
-                    BlockedPhase::Integrating,
-                    BlockedReason::Provider,
-                    "provider merge did not report the exact landed commit SHA",
-                );
-            };
-            if let Err(error) = git(
+            let persisted_attempt = self.queue.get_attempt(&attempt.id)?;
+            let expected_base = persisted_attempt
+                .target_base_sha
+                .as_deref()
+                .context("provider landing attempt has no validated target base")?;
+            let validated_commit = persisted_attempt
+                .validated_commit_sha
+                .as_deref()
+                .context("provider landing attempt has no validated commit")?;
+            let landed_tree = git_output(
                 &self.options.repo_path,
-                ["merge-base", "--is-ancestor", &landed_sha, &remote_ref],
-            ) {
-                self.block_item_owned(
-                    &item.id,
-                    BlockedPhase::Integrating,
-                    BlockedReason::Provider,
-                    &format!(
-                        "remote target does not contain provider-landed commit/source head {landed_sha}: {error}"
-                    ),
-                )?;
-                return self.queue.get_item(&item.id);
+                ["rev-parse", &format!("{}^{{tree}}", landing.commit_sha)],
+            )?;
+            let validated_tree = git_output(
+                &self.options.repo_path,
+                ["rev-parse", &format!("{validated_commit}^{{tree}}")],
+            )?;
+            if landed_tree != validated_tree {
+                anyhow::bail!(
+                    "provider-landed tree {landed_tree} differs from validated tree {validated_tree}"
+                );
             }
-            self.mark_integrated_owned(&item.id, &attempt.id, &landed_sha)
+            let first_parent = git_output(
+                &self.options.repo_path,
+                ["rev-parse", &format!("{}^1", landing.commit_sha)],
+            )?;
+            let validated_fast_forward = landing.commit_sha == item.current_head_sha
+                && git_is_ancestor(&self.options.repo_path, expected_base, &landing.commit_sha)?;
+            if first_parent != expected_base && !validated_fast_forward {
+                anyhow::bail!(
+                    "provider landed on base {first_parent}, expected validated base {expected_base}"
+                );
+            }
+            git(
+                &self.options.repo_path,
+                [
+                    "merge-base",
+                    "--is-ancestor",
+                    &landing.commit_sha,
+                    &remote_ref,
+                ],
+            )
+            .with_context(|| {
+                format!(
+                    "remote target does not contain provider-landed commit {}",
+                    landing.commit_sha
+                )
+            })?;
+            self.mark_integrated_owned(&item.id, &attempt.id, &landing.commit_sha)
+                .map(Some)
         }
 
         fn push_provider_resolution_branch_if_needed(
@@ -3530,38 +3951,13 @@ pub mod integrator {
         }
 
         pub fn workspace_status(&self) -> Result<Vec<WorkspaceStatus>> {
-            let items = self.queue.list_items()?;
-            let mut statuses = Vec::new();
-            for item in items
-                .into_iter()
-                .filter(|item| item.repo_key == self.options.repo_key)
-            {
-                let Some(path) = item.integration_workspace_path.as_ref().map(PathBuf::from) else {
-                    continue;
-                };
-                let exists = path.exists();
-                let dirty = exists && !git_output(&path, ["status", "--porcelain"])?.is_empty();
-                let conflict_files = if exists {
-                    conflict_files(&path)?
-                } else {
-                    Vec::new()
-                };
-                statuses.push(WorkspaceStatus {
-                    item_id: item.id,
-                    status: item.status,
-                    path,
-                    exists,
-                    dirty,
-                    conflict_files,
-                });
-            }
-            Ok(statuses)
+            workspace_status(&self.queue.reader(), &self.options.repo_key)
         }
 
         pub fn accept_current_workspace(&self, item_id: &str) -> Result<QueueItem> {
             if !self.queue.acquire_repo_lease(
                 &self.options.repo_key,
-                &self.options.owner_id,
+                &self.lease_owner_id,
                 self.options.lease_ttl_seconds,
             )? {
                 anyhow::bail!(
@@ -3616,6 +4012,18 @@ pub mod integrator {
                 &self.options.repo_path,
                 ["fetch", &self.options.base_remote, &item.target_branch],
             )
+        }
+
+        fn fetch_target_supervised(&self, item: &QueueItem, attempt: &Attempt) -> Result<()> {
+            self.ensure_repo_lease()?;
+            self.run_supervised_landing_command(
+                &item.id,
+                &attempt.id,
+                "git",
+                ["fetch", &self.options.base_remote, &item.target_branch],
+                Some(&self.options.repo_path),
+            )?;
+            Ok(())
         }
 
         fn fetch_source(&self, item: &QueueItem) -> Result<()> {
@@ -3730,6 +4138,31 @@ pub mod integrator {
         pub exists: bool,
         pub dirty: bool,
         pub conflict_files: Vec<String>,
+    }
+
+    pub fn workspace_status(
+        queue: &SqliteQueueReader,
+        repo_key: &str,
+    ) -> Result<Vec<WorkspaceStatus>> {
+        let items = queue.list_items()?;
+        let mut statuses = Vec::new();
+        for item in items.into_iter().filter(|item| item.repo_key == repo_key) {
+            let Some(path) = item.integration_workspace_path.as_ref().map(PathBuf::from) else {
+                continue;
+            };
+            let observation = observe_workspace(&path)?;
+            let exists = observation.is_some();
+            let (dirty, conflict_files) = observation.unwrap_or_default();
+            statuses.push(WorkspaceStatus {
+                item_id: item.id,
+                status: item.status,
+                path,
+                exists,
+                dirty,
+                conflict_files,
+            });
+        }
+        Ok(statuses)
     }
 
     #[derive(Debug, Deserialize)]
@@ -3905,12 +4338,28 @@ pub mod integrator {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
+    fn git_is_ancestor(cwd: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+        let output = git_status(cwd, ["merge-base", "--is-ancestor", ancestor, descendant])?;
+        if output.status.success() {
+            Ok(true)
+        } else if output.status.code() == Some(1) {
+            Ok(false)
+        } else {
+            anyhow::bail!(
+                "git merge-base --is-ancestor {ancestor} {descendant} failed in {}: {}",
+                cwd.display(),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        }
+    }
+
     fn command_output_timeout<I, S>(
         program: &str,
         args: I,
+        cwd: Option<&Path>,
         timeout: StdDuration,
         authorize_start: impl FnOnce(&mut dyn Write) -> Result<bool>,
-        mut is_cancelled: impl FnMut() -> Result<bool>,
+        mut check_authority: impl FnMut() -> Result<ExecutionAuthority>,
     ) -> Result<CommandOutputOutcome>
     where
         I: IntoIterator<Item = S>,
@@ -3921,6 +4370,9 @@ pub mod integrator {
         const TIMEOUT_GRACE: StdDuration = StdDuration::from_secs(5);
 
         let mut process = gated_process(program, args);
+        if let Some(cwd) = cwd {
+            process.current_dir(cwd);
+        }
         process.stdout(Stdio::piped()).stderr(Stdio::piped());
         let Some((mut child, process_group)) =
             spawn_authorized(process, authorize_start, &format!("run {program}"))?
@@ -3934,21 +4386,43 @@ pub mod integrator {
         let deadline = Instant::now() + timeout;
         let mut timed_out = false;
         let mut cancelled = false;
+        let mut cancellation_failure_started = None;
         let mut cancellation_error = None;
+        let mut next_cancellation_check = Instant::now();
         let status = loop {
             if let Some(status) = child.try_wait()? {
                 break status;
             }
-            match is_cancelled() {
-                Ok(true) => {
-                    cancelled = true;
-                    break terminate_process_group(&mut child, process_group, CANCELLATION_GRACE)?;
+            let current_time = Instant::now();
+            if current_time >= next_cancellation_check {
+                match authority_state(&mut check_authority, &mut cancellation_failure_started) {
+                    Ok(Some(ExecutionAuthority::Cancelled)) => {
+                        cancelled = true;
+                        break terminate_process_group(
+                            &mut child,
+                            process_group,
+                            CANCELLATION_GRACE,
+                        )?;
+                    }
+                    Ok(Some(ExecutionAuthority::Lost(message))) => {
+                        cancellation_error = Some(anyhow::anyhow!(message));
+                        break terminate_process_group(
+                            &mut child,
+                            process_group,
+                            CANCELLATION_GRACE,
+                        )?;
+                    }
+                    Ok(Some(ExecutionAuthority::Active)) | Ok(None) => {}
+                    Err(error) => {
+                        cancellation_error = Some(error);
+                        break terminate_process_group(
+                            &mut child,
+                            process_group,
+                            CANCELLATION_GRACE,
+                        )?;
+                    }
                 }
-                Ok(false) => {}
-                Err(error) => {
-                    cancellation_error = Some(error);
-                    break terminate_process_group(&mut child, process_group, CANCELLATION_GRACE)?;
-                }
+                next_cancellation_check = current_time + CANCELLATION_POLL_INTERVAL;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -3966,11 +4440,18 @@ pub mod integrator {
         let stderr = stderr_thread
             .join()
             .map_err(|_| anyhow::anyhow!("stderr capture thread panicked"))??;
-        if let Some(error) = cancellation_error {
-            return Err(error).context("check command cancellation");
-        }
-        if cancelled || is_cancelled()? {
+        if cancelled {
             return Ok(CommandOutputOutcome::Cancelled);
+        }
+        if let Some(error) = cancellation_error {
+            return Err(error).context("monitor command cancellation");
+        }
+        match wait_for_authority_state(&mut check_authority, &mut cancellation_failure_started)
+            .context("check command authority after command exit")?
+        {
+            ExecutionAuthority::Active => {}
+            ExecutionAuthority::Cancelled => return Ok(CommandOutputOutcome::Cancelled),
+            ExecutionAuthority::Lost(message) => anyhow::bail!(message),
         }
         if timed_out {
             anyhow::bail!("{program} timed out after {} seconds", timeout.as_secs());
@@ -4004,7 +4485,7 @@ pub mod integrator {
         environment: &[(&str, &str)],
         timeout: StdDuration,
         authorize_start: impl FnOnce(&mut dyn Write) -> Result<bool>,
-        mut is_cancelled: impl FnMut() -> Result<bool>,
+        mut check_authority: impl FnMut() -> Result<ExecutionAuthority>,
     ) -> Result<EvidenceCommandOutcome> {
         const POLL_INTERVAL: StdDuration = StdDuration::from_millis(10);
         const CANCELLATION_GRACE: StdDuration = StdDuration::from_millis(50);
@@ -4040,7 +4521,9 @@ pub mod integrator {
         let deadline = Instant::now() + timeout;
         let mut timed_out = false;
         let mut cancelled = false;
+        let mut cancellation_failure_started = None;
         let mut cancellation_error = None;
+        let mut next_cancellation_check = Instant::now();
         let status = loop {
             if let Some(status) = child
                 .try_wait()
@@ -4048,16 +4531,36 @@ pub mod integrator {
             {
                 break status;
             }
-            match is_cancelled() {
-                Ok(true) => {
-                    cancelled = true;
-                    break terminate_process_group(&mut child, process_group, CANCELLATION_GRACE)?;
+            let current_time = Instant::now();
+            if current_time >= next_cancellation_check {
+                match authority_state(&mut check_authority, &mut cancellation_failure_started) {
+                    Ok(Some(ExecutionAuthority::Cancelled)) => {
+                        cancelled = true;
+                        break terminate_process_group(
+                            &mut child,
+                            process_group,
+                            CANCELLATION_GRACE,
+                        )?;
+                    }
+                    Ok(Some(ExecutionAuthority::Lost(message))) => {
+                        cancellation_error = Some(anyhow::anyhow!(message));
+                        break terminate_process_group(
+                            &mut child,
+                            process_group,
+                            CANCELLATION_GRACE,
+                        )?;
+                    }
+                    Ok(Some(ExecutionAuthority::Active)) | Ok(None) => {}
+                    Err(error) => {
+                        cancellation_error = Some(error);
+                        break terminate_process_group(
+                            &mut child,
+                            process_group,
+                            CANCELLATION_GRACE,
+                        )?;
+                    }
                 }
-                Ok(false) => {}
-                Err(error) => {
-                    cancellation_error = Some(error);
-                    break terminate_process_group(&mut child, process_group, CANCELLATION_GRACE)?;
-                }
+                next_cancellation_check = current_time + CANCELLATION_POLL_INTERVAL;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -4087,14 +4590,34 @@ pub mod integrator {
         writeln!(log, "\n--- stderr ---")?;
         let mut stderr_file = fs::File::open(&stderr_path)?;
         std::io::copy(&mut stderr_file, &mut log)?;
-        cancelled = cancelled || is_cancelled()?;
+        let final_cancellation_error = if let Some(error) = cancellation_error {
+            Some(error)
+        } else if cancelled {
+            None
+        } else {
+            match wait_for_authority_state(&mut check_authority, &mut cancellation_failure_started)
+            {
+                Ok(ExecutionAuthority::Active) => None,
+                Ok(ExecutionAuthority::Cancelled) => {
+                    cancelled = true;
+                    None
+                }
+                Ok(ExecutionAuthority::Lost(message)) => Some(anyhow::anyhow!(message)),
+                Err(error) => Some(error),
+            }
+        };
         if cancelled {
             writeln!(log, "\n[IQ cancelled command]")?;
+        } else if let Some(error) = final_cancellation_error.as_ref() {
+            writeln!(
+                log,
+                "\n[IQ could not verify cancellation after command exit: {error:#}]"
+            )?;
         }
         fs::remove_file(stdout_path)?;
         fs::remove_file(stderr_path)?;
-        if let Some(error) = cancellation_error {
-            return Err(error).context("check evidence command cancellation");
+        if let Some(error) = final_cancellation_error {
+            return Err(error).context("check evidence command cancellation after command exit");
         }
         if cancelled {
             return Ok(EvidenceCommandOutcome::Cancelled(Some(status)));
@@ -4103,6 +4626,45 @@ pub mod integrator {
             return Ok(EvidenceCommandOutcome::TimedOut(status));
         }
         Ok(EvidenceCommandOutcome::Exited(status))
+    }
+
+    const CANCELLATION_POLL_INTERVAL: StdDuration = StdDuration::from_millis(100);
+    const CANCELLATION_FAILURE_GRACE: StdDuration = StdDuration::from_millis(100);
+
+    fn authority_state(
+        check_authority: &mut impl FnMut() -> Result<ExecutionAuthority>,
+        failure_started: &mut Option<Instant>,
+    ) -> Result<Option<ExecutionAuthority>> {
+        match check_authority() {
+            Ok(authority) => {
+                if failure_started.take().is_some() {
+                    eprintln!("IQ command authority probe recovered");
+                }
+                Ok(Some(authority))
+            }
+            Err(error) => {
+                let started = failure_started.get_or_insert_with(|| {
+                    eprintln!("IQ command authority probe unavailable; command continues briefly");
+                    Instant::now()
+                });
+                if started.elapsed() >= CANCELLATION_FAILURE_GRACE {
+                    return Err(error).context("command authority probe remained unavailable");
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    fn wait_for_authority_state(
+        check_authority: &mut impl FnMut() -> Result<ExecutionAuthority>,
+        failure_started: &mut Option<Instant>,
+    ) -> Result<ExecutionAuthority> {
+        loop {
+            if let Some(authority) = authority_state(check_authority, failure_started)? {
+                return Ok(authority);
+            }
+            thread::sleep(CANCELLATION_POLL_INTERVAL);
+        }
     }
 
     fn gated_process<I, S>(program: &str, args: I) -> Command
@@ -4222,7 +4784,7 @@ pub mod integrator {
     }
 
     fn workspace_dirty(workspace: &Path) -> Result<Option<String>> {
-        let status = git_output(workspace, ["status", "--porcelain"])?;
+        let status = git_observe_output(workspace, ["status", "--porcelain"])?;
         if status.is_empty() {
             Ok(None)
         } else {
@@ -4240,6 +4802,57 @@ pub mod integrator {
             .current_dir(cwd)
             .output()
             .with_context(|| format!("run git in {}", cwd.display()))
+    }
+
+    fn git_observe_output<I, S>(cwd: &Path, args: I) -> Result<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let args = args
+            .into_iter()
+            .map(|argument| argument.as_ref().to_os_string())
+            .collect::<Vec<OsString>>();
+        let output = Command::new("git")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .args(&args)
+            .current_dir(cwd)
+            .output()
+            .with_context(|| format!("run observational git in {}", cwd.display()))?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "observational git {:?} failed in {}: {}",
+                args,
+                cwd.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    fn observe_workspace(workspace: &Path) -> Result<Option<(bool, Vec<String>)>> {
+        if !workspace.exists() {
+            return Ok(None);
+        }
+        let status = match git_observe_output(workspace, ["status", "--porcelain"]) {
+            Ok(status) => status,
+            Err(_) if !workspace.exists() => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let conflicts =
+            match git_observe_output(workspace, ["diff", "--name-only", "--diff-filter=U"]) {
+                Ok(conflicts) => conflicts,
+                Err(_) if !workspace.exists() => return Ok(None),
+                Err(error) => return Err(error),
+            };
+        Ok(Some((
+            !status.is_empty(),
+            conflicts
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(str::to_string)
+                .collect(),
+        )))
     }
 
     fn path_arg(path: &Path) -> &str {
@@ -4283,14 +4896,22 @@ pub mod providers {
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
-    pub struct ProviderMergeResult {
-        pub landed_sha: Option<String>,
+    pub struct ProviderMergeCommand {
+        pub program: String,
+        pub args: Vec<String>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct ProviderLanding {
+        pub head_sha: String,
+        pub commit_sha: String,
     }
 
     pub trait ProviderAdapter {
         fn kind(&self) -> ProviderKind;
         fn snapshot(&self, url: &str) -> Result<ProviderSnapshot>;
-        fn merge(&self, url: &str, expected_head_sha: &str) -> Result<ProviderMergeResult>;
+        fn merge_command(&self, url: &str, expected_head_sha: &str) -> ProviderMergeCommand;
+        fn landing(&self, url: &str) -> Result<Option<ProviderLanding>>;
     }
 
     pub fn provider_for_url(url: &str) -> Result<Box<dyn ProviderAdapter>> {
@@ -4332,20 +4953,25 @@ pub mod providers {
             })
         }
 
-        fn merge(&self, url: &str, expected_head_sha: &str) -> Result<ProviderMergeResult> {
-            provider_command(
-                std::env::var("IQ_GITHUB_CLI").unwrap_or_else(|_| "gh".into()),
-                [
+        fn merge_command(&self, url: &str, expected_head_sha: &str) -> ProviderMergeCommand {
+            ProviderMergeCommand {
+                program: std::env::var("IQ_GITHUB_CLI").unwrap_or_else(|_| "gh".into()),
+                args: [
                     "pr",
                     "merge",
                     url,
                     "--merge",
                     "--match-head-commit",
                     expected_head_sha,
-                ],
-            )?;
-            let landed_sha = github_landed_sha(url).unwrap_or(None);
-            Ok(ProviderMergeResult { landed_sha })
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            }
+        }
+
+        fn landing(&self, url: &str) -> Result<Option<ProviderLanding>> {
+            github_landing(url)
         }
     }
 
@@ -4377,13 +5003,18 @@ pub mod providers {
             })
         }
 
-        fn merge(&self, url: &str, expected_head_sha: &str) -> Result<ProviderMergeResult> {
-            provider_command(
-                std::env::var("IQ_GITLAB_CLI").unwrap_or_else(|_| "glab".into()),
-                ["mr", "merge", url, "--yes", "--sha", expected_head_sha],
-            )?;
-            let landed_sha = gitlab_landed_sha(url).unwrap_or(None);
-            Ok(ProviderMergeResult { landed_sha })
+        fn merge_command(&self, url: &str, expected_head_sha: &str) -> ProviderMergeCommand {
+            ProviderMergeCommand {
+                program: std::env::var("IQ_GITLAB_CLI").unwrap_or_else(|_| "glab".into()),
+                args: ["mr", "merge", url, "--yes", "--sha", expected_head_sha]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            }
+        }
+
+        fn landing(&self, url: &str) -> Result<Option<ProviderLanding>> {
+            gitlab_landing(url)
         }
     }
 
@@ -4414,6 +5045,7 @@ pub mod providers {
     #[derive(Debug, Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct GitHubMergeView {
+        head_ref_oid: String,
         merge_commit: Option<GitHubMergeCommit>,
     }
 
@@ -4486,24 +5118,39 @@ pub mod providers {
         ProviderGate::Pass
     }
 
-    fn github_landed_sha(url: &str) -> Result<Option<String>> {
+    fn github_landing(url: &str) -> Result<Option<ProviderLanding>> {
         let value = provider_json(
             std::env::var("IQ_GITHUB_CLI").unwrap_or_else(|_| "gh".into()),
-            ["pr", "view", url, "--json", "mergeCommit"],
+            ["pr", "view", url, "--json", "headRefOid,mergeCommit"],
         )?;
         let parsed: GitHubMergeView =
             serde_json::from_value(value).context("parse gh merge JSON")?;
-        Ok(parsed.merge_commit.and_then(|commit| commit.oid))
+        Ok(parsed
+            .merge_commit
+            .and_then(|commit| commit.oid)
+            .map(|commit_sha| ProviderLanding {
+                head_sha: parsed.head_ref_oid,
+                commit_sha,
+            }))
     }
 
-    fn gitlab_landed_sha(url: &str) -> Result<Option<String>> {
+    fn gitlab_landing(url: &str) -> Result<Option<ProviderLanding>> {
         let value = provider_json(
             std::env::var("IQ_GITLAB_CLI").unwrap_or_else(|_| "glab".into()),
             ["mr", "view", url, "--output", "json"],
         )?;
         let parsed: GitLabMrView =
             serde_json::from_value(value).context("parse glab merged MR JSON")?;
-        Ok(parsed.merge_commit_sha.or(parsed.squash_commit_sha))
+        let commit_sha = parsed.merge_commit_sha.or(parsed.squash_commit_sha);
+        let head_sha = parsed.head_sha.or(parsed.sha);
+        match (head_sha, commit_sha) {
+            (_, None) => Ok(None),
+            (Some(head_sha), Some(commit_sha)) => Ok(Some(ProviderLanding {
+                head_sha,
+                commit_sha,
+            })),
+            (None, Some(_)) => anyhow::bail!("glab merged MR JSON missing head_sha/sha"),
+        }
     }
 
     fn provider_json<I, S>(program: String, args: I) -> Result<serde_json::Value>
@@ -4524,27 +5171,6 @@ pub mod providers {
             );
         }
         serde_json::from_slice(&output.stdout).context("parse provider CLI JSON")
-    }
-
-    fn provider_command<I, S>(program: String, args: I) -> Result<()>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<std::ffi::OsStr>,
-    {
-        let output = Command::new(&program)
-            .args(args)
-            .output()
-            .with_context(|| {
-                format!("run provider CLI {program}; install CLI or set provider credentials")
-            })?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            anyhow::bail!(
-                "provider CLI {program} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )
-        }
     }
 }
 
