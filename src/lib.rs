@@ -2698,41 +2698,40 @@ pub mod integrator {
     }
 
     #[cfg(target_os = "linux")]
-    fn btrfs_filesystem_id(path: &Path) -> Result<Option<Vec<u8>>> {
-        const BTRFS_SUPER_MAGIC: libc::c_long = 0x9123_683e;
+    fn mount_id(path: &Path) -> Result<u64> {
         let path_bytes = std::ffi::CString::new(path.as_os_str().as_bytes())
             .context("filesystem path contains NUL")?;
-        let mut stat = std::mem::MaybeUninit::<libc::statfs>::zeroed();
-        if unsafe { libc::statfs(path_bytes.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        let mut stat = std::mem::MaybeUninit::<libc::statx>::zeroed();
+        if unsafe {
+            libc::statx(
+                libc::AT_FDCWD,
+                path_bytes.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+                libc::STATX_MNT_ID,
+                stat.as_mut_ptr(),
+            )
+        } != 0
+        {
             return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("inspect filesystem for {}", path.display()));
+                .with_context(|| format!("inspect mount for {}", path.display()));
         }
         let stat = unsafe { stat.assume_init() };
-        if stat.f_type != BTRFS_SUPER_MAGIC {
-            return Ok(None);
+        if stat.stx_mask & libc::STATX_MNT_ID == 0 {
+            anyhow::bail!(
+                "kernel did not report mount identity for {}",
+                path.display()
+            );
         }
-        let identity = unsafe {
-            std::slice::from_raw_parts(
-                std::ptr::addr_of!(stat.f_fsid).cast::<u8>(),
-                std::mem::size_of_val(&stat.f_fsid),
-            )
-        };
-        Ok(Some(identity.to_vec()))
+        Ok(stat.stx_mnt_id)
     }
 
     fn require_same_filesystem(source: &Path, workspace_root: &Path) -> Result<()> {
         let same_device = fs::metadata(source)?.dev() == fs::metadata(workspace_root)?.dev();
         #[cfg(target_os = "linux")]
-        let same_btrfs = matches!(
-            (
-                btrfs_filesystem_id(source)?,
-                btrfs_filesystem_id(workspace_root)?
-            ),
-            (Some(source_id), Some(root_id)) if source_id == root_id
-        );
+        let same_mount = mount_id(source)? == mount_id(workspace_root)?;
         #[cfg(not(target_os = "linux"))]
-        let same_btrfs = false;
-        if !same_device && !same_btrfs {
+        let same_mount = false;
+        if !same_device && !same_mount {
             anyhow::bail!(
                 "IQ workspace root {} must use the same filesystem as Rift source {}",
                 workspace_root.display(),
