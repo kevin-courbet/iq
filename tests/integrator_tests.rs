@@ -3,6 +3,7 @@ use iq::integrator::{git, git_output, validation_command, Integrator, Integrator
 use iq::sqlite::{EnqueueRequest, SqliteQueue};
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tempfile::tempdir;
@@ -40,6 +41,7 @@ fn direct_landing_integrates_only_after_remote_target_contains_landed_commit() {
         lease_ttl_seconds: 30,
         base_remote: "origin".into(),
         workspace_root: fixture.temp.path().join("workspaces"),
+        rift_database: Some(fixture.rift_database.clone()),
     })
     .unwrap();
 
@@ -96,6 +98,7 @@ fn missing_validation_configuration_blocks_during_validating_phase() {
         lease_ttl_seconds: 30,
         base_remote: "origin".into(),
         workspace_root: fixture.temp.path().join("workspaces"),
+        rift_database: Some(fixture.rift_database.clone()),
     })
     .unwrap();
 
@@ -140,6 +143,7 @@ fn cargo_repo_without_iq_config_uses_cargo_test_default() {
         lease_ttl_seconds: 30,
         base_remote: "origin".into(),
         workspace_root: fixture.temp.path().join("workspaces"),
+        rift_database: Some(fixture.rift_database.clone()),
     })
     .unwrap();
 
@@ -206,6 +210,7 @@ fn integrator_refuses_to_transition_after_lease_owner_changes() {
         lease_ttl_seconds: 1,
         base_remote: "origin".into(),
         workspace_root: fixture.temp.path().join("workspaces"),
+        rift_database: Some(fixture.rift_database.clone()),
     })
     .unwrap();
     let repo_key_for_steal = repo_key.to_string();
@@ -227,7 +232,7 @@ fn integrator_refuses_to_transition_after_lease_owner_changes() {
     let item = queue.get_item(&enqueued.id).unwrap();
     assert!(matches!(
         item.status,
-        QueueStatus::Merging | QueueStatus::Merged | QueueStatus::Validating
+        QueueStatus::Ready | QueueStatus::Merging | QueueStatus::Merged | QueueStatus::Validating
     ));
     assert_eq!(item.landed_commit_sha, None);
 }
@@ -265,6 +270,7 @@ fn source_branch_head_mismatch_blocks_without_integrating_moved_code() {
         lease_ttl_seconds: 30,
         base_remote: "origin".into(),
         workspace_root: fixture.temp.path().join("workspaces"),
+        rift_database: Some(fixture.rift_database.clone()),
     })
     .unwrap();
 
@@ -316,6 +322,7 @@ fn answered_merge_conflict_resumes_same_attempt_and_integrates() {
         lease_ttl_seconds: 30,
         base_remote: "origin".into(),
         workspace_root: fixture.temp.path().join("workspaces"),
+        rift_database: Some(fixture.rift_database.clone()),
     })
     .unwrap();
     let blocked = integrator.run_once().unwrap().unwrap();
@@ -375,13 +382,14 @@ fn merge_resume_without_current_answered_prompt_does_not_accept_workspace_resolu
         lease_ttl_seconds: 30,
         base_remote: "origin".into(),
         workspace_root: fixture.temp.path().join("workspaces"),
+        rift_database: Some(fixture.rift_database.clone()),
     })
     .unwrap();
     let blocked = integrator.run_once().unwrap().unwrap();
     assert_eq!(blocked.status, QueueStatus::Blocked);
     let workspace = blocked
-        .integration_workspace_path
-        .as_ref()
+        .workspace
+        .path()
         .map(std::path::PathBuf::from)
         .unwrap();
     fs::write(workspace.join("conflict.txt"), "source\n").unwrap();
@@ -444,6 +452,7 @@ fn daemon_run_holds_later_ready_item_behind_oldest_blocked_item() {
         lease_ttl_seconds: 30,
         base_remote: "origin".into(),
         workspace_root: fixture.temp.path().join("workspaces"),
+        rift_database: Some(fixture.rift_database.clone()),
     })
     .unwrap();
     let blocked = integrator.run_once().unwrap().unwrap();
@@ -500,6 +509,7 @@ fn daemon_run_resumes_oldest_answered_item_before_claiming_later_ready_item() {
         lease_ttl_seconds: 30,
         base_remote: "origin".into(),
         workspace_root: fixture.temp.path().join("workspaces"),
+        rift_database: Some(fixture.rift_database.clone()),
     })
     .unwrap();
     let blocked = integrator.run_once().unwrap().unwrap();
@@ -584,6 +594,7 @@ exit 2
         lease_ttl_seconds: 30,
         base_remote: "origin".into(),
         workspace_root: fixture.temp.path().join("workspaces"),
+        rift_database: Some(fixture.rift_database.clone()),
     })
     .unwrap();
     let blocked = integrator.run_once().unwrap().unwrap();
@@ -646,6 +657,7 @@ fn target_moved_merge_conflict_blocks_with_conflict_metadata() {
         lease_ttl_seconds: 30,
         base_remote: "origin".into(),
         workspace_root: fixture.temp.path().join("workspaces"),
+        rift_database: Some(fixture.rift_database.clone()),
     })
     .unwrap();
 
@@ -698,6 +710,7 @@ fn target_moved_missing_validation_config_blocks_for_user_input() {
         lease_ttl_seconds: 30,
         base_remote: "origin".into(),
         workspace_root: fixture.temp.path().join("workspaces"),
+        rift_database: Some(fixture.rift_database.clone()),
     })
     .unwrap();
 
@@ -737,6 +750,7 @@ fn direct_landing_fetch_failure_persists_integrating_block() {
         lease_ttl_seconds: 30,
         base_remote: "origin".into(),
         workspace_root: fixture.temp.path().join("workspaces"),
+        rift_database: Some(fixture.rift_database.clone()),
     })
     .unwrap();
 
@@ -805,6 +819,7 @@ exit 2
         lease_ttl_seconds: 30,
         base_remote: "origin".into(),
         workspace_root: fixture.temp.path().join("workspaces"),
+        rift_database: Some(fixture.rift_database.clone()),
     })
     .unwrap();
 
@@ -831,6 +846,7 @@ struct GitFixture {
     temp: tempfile::TempDir,
     remote: std::path::PathBuf,
     repo: std::path::PathBuf,
+    rift_database: std::path::PathBuf,
 }
 
 impl GitFixture {
@@ -862,7 +878,25 @@ impl GitFixture {
         git(&repo, ["add", "."]).unwrap();
         git(&repo, ["commit", "-m", "base"]).unwrap();
         git(&repo, ["push", "-u", "origin", "main"]).unwrap();
-        Self { temp, remote, repo }
+        let rift_database = temp.path().join("rift.sqlite");
+        let output = Command::new("rift")
+            .arg("--database")
+            .arg(&rift_database)
+            .args(["init", "--here"])
+            .arg(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "rift init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Self {
+            temp,
+            remote,
+            repo,
+            rift_database,
+        }
     }
 
     fn create_source_branch(&self, branch: &str, path: &str, contents: &str) -> String {

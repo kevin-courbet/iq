@@ -2,6 +2,16 @@
 
 IQ is a durable, repository-native integration queue. It serializes completed branches into a target branch, runs repository-owned validation and signoff policy, preserves conflicted integration workspaces, and lands only the exact validated candidate.
 
+IQ uses Rift copy-on-write snapshots for integration workspaces. Managed repositories must be initialized Rift roots before IQ starts. Terminal and orphan IQ workspaces are removed automatically; IQ then runs global Rift garbage collection so removed Rift trash is not recoverable.
+
+Provision each repository once and configure an external workspace root on the same filesystem:
+
+```sh
+rift init --here /path/to/repo
+```
+
+IQ snapshots with Rift's complete copy-on-write mode so dependencies and build artifacts are physically reused, skips repository Rift hooks, and resets tracked state to the exact queued base SHA before integration.
+
 IQ is standalone and opt-in. Consumers such as Threadmill and Spindle provide repository paths, validation commands, signoff policy, communication transports, and service installation policy. They do not embed IQ source.
 
 ## Development

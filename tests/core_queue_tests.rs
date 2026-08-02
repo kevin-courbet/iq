@@ -135,6 +135,12 @@ fn blocked_user_prompt_answer_resumes_phase_but_agent_fix_requires_requeue() {
         .answer_prompt(&prompt_id, "use source", "user")
         .unwrap();
     assert_eq!(resumed.status, QueueStatus::Merging);
+    queue
+        .set_workspace_intent(&item.id, "/workspaces/item")
+        .unwrap();
+    queue
+        .set_workspace_identity(&item.id, "/workspaces/item", "rift-id", "source-rift-id")
+        .unwrap();
     let validating = queue
         .transition_item(&item.id, QueueStatus::Merged)
         .unwrap();
