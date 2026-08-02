@@ -2697,6 +2697,50 @@ pub mod integrator {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn mount_id(path: &Path) -> Result<u64> {
+        let path_bytes = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .context("filesystem path contains NUL")?;
+        let mut stat = std::mem::MaybeUninit::<libc::statx>::zeroed();
+        if unsafe {
+            libc::statx(
+                libc::AT_FDCWD,
+                path_bytes.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+                libc::STATX_MNT_ID,
+                stat.as_mut_ptr(),
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("inspect mount for {}", path.display()));
+        }
+        let stat = unsafe { stat.assume_init() };
+        if stat.stx_mask & libc::STATX_MNT_ID == 0 {
+            anyhow::bail!(
+                "kernel did not report mount identity for {}",
+                path.display()
+            );
+        }
+        Ok(stat.stx_mnt_id)
+    }
+
+    fn require_same_filesystem(source: &Path, workspace_root: &Path) -> Result<()> {
+        let same_device = fs::metadata(source)?.dev() == fs::metadata(workspace_root)?.dev();
+        #[cfg(target_os = "linux")]
+        let same_mount = !same_device && mount_id(source)? == mount_id(workspace_root)?;
+        #[cfg(not(target_os = "linux"))]
+        let same_mount = false;
+        if !same_device && !same_mount {
+            anyhow::bail!(
+                "IQ workspace root {} must use the same filesystem as Rift source {}",
+                workspace_root.display(),
+                source.display()
+            );
+        }
+        Ok(())
+    }
+
     fn read_regular_file(path: &Path, label: &str) -> Result<Vec<u8>> {
         let before = fs::symlink_metadata(path)
             .with_context(|| format!("inspect {label} {}", path.display()))?;
@@ -2955,13 +2999,7 @@ pub mod integrator {
                     .parent()
                     .context("IQ workspace root has no existing ancestor")?;
             }
-            if fs::metadata(filesystem_probe)?.dev() != fs::metadata(&source)?.dev() {
-                anyhow::bail!(
-                    "IQ workspace root {} must use the same filesystem as Rift source {}",
-                    root.display(),
-                    source.display()
-                );
-            }
+            require_same_filesystem(&source, filesystem_probe)?;
             let source_id = Self::read_marker_id(&source)?;
             let (database, registry_identity, _, _) = resolve_rift_database(database)?;
             if !source.join(".git").is_dir() {
@@ -3151,13 +3189,7 @@ pub mod integrator {
                     source.display()
                 );
             }
-            if fs::metadata(&root)?.dev() != fs::metadata(&source)?.dev() {
-                anyhow::bail!(
-                    "IQ workspace root {} must use the same filesystem as Rift source {}",
-                    root.display(),
-                    source.display()
-                );
-            }
+            require_same_filesystem(&source, &root)?;
             let source_id = Self::read_marker_id(&source)?;
             let (database, registry_identity, registry_dev, registry_ino) =
                 resolve_rift_database(database)?;
