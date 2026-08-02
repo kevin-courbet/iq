@@ -2728,7 +2728,7 @@ pub mod integrator {
     fn require_same_filesystem(source: &Path, workspace_root: &Path) -> Result<()> {
         let same_device = fs::metadata(source)?.dev() == fs::metadata(workspace_root)?.dev();
         #[cfg(target_os = "linux")]
-        let same_mount = mount_id(source)? == mount_id(workspace_root)?;
+        let same_mount = !same_device && mount_id(source)? == mount_id(workspace_root)?;
         #[cfg(not(target_os = "linux"))]
         let same_mount = false;
         if !same_device && !same_mount {
