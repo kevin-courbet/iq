@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use iq::communication::{build_transports, CommunicationConfig, DecisionCommunicator};
 use iq::integrator::{
-    validation_command, workspace_status, IntegrationPolicy, Integrator, IntegratorOptions,
-    SignoffPolicy,
+    validation_command, verify_rift_workspace_config, workspace_status, IntegrationPolicy,
+    Integrator, IntegratorOptions, SignoffPolicy,
 };
 use iq::issue_backends::{
     issue_adapter_for_provider, IssueBackendAdapter, IssueProvider, IssueSyncTarget,
@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 
@@ -75,8 +78,6 @@ enum Command {
     },
     Evidence {
         item: String,
-        #[arg(long)]
-        workspace_root: PathBuf,
         #[arg(long, value_enum, default_value_t = EvidencePhaseArg::All)]
         phase: EvidencePhaseArg,
     },
@@ -323,14 +324,10 @@ fn main() -> Result<()> {
                 .context("item has no current integration attempt")?;
             print_json(&queue.get_attempt(&attempt_id)?)?;
         }
-        Command::Evidence {
-            item,
-            workspace_root,
-            phase,
-        } => {
+        Command::Evidence { item, phase } => {
             let queue = SqliteQueueReader::open(&db_path)?;
             let queued = queue.get_item(&item)?;
-            print_json(&read_evidence(&queue, &queued, &workspace_root, phase)?)?;
+            print_json(&read_evidence(&queue, &queued, phase)?)?;
         }
         Command::Workspace { command } => match command {
             WorkspaceCommand::Status {
@@ -452,12 +449,12 @@ fn main() -> Result<()> {
             remote,
             workspace_root,
         } => run_remote_exec(db_path, repo_path, repo_key, target, remote, workspace_root)?,
-        Command::Doctor { config } => run_doctor(&config)?,
+        Command::Doctor { config } => run_doctor(&db_path, &config)?,
     }
     Ok(())
 }
 
-fn run_doctor(config_path: &std::path::Path) -> Result<()> {
+fn run_doctor(queue_db: &std::path::Path, config_path: &std::path::Path) -> Result<()> {
     let config = read_daemon_config(config_path)?;
     let gh = std::env::var("IQ_GITHUB_CLI").unwrap_or_else(|_| "gh".into());
     let mut results = Vec::new();
@@ -470,6 +467,21 @@ fn run_doctor(config_path: &std::path::Path) -> Result<()> {
         }
         let target = repo.target.as_deref().unwrap_or("main");
         let remote = repo.remote.as_deref().unwrap_or("origin");
+        let repo_key = repo
+            .repo_key
+            .clone()
+            .unwrap_or_else(|| default_repo_key(&repo.repo_path, target));
+        let workspace_root = integrator_options(
+            queue_db.to_path_buf(),
+            repo.repo_path.clone(),
+            Some(repo_key.clone()),
+            target,
+            remote.to_string(),
+            repo.workspace_root.clone(),
+            Some("iq-doctor".into()),
+        )
+        .workspace_root;
+        verify_rift_workspace_config(&repo.repo_path, &workspace_root, &repo_key, None, queue_db)?;
         let output = ProcessCommand::new("git")
             .args([
                 "ls-remote",
@@ -555,8 +567,9 @@ fn run_doctor(config_path: &std::path::Path) -> Result<()> {
             0
         };
         results.push(json!({
-            "repo_key": repo.repo_key.unwrap_or_else(|| default_repo_key(&repo.repo_path, target)),
+            "repo_key": repo_key,
             "repo_path": repo.repo_path,
+            "workspace_root": workspace_root,
             "target": target,
             "remote": remote,
             "validation_command": validation,
@@ -573,7 +586,7 @@ fn run_remote_exec(
     repo_key: String,
     target: String,
     remote: String,
-    workspace_root: PathBuf,
+    _workspace_root: PathBuf,
 ) -> Result<()> {
     let original = std::env::var("SSH_ORIGINAL_COMMAND")
         .context("remote-exec requires SSH_ORIGINAL_COMMAND")?;
@@ -624,7 +637,7 @@ fn run_remote_exec(
         RemoteCommand::Evidence { item, phase } => {
             let queue = SqliteQueueReader::open(&db_path)?;
             let queued = require_remote_item(&queue, &item, &repo_key)?;
-            print_json(&read_evidence(&queue, &queued, &workspace_root, phase)?)?;
+            print_json(&read_evidence(&queue, &queued, phase)?)?;
         }
         RemoteCommand::Requeue { item, head } => {
             let queue = SqliteQueue::open(&db_path)?;
@@ -728,7 +741,13 @@ fn integrator_options(
     owner: Option<String>,
 ) -> IntegratorOptions {
     let repo_key = repo_key.unwrap_or_else(|| default_repo_key(&repo_path, target));
-    let workspace_root = workspace_root.unwrap_or_else(|| repo_path.join(".iq-workspaces"));
+    let workspace_root = workspace_root.unwrap_or_else(|| {
+        queue_db
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("workspaces")
+            .join(workspace_scope(&repo_key))
+    });
     IntegratorOptions {
         repo_key,
         repo_path,
@@ -737,7 +756,18 @@ fn integrator_options(
         lease_ttl_seconds: 30,
         base_remote: remote,
         workspace_root,
+        rift_database: None,
     }
+}
+
+fn workspace_scope(repo_key: &str) -> String {
+    let hash = repo_key
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
+    format!("{hash:016x}")
 }
 
 fn default_repo_key(repo_path: &std::path::Path, target: &str) -> String {
@@ -753,7 +783,6 @@ fn default_repo_key(repo_path: &std::path::Path, target: &str) -> String {
 fn read_evidence(
     queue: &SqliteQueueReader,
     item: &QueueItem,
-    workspace_root: &std::path::Path,
     phase: EvidencePhaseArg,
 ) -> Result<EvidenceOutput> {
     let attempt_id = item
@@ -765,7 +794,7 @@ fn read_evidence(
         .validation_log_path
         .as_deref()
         .map(PathBuf::from)
-        .map(|path| validated_evidence_dir(workspace_root, item, &attempt, &path))
+        .map(|path| validated_evidence_dir(queue, item, &attempt, &path))
         .transpose()?;
     let validation = if matches!(phase, EvidencePhaseArg::All | EvidencePhaseArg::Validation) {
         attempt
@@ -801,46 +830,50 @@ fn read_evidence(
 }
 
 fn validated_evidence_dir(
-    workspace_root: &std::path::Path,
+    queue: &SqliteQueueReader,
     item: &QueueItem,
     attempt: &Attempt,
     path: &std::path::Path,
 ) -> Result<PathBuf> {
-    let expected = workspace_root
-        .join(".evidence")
-        .join(&item.id)
-        .join(&attempt.id);
+    let evidence_root = queue
+        .path()
+        .parent()
+        .context("queue database has no evidence parent")?
+        .join("evidence");
+    let expected = evidence_root.join(&item.id).join(&attempt.id);
     let attempt_dir = path
         .parent()
         .context("evidence path has no attempt directory")?;
     let item_dir = attempt_dir
         .parent()
         .context("evidence path has no item directory")?;
-    let evidence_root = item_dir
+    let actual_evidence_root = item_dir
         .parent()
         .context("evidence path has no evidence root")?;
     if attempt_dir != expected
         || attempt_dir.file_name() != Some(std::ffi::OsStr::new(&attempt.id))
         || item_dir.file_name() != Some(std::ffi::OsStr::new(&item.id))
-        || evidence_root.file_name() != Some(std::ffi::OsStr::new(".evidence"))
+        || actual_evidence_root != evidence_root
     {
         anyhow::bail!("attempt evidence path is outside its queue-owned evidence directory");
     }
-    for component in [evidence_root, item_dir, attempt_dir] {
+    for component in [actual_evidence_root, item_dir, attempt_dir] {
         let metadata = std::fs::symlink_metadata(component)
             .with_context(|| format!("inspect evidence path {}", component.display()))?;
         if metadata.file_type().is_symlink() {
             anyhow::bail!("attempt evidence path contains a symlink");
         }
     }
-    let canonical_workspace = workspace_root
+    let canonical_expected_root = evidence_root
+        .parent()
+        .context("evidence root has no parent")?
         .canonicalize()
-        .with_context(|| format!("resolve workspace root {}", workspace_root.display()))?;
-    let canonical_evidence_root = evidence_root
+        .with_context(|| format!("resolve evidence parent {}", evidence_root.display()))?;
+    let canonical_evidence_root = actual_evidence_root
         .canonicalize()
-        .with_context(|| format!("resolve evidence root {}", evidence_root.display()))?;
-    if canonical_evidence_root.parent() != Some(canonical_workspace.as_path()) {
-        anyhow::bail!("attempt evidence root is outside configured workspace root");
+        .with_context(|| format!("resolve evidence root {}", actual_evidence_root.display()))?;
+    if canonical_evidence_root.parent() != Some(canonical_expected_root.as_path()) {
+        anyhow::bail!("attempt evidence root is outside queue-owned evidence storage");
     }
     let canonical_attempt = attempt_dir
         .canonicalize()
@@ -858,7 +891,7 @@ fn read_optional_evidence_file(
     path: &std::path::Path,
     evidence_dir: &std::path::Path,
 ) -> Result<Option<EvidenceFile>> {
-    match std::fs::metadata(path) {
+    match std::fs::symlink_metadata(path) {
         Ok(_) => read_evidence_file(path, evidence_dir).map(Some),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => {
@@ -878,8 +911,44 @@ fn read_evidence_file(
     if canonical_path.parent() != Some(evidence_dir) {
         anyhow::bail!("attempt evidence file escapes its queue-owned evidence directory");
     }
-    let mut file = std::fs::File::open(&canonical_path)
-        .with_context(|| format!("open evidence file {}", path.display()))?;
+    let directory_metadata = std::fs::symlink_metadata(evidence_dir)
+        .with_context(|| format!("inspect evidence directory {}", evidence_dir.display()))?;
+    if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+        anyhow::bail!("evidence directory must be a real directory");
+    }
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(evidence_dir)
+        .with_context(|| format!("open evidence directory {}", evidence_dir.display()))?;
+    let opened_directory = directory.metadata()?;
+    if directory_metadata.dev() != opened_directory.dev()
+        || directory_metadata.ino() != opened_directory.ino()
+    {
+        anyhow::bail!("evidence directory changed while opening");
+    }
+    let file_name = canonical_path
+        .file_name()
+        .context("evidence file has no file name")?;
+    if file_name.as_bytes().contains(&b'/') {
+        anyhow::bail!("invalid evidence file name");
+    }
+    let file_name = std::ffi::CString::new(file_name.as_bytes())?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            file_name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("open evidence file {}", path.display()));
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    if !file.metadata()?.is_file() {
+        anyhow::bail!("evidence file must be a regular file");
+    }
     let length = file.metadata()?.len();
     let truncated = length > MAX_EVIDENCE_BYTES;
     let mut bytes = Vec::new();
