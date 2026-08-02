@@ -2588,7 +2588,7 @@ pub mod integrator {
         pub rift_database: Option<PathBuf>,
     }
 
-    #[derive(Clone, Debug, Deserialize)]
+    #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
     #[serde(deny_unknown_fields)]
     pub struct SignoffPolicy {
         pub command: String,
