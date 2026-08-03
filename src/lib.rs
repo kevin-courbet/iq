@@ -2644,6 +2644,8 @@ pub mod integrator {
         registry_identity: String,
     }
 
+    const RIFT_TRASH_DIRECTORY: &str = ".trash";
+
     fn default_rift_database_path() -> Result<PathBuf> {
         if cfg!(target_os = "macos") {
             let home = std::env::var_os("HOME").context("HOME is required for Rift registry")?;
@@ -2695,6 +2697,21 @@ pub mod integrator {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error).with_context(|| format!("inspect {}", path.display())),
         }
+    }
+
+    fn is_rift_workspace_root_entry(path: &Path) -> Result<bool> {
+        if path.file_name() != Some(OsStr::new(RIFT_TRASH_DIRECTORY)) {
+            return Ok(false);
+        }
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("inspect Rift trash directory {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            anyhow::bail!(
+                "Rift trash path must be a real directory: {}",
+                path.display()
+            );
+        }
+        Ok(true)
     }
 
     #[cfg(target_os = "linux")]
@@ -3137,6 +3154,9 @@ pub mod integrator {
                                 if name == OsStr::new(".iq-workspace-owner.json")
                                     || name == OsStr::new(".iq-workspace-generation")
                         ) {
+                            continue;
+                        }
+                        if is_rift_workspace_root_entry(&path)? {
                             continue;
                         }
                         if !listed.contains(&path) {
@@ -6444,6 +6464,9 @@ pub mod integrator {
                         if name == OsStr::new(".iq-workspace-owner.json")
                             || name == OsStr::new(".iq-workspace-generation")
                 ) {
+                    continue;
+                }
+                if is_rift_workspace_root_entry(&path)? {
                     continue;
                 }
                 if !inventory_paths.contains(&path) {
