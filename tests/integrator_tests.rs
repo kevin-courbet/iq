@@ -1,7 +1,13 @@
+use iq::composition::{
+    load_local_policy, RepositoryInitOptions, RepositoryManager, SignoffPolicy, ValidationPolicy,
+};
 use iq::core::{BlockedPhase, BlockedReason, QueueStatus};
-use iq::integrator::{git, git_output, validation_command, Integrator, IntegratorOptions};
+use iq::integrator::{
+    git, git_output, HostSignoffPolicy, IntegrationPolicy, Integrator, IntegratorOptions,
+};
 use iq::sqlite::{EnqueueRequest, SqliteQueue};
 use std::fs;
+use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -10,6 +16,22 @@ use tempfile::tempdir;
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn track_ignored_file(repo: &Path, path: &str) {
+    let object = git_output(repo, ["hash-object", "-w", "--", path]).unwrap();
+    git(
+        repo,
+        [
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "100644",
+            object.as_str(),
+            path,
+        ],
+    )
+    .unwrap();
 }
 
 #[test]
@@ -32,17 +54,18 @@ fn direct_landing_integrates_only_after_remote_target_contains_landed_commit() {
         })
         .unwrap();
 
-    let integrator = Integrator::new(IntegratorOptions {
-        repo_key: repo_key.into(),
-        repo_path: fixture.repo.clone(),
-        queue_db: db,
-        owner_id: "test-integrator".into(),
-        lease_ttl_seconds: 30,
-        base_remote: "origin".into(),
-        workspace_root: fixture.temp.path().join("workspaces"),
-        rift_database: Some(fixture.rift_database.clone()),
-    })
-    .unwrap();
+    let integrator = fixture
+        .integrator(IntegratorOptions {
+            repo_key: repo_key.into(),
+            repo_path: fixture.repo.clone(),
+            queue_db: db,
+            owner_id: "test-integrator".into(),
+            lease_ttl_seconds: 30,
+            base_remote: "origin".into(),
+            workspace_root: fixture.temp.path().join("workspaces"),
+            rift_database: Some(fixture.rift_database.clone()),
+        })
+        .unwrap();
 
     let item = integrator.run_once().unwrap().unwrap();
 
@@ -65,7 +88,7 @@ fn direct_landing_integrates_only_after_remote_target_contains_landed_commit() {
 }
 
 #[test]
-fn missing_validation_configuration_blocks_during_validating_phase() {
+fn no_validation_accepts_exact_candidate_and_reports_skipped_policy() {
     let fixture = GitFixture::new(false);
     let source_head =
         fixture.create_source_branch("agent/no-validation", "feature.txt", "feature\n");
@@ -89,62 +112,18 @@ fn missing_validation_configuration_blocks_during_validating_phase() {
         })
         .unwrap();
 
-    let integrator = Integrator::new(IntegratorOptions {
-        repo_key: repo_key.into(),
-        repo_path: fixture.repo.clone(),
-        queue_db: db,
-        owner_id: "test-integrator".into(),
-        lease_ttl_seconds: 30,
-        base_remote: "origin".into(),
-        workspace_root: fixture.temp.path().join("workspaces"),
-        rift_database: Some(fixture.rift_database.clone()),
-    })
-    .unwrap();
-
-    let item = integrator.run_once().unwrap().unwrap();
-
-    assert_eq!(item.status, QueueStatus::Blocked);
-    assert_eq!(item.blocked_phase, Some(BlockedPhase::Validating));
-    assert_eq!(item.blocked_reason, Some(BlockedReason::NeedsUserInput));
-}
-
-#[test]
-fn cargo_repo_without_iq_config_uses_cargo_test_default() {
-    let fixture = GitFixture::new(false);
-    fixture.create_cargo_project_on_main();
-    let source_head =
-        fixture.create_source_branch("agent/cargo-default", "feature.txt", "feature\n");
-    git(
-        &fixture.repo,
-        ["push", "-u", "origin", "agent/cargo-default"],
-    )
-    .unwrap();
-    let db = fixture.temp.path().join("queues.db");
-    let queue = SqliteQueue::open(&db).unwrap();
-    let repo_key = "fixture::main";
-    queue
-        .enqueue(EnqueueRequest {
+    let integrator = fixture
+        .integrator(IntegratorOptions {
             repo_key: repo_key.into(),
-            repo_path: fixture.repo.to_string_lossy().to_string(),
-            source_branch: "agent/cargo-default".into(),
-            target_branch: "main".into(),
-            current_head_sha: source_head,
-            pr_url: None,
-            producer_metadata: serde_json::json!({"worker":"W001"}),
+            repo_path: fixture.repo.clone(),
+            queue_db: db,
+            owner_id: "test-integrator".into(),
+            lease_ttl_seconds: 30,
+            base_remote: "origin".into(),
+            workspace_root: fixture.temp.path().join("workspaces"),
+            rift_database: Some(fixture.rift_database.clone()),
         })
         .unwrap();
-
-    let integrator = Integrator::new(IntegratorOptions {
-        repo_key: repo_key.into(),
-        repo_path: fixture.repo.clone(),
-        queue_db: db,
-        owner_id: "test-integrator".into(),
-        lease_ttl_seconds: 30,
-        base_remote: "origin".into(),
-        workspace_root: fixture.temp.path().join("workspaces"),
-        rift_database: Some(fixture.rift_database.clone()),
-    })
-    .unwrap();
 
     let item = integrator.run_once().unwrap().unwrap();
 
@@ -152,33 +131,260 @@ fn cargo_repo_without_iq_config_uses_cargo_test_default() {
     let attempt = queue
         .get_attempt(item.current_attempt_id.as_deref().unwrap())
         .unwrap();
-    assert_eq!(attempt.validation_command.as_deref(), Some("cargo test"));
+    assert_eq!(attempt.validated_commit_sha, item.landed_commit_sha);
+    assert_eq!(attempt.validation_command, None);
+    assert_eq!(
+        iq::composition::verify_policy_snapshot(
+            attempt.policy_snapshot_json.as_deref().unwrap(),
+            attempt.policy_digest.as_deref().unwrap(),
+        )
+        .unwrap()
+        .policy,
+        ValidationPolicy::None
+    );
+    let event_types = queue
+        .events(&item.id)
+        .unwrap()
+        .into_iter()
+        .map(|event| event.event_type)
+        .collect::<Vec<_>>();
+    assert!(event_types.contains(&"validation_skipped".into()));
+    assert!(event_types.contains(&"signoff_not_required".into()));
 }
 
 #[test]
-fn iq_config_validation_command_overrides_repo_default() {
-    let fixture = GitFixture::new(false);
-    fixture.create_cargo_project_on_main();
-    fixture.set_validation_command("git diff --check");
-
-    let command = validation_command(&fixture.repo).unwrap();
-
-    assert_eq!(command.as_deref(), Some("git diff --check"));
-}
-
-#[test]
-fn taskfile_validate_is_preferred_default_validation_command() {
+fn local_policy_is_optional_strict_and_untracked() {
     let temp = tempdir().unwrap();
+    git(temp.path(), ["init"]).unwrap();
+
+    let (absent, _, _) = load_local_policy(temp.path()).unwrap();
+    assert_eq!(absent.policy, ValidationPolicy::None);
+
+    fs::create_dir(temp.path().join(".iq")).unwrap();
+    fs::write(temp.path().join(".iq/config.json"), b"{}").unwrap();
+    assert!(load_local_policy(temp.path()).is_err());
+
     fs::write(
-        temp.path().join("Taskfile.yml"),
-        "version: '3'\ntasks:\n  validate:\n    cmds:\n      - cargo test\n",
+        temp.path().join(".iq/config.json"),
+        br#"{"version":1,"integration":{"validation":{"command":"git diff --check"},"signoff":{"mode":"none"}}}"#,
     )
     .unwrap();
-    fs::write(temp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+    let (configured, snapshot, digest) = load_local_policy(temp.path()).unwrap();
+    assert_eq!(
+        configured.policy,
+        ValidationPolicy::Command {
+            command: "git diff --check".into(),
+            signoff: SignoffPolicy::None,
+        }
+    );
+    assert_eq!(
+        iq::composition::verify_policy_snapshot(&snapshot, &digest).unwrap(),
+        configured
+    );
 
-    let command = validation_command(temp.path()).unwrap();
+    track_ignored_file(temp.path(), ".iq/config.json");
+    let error = format!("{:#}", load_local_policy(temp.path()).unwrap_err());
+    assert!(error.contains("must not be tracked"), "{error}");
+}
 
-    assert_eq!(command.as_deref(), Some("task validate"));
+#[test]
+fn local_policy_rejects_oversized_files_and_symlinked_directories() {
+    let temp = tempdir().unwrap();
+    git(temp.path(), ["init"]).unwrap();
+    fs::create_dir(temp.path().join(".iq")).unwrap();
+    fs::write(
+        temp.path().join(".iq/config.json"),
+        vec![b' '; 1024 * 1024 + 1],
+    )
+    .unwrap();
+    let oversized = format!("{:#}", load_local_policy(temp.path()).unwrap_err());
+    assert!(oversized.contains("exceeds"), "{oversized}");
+
+    fs::remove_dir_all(temp.path().join(".iq")).unwrap();
+    let external = temp.path().join("external-policy");
+    fs::create_dir(&external).unwrap();
+    fs::write(external.join("config.json"), b"{}").unwrap();
+    symlink(&external, temp.path().join(".iq")).unwrap();
+    let symlinked = format!("{:#}", load_local_policy(temp.path()).unwrap_err());
+    assert!(symlinked.contains("non-symlink directory"), "{symlinked}");
+}
+
+#[test]
+fn tracked_local_policy_is_rejected_before_landing() {
+    let fixture = GitFixture::new(false);
+    let source_head = fixture.create_source_branch(
+        "agent/tracked-policy",
+        ".iq/config.json",
+        r#"{"version":1}"#,
+    );
+    let db = fixture.temp.path().join("queues.db");
+    let queue = SqliteQueue::open(&db).unwrap();
+    let item = queue
+        .enqueue(EnqueueRequest {
+            repo_key: "fixture::main".into(),
+            repo_path: fixture.repo.to_string_lossy().to_string(),
+            source_branch: "agent/tracked-policy".into(),
+            target_branch: "main".into(),
+            current_head_sha: source_head,
+            pr_url: None,
+            producer_metadata: serde_json::json!({"worker":"W001"}),
+        })
+        .unwrap();
+    let integrator = fixture
+        .integrator(IntegratorOptions {
+            repo_key: "fixture::main".into(),
+            repo_path: fixture.repo.clone(),
+            queue_db: db,
+            owner_id: "test-integrator".into(),
+            lease_ttl_seconds: 30,
+            base_remote: "origin".into(),
+            workspace_root: fixture.temp.path().join("workspaces"),
+            rift_database: Some(fixture.rift_database.clone()),
+        })
+        .unwrap();
+
+    let blocked = integrator.run_once().unwrap().unwrap();
+
+    assert_eq!(blocked.id, item.id);
+    assert_eq!(blocked.status, QueueStatus::Blocked);
+    assert_eq!(blocked.blocked_phase, Some(BlockedPhase::Integrating));
+    assert_eq!(blocked.blocked_reason, Some(BlockedReason::NeedsAgentFix));
+    assert!(blocked.landed_commit_sha.is_none());
+}
+
+#[test]
+fn registered_attempt_snapshots_local_policy_once() {
+    let _guard = env_lock().lock().unwrap();
+    let fixture = GitFixture::new(false);
+    std::env::set_var("IQ_RIFT_DATABASE", &fixture.rift_database);
+    let first_sha = fixture.create_source_branch("agent/first", "first.txt", "first\n");
+    let second_sha = fixture.create_source_branch("agent/second", "second.txt", "second\n");
+    git(&fixture.repo, ["checkout", "main"]).unwrap();
+    let db = fixture.temp.path().join("queues.db");
+    let queue = SqliteQueue::open(&db).unwrap();
+    let manager = RepositoryManager::new(queue.clone());
+    let repository = manager
+        .init(
+            &fixture.repo,
+            RepositoryInitOptions {
+                target_branch: "main".into(),
+                remote: "origin".into(),
+                seed_path: Some(fixture.temp.path().join("seed-root/seed")),
+                workspace_root: Some(fixture.temp.path().join("development-workspaces")),
+            },
+        )
+        .unwrap();
+    assert!(!Path::new(repository.seed.path().unwrap())
+        .join(".iq/config.json")
+        .exists());
+    let host_policy_result = Integrator::new_with_policy(
+        IntegratorOptions {
+            repo_key: repository.key.clone(),
+            repo_path: fixture.repo.clone(),
+            queue_db: db.clone(),
+            owner_id: "host-policy-test".into(),
+            lease_ttl_seconds: 30,
+            base_remote: "origin".into(),
+            workspace_root: fixture.temp.path().join("host-policy-workspaces"),
+            rift_database: Some(fixture.rift_database.clone()),
+        },
+        IntegrationPolicy::Validation {
+            command: "git diff --check".into(),
+            signoff: HostSignoffPolicy::None,
+        },
+    );
+    let error = match host_policy_result {
+        Ok(_) => panic!("registered repository accepted host validation"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(
+        error.contains("local integration-checkout policy"),
+        "{error}"
+    );
+
+    fs::write(fixture.repo.join(".git/info/exclude"), ".iq/config.json\n").unwrap();
+    fs::create_dir_all(fixture.repo.join(".iq")).unwrap();
+    let config_path = fixture.repo.join(".iq/config.json");
+    let command = format!(
+        "test -f .iq/config.json && printf '{{malformed' > '{}' && git diff --check",
+        config_path.display()
+    );
+    fs::write(
+        &config_path,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "integration": {
+                "validation": {"command": command},
+                "signoff": {"mode": "none"}
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let first = queue
+        .enqueue(EnqueueRequest {
+            repo_key: repository.key.clone(),
+            repo_path: fixture.repo.to_string_lossy().to_string(),
+            source_branch: "agent/first".into(),
+            target_branch: "main".into(),
+            current_head_sha: first_sha,
+            pr_url: None,
+            producer_metadata: serde_json::json!({"worker":"W001"}),
+        })
+        .unwrap();
+    let second = queue
+        .enqueue(EnqueueRequest {
+            repo_key: repository.key.clone(),
+            repo_path: fixture.repo.to_string_lossy().to_string(),
+            source_branch: "agent/second".into(),
+            target_branch: "main".into(),
+            current_head_sha: second_sha,
+            pr_url: None,
+            producer_metadata: serde_json::json!({"worker":"W002"}),
+        })
+        .unwrap();
+    let integrator = Integrator::new(IntegratorOptions {
+        repo_key: repository.key,
+        repo_path: fixture.repo.clone(),
+        queue_db: db,
+        owner_id: "test-integrator".into(),
+        lease_ttl_seconds: 30,
+        base_remote: "origin".into(),
+        workspace_root: fixture.temp.path().join("integration-workspaces"),
+        rift_database: Some(fixture.rift_database.clone()),
+    })
+    .unwrap();
+
+    let integrated = integrator.run_once().unwrap().unwrap();
+    assert_eq!(integrated.id, first.id);
+    assert_eq!(integrated.status, QueueStatus::Integrated);
+    let attempt = queue
+        .get_attempt(integrated.current_attempt_id.as_deref().unwrap())
+        .unwrap();
+    let snapshot = attempt.policy_snapshot_json.unwrap();
+    let digest = attempt.policy_digest.unwrap();
+    assert!(matches!(
+        iq::composition::verify_policy_snapshot(&snapshot, &digest)
+            .unwrap()
+            .policy,
+        ValidationPolicy::Command { .. }
+    ));
+
+    let error = format!("{:#}", integrator.run_once().unwrap_err());
+    assert!(
+        error.contains("parse strict versioned local policy"),
+        "{error}"
+    );
+    assert_eq!(
+        queue.get_item(&second.id).unwrap().status,
+        QueueStatus::Ready
+    );
+    assert!(queue
+        .get_item(&second.id)
+        .unwrap()
+        .current_attempt_id
+        .is_none());
+    std::env::remove_var("IQ_RIFT_DATABASE");
 }
 
 #[test]
@@ -204,17 +410,18 @@ fn integrator_refuses_to_transition_after_lease_owner_changes() {
             producer_metadata: serde_json::json!({"worker":"W001"}),
         })
         .unwrap();
-    let integrator = Integrator::new(IntegratorOptions {
-        repo_key: repo_key.into(),
-        repo_path: fixture.repo.clone(),
-        queue_db: db.clone(),
-        owner_id: "owner-a".into(),
-        lease_ttl_seconds: 1,
-        base_remote: "origin".into(),
-        workspace_root: fixture.temp.path().join("workspaces"),
-        rift_database: Some(fixture.rift_database.clone()),
-    })
-    .unwrap();
+    let integrator = fixture
+        .integrator(IntegratorOptions {
+            repo_key: repo_key.into(),
+            repo_path: fixture.repo.clone(),
+            queue_db: db.clone(),
+            owner_id: "owner-a".into(),
+            lease_ttl_seconds: 1,
+            base_remote: "origin".into(),
+            workspace_root: fixture.temp.path().join("workspaces"),
+            rift_database: Some(fixture.rift_database.clone()),
+        })
+        .unwrap();
     let result = integrator.run_once();
 
     match result {
@@ -262,17 +469,18 @@ fn source_branch_head_mismatch_blocks_without_integrating_moved_code() {
     let moved_head = git_output(&fixture.repo, ["rev-parse", "HEAD"]).unwrap();
     git(&fixture.repo, ["push", "origin", "agent/moved"]).unwrap();
 
-    let integrator = Integrator::new(IntegratorOptions {
-        repo_key: repo_key.into(),
-        repo_path: fixture.repo.clone(),
-        queue_db: db,
-        owner_id: "test-integrator".into(),
-        lease_ttl_seconds: 30,
-        base_remote: "origin".into(),
-        workspace_root: fixture.temp.path().join("workspaces"),
-        rift_database: Some(fixture.rift_database.clone()),
-    })
-    .unwrap();
+    let integrator = fixture
+        .integrator(IntegratorOptions {
+            repo_key: repo_key.into(),
+            repo_path: fixture.repo.clone(),
+            queue_db: db,
+            owner_id: "test-integrator".into(),
+            lease_ttl_seconds: 30,
+            base_remote: "origin".into(),
+            workspace_root: fixture.temp.path().join("workspaces"),
+            rift_database: Some(fixture.rift_database.clone()),
+        })
+        .unwrap();
 
     let item = integrator.run_once().unwrap().unwrap();
 
@@ -314,17 +522,18 @@ fn answered_merge_conflict_resumes_same_attempt_and_integrates() {
         })
         .unwrap();
 
-    let integrator = Integrator::new(IntegratorOptions {
-        repo_key: repo_key.into(),
-        repo_path: fixture.repo.clone(),
-        queue_db: db.clone(),
-        owner_id: "test-integrator".into(),
-        lease_ttl_seconds: 30,
-        base_remote: "origin".into(),
-        workspace_root: fixture.temp.path().join("workspaces"),
-        rift_database: Some(fixture.rift_database.clone()),
-    })
-    .unwrap();
+    let integrator = fixture
+        .integrator(IntegratorOptions {
+            repo_key: repo_key.into(),
+            repo_path: fixture.repo.clone(),
+            queue_db: db.clone(),
+            owner_id: "test-integrator".into(),
+            lease_ttl_seconds: 30,
+            base_remote: "origin".into(),
+            workspace_root: fixture.temp.path().join("workspaces"),
+            rift_database: Some(fixture.rift_database.clone()),
+        })
+        .unwrap();
     let blocked = integrator.run_once().unwrap().unwrap();
     assert_eq!(blocked.status, QueueStatus::Blocked);
     assert_eq!(blocked.blocked_phase, Some(BlockedPhase::Merging));
@@ -374,17 +583,18 @@ fn merge_resume_without_current_answered_prompt_does_not_accept_workspace_resolu
         })
         .unwrap();
 
-    let integrator = Integrator::new(IntegratorOptions {
-        repo_key: repo_key.into(),
-        repo_path: fixture.repo.clone(),
-        queue_db: db.clone(),
-        owner_id: "test-integrator".into(),
-        lease_ttl_seconds: 30,
-        base_remote: "origin".into(),
-        workspace_root: fixture.temp.path().join("workspaces"),
-        rift_database: Some(fixture.rift_database.clone()),
-    })
-    .unwrap();
+    let integrator = fixture
+        .integrator(IntegratorOptions {
+            repo_key: repo_key.into(),
+            repo_path: fixture.repo.clone(),
+            queue_db: db.clone(),
+            owner_id: "test-integrator".into(),
+            lease_ttl_seconds: 30,
+            base_remote: "origin".into(),
+            workspace_root: fixture.temp.path().join("workspaces"),
+            rift_database: Some(fixture.rift_database.clone()),
+        })
+        .unwrap();
     let blocked = integrator.run_once().unwrap().unwrap();
     assert_eq!(blocked.status, QueueStatus::Blocked);
     let workspace = blocked
@@ -444,17 +654,18 @@ fn daemon_run_holds_later_ready_item_behind_oldest_blocked_item() {
         })
         .unwrap();
 
-    let integrator = Integrator::new(IntegratorOptions {
-        repo_key: repo_key.into(),
-        repo_path: fixture.repo.clone(),
-        queue_db: db,
-        owner_id: "test-integrator".into(),
-        lease_ttl_seconds: 30,
-        base_remote: "origin".into(),
-        workspace_root: fixture.temp.path().join("workspaces"),
-        rift_database: Some(fixture.rift_database.clone()),
-    })
-    .unwrap();
+    let integrator = fixture
+        .integrator(IntegratorOptions {
+            repo_key: repo_key.into(),
+            repo_path: fixture.repo.clone(),
+            queue_db: db,
+            owner_id: "test-integrator".into(),
+            lease_ttl_seconds: 30,
+            base_remote: "origin".into(),
+            workspace_root: fixture.temp.path().join("workspaces"),
+            rift_database: Some(fixture.rift_database.clone()),
+        })
+        .unwrap();
     let blocked = integrator.run_once().unwrap().unwrap();
     assert_eq!(blocked.id, first.id);
     assert_eq!(blocked.status, QueueStatus::Blocked);
@@ -501,17 +712,18 @@ fn daemon_run_resumes_oldest_answered_item_before_claiming_later_ready_item() {
         })
         .unwrap();
 
-    let integrator = Integrator::new(IntegratorOptions {
-        repo_key: repo_key.into(),
-        repo_path: fixture.repo.clone(),
-        queue_db: db.clone(),
-        owner_id: "test-integrator".into(),
-        lease_ttl_seconds: 30,
-        base_remote: "origin".into(),
-        workspace_root: fixture.temp.path().join("workspaces"),
-        rift_database: Some(fixture.rift_database.clone()),
-    })
-    .unwrap();
+    let integrator = fixture
+        .integrator(IntegratorOptions {
+            repo_key: repo_key.into(),
+            repo_path: fixture.repo.clone(),
+            queue_db: db.clone(),
+            owner_id: "test-integrator".into(),
+            lease_ttl_seconds: 30,
+            base_remote: "origin".into(),
+            workspace_root: fixture.temp.path().join("workspaces"),
+            rift_database: Some(fixture.rift_database.clone()),
+        })
+        .unwrap();
     let blocked = integrator.run_once().unwrap().unwrap();
     let prompt_id = blocked.validation_evidence["prompt_id"].as_str().unwrap();
     queue
@@ -586,17 +798,18 @@ exit 2
     }
     std::env::set_var("IQ_GITHUB_CLI", &fake_gh);
 
-    let integrator = Integrator::new(IntegratorOptions {
-        repo_key: repo_key.into(),
-        repo_path: fixture.repo.clone(),
-        queue_db: db.clone(),
-        owner_id: "test-integrator".into(),
-        lease_ttl_seconds: 30,
-        base_remote: "origin".into(),
-        workspace_root: fixture.temp.path().join("workspaces"),
-        rift_database: Some(fixture.rift_database.clone()),
-    })
-    .unwrap();
+    let integrator = fixture
+        .integrator(IntegratorOptions {
+            repo_key: repo_key.into(),
+            repo_path: fixture.repo.clone(),
+            queue_db: db.clone(),
+            owner_id: "test-integrator".into(),
+            lease_ttl_seconds: 30,
+            base_remote: "origin".into(),
+            workspace_root: fixture.temp.path().join("workspaces"),
+            rift_database: Some(fixture.rift_database.clone()),
+        })
+        .unwrap();
     let blocked = integrator.run_once().unwrap().unwrap();
     let prompt_id = blocked.validation_evidence["prompt_id"].as_str().unwrap();
     queue
@@ -649,17 +862,18 @@ fn target_moved_merge_conflict_blocks_with_conflict_metadata() {
         })
         .unwrap();
 
-    let integrator = Integrator::new(IntegratorOptions {
-        repo_key: repo_key.into(),
-        repo_path: fixture.repo.clone(),
-        queue_db: db,
-        owner_id: "test-integrator".into(),
-        lease_ttl_seconds: 30,
-        base_remote: "origin".into(),
-        workspace_root: fixture.temp.path().join("workspaces"),
-        rift_database: Some(fixture.rift_database.clone()),
-    })
-    .unwrap();
+    let integrator = fixture
+        .integrator(IntegratorOptions {
+            repo_key: repo_key.into(),
+            repo_path: fixture.repo.clone(),
+            queue_db: db,
+            owner_id: "test-integrator".into(),
+            lease_ttl_seconds: 30,
+            base_remote: "origin".into(),
+            workspace_root: fixture.temp.path().join("workspaces"),
+            rift_database: Some(fixture.rift_database.clone()),
+        })
+        .unwrap();
 
     let item = integrator.run_once().unwrap().unwrap();
 
@@ -671,7 +885,7 @@ fn target_moved_merge_conflict_blocks_with_conflict_metadata() {
 }
 
 #[test]
-fn target_moved_missing_validation_config_blocks_for_user_input() {
+fn target_movement_keeps_the_attempt_validation_policy() {
     let fixture = GitFixture::new(true);
     let source_head =
         fixture.create_source_branch("agent/missing-revalidation", "feature.txt", "feature\n");
@@ -686,7 +900,7 @@ fn target_moved_missing_validation_config_blocks_for_user_input() {
         fixture.remote.display(),
         fixture.remote.display(),
     ));
-    fixture.create_unpublished_target_deleting_validation(moved_branch);
+    fixture.create_unpublished_target_change(moved_branch, "target.txt", "target\n");
     let db = fixture.temp.path().join("queues.db");
     let queue = SqliteQueue::open(&db).unwrap();
     let repo_key = "fixture::main";
@@ -702,23 +916,27 @@ fn target_moved_missing_validation_config_blocks_for_user_input() {
         })
         .unwrap();
 
-    let integrator = Integrator::new(IntegratorOptions {
-        repo_key: repo_key.into(),
-        repo_path: fixture.repo.clone(),
-        queue_db: db,
-        owner_id: "test-integrator".into(),
-        lease_ttl_seconds: 30,
-        base_remote: "origin".into(),
-        workspace_root: fixture.temp.path().join("workspaces"),
-        rift_database: Some(fixture.rift_database.clone()),
-    })
-    .unwrap();
+    let integrator = fixture
+        .integrator(IntegratorOptions {
+            repo_key: repo_key.into(),
+            repo_path: fixture.repo.clone(),
+            queue_db: db,
+            owner_id: "test-integrator".into(),
+            lease_ttl_seconds: 30,
+            base_remote: "origin".into(),
+            workspace_root: fixture.temp.path().join("workspaces"),
+            rift_database: Some(fixture.rift_database.clone()),
+        })
+        .unwrap();
 
     let item = integrator.run_once().unwrap().unwrap();
 
-    assert_eq!(item.status, QueueStatus::Blocked);
-    assert_eq!(item.blocked_phase, Some(BlockedPhase::Validating));
-    assert_eq!(item.blocked_reason, Some(BlockedReason::NeedsUserInput));
+    assert_eq!(item.status, QueueStatus::Integrated);
+    let attempt = queue
+        .get_attempt(item.current_attempt_id.as_deref().unwrap())
+        .unwrap();
+    assert!(attempt.policy_snapshot_json.is_none());
+    assert!(attempt.validation_command.is_some());
 }
 
 #[test]
@@ -742,17 +960,18 @@ fn direct_landing_fetch_failure_persists_integrating_block() {
         })
         .unwrap();
 
-    let integrator = Integrator::new(IntegratorOptions {
-        repo_key: repo_key.into(),
-        repo_path: fixture.repo.clone(),
-        queue_db: db,
-        owner_id: "test-integrator".into(),
-        lease_ttl_seconds: 30,
-        base_remote: "origin".into(),
-        workspace_root: fixture.temp.path().join("workspaces"),
-        rift_database: Some(fixture.rift_database.clone()),
-    })
-    .unwrap();
+    let integrator = fixture
+        .integrator(IntegratorOptions {
+            repo_key: repo_key.into(),
+            repo_path: fixture.repo.clone(),
+            queue_db: db,
+            owner_id: "test-integrator".into(),
+            lease_ttl_seconds: 30,
+            base_remote: "origin".into(),
+            workspace_root: fixture.temp.path().join("workspaces"),
+            rift_database: Some(fixture.rift_database.clone()),
+        })
+        .unwrap();
 
     let item = integrator.run_once().unwrap().unwrap();
 
@@ -811,17 +1030,18 @@ exit 2
     }
     std::env::set_var("IQ_GITHUB_CLI", &fake_gh);
 
-    let integrator = Integrator::new(IntegratorOptions {
-        repo_key: repo_key.into(),
-        repo_path: fixture.repo.clone(),
-        queue_db: db,
-        owner_id: "test-integrator".into(),
-        lease_ttl_seconds: 30,
-        base_remote: "origin".into(),
-        workspace_root: fixture.temp.path().join("workspaces"),
-        rift_database: Some(fixture.rift_database.clone()),
-    })
-    .unwrap();
+    let integrator = fixture
+        .integrator(IntegratorOptions {
+            repo_key: repo_key.into(),
+            repo_path: fixture.repo.clone(),
+            queue_db: db,
+            owner_id: "test-integrator".into(),
+            lease_ttl_seconds: 30,
+            base_remote: "origin".into(),
+            workspace_root: fixture.temp.path().join("workspaces"),
+            rift_database: Some(fixture.rift_database.clone()),
+        })
+        .unwrap();
 
     let item = integrator.run_once().unwrap().unwrap();
 
@@ -847,10 +1067,11 @@ struct GitFixture {
     remote: std::path::PathBuf,
     repo: std::path::PathBuf,
     rift_database: std::path::PathBuf,
+    validation_command: Mutex<Option<String>>,
 }
 
 impl GitFixture {
-    fn new(include_validation: bool) -> Self {
+    fn new(_include_validation: bool) -> Self {
         let temp = tempdir().unwrap();
         let remote = temp.path().join("remote.git");
         git(temp.path(), ["init", "--bare", remote.to_str().unwrap()]).unwrap();
@@ -868,14 +1089,6 @@ impl GitFixture {
         git(&repo, ["config", "core.hooksPath", hooks.to_str().unwrap()]).unwrap();
         git(&repo, ["checkout", "-b", "main"]).unwrap();
         fs::write(repo.join("README.md"), "base\n").unwrap();
-        if include_validation {
-            fs::create_dir_all(repo.join(".iq")).unwrap();
-            fs::write(
-                repo.join(".iq/config.json"),
-                r#"{"integration":{"validation":{"command":"git diff --check"}}}"#,
-            )
-            .unwrap();
-        }
         git(&repo, ["add", "."]).unwrap();
         git(&repo, ["commit", "-m", "base"]).unwrap();
         git(&repo, ["push", "-u", "origin", "main"]).unwrap();
@@ -897,13 +1110,21 @@ impl GitFixture {
             remote,
             repo,
             rift_database,
+            validation_command: Mutex::new(None),
         }
     }
 
     fn create_source_branch(&self, branch: &str, path: &str, contents: &str) -> String {
         git(&self.repo, ["checkout", "-b", branch, "main"]).unwrap();
+        if let Some(parent) = self.repo.join(Path::new(path)).parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
         fs::write(self.repo.join(Path::new(path)), contents).unwrap();
-        git(&self.repo, ["add", path]).unwrap();
+        if path == ".iq/config.json" {
+            track_ignored_file(&self.repo, path);
+        } else {
+            git(&self.repo, ["add", path]).unwrap();
+        }
         git(&self.repo, ["commit", "-m", "feature"]).unwrap();
         let sha = git_output(&self.repo, ["rev-parse", "HEAD"]).unwrap();
         git(
@@ -915,42 +1136,21 @@ impl GitFixture {
     }
 
     fn set_validation_command(&self, command: &str) {
-        git(&self.repo, ["checkout", "main"]).unwrap();
-        fs::create_dir_all(self.repo.join(".iq")).unwrap();
-        fs::write(
-            self.repo.join(".iq/config.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "integration": {"validation": {"command": command}}
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        git(&self.repo, ["add", ".iq/config.json"]).unwrap();
-        git(&self.repo, ["commit", "-m", "validation command"]).unwrap();
-        git(&self.repo, ["push", "origin", "main"]).unwrap();
+        *self.validation_command.lock().unwrap() = Some(command.into());
     }
 
-    fn create_cargo_project_on_main(&self) {
-        git(&self.repo, ["checkout", "main"]).unwrap();
-        fs::create_dir_all(self.repo.join("src")).unwrap();
-        fs::write(
-            self.repo.join("Cargo.toml"),
-            "[package]\nname = \"iq-demo-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .unwrap();
-        fs::write(
-            self.repo.join("src/lib.rs"),
-            "pub fn fixture_value() -> &'static str { \"iq-demo-fixture\" }\n",
-        )
-        .unwrap();
-        fs::write(self.repo.join(".gitignore"), "/target\n/Cargo.lock\n").unwrap();
-        git(
-            &self.repo,
-            ["add", "Cargo.toml", "src/lib.rs", ".gitignore"],
-        )
-        .unwrap();
-        git(&self.repo, ["commit", "-m", "cargo project"]).unwrap();
-        git(&self.repo, ["push", "origin", "main"]).unwrap();
+    fn integrator(&self, options: IntegratorOptions) -> anyhow::Result<Integrator> {
+        let policy = self
+            .validation_command
+            .lock()
+            .unwrap()
+            .clone()
+            .map(|command| IntegrationPolicy::Validation {
+                command,
+                signoff: HostSignoffPolicy::None,
+            })
+            .unwrap_or(IntegrationPolicy::NoValidation);
+        Integrator::new_with_policy(options, policy)
     }
 
     fn create_unpublished_target_change(&self, branch: &str, path: &str, contents: &str) -> String {
@@ -958,20 +1158,6 @@ impl GitFixture {
         fs::write(self.repo.join(Path::new(path)), contents).unwrap();
         git(&self.repo, ["add", path]).unwrap();
         git(&self.repo, ["commit", "-m", "target moved"]).unwrap();
-        let sha = git_output(&self.repo, ["rev-parse", "HEAD"]).unwrap();
-        git(
-            &self.repo,
-            ["push", "origin", &format!("HEAD:refs/heads/{branch}")],
-        )
-        .unwrap();
-        sha
-    }
-
-    fn create_unpublished_target_deleting_validation(&self, branch: &str) -> String {
-        git(&self.repo, ["checkout", "-b", branch, "main"]).unwrap();
-        fs::remove_file(self.repo.join(".iq/config.json")).unwrap();
-        git(&self.repo, ["add", ".iq/config.json"]).unwrap();
-        git(&self.repo, ["commit", "-m", "remove validation config"]).unwrap();
         let sha = git_output(&self.repo, ["rev-parse", "HEAD"]).unwrap();
         git(
             &self.repo,

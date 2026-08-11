@@ -8,7 +8,7 @@
 
 IQ owns the complete standalone composition lifecycle. A registered target checkout is integration-only. IQ creates an exact detached Rift seed, creates IQ development Rift workspaces from that seed, and imports immutable exact-HEAD local submissions into private refs. A local candidate has one parent and applies only the persisted development-base-to-submission change to the current target.
 
-Repository policy is trusted only from strict versioned `.iq/config.json` at the exact target-base SHA. Policy contains an explicit validation command and signoff that is exactly `none` or `required`. Required signoff contains an explicit command and contexts. Each attempt persists the target SHA, canonical policy snapshot, and SHA-256 digest. Target movement invalidates all evidence.
+Integration policy is attempt-owned and exact. ADR 0004 supersedes this ADR's former target-tree policy source and defines optional local policy, attempt snapshots, and policy behavior during target movement.
 
 IQ persists the registered remote name and canonical fetch and push URL identities before its first fetch. Every registered operation verifies these identities before policy loading or remote mutation. IQ marks an item integrated only after it verifies the landed candidate and completes durable registered-checkout reconciliation to the exact fetched remote target. Every provider landing requires its post-signoff snapshot gate to pass before target mutation. A registered PR/MR keeps its provider metadata and provider gates, but IQ lands the exact validated candidate with a compare-and-set Git push instead of a provider target-mutation API. After signoff, a final target fetch and provider snapshot must still report the queued head and exact fetched base. Reconciliation records intent before an exact reset and supports rewritten target history. The same transaction records that remote SHA as the seed refresh target and records development cleanup for local landing. SQLite lifecycle state and exact Rift identity make every boundary restart-safe. Cleanup preserves dirty or active Git work, including all untracked files regardless of repository status configuration, and resolves relocated Rifts by identity, including verified paths outside a former IQ root.
 
@@ -25,5 +25,5 @@ IQ owns its default state namespace. The state root is absolute and non-empty. I
 - Producers do not edit or push from registered target checkouts.
 - Local sources are immutable commits, not mutable branch names.
 - Rift remains the only workspace and cleanup backend.
-- Registration and integration fail when exact target policy is absent or invalid.
+- Registration and seed refresh are independent of integration policy.
 - Git-worktree integration, inferred policy, metadata-less adoption, and consumer runtime assumptions are outside this design.

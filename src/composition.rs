@@ -2,8 +2,12 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::ffi::OsStr;
-use std::fs;
+use std::ffi::{CString, OsStr};
+use std::fs::{self, OpenOptions};
+use std::io::Read;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
@@ -17,6 +21,7 @@ use crate::sqlite::{
 };
 
 const LEASE_SECONDS: i64 = 30;
+const MAX_POLICY_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct RepositoryInitOptions {
@@ -30,9 +35,17 @@ pub struct RepositoryInitOptions {
 #[serde(deny_unknown_fields)]
 pub struct PolicySnapshot {
     pub version: u32,
-    pub target_base_sha: String,
-    pub validation_command: String,
-    pub signoff: SignoffPolicy,
+    pub policy: ValidationPolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ValidationPolicy {
+    None,
+    Command {
+        command: String,
+        signoff: SignoffPolicy,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -182,7 +195,7 @@ impl RepositoryManager {
         let target_ref = format!("refs/remotes/{}/{}", remote.name, options.target_branch);
         let target_sha = git_output(&integration_path, ["rev-parse", &target_ref])?;
         require_exact_integration_head(&integration_path, &target_sha)?;
-        let (policy, policy_json, policy_digest) = load_policy_at(&integration_path, &target_sha)?;
+        reject_tracked_policy(&integration_path)?;
         let state_root = self
             .queue
             .path()
@@ -210,17 +223,9 @@ impl RepositoryManager {
             {
                 anyhow::bail!("repository {repo_key} is registered with different configuration");
             }
-            if existing.policy_target_sha != target_sha
-                || existing.policy_snapshot_json != policy_json
-                || existing.policy_digest != policy_digest
-            {
-                self.queue.refresh_registered_target(
-                    &repo_key,
-                    &self.owner_id,
-                    &target_sha,
-                    &policy_json,
-                    &policy_digest,
-                )?;
+            if existing.seed_refresh.target_sha() != target_sha {
+                self.queue
+                    .refresh_registered_target(&repo_key, &self.owner_id, &target_sha)?;
             }
             let existing = self.queue.repository(&repo_key)?;
             self.reconcile_seed(&guard, &existing)?;
@@ -262,9 +267,6 @@ impl RepositoryManager {
             seed_refresh: SeedRefreshState::Pending {
                 target_sha: target_sha.clone(),
             },
-            policy_target_sha: policy.target_base_sha,
-            policy_snapshot_json: policy_json,
-            policy_digest,
             created_at: timestamp.clone(),
             updated_at: timestamp,
         };
@@ -277,6 +279,19 @@ impl RepositoryManager {
 
     pub fn list(&self) -> Result<Vec<RegisteredRepository>> {
         self.queue.list_repositories()
+    }
+
+    pub fn inspect_local_policy(&self, repo_key: &str) -> Result<PolicySnapshot> {
+        let repository = self.queue.repository(repo_key)?;
+        verify_remote_identity(&repository.integration_path, &repository.remote)?;
+        let _guard = RepositoryGuard::acquire(
+            self.queue.clone(),
+            &repository.integration_path,
+            repo_key,
+            &self.owner_id,
+        )?;
+        let (policy, _, _) = load_local_policy(&repository.integration_path)?;
+        Ok(policy)
     }
 
     pub fn status(&self, repo_key: &str) -> Result<RepositoryStatus> {
@@ -404,6 +419,7 @@ impl RepositoryManager {
         if manager.verify_retained(identity)? != workspace.path {
             anyhow::bail!("development workspace path differs from its durable Rift identity");
         }
+        reject_tracked_policy(&workspace.path)?;
         let submission = if let Some(submission) =
             self.queue.creating_local_submission(&workspace.id)?
         {
@@ -754,20 +770,6 @@ impl RepositoryManager {
             },
         )?;
         let result = (|| {
-            let (_, policy_json, digest) =
-                load_policy_at(&repository.integration_path, target_sha)?;
-            if repository.policy_target_sha != target_sha
-                || repository.policy_snapshot_json != policy_json
-                || repository.policy_digest != digest
-            {
-                self.queue.update_repository_policy(
-                    &repository.key,
-                    &self.owner_id,
-                    target_sha,
-                    &policy_json,
-                    &digest,
-                )?;
-            }
             let seed = repository
                 .seed
                 .identity()
@@ -1207,21 +1209,74 @@ pub(crate) fn reconcile_registered_checkout(
     }
 }
 
-pub fn load_policy_at(repo: &Path, target_sha: &str) -> Result<(PolicySnapshot, String, String)> {
-    require_full_sha(target_sha)?;
-    let output = Command::new("git")
-        .args(["show", &format!("{target_sha}:.iq/config.json")])
-        .current_dir(repo)
-        .output()
-        .with_context(|| format!("read trusted .iq/config.json from {target_sha}"))?;
-    if !output.status.success() {
+pub fn load_local_policy(repo: &Path) -> Result<(PolicySnapshot, String, String)> {
+    reject_tracked_policy(repo)?;
+    let config_directory = repo.join(".iq");
+    let config_path = config_directory.join("config.json");
+    let directory_metadata = match fs::symlink_metadata(&config_directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return canonical_policy_snapshot(ValidationPolicy::None)
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {}", config_directory.display()))
+        }
+    };
+    if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
         anyhow::bail!(
-            "target {target_sha} has no readable strict .iq/config.json: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "local IQ policy directory must be a regular non-symlink directory: {}",
+            config_directory.display()
         );
     }
-    let raw: RawConfig = serde_json::from_slice(&output.stdout)
-        .context("parse strict versioned .iq/config.json from exact target")?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(&config_directory)
+        .with_context(|| {
+            format!(
+                "open local IQ policy directory {}",
+                config_directory.display()
+            )
+        })?;
+    verify_policy_directory(&config_directory, &directory, &directory_metadata)?;
+    let file_name = CString::new("config.json").expect("static policy file name has no NUL");
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            file_name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if descriptor < 0 {
+        let error = std::io::Error::last_os_error();
+        verify_policy_directory(&config_directory, &directory, &directory_metadata)?;
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return canonical_policy_snapshot(ValidationPolicy::None);
+        }
+        return Err(error).context("open local IQ policy config.json");
+    }
+    let file = unsafe { fs::File::from_raw_fd(descriptor) };
+    verify_policy_directory(&config_directory, &directory, &directory_metadata)?;
+    let metadata = file
+        .metadata()
+        .context("inspect open local IQ policy config.json")?;
+    if !metadata.is_file() {
+        anyhow::bail!("local IQ policy config.json must be a regular non-symlink file");
+    }
+    let mut contents = Vec::new();
+    file.take((MAX_POLICY_BYTES + 1) as u64)
+        .read_to_end(&mut contents)
+        .context("read local IQ policy config.json")?;
+    verify_policy_directory(&config_directory, &directory, &directory_metadata)?;
+    if contents.len() > MAX_POLICY_BYTES {
+        anyhow::bail!("local IQ policy exceeds the {MAX_POLICY_BYTES} byte limit");
+    }
+    let raw: RawConfig = serde_json::from_slice(&contents).with_context(|| {
+        format!(
+            "parse strict versioned local policy {}",
+            config_path.display()
+        )
+    })?;
     if raw.version != 1 {
         anyhow::bail!(
             "unsupported .iq/config.json version {}; expected 1",
@@ -1230,8 +1285,73 @@ pub fn load_policy_at(repo: &Path, target_sha: &str) -> Result<(PolicySnapshot, 
     }
     let validation_command =
         exact_nonblank(raw.integration.validation.command, "validation command")?;
-    let signoff = match raw.integration.signoff {
-        SignoffPolicy::None => SignoffPolicy::None,
+    let signoff = validate_signoff(raw.integration.signoff)?;
+    canonical_policy_snapshot(ValidationPolicy::Command {
+        command: validation_command,
+        signoff,
+    })
+}
+
+fn verify_policy_directory(
+    path: &Path,
+    directory: &fs::File,
+    original: &fs::Metadata,
+) -> Result<()> {
+    let current = fs::symlink_metadata(path)
+        .with_context(|| format!("reinspect local IQ policy directory {}", path.display()))?;
+    let open = directory
+        .metadata()
+        .with_context(|| format!("inspect open local IQ policy directory {}", path.display()))?;
+    if current.file_type().is_symlink()
+        || !current.is_dir()
+        || original.dev() != open.dev()
+        || original.ino() != open.ino()
+        || current.dev() != open.dev()
+        || current.ino() != open.ino()
+    {
+        anyhow::bail!("local IQ policy directory identity changed while reading policy");
+    }
+    Ok(())
+}
+
+fn canonical_policy_snapshot(policy: ValidationPolicy) -> Result<(PolicySnapshot, String, String)> {
+    let policy = PolicySnapshot { version: 1, policy };
+    let json = serde_json::to_string(&policy)?;
+    let digest = format!("{:x}", Sha256::digest(json.as_bytes()));
+    Ok((policy, json, digest))
+}
+
+pub(crate) fn no_validation_policy_snapshot() -> Result<(String, String)> {
+    let (_, snapshot, digest) = canonical_policy_snapshot(ValidationPolicy::None)?;
+    Ok((snapshot, digest))
+}
+
+pub fn verify_policy_snapshot(policy_json: &str, digest: &str) -> Result<PolicySnapshot> {
+    let actual = format!("{:x}", Sha256::digest(policy_json.as_bytes()));
+    if actual != digest {
+        anyhow::bail!("persisted policy SHA-256 digest does not match its snapshot");
+    }
+    let mut policy: PolicySnapshot =
+        serde_json::from_str(policy_json).context("parse persisted strict policy snapshot")?;
+    if policy.version != 1 {
+        anyhow::bail!("persisted policy snapshot has an unsupported version");
+    }
+    policy.policy = match policy.policy {
+        ValidationPolicy::None => ValidationPolicy::None,
+        ValidationPolicy::Command { command, signoff } => ValidationPolicy::Command {
+            command: exact_nonblank(command, "persisted validation command")?,
+            signoff: validate_signoff(signoff)?,
+        },
+    };
+    if serde_json::to_string(&policy)? != policy_json {
+        anyhow::bail!("persisted policy snapshot is not canonical JSON");
+    }
+    Ok(policy)
+}
+
+fn validate_signoff(signoff: SignoffPolicy) -> Result<SignoffPolicy> {
+    match signoff {
+        SignoffPolicy::None => Ok(SignoffPolicy::None),
         SignoffPolicy::Required { command, contexts } => {
             let command = exact_nonblank(command, "signoff command")?;
             if contexts.is_empty() {
@@ -1245,38 +1365,33 @@ pub fn load_policy_at(repo: &Path, target_sha: &str) -> Result<(PolicySnapshot, 
                 }
                 validated.push(context);
             }
-            SignoffPolicy::Required {
+            Ok(SignoffPolicy::Required {
                 command,
                 contexts: validated,
-            }
+            })
         }
-    };
-    let policy = PolicySnapshot {
-        version: 1,
-        target_base_sha: target_sha.to_string(),
-        validation_command,
-        signoff,
-    };
-    let json = serde_json::to_string(&policy)?;
-    let digest = format!("{:x}", Sha256::digest(json.as_bytes()));
-    Ok((policy, json, digest))
+    }
 }
 
-pub fn verify_policy_snapshot(
-    policy_json: &str,
-    digest: &str,
-    target_sha: &str,
-) -> Result<PolicySnapshot> {
-    let actual = format!("{:x}", Sha256::digest(policy_json.as_bytes()));
-    if actual != digest {
-        anyhow::bail!("persisted policy SHA-256 digest does not match its snapshot");
+pub(crate) fn reject_tracked_policy(repo: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["ls-files", "--error-unmatch", "--", ".iq/config.json"])
+        .current_dir(repo)
+        .output()
+        .with_context(|| format!("check tracked IQ policy in {}", repo.display()))?;
+    if output.status.success() {
+        anyhow::bail!(
+            ".iq/config.json is local control-plane configuration and must not be tracked"
+        );
     }
-    let policy: PolicySnapshot =
-        serde_json::from_str(policy_json).context("parse persisted strict policy snapshot")?;
-    if policy.version != 1 || policy.target_base_sha != target_sha {
-        anyhow::bail!("persisted policy snapshot does not match exact attempt target SHA");
+    if output.status.code() != Some(1) {
+        anyhow::bail!(
+            "cannot determine whether .iq/config.json is tracked: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
-    Ok(policy)
+    Ok(())
 }
 
 fn exact_nonblank(value: String, label: &str) -> Result<String> {
@@ -1576,7 +1691,7 @@ fn validate_ref_component(value: &str, label: &str) -> Result<()> {
 
 fn require_full_sha(value: &str) -> Result<()> {
     if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        anyhow::bail!("target policy identity must be a full hexadecimal Git object ID");
+        anyhow::bail!("Git object identity must be a full hexadecimal object ID");
     }
     Ok(())
 }

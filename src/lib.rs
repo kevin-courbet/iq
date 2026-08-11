@@ -357,9 +357,6 @@ pub mod sqlite {
         pub workspace_root: PathBuf,
         pub checkout_reconciliation: CheckoutReconciliationState,
         pub seed_refresh: SeedRefreshState,
-        pub policy_target_sha: String,
-        pub policy_snapshot_json: String,
-        pub policy_digest: String,
         pub created_at: String,
         pub updated_at: String,
     }
@@ -379,6 +376,16 @@ pub mod sqlite {
         Ready { target_sha: String },
         Pending { target_sha: String },
         Failed { target_sha: String, message: String },
+    }
+
+    impl SeedRefreshState {
+        pub fn target_sha(&self) -> &str {
+            match self {
+                Self::Ready { target_sha }
+                | Self::Pending { target_sha }
+                | Self::Failed { target_sha, .. } => target_sha,
+            }
+        }
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -555,11 +562,23 @@ pub mod sqlite {
         pub validation_command: Option<String>,
         pub validation_exit_code: Option<i64>,
         pub validation_log_path: Option<String>,
-        pub policy_target_sha: Option<String>,
         pub policy_snapshot_json: Option<String>,
         pub policy_digest: Option<String>,
         pub signoff_evidence_json: Option<String>,
         pub moved_base: MovedBaseState,
+    }
+
+    struct NoValidationAttemptRow {
+        item_id: String,
+        target_base_sha: Option<String>,
+        merge_commit_sha: Option<String>,
+        validated_commit_sha: Option<String>,
+        validation_command: Option<String>,
+        validation_exit_code: Option<i64>,
+        validation_log_path: Option<String>,
+        policy_snapshot_json: Option<String>,
+        policy_digest: Option<String>,
+        signoff_evidence_json: Option<String>,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -577,12 +596,12 @@ pub mod sqlite {
         },
     }
 
-    pub(crate) enum MovedTargetPolicy<'a> {
-        Trusted {
+    pub(crate) enum AttemptPolicy<'a> {
+        Snapshot {
             snapshot_json: &'a str,
             digest: &'a str,
         },
-        Host,
+        HostValidation,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -806,11 +825,24 @@ pub mod sqlite {
                     .optional()?;
                 match version.as_deref() {
                     Some("2") => Self::migrate_released_v2(&mut conn)?,
-                    Some("3") => Self::migrate_standalone_v3(&mut conn, &path)?,
-                    Some("4") => Self::migrate_standalone_v4(&mut conn)?,
-                    Some("5") => Self::migrate_standalone_v5(&mut conn)?,
-                    Some("6") => Self::migrate_standalone_v6(&mut conn)?,
-                    Some("7") => Self::validate_standalone_v7(&conn)?,
+                    Some("3") => {
+                        Self::migrate_standalone_v3(&mut conn, &path)?;
+                        Self::migrate_standalone_v7(&mut conn)?;
+                    }
+                    Some("4") => {
+                        Self::migrate_standalone_v4(&mut conn)?;
+                        Self::migrate_standalone_v7(&mut conn)?;
+                    }
+                    Some("5") => {
+                        Self::migrate_standalone_v5(&mut conn)?;
+                        Self::migrate_standalone_v7(&mut conn)?;
+                    }
+                    Some("6") => {
+                        Self::migrate_standalone_v6(&mut conn)?;
+                        Self::migrate_standalone_v7(&mut conn)?;
+                    }
+                    Some("7") => Self::migrate_standalone_v7(&mut conn)?,
+                    Some("8") => Self::validate_standalone_v8(&conn)?,
                     Some(version) => anyhow::bail!("unsupported IQ schema version {version}"),
                     None => anyhow::bail!("existing IQ database has no standalone schema version"),
                 }
@@ -830,7 +862,7 @@ pub mod sqlite {
                 .optional()?;
             if workspace_schema_version
                 .as_deref()
-                .is_some_and(|version| version != "7")
+                .is_some_and(|version| version != "8")
             {
                 anyhow::bail!(
                     "unsupported workspace schema version {}",
@@ -843,12 +875,12 @@ pub mod sqlite {
             tx.execute_batch(LANDING_STATE_TRIGGERS)?;
             tx.execute_batch(REGISTERED_REMOTE_TRIGGERS)?;
             tx.execute(
-                "INSERT INTO queue_metadata (key,value) VALUES ('workspace_schema_version','7') ON CONFLICT(key) DO UPDATE SET value='7'",
+                "INSERT INTO queue_metadata (key,value) VALUES ('workspace_schema_version','8') ON CONFLICT(key) DO UPDATE SET value='8'",
                 [],
             )?;
             tx.execute_batch(WORKSPACE_STATE_TRIGGERS)?;
             tx.commit()?;
-            Self::validate_standalone_v7(&conn)?;
+            Self::validate_standalone_v8(&conn)?;
             let metadata = fs::symlink_metadata(&path)
                 .with_context(|| format!("inspect queue db {}", path.display()))?;
             if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -961,6 +993,98 @@ pub mod sqlite {
             Ok(())
         }
 
+        fn migrate_standalone_v7(conn: &mut Connection) -> Result<()> {
+            conn.pragma_update(None, "foreign_keys", "OFF")?;
+            conn.pragma_update(None, "legacy_alter_table", "ON")?;
+            let migration = (|| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                Self::reject_active_migration_leases(&tx, "7")?;
+                Self::reject_nonterminal_migration_items(&tx, "7")?;
+                tx.execute_batch(
+                    r#"
+ALTER TABLE integration_attempts RENAME TO integration_attempts_v7;
+ALTER TABLE registered_repositories RENAME TO registered_repositories_v7;
+"#,
+                )?;
+                tx.execute_batch(SCHEMA)?;
+                tx.execute_batch(COMPOSITION_SCHEMA)?;
+                tx.execute_batch(
+                    r#"INSERT INTO registered_repositories (
+  repo_key,integration_path,target_branch,remote,seed_path,seed_rift_id,seed_source_rift_id,workspace_root,checkout_reconciliation_json,seed_refresh_json,created_at,updated_at
+)
+SELECT
+  repo_key,integration_path,target_branch,remote,seed_path,seed_rift_id,seed_source_rift_id,workspace_root,checkout_reconciliation_json,seed_refresh_json,created_at,updated_at
+FROM registered_repositories_v7;
+INSERT INTO integration_attempts (
+  id,item_id,attempt_number,source_head_sha,target_base_sha,merge_commit_sha,validated_commit_sha,landed_commit_sha,validation_command,validation_exit_code,validation_log_path,policy_snapshot_json,policy_digest,signoff_evidence_json,moved_base_json,started_at,finished_at,result
+)
+SELECT
+  id,item_id,attempt_number,source_head_sha,target_base_sha,merge_commit_sha,validated_commit_sha,landed_commit_sha,validation_command,validation_exit_code,validation_log_path,policy_snapshot_json,policy_digest,signoff_evidence_json,moved_base_json,started_at,finished_at,result
+FROM integration_attempts_v7;
+DROP TABLE integration_attempts_v7;
+DROP TABLE registered_repositories_v7;
+UPDATE queue_metadata SET value='8' WHERE key='workspace_schema_version';"#,
+                )?;
+                tx.execute_batch(QUEUE_SOURCE_TRIGGERS)?;
+                tx.execute_batch(REGISTERED_CHECKOUT_TRIGGERS)?;
+                tx.execute_batch(LANDING_STATE_TRIGGERS)?;
+                tx.execute_batch(REGISTERED_REMOTE_TRIGGERS)?;
+                tx.execute_batch(WORKSPACE_STATE_TRIGGERS)?;
+                Self::validate_standalone_v8(&tx)?;
+                tx.commit()?;
+                Ok::<(), anyhow::Error>(())
+            })();
+            conn.pragma_update(None, "legacy_alter_table", "OFF")?;
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            migration
+        }
+
+        fn validate_standalone_v8(conn: &Connection) -> Result<()> {
+            Self::validate_standalone_v7(conn).map_err(|error| {
+                anyhow::anyhow!("IQ schema version 8 structural validation failed: {error:#}")
+            })?;
+            let retired_columns: i64 = conn.query_row(
+                "SELECT (SELECT COUNT(*) FROM pragma_table_info('registered_repositories') WHERE name IN ('policy_target_sha','policy_snapshot_json','policy_digest')) + (SELECT COUNT(*) FROM pragma_table_info('integration_attempts') WHERE name='policy_target_sha')",
+                [],
+                |row| row.get(0),
+            )?;
+            if retired_columns != 0 {
+                anyhow::bail!("IQ schema version 8 retains retired repository policy columns");
+            }
+            let malformed_policy_pairs: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM queue_items item JOIN integration_attempts attempt ON attempt.id=item.current_attempt_id WHERE item.status IN ('merging','merged','validating','validated','integrating','blocked') AND ((attempt.policy_snapshot_json IS NULL)!=(attempt.policy_digest IS NULL) OR (attempt.policy_snapshot_json IS NOT NULL AND json_valid(attempt.policy_snapshot_json)=0))",
+                [],
+                |row| row.get(0),
+            )?;
+            if malformed_policy_pairs != 0 {
+                anyhow::bail!(
+                    "IQ schema version 8 has {malformed_policy_pairs} malformed attempt policy row(s)"
+                );
+            }
+            let missing_active_policy: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM queue_items item JOIN registered_repositories repository ON repository.repo_key=item.repo_key JOIN integration_attempts attempt ON attempt.id=item.current_attempt_id WHERE item.status IN ('merging','merged','validating','validated','integrating','blocked') AND (attempt.policy_snapshot_json IS NULL OR attempt.policy_digest IS NULL)",
+                [],
+                |row| row.get(0),
+            )?;
+            if missing_active_policy != 0 {
+                anyhow::bail!(
+                    "IQ schema version 8 has {missing_active_policy} active registered attempt(s) without policy snapshots"
+                );
+            }
+            let mut statement = conn.prepare(
+                "SELECT attempt.policy_snapshot_json,attempt.policy_digest FROM queue_items item JOIN integration_attempts attempt ON attempt.id=item.current_attempt_id WHERE item.status IN ('merging','merged','validating','validated','integrating','blocked') AND attempt.policy_snapshot_json IS NOT NULL",
+            )?;
+            let snapshots = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for (snapshot, digest) in snapshots {
+                crate::composition::verify_policy_snapshot(&snapshot, &digest)?;
+            }
+            Ok(())
+        }
+
         fn migrate_released_v2(conn: &mut Connection) -> Result<()> {
             let invalid_rows: i64 = conn.query_row(
                 "SELECT
@@ -1007,16 +1131,8 @@ pub mod sqlite {
             conn.pragma_update(None, "legacy_alter_table", "ON")?;
             let migration = (|| {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let active_leases: i64 = tx.query_row(
-                    "SELECT COUNT(*) FROM repo_leases WHERE expires_at>?1",
-                    params![now()],
-                    |row| row.get(0),
-                )?;
-                if active_leases != 0 {
-                    anyhow::bail!(
-                        "released IQ schema version 2 has {active_leases} active repository operation lease(s)"
-                    );
-                }
+                Self::reject_active_migration_leases(&tx, "2")?;
+                Self::reject_nonterminal_migration_items(&tx, "2")?;
                 let path_updates = Self::validated_v2_repository_paths(&tx)?;
                 for update in path_updates.queue {
                     tx.execute(
@@ -1053,14 +1169,14 @@ SELECT
   'remote_branch',source_branch,NULL,CASE WHEN pr_url IS NULL THEN 'direct' ELSE 'provider' END,NULL,created_at,updated_at
 FROM queue_items_v2;
 INSERT INTO integration_attempts (
-  id,item_id,attempt_number,source_head_sha,target_base_sha,merge_commit_sha,validated_commit_sha,landed_commit_sha,validation_command,validation_exit_code,validation_log_path,policy_target_sha,policy_snapshot_json,policy_digest,signoff_evidence_json,moved_base_json,started_at,finished_at,result
+  id,item_id,attempt_number,source_head_sha,target_base_sha,merge_commit_sha,validated_commit_sha,landed_commit_sha,validation_command,validation_exit_code,validation_log_path,policy_snapshot_json,policy_digest,signoff_evidence_json,moved_base_json,started_at,finished_at,result
 )
 SELECT
-  id,item_id,attempt_number,source_head_sha,target_base_sha,merge_commit_sha,validated_commit_sha,landed_commit_sha,validation_command,validation_exit_code,validation_log_path,NULL,NULL,NULL,NULL,'{"state":"none"}',started_at,finished_at,result
+  id,item_id,attempt_number,source_head_sha,target_base_sha,merge_commit_sha,validated_commit_sha,landed_commit_sha,validation_command,validation_exit_code,validation_log_path,NULL,NULL,NULL,'{"state":"none"}',started_at,finished_at,result
 FROM integration_attempts_v2;
 DROP TABLE integration_attempts_v2;
 DROP TABLE queue_items_v2;
-UPDATE queue_metadata SET value='7' WHERE key='workspace_schema_version';"#,
+UPDATE queue_metadata SET value='8' WHERE key='workspace_schema_version';"#,
                 )?;
                 Self::migrate_registered_remote_identities(&tx)?;
                 tx.execute_batch(QUEUE_SOURCE_TRIGGERS)?;
@@ -1068,7 +1184,7 @@ UPDATE queue_metadata SET value='7' WHERE key='workspace_schema_version';"#,
                 tx.execute_batch(LANDING_STATE_TRIGGERS)?;
                 tx.execute_batch(REGISTERED_REMOTE_TRIGGERS)?;
                 tx.execute_batch(WORKSPACE_STATE_TRIGGERS)?;
-                Self::validate_standalone_v7(&tx)?;
+                Self::validate_standalone_v8(&tx)?;
                 tx.commit()?;
                 Ok::<(), anyhow::Error>(())
             })();
@@ -1202,6 +1318,7 @@ UPDATE queue_metadata SET value='7' WHERE key='workspace_schema_version';"#,
             let migration = (|| {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 Self::reject_active_migration_leases(&tx, "3")?;
+                Self::reject_nonterminal_migration_items(&tx, "3")?;
                 Self::reconcile_workspace_owner_markers(&tx, database_path, true)?;
                 let invalid_seed_state: i64 = tx.query_row(
                     "SELECT COUNT(*) FROM registered_repositories WHERE json_extract(seed_refresh_json,'$.state')!='ready'",
@@ -1321,6 +1438,7 @@ SET seed_refresh_json=json_object('state','ready','target_sha',policy_target_sha
             let migration = (|| {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 Self::reject_active_migration_leases(&tx, "4")?;
+                Self::reject_nonterminal_migration_items(&tx, "4")?;
                 let invalid_seed_state: i64 = tx.query_row(
                     "SELECT COUNT(*) FROM registered_repositories WHERE json_extract(seed_refresh_json,'$.state')!='ready'",
                     [],
@@ -1376,6 +1494,7 @@ UPDATE queue_metadata SET value='7' WHERE key='workspace_schema_version';"#,
             let migration = (|| {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 Self::reject_active_migration_leases(&tx, "5")?;
+                Self::reject_nonterminal_migration_items(&tx, "5")?;
                 let malformed_seed_targets: i64 = tx.query_row(
                     "SELECT COUNT(*) FROM registered_repositories WHERE
                    json_valid(seed_refresh_json)=0 OR
@@ -1418,6 +1537,7 @@ UPDATE queue_metadata SET value='7' WHERE key='workspace_schema_version';"#,
             let migration = (|| {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 Self::reject_active_migration_leases(&tx, "6")?;
+                Self::reject_nonterminal_migration_items(&tx, "6")?;
                 tx.execute_batch(COMPOSITION_SCHEMA)?;
                 Self::migrate_queue_landing_state(&tx)?;
                 Self::migrate_registered_remote_identities(&tx)?;
@@ -1512,6 +1632,20 @@ DROP TABLE queue_items_v6;"#,
             if active_leases != 0 {
                 anyhow::bail!(
                     "standalone IQ schema version {version} has {active_leases} active repository operation lease(s)"
+                );
+            }
+            Ok(())
+        }
+
+        fn reject_nonterminal_migration_items(conn: &Connection, version: &str) -> Result<()> {
+            let nonterminal_items: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM queue_items WHERE status NOT IN ('integrated','cancelled')",
+                [],
+                |row| row.get(0),
+            )?;
+            if nonterminal_items != 0 {
+                anyhow::bail!(
+                    "standalone IQ schema version {version} has {nonterminal_items} nonterminal queue item(s); finish or cancel them before migration"
                 );
             }
             Ok(())
@@ -1760,17 +1894,23 @@ DROP TABLE queue_items_v6;"#,
         }
 
         pub fn claim_next_ready(&self, repo_key: &str) -> Result<Option<(QueueItem, Attempt)>> {
-            self.claim_next_ready_with_authority(repo_key, MutationAuthority::External)
+            self.claim_next_ready_with_authority(
+                repo_key,
+                MutationAuthority::External,
+                AttemptPolicy::HostValidation,
+            )
         }
 
         pub(crate) fn claim_next_ready_owned(
             &self,
             repo_key: &str,
             owner_id: &str,
+            policy: AttemptPolicy<'_>,
         ) -> Result<Option<(QueueItem, Attempt)>> {
             self.claim_next_ready_with_authority(
                 repo_key,
                 MutationAuthority::RepositoryLease { repo_key, owner_id },
+                policy,
             )
         }
 
@@ -1778,6 +1918,7 @@ DROP TABLE queue_items_v6;"#,
             &self,
             repo_key: &str,
             authority: MutationAuthority<'_>,
+            policy: AttemptPolicy<'_>,
         ) -> Result<Option<(QueueItem, Attempt)>> {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1797,6 +1938,14 @@ DROP TABLE queue_items_v6;"#,
                 tx.commit()?;
                 return Ok(None);
             }
+            let registered: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM registered_repositories WHERE repo_key=?1)",
+                params![repo_key],
+                |row| row.get(0),
+            )?;
+            if matches!((&policy, registered), (AttemptPolicy::HostValidation, true)) {
+                anyhow::bail!("registered attempt requires a local policy snapshot");
+            }
             let attempt_id = Uuid::new_v4().to_string();
             let attempt_number: i64 = tx.query_row(
                 "SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM integration_attempts WHERE item_id=?1",
@@ -1804,9 +1953,19 @@ DROP TABLE queue_items_v6;"#,
                 |row| row.get(0),
             )?;
             let now = now();
+            let (policy_snapshot, policy_digest) = match policy {
+                AttemptPolicy::Snapshot {
+                    snapshot_json,
+                    digest,
+                } => {
+                    crate::composition::verify_policy_snapshot(snapshot_json, digest)?;
+                    (Some(snapshot_json), Some(digest))
+                }
+                AttemptPolicy::HostValidation => (None, None),
+            };
             tx.execute(
-                "INSERT INTO integration_attempts (id,item_id,attempt_number,source_head_sha,started_at) VALUES (?1,?2,?3,?4,?5)",
-                params![attempt_id, item.id, attempt_number, item.current_head_sha, now],
+                "INSERT INTO integration_attempts (id,item_id,attempt_number,source_head_sha,policy_snapshot_json,policy_digest,started_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![attempt_id, item.id, attempt_number, item.current_head_sha, policy_snapshot, policy_digest, now],
             )?;
             tx.execute(
                 r#"UPDATE queue_items SET status='merging',current_attempt_id=?1,landing_state_json='{"state":"ready"}',blocked_phase=NULL,blocked_reason=NULL,blocked_message=NULL,prompt_id=NULL,updated_at=?2 WHERE id=?3"#,
@@ -2955,21 +3114,130 @@ DROP TABLE queue_items_v6;"#,
             Ok(())
         }
 
-        pub fn update_attempt_policy(
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn accept_candidate_without_validation(
             &self,
+            item_id: &str,
             attempt_id: &str,
-            target_sha: &str,
-            snapshot_json: &str,
-            digest: &str,
+            target_base_sha: &str,
+            candidate_sha: &str,
+            expected_status: QueueStatus,
+            repo_key: &str,
+            owner_id: &str,
         ) -> Result<()> {
-            let conn = self.connect()?;
-            let changed = conn.execute(
-                "UPDATE integration_attempts SET policy_target_sha=?1,policy_snapshot_json=?2,policy_digest=?3,validation_command=NULL,validation_exit_code=NULL,validation_log_path=NULL,validated_commit_sha=NULL,signoff_evidence_json=NULL WHERE id=?4",
-                params![target_sha,snapshot_json,digest,attempt_id],
+            for (value, label) in [
+                (target_base_sha, "no-validation target"),
+                (candidate_sha, "no-validation candidate"),
+            ] {
+                if !matches!(value.len(), 40 | 64)
+                    || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    anyhow::bail!("{label} must be a full hexadecimal Git object ID");
+                }
+            }
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let (item_status, current_attempt_id, item_repo_key): (String, Option<String>, String) =
+                required_row(
+                    tx.query_row(
+                        "SELECT status,current_attempt_id,repo_key FROM queue_items WHERE id=?1",
+                        params![item_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    ),
+                    "queue item",
+                    item_id,
+                )?;
+            Self::require_mutation_authority(
+                &tx,
+                &item_repo_key,
+                MutationAuthority::RepositoryLease { repo_key, owner_id },
+            )?;
+            if item_status != expected_status.to_string()
+                || current_attempt_id.as_deref() != Some(attempt_id)
+            {
+                anyhow::bail!(
+                    "no-validation acceptance does not match the current item attempt and status"
+                );
+            }
+            let attempt = required_row(
+                tx.query_row(
+                    "SELECT item_id,target_base_sha,merge_commit_sha,validated_commit_sha,validation_command,validation_exit_code,validation_log_path,policy_snapshot_json,policy_digest,signoff_evidence_json FROM integration_attempts WHERE id=?1",
+                    params![attempt_id],
+                    |row| Ok(NoValidationAttemptRow {
+                        item_id: row.get(0)?,
+                        target_base_sha: row.get(1)?,
+                        merge_commit_sha: row.get(2)?,
+                        validated_commit_sha: row.get(3)?,
+                        validation_command: row.get(4)?,
+                        validation_exit_code: row.get(5)?,
+                        validation_log_path: row.get(6)?,
+                        policy_snapshot_json: row.get(7)?,
+                        policy_digest: row.get(8)?,
+                        signoff_evidence_json: row.get(9)?,
+                    }),
+                ),
+                "integration attempt",
+                attempt_id,
+            )?;
+            if attempt.item_id != item_id
+                || attempt.target_base_sha.as_deref() != Some(target_base_sha)
+                || attempt.merge_commit_sha.as_deref() != Some(candidate_sha)
+            {
+                anyhow::bail!(
+                    "no-validation acceptance does not match the persisted target and candidate"
+                );
+            }
+            let snapshot = attempt
+                .policy_snapshot_json
+                .as_deref()
+                .context("no-validation attempt has no persisted policy snapshot")?;
+            let digest = attempt
+                .policy_digest
+                .as_deref()
+                .context("no-validation attempt has no persisted policy digest")?;
+            let policy = crate::composition::verify_policy_snapshot(snapshot, digest)?;
+            if policy.policy != crate::composition::ValidationPolicy::None {
+                anyhow::bail!("attempt policy requires validation");
+            }
+            if attempt.validated_commit_sha.as_deref() == Some(candidate_sha)
+                && attempt.validation_command.is_none()
+                && attempt.validation_exit_code.is_none()
+                && attempt.validation_log_path.is_none()
+                && attempt.signoff_evidence_json.is_none()
+            {
+                tx.commit()?;
+                return Ok(());
+            }
+            if attempt.validated_commit_sha.is_some()
+                || attempt.validation_command.is_some()
+                || attempt.validation_exit_code.is_some()
+                || attempt.validation_log_path.is_some()
+                || attempt.signoff_evidence_json.is_some()
+            {
+                anyhow::bail!("attempt already has different candidate evidence");
+            }
+            let changed = tx.execute(
+                "UPDATE integration_attempts SET validated_commit_sha=?1 WHERE id=?2 AND item_id=?3 AND target_base_sha=?4 AND merge_commit_sha=?1",
+                params![candidate_sha,attempt_id,item_id,target_base_sha],
             )?;
             if changed != 1 {
-                anyhow::bail!("integration attempt disappeared during policy snapshot");
+                anyhow::bail!(
+                    "integration attempt identity changed during no-validation acceptance"
+                );
             }
+            Self::record_event_tx(
+                &tx,
+                item_id,
+                "validation_skipped",
+                &format!("validation skipped for exact candidate {candidate_sha}"),
+            )?;
+            Self::record_event_tx(
+                &tx,
+                item_id,
+                "signoff_not_required",
+                &format!("signoff not required for exact candidate {candidate_sha}"),
+            )?;
+            tx.commit()?;
             Ok(())
         }
 
@@ -2990,23 +3258,15 @@ DROP TABLE queue_items_v6;"#,
             attempt_id: &str,
             target_sha: &str,
             source_sha: &str,
-            policy: MovedTargetPolicy<'_>,
         ) -> Result<()> {
             let conn = self.connect()?;
             let moved = serde_json::to_string(&MovedBaseState::Pending {
                 target_sha: target_sha.to_string(),
                 source_sha: source_sha.to_string(),
             })?;
-            let (policy_target, policy_snapshot, policy_digest) = match policy {
-                MovedTargetPolicy::Trusted {
-                    snapshot_json,
-                    digest,
-                } => (Some(target_sha), Some(snapshot_json), Some(digest)),
-                MovedTargetPolicy::Host => (None, None, None),
-            };
             let changed = conn.execute(
-                "UPDATE integration_attempts SET target_base_sha=?1,merge_commit_sha=NULL,validated_commit_sha=NULL,validation_command=NULL,validation_exit_code=NULL,validation_log_path=NULL,policy_target_sha=?2,policy_snapshot_json=?3,policy_digest=?4,signoff_evidence_json=NULL,moved_base_json=?5 WHERE id=?6",
-                params![target_sha,policy_target,policy_snapshot,policy_digest,moved,attempt_id],
+                "UPDATE integration_attempts SET target_base_sha=?1,merge_commit_sha=NULL,validated_commit_sha=NULL,validation_command=NULL,validation_exit_code=NULL,validation_log_path=NULL,signoff_evidence_json=NULL,moved_base_json=?2 WHERE id=?3",
+                params![target_sha,moved,attempt_id],
             )?;
             if changed != 1 {
                 anyhow::bail!("integration attempt disappeared during moved-base intent");
@@ -3500,8 +3760,8 @@ DROP TABLE queue_items_v6;"#,
                     return Ok(());
                 }
                 tx.execute(
-                    "INSERT INTO registered_repositories (repo_key,integration_path,target_branch,remote,seed_path,seed_rift_id,seed_source_rift_id,workspace_root,checkout_reconciliation_json,seed_refresh_json,policy_target_sha,policy_snapshot_json,policy_digest,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,NULL,NULL,?6,?7,?8,?9,?10,?11,?12,?12)",
-                    params![repository.key,path_bytes(&repository.integration_path),repository.target_branch,repository.remote.name,path_bytes(Path::new(repository.seed.path().context("repository seed intent has no path")?)),path_bytes(&repository.workspace_root),serde_json::to_string(&repository.checkout_reconciliation)?,serde_json::to_string(&repository.seed_refresh)?,repository.policy_target_sha,repository.policy_snapshot_json,repository.policy_digest,repository.created_at],
+                    "INSERT INTO registered_repositories (repo_key,integration_path,target_branch,remote,seed_path,seed_rift_id,seed_source_rift_id,workspace_root,checkout_reconciliation_json,seed_refresh_json,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,NULL,NULL,?6,?7,?8,?9,?9)",
+                    params![repository.key,path_bytes(&repository.integration_path),repository.target_branch,repository.remote.name,path_bytes(Path::new(repository.seed.path().context("repository seed intent has no path")?)),path_bytes(&repository.workspace_root),serde_json::to_string(&repository.checkout_reconciliation)?,serde_json::to_string(&repository.seed_refresh)?,repository.created_at],
                 )?;
                 Ok(())
             })
@@ -3556,31 +3816,11 @@ DROP TABLE queue_items_v6;"#,
             })
         }
 
-        pub fn update_repository_policy(
-            &self,
-            repo_key: &str,
-            owner_id: &str,
-            target_sha: &str,
-            snapshot_json: &str,
-            digest: &str,
-        ) -> Result<()> {
-            self.composition_transaction(repo_key, owner_id, |tx| {
-                let changed = tx.execute(
-                    "UPDATE registered_repositories SET policy_target_sha=?1,policy_snapshot_json=?2,policy_digest=?3,updated_at=?4 WHERE repo_key=?5",
-                    params![target_sha,snapshot_json,digest,now(),repo_key],
-                )?;
-                if changed != 1 { anyhow::bail!("registered repository disappeared during policy refresh"); }
-                Ok(())
-            })
-        }
-
         pub fn refresh_registered_target(
             &self,
             repo_key: &str,
             owner_id: &str,
             target_sha: &str,
-            snapshot_json: &str,
-            digest: &str,
         ) -> Result<()> {
             let checkout = CheckoutReconciliationState::Ready {
                 target_sha: target_sha.to_string(),
@@ -3590,8 +3830,8 @@ DROP TABLE queue_items_v6;"#,
             };
             self.composition_transaction(repo_key, owner_id, |tx| {
                 let changed = tx.execute(
-                    "UPDATE registered_repositories SET checkout_reconciliation_json=?1,seed_refresh_json=?2,policy_target_sha=?3,policy_snapshot_json=?4,policy_digest=?5,updated_at=?6 WHERE repo_key=?7",
-                    params![serde_json::to_string(&checkout)?,serde_json::to_string(&seed)?,target_sha,snapshot_json,digest,now(),repo_key],
+                    "UPDATE registered_repositories SET checkout_reconciliation_json=?1,seed_refresh_json=?2,updated_at=?3 WHERE repo_key=?4",
+                    params![serde_json::to_string(&checkout)?,serde_json::to_string(&seed)?,now(),repo_key],
                 )?;
                 if changed != 1 {
                     anyhow::bail!("registered repository disappeared during target refresh");
@@ -4092,7 +4332,7 @@ DROP TABLE queue_items_v6;"#,
                     |row| row.get(0),
                 )
                 .optional()?;
-            if workspace_schema_version.as_deref() != Some("7") {
+            if workspace_schema_version.as_deref() != Some("8") {
                 anyhow::bail!(
                     "queue database workspace schema is missing or unsupported; restart the IQ daemon"
                 );
@@ -4335,7 +4575,7 @@ DROP TABLE queue_items_v6;"#,
             let conn = self.connect(Self::BUSY_TIMEOUT)?;
             required_row(
                 conn.query_row(
-                    "SELECT id,item_id,attempt_number,source_head_sha,target_base_sha,merge_commit_sha,validated_commit_sha,landed_commit_sha,validation_command,validation_exit_code,validation_log_path,policy_target_sha,policy_snapshot_json,policy_digest,signoff_evidence_json,moved_base_json FROM integration_attempts WHERE id=?1",
+                    "SELECT id,item_id,attempt_number,source_head_sha,target_base_sha,merge_commit_sha,validated_commit_sha,landed_commit_sha,validation_command,validation_exit_code,validation_log_path,policy_snapshot_json,policy_digest,signoff_evidence_json,moved_base_json FROM integration_attempts WHERE id=?1",
                     params![attempt_id],
                     |row| {
                         Ok(Attempt {
@@ -4350,11 +4590,10 @@ DROP TABLE queue_items_v6;"#,
                             validation_command: row.get(8)?,
                             validation_exit_code: row.get(9)?,
                             validation_log_path: row.get(10)?,
-                            policy_target_sha: row.get(11)?,
-                            policy_snapshot_json: row.get(12)?,
-                            policy_digest: row.get(13)?,
-                            signoff_evidence_json: row.get(14)?,
-                            moved_base: serde_json::from_str(&row.get::<_, String>(15)?)
+                            policy_snapshot_json: row.get(11)?,
+                            policy_digest: row.get(12)?,
+                            signoff_evidence_json: row.get(13)?,
+                            moved_base: serde_json::from_str(&row.get::<_, String>(14)?)
                                 .map_err(|error| map_json_error("moved_base_json", error))?,
                         })
                     },
@@ -4569,9 +4808,6 @@ DROP TABLE queue_items_v6;"#,
             workspace_root: row_path(row, "workspace_root")?,
             checkout_reconciliation,
             seed_refresh,
-            policy_target_sha: row.get("policy_target_sha")?,
-            policy_snapshot_json: row.get("policy_snapshot_json")?,
-            policy_digest: row.get("policy_digest")?,
             created_at: row.get("created_at")?,
             updated_at: row.get("updated_at")?,
         })
@@ -4933,7 +5169,6 @@ CREATE TABLE IF NOT EXISTS integration_attempts (
   validation_command TEXT,
   validation_exit_code INTEGER,
   validation_log_path TEXT,
-  policy_target_sha TEXT,
   policy_snapshot_json TEXT,
   policy_digest TEXT,
   signoff_evidence_json TEXT,
@@ -5046,9 +5281,6 @@ CREATE TABLE IF NOT EXISTS registered_repositories (
   workspace_root BLOB NOT NULL UNIQUE,
   checkout_reconciliation_json TEXT NOT NULL,
   seed_refresh_json TEXT NOT NULL,
-  policy_target_sha TEXT NOT NULL,
-  policy_snapshot_json TEXT NOT NULL,
-  policy_digest TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -5287,16 +5519,26 @@ pub mod integrator {
         pub trusted_creator: String,
     }
 
-    #[derive(Clone, Debug)]
-    pub struct IntegrationPolicy {
-        pub validation_command: Option<String>,
-        pub signoff: Option<SignoffPolicy>,
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub enum IntegrationPolicy {
+        NoValidation,
+        Validation {
+            command: String,
+            signoff: HostSignoffPolicy,
+        },
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub enum HostSignoffPolicy {
+        None,
+        Required(SignoffPolicy),
     }
 
     pub struct Integrator {
         queue: SqliteQueue,
         options: IntegratorOptions,
         policy: IntegrationPolicy,
+        registered: bool,
         lease_owner_id: String,
         workspaces: RiftWorkspaceManager,
     }
@@ -5323,6 +5565,47 @@ pub mod integrator {
     }
 
     const RIFT_TRASH_DIRECTORY: &str = ".trash";
+
+    fn validate_host_policy(policy: IntegrationPolicy) -> Result<IntegrationPolicy> {
+        let IntegrationPolicy::Validation { command, signoff } = policy else {
+            return Ok(IntegrationPolicy::NoValidation);
+        };
+        if command.is_empty() || command.trim() != command {
+            anyhow::bail!(
+                "host validation command must be non-empty and have no surrounding whitespace"
+            );
+        }
+        let signoff = match signoff {
+            HostSignoffPolicy::None => HostSignoffPolicy::None,
+            HostSignoffPolicy::Required(signoff) => {
+                if signoff.command.is_empty()
+                    || signoff.command.trim() != signoff.command
+                    || signoff.repository.is_empty()
+                    || signoff.repository.trim() != signoff.repository
+                    || signoff.trusted_creator.is_empty()
+                    || signoff.trusted_creator.trim() != signoff.trusted_creator
+                    || signoff.required_contexts.is_empty()
+                    || signoff
+                        .required_contexts
+                        .iter()
+                        .any(|context| context.is_empty() || context.trim() != context)
+                    || signoff
+                        .required_contexts
+                        .iter()
+                        .enumerate()
+                        .any(|(index, context)| {
+                            signoff.required_contexts[..index].contains(context)
+                        })
+                {
+                    anyhow::bail!(
+                        "host signoff policy requires exact command, repository, trusted_creator, and unique required_contexts"
+                    );
+                }
+                HostSignoffPolicy::Required(signoff)
+            }
+        };
+        Ok(IntegrationPolicy::Validation { command, signoff })
+    }
 
     pub fn workspace_scope(repo_key: &str) -> String {
         let hash = repo_key
@@ -7095,16 +7378,12 @@ pub mod integrator {
 
     impl Integrator {
         pub fn new(options: IntegratorOptions) -> Result<Self> {
-            let policy = IntegrationPolicy {
-                validation_command: None,
-                signoff: None,
-            };
-            Self::new_with_policy(options, policy)
+            Self::new_with_policy(options, IntegrationPolicy::NoValidation)
         }
 
         pub fn new_with_policy(
             mut options: IntegratorOptions,
-            mut policy: IntegrationPolicy,
+            policy: IntegrationPolicy,
         ) -> Result<Self> {
             options.repo_path = options.repo_path.canonicalize().with_context(|| {
                 format!(
@@ -7136,8 +7415,10 @@ pub mod integrator {
                 target,
                 &options.base_remote,
             )?;
-            if !registered && policy.validation_command.is_none() {
-                policy.validation_command = validation_command(&options.repo_path)?;
+            if registered && !matches!(&policy, IntegrationPolicy::NoValidation) {
+                anyhow::bail!(
+                    "registered repositories reject daemon validation and signoff; local integration-checkout policy is authoritative"
+                );
             }
             options.workspace_root = resolve_path_without_creating(&options.workspace_root)?;
             queue.verify_workspace_root_path(&options.repo_key, &options.workspace_root)?;
@@ -7152,35 +7433,7 @@ pub mod integrator {
                 workspace_generation,
             )?;
             options.workspace_root = workspaces.root.clone();
-            policy.validation_command = policy
-                .validation_command
-                .map(|command| command.trim().to_string())
-                .filter(|command| !command.is_empty());
-            if let Some(signoff) = policy.signoff.as_mut() {
-                signoff.command = signoff.command.trim().to_string();
-                signoff.repository = signoff.repository.trim().to_string();
-                signoff.trusted_creator = signoff.trusted_creator.trim().to_string();
-                signoff.required_contexts = signoff
-                    .required_contexts
-                    .iter()
-                    .map(|context| context.trim().to_string())
-                    .filter(|context| !context.is_empty())
-                    .fold(Vec::new(), |mut contexts, context| {
-                        if !contexts.contains(&context) {
-                            contexts.push(context);
-                        }
-                        contexts
-                    });
-                if signoff.command.is_empty()
-                    || signoff.repository.is_empty()
-                    || signoff.trusted_creator.is_empty()
-                    || signoff.required_contexts.is_empty()
-                {
-                    anyhow::bail!(
-                        "signoff policy requires command, repository, trusted_creator, and required_contexts"
-                    );
-                }
-            }
+            let policy = validate_host_policy(policy)?;
             let lease_owner_id = format!("{}:{}", options.owner_id, Uuid::new_v4());
             queue.register_workspace_root(
                 &options.repo_key,
@@ -7193,6 +7446,7 @@ pub mod integrator {
                 queue,
                 options,
                 policy,
+                registered,
                 lease_owner_id,
                 workspaces,
             })
@@ -7265,9 +7519,27 @@ pub mod integrator {
             if active.status != QueueStatus::Ready {
                 return self.resume_item_owned(&active.id).map(Some);
             }
-            let Some((item, attempt)) = self
-                .queue
-                .claim_next_ready_owned(&self.options.repo_key, &self.lease_owner_id)?
+            let policy_snapshot = if self.registered {
+                let (_, snapshot, digest) =
+                    crate::composition::load_local_policy(&self.options.repo_path)?;
+                Some((snapshot, digest))
+            } else if matches!(&self.policy, IntegrationPolicy::NoValidation) {
+                Some(crate::composition::no_validation_policy_snapshot()?)
+            } else {
+                None
+            };
+            let attempt_policy = match policy_snapshot.as_ref() {
+                Some((snapshot, digest)) => crate::sqlite::AttemptPolicy::Snapshot {
+                    snapshot_json: snapshot,
+                    digest,
+                },
+                None => crate::sqlite::AttemptPolicy::HostValidation,
+            };
+            let Some((item, attempt)) = self.queue.claim_next_ready_owned(
+                &self.options.repo_key,
+                &self.lease_owner_id,
+                attempt_policy,
+            )?
             else {
                 return Ok(None);
             };
@@ -8335,31 +8607,28 @@ pub mod integrator {
         fn policy_for_attempt(
             &self,
             attempt: &Attempt,
-            target_sha: &str,
         ) -> Result<crate::composition::PolicySnapshot> {
-            if attempt.policy_target_sha.as_deref() == Some(target_sha) {
-                if let (Some(snapshot), Some(digest)) = (
-                    attempt.policy_snapshot_json.as_deref(),
-                    attempt.policy_digest.as_deref(),
-                ) {
-                    return crate::composition::verify_policy_snapshot(
-                        snapshot, digest, target_sha,
-                    );
-                }
-            }
-            let (policy, snapshot, digest) =
-                crate::composition::load_policy_at(&self.options.repo_path, target_sha)?;
-            self.ensure_repo_lease()?;
-            self.queue
-                .update_attempt_policy(&attempt.id, target_sha, &snapshot, &digest)?;
-            Ok(policy)
+            let snapshot = attempt
+                .policy_snapshot_json
+                .as_deref()
+                .context("registered attempt has no local policy snapshot")?;
+            let digest = attempt
+                .policy_digest
+                .as_deref()
+                .context("registered attempt has no local policy digest")?;
+            crate::composition::verify_policy_snapshot(snapshot, digest)
         }
 
         fn requires_trusted_policy(&self, item: &QueueItem) -> Result<bool> {
-            Ok(matches!(
+            let registered = self.queue.repository_if_exists(&item.repo_key)?.is_some();
+            if matches!(
                 item.source,
                 crate::core::QueueSource::LocalSubmission { .. }
-            ) || self.queue.repository_if_exists(&item.repo_key)?.is_some())
+            ) && !registered
+            {
+                anyhow::bail!("local submission belongs to an unregistered repository");
+            }
+            Ok(registered)
         }
 
         fn require_exact_policy_signoff(
@@ -8370,12 +8639,11 @@ pub mod integrator {
             candidate_sha: &str,
         ) -> Result<Option<QueueItem>> {
             let current = self.queue.get_attempt(&attempt.id)?;
-            let target_sha = current
-                .target_base_sha
-                .as_deref()
-                .context("signoff attempt has no exact target base")?;
-            let policy = self.policy_for_attempt(&current, target_sha)?;
-            let crate::composition::SignoffPolicy::Required { command, contexts } = policy.signoff
+            let policy = self.policy_for_attempt(&current)?;
+            let crate::composition::ValidationPolicy::Command {
+                signoff: crate::composition::SignoffPolicy::Required { command, contexts },
+                ..
+            } = policy.policy
             else {
                 return Ok(None);
             };
@@ -8479,12 +8747,11 @@ pub mod integrator {
                 return Ok(());
             }
             let current = self.queue.get_attempt(&attempt.id)?;
-            let target_sha = current
-                .target_base_sha
-                .as_deref()
-                .context("fenced attempt has no exact target base")?;
-            let policy = self.policy_for_attempt(&current, target_sha)?;
-            let crate::composition::SignoffPolicy::Required { contexts, .. } = policy.signoff
+            let policy = self.policy_for_attempt(&current)?;
+            let crate::composition::ValidationPolicy::Command {
+                signoff: crate::composition::SignoffPolicy::Required { contexts, .. },
+                ..
+            } = policy.policy
             else {
                 return Ok(());
             };
@@ -8516,34 +8783,27 @@ pub mod integrator {
             if item.status == QueueStatus::Cancelled {
                 return Ok(item);
             }
-            let target_sha = self
-                .queue
-                .get_attempt(&attempt.id)?
-                .target_base_sha
-                .context("integration attempt has no exact target base for policy")?;
             let command = if self.requires_trusted_policy(&item)? {
-                match self.policy_for_attempt(attempt, &target_sha) {
-                    Ok(policy) => policy.validation_command,
+                match self.policy_for_attempt(attempt) {
+                    Ok(policy) => match policy.policy {
+                        crate::composition::ValidationPolicy::None => None,
+                        crate::composition::ValidationPolicy::Command { command, .. } => {
+                            Some(command)
+                        }
+                    },
                     Err(error) => {
                         return self.block_and_get(
                             &item.id,
                             BlockedPhase::Validating,
                             BlockedReason::NeedsAgentFix,
-                            &format!("exact target policy is missing or invalid: {error:#}"),
+                            &format!("attempt policy snapshot is missing or invalid: {error:#}"),
                         );
                     }
                 }
             } else {
-                match self.policy.validation_command.clone() {
-                    Some(command) => command,
-                    None => {
-                        return self.block_and_get(
-                            &item.id,
-                            BlockedPhase::Validating,
-                            BlockedReason::NeedsUserInput,
-                            "missing integration validation command",
-                        );
-                    }
+                match &self.policy {
+                    IntegrationPolicy::NoValidation => None,
+                    IntegrationPolicy::Validation { command, .. } => Some(command.clone()),
                 }
             };
             if let Some(dirty) = workspace_dirty(&workspace)? {
@@ -8554,6 +8814,25 @@ pub mod integrator {
                     &format!("candidate is dirty before validation: {dirty}"),
                 );
             }
+            let Some(command) = command else {
+                let candidate_sha = git_output(&workspace, ["rev-parse", "HEAD"])?;
+                let target_base_sha = self
+                    .queue
+                    .get_attempt(&attempt.id)?
+                    .target_base_sha
+                    .context("no-validation attempt has no exact target base")?;
+                self.ensure_repo_lease()?;
+                self.queue.accept_candidate_without_validation(
+                    &item.id,
+                    &attempt.id,
+                    &target_base_sha,
+                    &candidate_sha,
+                    QueueStatus::Validating,
+                    &self.options.repo_key,
+                    &self.lease_owner_id,
+                )?;
+                return self.transition_item_owned(&item.id, QueueStatus::Validated);
+            };
             let log_dir = self.evidence_dir(&item, attempt)?;
             let log_path = log_dir.path.join("validation.log");
             let outcome = match run_evidence_command(
@@ -8681,17 +8960,13 @@ pub mod integrator {
             }
             if self.requires_trusted_policy(&item)? {
                 let persisted_attempt = self.queue.get_attempt(&attempt.id)?;
-                let policy_target = persisted_attempt
-                    .target_base_sha
-                    .as_deref()
-                    .context("integration attempt has no exact policy target SHA")?;
-                if let Err(error) = self.policy_for_attempt(&persisted_attempt, policy_target) {
+                if let Err(error) = self.policy_for_attempt(&persisted_attempt) {
                     return self.block_and_get(
                         &item.id,
                         BlockedPhase::Integrating,
                         BlockedReason::NeedsAgentFix,
                         &format!(
-                            "exact target policy is missing or invalid during integration: {error:#}"
+                            "attempt policy snapshot is missing or invalid during integration: {error:#}"
                         ),
                     );
                 }
@@ -8815,7 +9090,11 @@ pub mod integrator {
                 {
                     return Ok(blocked);
                 }
-            } else if let Some(signoff) = &self.policy.signoff {
+            } else if let IntegrationPolicy::Validation {
+                signoff: HostSignoffPolicy::Required(signoff),
+                ..
+            } = &self.policy
+            {
                 if let Some(blocked) =
                     self.sign_candidate(&item, attempt, &workspace, &landed_sha, signoff)?
                 {
@@ -9465,6 +9744,7 @@ pub mod integrator {
             attempt: &Attempt,
             workspace: &Path,
         ) -> Result<()> {
+            crate::composition::reject_tracked_policy(workspace)?;
             let current_attempt = self.queue.get_attempt(&attempt.id)?;
             let head = git_output(workspace, ["rev-parse", "HEAD"])?;
             let validated = current_attempt
@@ -9557,41 +9837,11 @@ pub mod integrator {
                         }
                     };
                     self.ensure_repo_lease()?;
-                    if self.requires_trusted_policy(item)? {
-                        match crate::composition::load_policy_at(
-                            &self.options.repo_path,
-                            moved_base_sha,
-                        ) {
-                            Ok((_, snapshot, digest)) => {
-                                self.queue.begin_moved_base_reconciliation(
-                                    &attempt.id,
-                                    moved_base_sha,
-                                    &source_sha,
-                                    crate::sqlite::MovedTargetPolicy::Trusted {
-                                        snapshot_json: &snapshot,
-                                        digest: &digest,
-                                    },
-                                )?
-                            }
-                            Err(error) => {
-                                return Ok(Some(self.block_and_get(
-                                    &item.id,
-                                    BlockedPhase::Validating,
-                                    BlockedReason::NeedsAgentFix,
-                                    &format!(
-                                        "exact moved-target policy is missing or invalid: {error:#}"
-                                    ),
-                                )?));
-                            }
-                        }
-                    } else {
-                        self.queue.begin_moved_base_reconciliation(
-                            &attempt.id,
-                            moved_base_sha,
-                            &source_sha,
-                            crate::sqlite::MovedTargetPolicy::Host,
-                        )?;
-                    }
+                    self.queue.begin_moved_base_reconciliation(
+                        &attempt.id,
+                        moved_base_sha,
+                        &source_sha,
+                    )?;
                     source_sha
                 }
             };
@@ -9756,35 +10006,28 @@ pub mod integrator {
             label: &str,
         ) -> Result<Option<QueueItem>> {
             let command = if self.requires_trusted_policy(item)? {
-                match self.policy_for_attempt(attempt, moved_base_sha) {
-                    Ok(policy) => policy.validation_command,
+                match self.policy_for_attempt(attempt) {
+                    Ok(policy) => match policy.policy {
+                        crate::composition::ValidationPolicy::None => None,
+                        crate::composition::ValidationPolicy::Command { command, .. } => {
+                            Some(command)
+                        }
+                    },
                     Err(error) => {
                         return Ok(Some(self.block_and_get(
                             &item.id,
                             BlockedPhase::Validating,
                             BlockedReason::NeedsAgentFix,
-                            &format!("exact moved-target policy is missing or invalid after {label}: {error:#}"),
+                            &format!("attempt policy snapshot is missing or invalid after {label}: {error:#}"),
                         )?));
                     }
                 }
             } else {
-                match self.policy.validation_command.clone() {
-                    Some(command) => command,
-                    None => {
-                        return Ok(Some(self.block_and_get(
-                            &item.id,
-                            BlockedPhase::Validating,
-                            BlockedReason::NeedsUserInput,
-                            &format!("missing integration validation command after {label}"),
-                        )?));
-                    }
+                match &self.policy {
+                    IntegrationPolicy::NoValidation => None,
+                    IntegrationPolicy::Validation { command, .. } => Some(command.clone()),
                 }
             };
-            let log_dir = self.evidence_dir(item, attempt)?;
-            let safe_label = label.replace([' ', '/'], "-");
-            let log_path = log_dir
-                .path
-                .join(format!("revalidation-after-{safe_label}.log"));
             if let Some(dirty) = workspace_dirty(workspace)? {
                 return Ok(Some(self.block_and_get(
                     &item.id,
@@ -9793,6 +10036,25 @@ pub mod integrator {
                     &format!("candidate is dirty before revalidation after {label}: {dirty}"),
                 )?));
             }
+            let Some(command) = command else {
+                let candidate_sha = git_output(workspace, ["rev-parse", "HEAD"])?;
+                self.ensure_repo_lease()?;
+                self.queue.accept_candidate_without_validation(
+                    &item.id,
+                    &attempt.id,
+                    moved_base_sha,
+                    &candidate_sha,
+                    QueueStatus::Integrating,
+                    &self.options.repo_key,
+                    &self.lease_owner_id,
+                )?;
+                return Ok(None);
+            };
+            let log_dir = self.evidence_dir(item, attempt)?;
+            let safe_label = label.replace([' ', '/'], "-");
+            let log_path = log_dir
+                .path
+                .join(format!("revalidation-after-{safe_label}.log"));
             let outcome = match run_evidence_command(
                 &command,
                 workspace,
@@ -10131,7 +10393,11 @@ pub mod integrator {
                 {
                     return Ok(blocked);
                 }
-            } else if let Some(signoff) = &self.policy.signoff {
+            } else if let IntegrationPolicy::Validation {
+                signoff: HostSignoffPolicy::Required(signoff),
+                ..
+            } = &self.policy
+            {
                 if let Some(blocked) =
                     self.sign_candidate(&item, attempt, &workspace, &candidate_sha, signoff)?
                 {
@@ -10928,136 +11194,6 @@ pub mod integrator {
             });
         }
         Ok(statuses)
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct IqConfig {
-        integration: Option<IntegrationConfig>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct IntegrationConfig {
-        validation: Option<ValidationConfig>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct ValidationConfig {
-        command: Option<String>,
-    }
-
-    pub fn validation_command(repo_path: &Path) -> Result<Option<String>> {
-        let config_path = repo_path.join(".iq/config.json");
-        if config_path.exists() {
-            let contents = fs::read_to_string(&config_path)
-                .with_context(|| format!("read {}", config_path.display()))?;
-            let parsed: IqConfig = serde_json::from_str(&contents)
-                .with_context(|| format!("parse {}", config_path.display()))?;
-            if let Some(command) = parsed
-                .integration
-                .and_then(|integration| integration.validation)
-                .and_then(|validation| validation.command)
-                .filter(|command| !command.trim().is_empty())
-            {
-                return Ok(Some(command));
-            }
-        }
-
-        default_validation_command(repo_path)
-    }
-
-    fn default_validation_command(repo_path: &Path) -> Result<Option<String>> {
-        if taskfile_has_validate(repo_path)? {
-            return Ok(Some("task validate".into()));
-        }
-        if makefile_has_validate(repo_path)? {
-            return Ok(Some("make validate".into()));
-        }
-        if repo_path.join("Cargo.toml").exists() {
-            return Ok(Some("cargo test".into()));
-        }
-        if let Some(command) = package_json_validation_command(repo_path)? {
-            return Ok(Some(command));
-        }
-        Ok(None)
-    }
-
-    fn taskfile_has_validate(repo_path: &Path) -> Result<bool> {
-        for name in [
-            "Taskfile.yml",
-            "Taskfile.yaml",
-            "Taskfile.dist.yml",
-            "Taskfile.dist.yaml",
-        ] {
-            let path = repo_path.join(name);
-            if path.exists() && yaml_has_top_level_task(&path, "validate")? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    fn makefile_has_validate(repo_path: &Path) -> Result<bool> {
-        for name in ["Makefile", "makefile", "GNUmakefile"] {
-            let path = repo_path.join(name);
-            if !path.exists() {
-                continue;
-            }
-            let contents =
-                fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-            if contents
-                .lines()
-                .any(|line| line.starts_with("validate:") || line.starts_with("validate::"))
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    fn yaml_has_top_level_task(path: &Path, task_name: &str) -> Result<bool> {
-        let contents =
-            fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        let parsed: serde_yaml::Value =
-            serde_yaml::from_str(&contents).with_context(|| format!("parse {}", path.display()))?;
-        Ok(parsed
-            .get("tasks")
-            .and_then(|tasks| tasks.as_mapping())
-            .map(|tasks| tasks.contains_key(serde_yaml::Value::String(task_name.into())))
-            .unwrap_or(false))
-    }
-
-    fn package_json_validation_command(repo_path: &Path) -> Result<Option<String>> {
-        let path = repo_path.join("package.json");
-        if !path.exists() {
-            return Ok(None);
-        }
-        let contents =
-            fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let parsed: JsonValue =
-            serde_json::from_str(&contents).with_context(|| format!("parse {}", path.display()))?;
-        let scripts = parsed.get("scripts").and_then(JsonValue::as_object);
-        let Some(scripts) = scripts else {
-            return Ok(None);
-        };
-        if scripts.contains_key("validate") {
-            return Ok(Some(format!("{} run validate", package_manager(repo_path))));
-        }
-        if scripts.contains_key("test") {
-            return Ok(Some(format!("{} test", package_manager(repo_path))));
-        }
-        Ok(None)
-    }
-
-    fn package_manager(repo_path: &Path) -> &'static str {
-        if repo_path.join("bun.lock").exists() || repo_path.join("bun.lockb").exists() {
-            "bun"
-        } else if repo_path.join("pnpm-lock.yaml").exists() {
-            "pnpm"
-        } else if repo_path.join("yarn.lock").exists() {
-            "yarn"
-        } else {
-            "npm"
-        }
     }
 
     pub fn git<I, S>(cwd: &Path, args: I) -> Result<()>

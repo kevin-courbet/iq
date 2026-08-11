@@ -4,7 +4,7 @@ use iq::communication::{build_transports, CommunicationConfig, DecisionCommunica
 use iq::composition::{RepositoryInitOptions, RepositoryManager};
 use iq::core::QueueSource;
 use iq::integrator::{
-    validation_command, verify_rift_workspace_config, workspace_status, IntegrationPolicy,
+    verify_rift_workspace_config, workspace_status, HostSignoffPolicy, IntegrationPolicy,
     Integrator, IntegratorOptions, SignoffPolicy,
 };
 use iq::issue_backends::{
@@ -713,6 +713,8 @@ fn main() -> Result<()> {
 
 fn run_doctor(queue_db: &std::path::Path, config_path: &std::path::Path) -> Result<()> {
     let config = read_daemon_config(config_path)?;
+    let queue = SqliteQueue::open(queue_db)?;
+    let repository_manager = RepositoryManager::new(queue.clone());
     let gh = std::env::var("IQ_GITHUB_CLI").unwrap_or_else(|_| "gh".into());
     let mut results = Vec::new();
     for validated in config.repos {
@@ -722,8 +724,14 @@ fn run_doctor(queue_db: &std::path::Path, config_path: &std::path::Path) -> Resu
             repo_key,
             target,
             remote,
-            validation_command,
+            validation,
         } = validated;
+        let registered = queue.repository_if_exists(&repo_key)?.is_some();
+        if registered && (validation != ValidationConfig::None || repo.signoff.is_some()) {
+            anyhow::bail!(
+                "registered repository {repo_key} rejects daemon validation and signoff settings"
+            );
+        }
         let workspace_root = integrator_options(
             queue_db.to_path_buf(),
             canonical_repo_path.clone(),
@@ -807,14 +815,35 @@ fn run_doctor(queue_db: &std::path::Path, config_path: &std::path::Path) -> Resu
         } else {
             0
         };
+        let validation_report = if registered {
+            let policy = repository_manager.inspect_local_policy(&repo_key)?;
+            json!({
+                "authority": "local_integration_checkout",
+                "policy": policy.policy,
+            })
+        } else {
+            match &validation {
+                ValidationConfig::None => json!({
+                    "authority": "none",
+                    "policy": {"mode": "none"},
+                }),
+                ValidationConfig::Command { command } => json!({
+                    "authority": "daemon",
+                    "policy": {
+                        "mode": "command",
+                        "command": command,
+                        "signoff_required": repo.signoff.is_some(),
+                    },
+                }),
+            }
+        };
         results.push(json!({
             "repo_key": repo_key,
             "repo_path": canonical_repo_path,
             "workspace_root": workspace_root,
             "target": target,
             "remote": remote,
-            "validation_command": validation_command,
-            "signoff_required": repo.signoff.is_some(),
+            "validation": validation_report,
             "communication_transports": communication_transport_count,
         }));
     }
@@ -1251,8 +1280,7 @@ struct DaemonRepoConfig {
     remote: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     workspace_root: Option<PathBuf>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    validation_command: Option<String>,
+    validation: ValidationConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     signoff: Option<SignoffPolicy>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1271,7 +1299,7 @@ struct ValidatedDaemonRepo {
     repo_key: String,
     target: String,
     remote: String,
-    validation_command: String,
+    validation: ValidationConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1286,14 +1314,14 @@ struct DesiredInventory {
 struct DesiredRepository {
     repo_path: PathBuf,
     target: String,
-    validation: ValidationIntent,
+    validation: ValidationConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
-enum ValidationIntent {
-    Auto,
-    Explicit { command: String },
+enum ValidationConfig {
+    None,
+    Command { command: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1316,20 +1344,13 @@ struct ManagerBoundary {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum ManagerOwnership {
     Adopted {
-        original_validation: ValidationState,
-        last_applied_validation: ValidationState,
+        original_validation: ValidationConfig,
+        last_applied_validation: ValidationConfig,
     },
     Created {
         baseline: Box<RepositoryBaseline>,
-        last_applied_validation: ValidationState,
+        last_applied_validation: ValidationConfig,
     },
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum ValidationState {
-    Auto,
-    Explicit { command: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -1492,7 +1513,7 @@ fn reconcile_config(
                         anyhow::bail!("app-owned validation changed externally for {boundary_key}");
                     }
                     if let Some((_, intent)) = desired_repo {
-                        let next_validation = validation_state_for_intent(intent)?;
+                        let next_validation = validate_validation_config(intent)?;
                         effective_repos.push(apply_validation_state(
                             canonicalize_repo_path(repo.clone(), &boundary),
                             &next_validation,
@@ -1529,7 +1550,7 @@ fn reconcile_config(
                         anyhow::bail!("app-owned validation changed externally for {boundary_key}");
                     }
                     if let Some((_, intent)) = desired_repo {
-                        let next_validation = validation_state_for_intent(intent)?;
+                        let next_validation = validate_validation_config(intent)?;
                         effective_repos
                             .push(apply_validation_state(repo.clone(), &next_validation)?);
                         next_boundaries.push(ManagerBoundary {
@@ -1546,7 +1567,7 @@ fn reconcile_config(
             }
         } else if let Some((_, intent)) = desired_by_key.get(&boundary_key) {
             let original_validation = validation_state_for_repo(repo)?;
-            let next_validation = validation_state_for_intent(intent)?;
+            let next_validation = validate_validation_config(intent)?;
             effective_repos.push(apply_validation_state(
                 canonicalize_repo_path(repo.clone(), &boundary),
                 &next_validation,
@@ -1581,11 +1602,11 @@ fn reconcile_config(
                     .context("workspace root required for new repository boundary")?,
                 boundary,
             )),
-            validation_command: None,
+            validation: ValidationConfig::None,
             signoff: None,
             communication: None,
         };
-        let next_validation = validation_state_for_intent(intent)?;
+        let next_validation = validate_validation_config(intent)?;
         effective_repos.push(apply_validation_state(repo.clone(), &next_validation)?);
         next_boundaries.push(ManagerBoundary {
             repo_path: boundary.canonical_path.clone(),
@@ -1722,7 +1743,7 @@ fn verify_generation(
 
 fn normalize_desired_repositories(
     repositories: &[DesiredRepository],
-) -> Result<Vec<(Boundary, ValidationIntentValue)>> {
+) -> Result<Vec<(Boundary, ValidationConfig)>> {
     let mut boundaries = HashSet::new();
     let mut repo_keys = HashSet::new();
     repositories
@@ -1746,60 +1767,30 @@ fn normalize_desired_repositories(
             }
             Ok((
                 boundary,
-                ValidationIntentValue::from_input(&repository.validation)?,
+                validate_validation_config(&repository.validation)?,
             ))
         })
         .collect()
 }
 
-#[derive(Debug, Clone)]
-enum ValidationIntentValue {
-    Auto,
-    Explicit(String),
-}
-
-impl ValidationIntentValue {
-    fn from_input(input: &ValidationIntent) -> Result<Self> {
-        match input {
-            ValidationIntent::Auto => Ok(Self::Auto),
-            ValidationIntent::Explicit { command } => Ok(Self::Explicit(
-                require_exact_nonblank(command, "explicit validation command")?.to_string(),
-            )),
-        }
-    }
-}
-
-fn validation_state_for_intent(intent: &ValidationIntentValue) -> Result<ValidationState> {
-    Ok(match intent {
-        ValidationIntentValue::Auto => ValidationState::Auto,
-        ValidationIntentValue::Explicit(command) => ValidationState::Explicit {
-            command: command.clone(),
+fn validate_validation_config(validation: &ValidationConfig) -> Result<ValidationConfig> {
+    Ok(match validation {
+        ValidationConfig::None => ValidationConfig::None,
+        ValidationConfig::Command { command } => ValidationConfig::Command {
+            command: require_exact_nonblank(command, "validation command")?.to_string(),
         },
     })
 }
 
-fn validation_state_for_repo(repo: &DaemonRepoConfig) -> Result<ValidationState> {
-    Ok(match &repo.validation_command {
-        None => ValidationState::Auto,
-        Some(command) if command.trim().is_empty() => {
-            anyhow::bail!("validation_command must not be blank")
-        }
-        Some(command) => ValidationState::Explicit {
-            command: command.clone(),
-        },
-    })
+fn validation_state_for_repo(repo: &DaemonRepoConfig) -> Result<ValidationConfig> {
+    validate_validation_config(&repo.validation)
 }
 
 fn apply_validation_state(
     mut repo: DaemonRepoConfig,
-    state: &ValidationState,
+    state: &ValidationConfig,
 ) -> Result<DaemonRepoConfig> {
-    repo.validation_command = match state {
-        ValidationState::Auto => None,
-        ValidationState::Explicit { command } => {
-            Some(require_exact_nonblank(command, "validation command")?.to_string())
-        }
-    };
+    repo.validation = validate_validation_config(state)?;
     Ok(repo)
 }
 
@@ -1898,15 +1889,10 @@ fn validate_daemon_config(
                 );
             }
         }
-        let validation_command = match &repo.validation_command {
-            Some(command) => require_exact_nonblank(command, "validation_command")?.to_string(),
-            None => validation_command(&canonical_repo_path)?.with_context(|| {
-                format!(
-                    "repository {} has no configured or derivable validation command",
-                    canonical_repo_path.display()
-                )
-            })?,
-        };
+        let validation = validate_validation_config(&repo.validation)?;
+        if validation == ValidationConfig::None && repo.signoff.is_some() {
+            anyhow::bail!("signoff requires validation mode command");
+        }
         validate_signoff(repo.signoff.as_ref())?;
         if let Some(communication) = &repo.communication {
             build_transports(&communication.transports)
@@ -1918,7 +1904,7 @@ fn validate_daemon_config(
             repo_key,
             target,
             remote,
-            validation_command,
+            validation,
         });
     }
     Ok(ValidatedDaemonConfig { repos })
@@ -2043,8 +2029,8 @@ fn validate_manager_ownership(
     boundary: &Boundary,
     repo_key: &str,
 ) -> Result<()> {
-    let validate_validation = |state: &ValidationState, label: &str| -> Result<()> {
-        if let ValidationState::Explicit { command } = state {
+    let validate_validation = |state: &ValidationConfig, label: &str| -> Result<()> {
+        if let ValidationConfig::Command { command } = state {
             require_exact_nonblank(command, label)?;
         }
         Ok(())
@@ -2557,6 +2543,7 @@ fn run_daemon_config(
     interval_seconds: u64,
 ) -> Result<()> {
     let config = read_daemon_config(config_path)?;
+    let queue = SqliteQueue::open(&db_path)?;
     let mut runners = Vec::new();
     for validated in config.repos {
         let ValidatedDaemonRepo {
@@ -2565,8 +2552,14 @@ fn run_daemon_config(
             repo_key,
             target,
             remote,
-            validation_command,
+            validation,
         } = validated;
+        let registered = queue.repository_if_exists(&repo_key)?.is_some();
+        if registered && (validation != ValidationConfig::None || repo.signoff.is_some()) {
+            anyhow::bail!(
+                "registered repository {repo_key} rejects daemon validation and signoff settings"
+            );
+        }
         let options = integrator_options(
             db_path.clone(),
             canonical_repo_path,
@@ -2576,13 +2569,17 @@ fn run_daemon_config(
             repo.workspace_root,
             owner.clone(),
         )?;
-        let integrator = Integrator::new_with_policy(
-            options,
-            IntegrationPolicy {
-                validation_command: Some(validation_command),
-                signoff: repo.signoff,
+        let policy = match validation {
+            ValidationConfig::Command { command } => IntegrationPolicy::Validation {
+                command,
+                signoff: repo
+                    .signoff
+                    .map(HostSignoffPolicy::Required)
+                    .unwrap_or(HostSignoffPolicy::None),
             },
-        )?;
+            ValidationConfig::None => IntegrationPolicy::NoValidation,
+        };
+        let integrator = Integrator::new_with_policy(options, policy)?;
         let communicator = repo
             .communication
             .map(|communication| {
@@ -2678,5 +2675,49 @@ impl From<IssueProviderArg> for IssueProvider {
             IssueProviderArg::Github => IssueProvider::GitHub,
             IssueProviderArg::Gitlab => IssueProvider::GitLab,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_validation_requires_explicit_none_or_command_mode() {
+        let none = parse_daemon_config(
+            b"repos:\n  - repo_path: /repo\n    validation:\n      mode: none\n",
+            Path::new("iq.yaml"),
+        )
+        .unwrap();
+        assert_eq!(none.repos[0].validation, ValidationConfig::None);
+
+        let command = parse_daemon_config(
+            b"repos:\n  - repo_path: /repo\n    validation:\n      mode: command\n      command: git diff --check\n",
+            Path::new("iq.yaml"),
+        )
+        .unwrap();
+        assert_eq!(
+            command.repos[0].validation,
+            ValidationConfig::Command {
+                command: "git diff --check".into()
+            }
+        );
+
+        for ambiguous in [
+            b"repos:\n  - repo_path: /repo\n    validation:\n      mode: auto\n".as_slice(),
+            b"repos:\n  - repo_path: /repo\n    validation_command: git diff --check\n".as_slice(),
+            b"repos:\n  - repo_path: /repo\n".as_slice(),
+        ] {
+            assert!(parse_daemon_config(ambiguous, Path::new("iq.yaml")).is_err());
+        }
+
+        assert!(serde_json::from_slice::<DesiredInventory>(
+            br#"{"manager_id":"manager","repositories":[{"repo_path":"/repo","target":"main","validation":{"mode":"auto"}}]}"#,
+        )
+        .is_err());
+        assert!(serde_json::from_slice::<ManagerState>(
+            br#"{"manager_id":"manager","boundaries":[{"repo_path":"/repo","target":"main","repo_key":"repo::main","ownership":{"kind":"adopted","original_validation":{"kind":"auto"},"last_applied_validation":{"kind":"auto"}}}]}"#,
+        )
+        .is_err());
     }
 }

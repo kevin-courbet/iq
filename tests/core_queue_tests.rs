@@ -259,6 +259,151 @@ fn sqlite_read_fails_on_corrupt_persisted_json_fields() {
 }
 
 #[test]
+fn schema_v8_preserves_terminal_attempt_policy_as_opaque_history() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("queues.db");
+    let queue = SqliteQueue::open(&db).unwrap();
+    let item = queue
+        .enqueue(EnqueueRequest {
+            repo_key: "repo::main".into(),
+            repo_path: "/repo".into(),
+            source_branch: "agent/one".into(),
+            target_branch: "main".into(),
+            current_head_sha: "111".into(),
+            pr_url: None,
+            producer_metadata: serde_json::json!({"worker":"W001"}),
+        })
+        .unwrap();
+    let (_, attempt) = queue.claim_next_ready("repo::main").unwrap().unwrap();
+    queue
+        .transition_item(&item.id, QueueStatus::Cancelled)
+        .unwrap();
+    drop(queue);
+
+    let connection = Connection::open(&db).unwrap();
+    mark_database_as_v7(&connection);
+    connection
+        .execute(
+            "UPDATE integration_attempts SET policy_target_sha='legacy-target',policy_snapshot_json='opaque legacy policy',policy_digest='opaque legacy digest' WHERE id=?1",
+            params![attempt.id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let migrated = SqliteQueue::open(&db).unwrap();
+    let migrated_attempt = migrated.get_attempt(&attempt.id).unwrap();
+    assert_eq!(
+        migrated_attempt.policy_snapshot_json.as_deref(),
+        Some("opaque legacy policy")
+    );
+    assert_eq!(
+        migrated_attempt.policy_digest.as_deref(),
+        Some("opaque legacy digest")
+    );
+
+    let connection = Connection::open(&db).unwrap();
+    let version: String = connection
+        .query_row(
+            "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let retired_columns: i64 = connection
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM pragma_table_info('registered_repositories') WHERE name IN ('policy_target_sha','policy_snapshot_json','policy_digest')) + (SELECT COUNT(*) FROM pragma_table_info('integration_attempts') WHERE name='policy_target_sha')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, "8");
+    assert_eq!(retired_columns, 0);
+}
+
+#[test]
+fn schema_v8_rejects_nonterminal_queue_items() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("queues.db");
+    let queue = SqliteQueue::open(&db).unwrap();
+    queue
+        .enqueue(EnqueueRequest {
+            repo_key: "repo::main".into(),
+            repo_path: "/repo".into(),
+            source_branch: "agent/one".into(),
+            target_branch: "main".into(),
+            current_head_sha: "111".into(),
+            pr_url: None,
+            producer_metadata: serde_json::json!({"worker":"W001"}),
+        })
+        .unwrap();
+    drop(queue);
+
+    let connection = Connection::open(&db).unwrap();
+    mark_database_as_v7(&connection);
+    drop(connection);
+
+    let error = match SqliteQueue::open(&db) {
+        Ok(_) => panic!("nonterminal queue migrated"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(error.contains("1 nonterminal queue item"));
+    let connection = Connection::open(&db).unwrap();
+    let version: String = connection
+        .query_row(
+            "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, "7");
+}
+
+#[test]
+fn schema_v8_rejects_active_repository_leases() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("queues.db");
+    let queue = SqliteQueue::open(&db).unwrap();
+    assert!(queue.acquire_repo_lease("repo::main", "owner", 60).unwrap());
+    drop(queue);
+
+    let connection = Connection::open(&db).unwrap();
+    mark_database_as_v7(&connection);
+    drop(connection);
+
+    let error = match SqliteQueue::open(&db) {
+        Ok(_) => panic!("active lease migrated"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(error.contains("1 active repository operation lease"));
+    let connection = Connection::open(&db).unwrap();
+    let version: String = connection
+        .query_row(
+            "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, "7");
+}
+
+fn mark_database_as_v7(connection: &Connection) {
+    connection
+        .execute_batch(
+            "ALTER TABLE integration_attempts ADD COLUMN policy_target_sha TEXT;
+             ALTER TABLE registered_repositories ADD COLUMN policy_target_sha TEXT NOT NULL DEFAULT '';
+             ALTER TABLE registered_repositories ADD COLUMN policy_snapshot_json TEXT NOT NULL DEFAULT '';
+             ALTER TABLE registered_repositories ADD COLUMN policy_digest TEXT NOT NULL DEFAULT '';",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE queue_metadata SET value='7' WHERE key='workspace_schema_version'",
+            [],
+        )
+        .unwrap();
+}
+
+#[test]
 fn sqlite_repo_lease_prevents_concurrent_integrators_until_expiry() {
     let temp = tempdir().unwrap();
     let queue = SqliteQueue::open(&temp.path().join("queues.db")).unwrap();
