@@ -862,6 +862,7 @@ impl GitFixture {
         .unwrap();
         git(&repo, ["config", "user.email", "iq@example.test"]).unwrap();
         git(&repo, ["config", "user.name", "IQ Test"]).unwrap();
+        git(&repo, ["config", "commit.gpgsign", "false"]).unwrap();
         let hooks = temp.path().join("empty-hooks");
         fs::create_dir(&hooks).unwrap();
         git(&repo, ["config", "core.hooksPath", hooks.to_str().unwrap()]).unwrap();
