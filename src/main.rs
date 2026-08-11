@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use iq::communication::{build_transports, CommunicationConfig, DecisionCommunicator};
+use iq::composition::{RepositoryInitOptions, RepositoryManager};
+use iq::core::QueueSource;
 use iq::integrator::{
     validation_command, verify_rift_workspace_config, workspace_status, IntegrationPolicy,
     Integrator, IntegratorOptions, SignoffPolicy,
@@ -34,6 +36,44 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    Repo {
+        #[command(subcommand)]
+        command: RepoCommand,
+    },
+    DevWorkspace {
+        #[command(subcommand)]
+        command: DevWorkspaceCommand,
+    },
+    Submit {
+        #[arg(long)]
+        workspace: String,
+        #[arg(long)]
+        replace: Option<String>,
+    },
+    Cleanup {
+        #[arg(long)]
+        repo_key: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+    },
+    Integrate {
+        #[arg(long, conflicts_with = "resume", required_unless_present = "resume")]
+        next: bool,
+        #[arg(long, conflicts_with = "next", required_unless_present = "next")]
+        resume: Option<String>,
+        #[arg(long)]
+        repo_path: PathBuf,
+        #[arg(long)]
+        repo_key: Option<String>,
+        #[arg(long, default_value = "main")]
+        target: String,
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        #[arg(long)]
+        workspace_root: Option<PathBuf>,
+        #[arg(long)]
+        owner: Option<String>,
+    },
     Enqueue {
         #[arg(long)]
         repo_path: PathBuf,
@@ -128,8 +168,49 @@ enum Command {
 }
 
 #[derive(Subcommand, Debug)]
+enum RepoCommand {
+    Init {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        #[arg(long, default_value = "main")]
+        target: String,
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        #[arg(long)]
+        seed: Option<PathBuf>,
+        #[arg(long)]
+        workspace_root: Option<PathBuf>,
+    },
+    List,
+    Status {
+        #[arg(long)]
+        repo_key: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DevWorkspaceCommand {
+    Create {
+        #[arg(long)]
+        repo_key: String,
+        #[arg(long)]
+        name: String,
+    },
+    List {
+        #[arg(long)]
+        repo_key: Option<String>,
+    },
+    Status {
+        id: String,
+    },
+    Remove {
+        id: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum ConfigCommand {
-    /// Reconcile Threadmill-owned repositories without parsing IQ YAML in the host.
+    /// Reconcile IQ-owned repositories without parsing IQ YAML in the host.
     Reconcile {
         #[arg(long)]
         current_config: PathBuf,
@@ -293,8 +374,94 @@ enum IssueProviderArg {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let db_path = cli.queue_db.unwrap_or_else(SqliteQueue::default_db_path);
+    let db_path = match cli.queue_db {
+        Some(path) => path,
+        None => SqliteQueue::default_db_path()?,
+    };
     match cli.command {
+        Command::Repo { command } => {
+            let manager = RepositoryManager::new(SqliteQueue::open(&db_path)?);
+            match command {
+                RepoCommand::Init {
+                    path,
+                    target,
+                    remote,
+                    seed,
+                    workspace_root,
+                } => print_json(&manager.init(
+                    &path,
+                    RepositoryInitOptions {
+                        target_branch: target,
+                        remote,
+                        seed_path: seed,
+                        workspace_root,
+                    },
+                )?)?,
+                RepoCommand::List => print_json(&manager.list()?)?,
+                RepoCommand::Status { repo_key } => print_json(&manager.status(&repo_key)?)?,
+            }
+        }
+        Command::DevWorkspace { command } => {
+            let manager = RepositoryManager::new(SqliteQueue::open(&db_path)?);
+            match command {
+                DevWorkspaceCommand::Create { repo_key, name } => {
+                    print_json(&manager.create_workspace(&repo_key, &name)?)?
+                }
+                DevWorkspaceCommand::List { repo_key } => {
+                    print_json(&manager.workspaces(repo_key.as_deref())?)?
+                }
+                DevWorkspaceCommand::Status { id } => print_json(&manager.workspace_status(&id)?)?,
+                DevWorkspaceCommand::Remove { id } => print_json(&manager.remove_workspace(&id)?)?,
+            }
+        }
+        Command::Submit { workspace, replace } => {
+            let manager = RepositoryManager::new(SqliteQueue::open(&db_path)?);
+            print_json(&manager.submit(&workspace, replace.as_deref())?)?;
+        }
+        Command::Cleanup {
+            repo_key,
+            workspace,
+        } => {
+            let manager = RepositoryManager::new(SqliteQueue::open(&db_path)?);
+            if let Some(workspace) = workspace {
+                print_json(&manager.remove_workspace(&workspace)?)?;
+            } else {
+                let repo_keys = match repo_key {
+                    Some(repo_key) => vec![repo_key],
+                    None => manager.list()?.into_iter().map(|repo| repo.key).collect(),
+                };
+                let mut cleaned = Vec::new();
+                for repo_key in repo_keys {
+                    cleaned.extend(manager.cleanup_repo(&repo_key)?);
+                }
+                print_json(&cleaned)?;
+            }
+        }
+        Command::Integrate {
+            next: _,
+            resume,
+            repo_path,
+            repo_key,
+            target,
+            remote,
+            workspace_root,
+            owner,
+        } => {
+            let integrator = Integrator::new(integrator_options(
+                db_path,
+                repo_path,
+                repo_key,
+                &target,
+                remote,
+                workspace_root,
+                owner,
+            )?)?;
+            if let Some(item) = resume {
+                print_json(&integrator.resume_item(&item)?)?;
+            } else {
+                print_json(&integrator.run_once()?)?;
+            }
+        }
         Command::Enqueue {
             repo_path,
             repo_key,
@@ -306,11 +473,18 @@ fn main() -> Result<()> {
             remote,
         } => {
             let queue = SqliteQueue::open(&db_path)?;
-            let repo_key = repo_key.unwrap_or_else(|| default_repo_key(&repo_path, &target));
+            let repo_path = canonical_repo_path(&repo_path, "enqueue repository")?;
+            let repo_key = match repo_key {
+                Some(repo_key) => repo_key,
+                None => default_repo_key(&repo_path, &target)?,
+            };
             validate_branch_handoff(&repo_path, &remote, &source, &target, &head)?;
             let item = queue.enqueue(EnqueueRequest {
                 repo_key,
-                repo_path: repo_path.to_string_lossy().to_string(),
+                repo_path: repo_path
+                    .to_str()
+                    .context("canonical enqueue repository path is not valid UTF-8")?
+                    .to_string(),
                 source_branch: source,
                 target_branch: target,
                 current_head_sha: head,
@@ -338,6 +512,11 @@ fn main() -> Result<()> {
         Command::Requeue { item, head, remote } => {
             let queue = SqliteQueue::open(&db_path)?;
             let queued = queue.get_item(&item)?;
+            if matches!(queued.source, QueueSource::LocalSubmission { .. }) {
+                anyhow::bail!(
+                    "local submissions are immutable; use submit --replace for an agent fix"
+                );
+            }
             validate_branch_handoff(
                 std::path::Path::new(&queued.repo_path),
                 &remote,
@@ -376,7 +555,16 @@ fn main() -> Result<()> {
                 workspace_root: _,
                 owner: _,
             } => {
-                let repo_key = repo_key.unwrap_or_else(|| default_repo_key(&repo_path, "main"));
+                let repo_key = match repo_key {
+                    Some(repo_key) => repo_key,
+                    None => {
+                        let repo_path = canonical_existing_repo_path(
+                            &repo_path,
+                            "workspace status repository",
+                        )?;
+                        default_repo_key(&repo_path, "main")?
+                    }
+                };
                 let queue = SqliteQueueReader::open(&db_path)?;
                 print_json(&workspace_status(&queue, &repo_key)?)?;
             }
@@ -396,7 +584,7 @@ fn main() -> Result<()> {
                     remote,
                     workspace_root,
                     owner,
-                ))?;
+                )?)?;
                 print_json(&integrator.accept_current_workspace(&item)?)?;
             }
             WorkspaceCommand::Reset {
@@ -414,7 +602,7 @@ fn main() -> Result<()> {
                     remote,
                     workspace_root,
                     owner,
-                ))?;
+                )?)?;
                 print_json(&integrator.reset_workspaces()?)?;
             }
         },
@@ -544,7 +732,7 @@ fn run_doctor(queue_db: &std::path::Path, config_path: &std::path::Path) -> Resu
             remote.clone(),
             repo.workspace_root.clone(),
             Some("iq-doctor".into()),
-        )
+        )?
         .workspace_root;
         verify_rift_workspace_config(
             &canonical_repo_path,
@@ -653,10 +841,14 @@ fn run_remote_exec(
             producer,
         } => {
             let queue = SqliteQueue::open(&db_path)?;
+            let repo_path = canonical_repo_path(&repo_path, "remote enqueue repository")?;
             validate_branch_handoff(&repo_path, &remote, &source, &target, &head)?;
             let item = queue.enqueue(EnqueueRequest {
                 repo_key,
-                repo_path: repo_path.to_string_lossy().to_string(),
+                repo_path: repo_path
+                    .to_str()
+                    .context("canonical remote enqueue repository path is not valid UTF-8")?
+                    .to_string(),
                 source_branch: source,
                 target_branch: target,
                 current_head_sha: head,
@@ -792,8 +984,12 @@ fn integrator_options(
     remote: String,
     workspace_root: Option<PathBuf>,
     owner: Option<String>,
-) -> IntegratorOptions {
-    let repo_key = repo_key.unwrap_or_else(|| default_repo_key(&repo_path, target));
+) -> Result<IntegratorOptions> {
+    let repo_path = canonical_existing_repo_path(&repo_path, "integrator repository")?;
+    let repo_key = match repo_key {
+        Some(repo_key) => repo_key,
+        None => default_repo_key(&repo_path, target)?,
+    };
     let workspace_root = workspace_root.unwrap_or_else(|| {
         queue_db
             .parent()
@@ -801,7 +997,7 @@ fn integrator_options(
             .join("workspaces")
             .join(workspace_scope(&repo_key))
     });
-    IntegratorOptions {
+    Ok(IntegratorOptions {
         repo_key,
         repo_path,
         queue_db,
@@ -810,7 +1006,7 @@ fn integrator_options(
         base_remote: remote,
         workspace_root,
         rift_database: None,
-    }
+    })
 }
 
 fn workspace_scope(repo_key: &str) -> String {
@@ -823,14 +1019,25 @@ fn workspace_scope(repo_key: &str) -> String {
     format!("{hash:016x}")
 }
 
-fn default_repo_key(repo_path: &std::path::Path, target: &str) -> String {
-    format!(
-        "{}::{target}",
-        repo_path
-            .canonicalize()
-            .unwrap_or_else(|_| repo_path.to_path_buf())
-            .display()
-    )
+fn default_repo_key(repo_path: &std::path::Path, target: &str) -> Result<String> {
+    let path = repo_path
+        .to_str()
+        .context("canonical repository path is not valid UTF-8")?;
+    Ok(format!("{path}::{target}"))
+}
+
+fn canonical_existing_repo_path(path: &Path, label: &str) -> Result<PathBuf> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("resolve {label} {}", path.display()))?;
+    require_utf8_path(&canonical, label)?;
+    if !canonical.is_dir() {
+        anyhow::bail!(
+            "{label} path must be an existing directory: {}",
+            path.display()
+        );
+    }
+    Ok(canonical)
 }
 
 fn read_evidence(
@@ -1253,12 +1460,12 @@ fn reconcile_config(
         let current_repo = current.get(boundary_key).ok_or_else(|| {
             anyhow::anyhow!("owned manager boundary {boundary_key} is missing from current config")
         })?;
-        if config_repo_key(current_repo, &config_boundary_for_matching(current_repo)?)
+        if config_repo_key(current_repo, &config_boundary_for_matching(current_repo)?)?
             != owned_entry.repo_key
         {
             anyhow::bail!(
                 "owned manager boundary {boundary_key} has repo_key {}, expected {}",
-                config_repo_key(current_repo, &config_boundary_for_matching(current_repo)?),
+                config_repo_key(current_repo, &config_boundary_for_matching(current_repo)?)?,
                 owned_entry.repo_key
             );
         }
@@ -1312,7 +1519,7 @@ fn reconcile_config(
                     baseline,
                     last_applied_validation,
                 } => {
-                    if !matches_baseline(repo, baseline) {
+                    if !matches_baseline(repo, baseline)? {
                         anyhow::bail!(
                             "manager-created boundary {boundary_key} policy changed externally; refusing destructive removal or overwrite"
                         );
@@ -1347,7 +1554,7 @@ fn reconcile_config(
             next_boundaries.push(ManagerBoundary {
                 repo_path: boundary.canonical_path.clone(),
                 target: boundary.target.clone(),
-                repo_key: config_repo_key(repo, &boundary),
+                repo_key: config_repo_key(repo, &boundary)?,
                 ownership: ManagerOwnership::Adopted {
                     original_validation,
                     last_applied_validation: next_validation,
@@ -1362,7 +1569,7 @@ fn reconcile_config(
         if current.contains_key(&boundary.key()) {
             continue;
         }
-        let repo_key = default_repo_key(&boundary.canonical_path, &boundary.target);
+        let repo_key = default_repo_key(&boundary.canonical_path, &boundary.target)?;
         let repo = DaemonRepoConfig {
             repo_path: boundary.canonical_path.clone(),
             repo_key: Some(repo_key.clone()),
@@ -1385,7 +1592,7 @@ fn reconcile_config(
             target: boundary.target.clone(),
             repo_key,
             ownership: ManagerOwnership::Created {
-                baseline: Box::new(repository_baseline(&repo)),
+                baseline: Box::new(repository_baseline(&repo)?),
                 last_applied_validation: next_validation,
             },
         });
@@ -1428,7 +1635,7 @@ fn reconcile_config(
         current_manager_state: input_snapshot_digest(current_state_bytes.as_deref()),
         files: vec![
             generated_file_digest("iq.yaml", &staged_config_bytes),
-            generated_file_digest("threadmill-manager-state.json", &staged_state_bytes),
+            generated_file_digest("iq-manager-state.json", &staged_state_bytes),
             generated_file_digest("action", &staged_action_bytes),
         ],
     };
@@ -1533,7 +1740,7 @@ fn normalize_desired_repositories(
                     boundary.key()
                 );
             }
-            let repo_key = default_repo_key(&boundary.canonical_path, &boundary.target);
+            let repo_key = default_repo_key(&boundary.canonical_path, &boundary.target)?;
             if !repo_keys.insert(repo_key.clone()) {
                 anyhow::bail!("desired inventory duplicates repo_key {repo_key}");
             }
@@ -1601,30 +1808,32 @@ fn canonicalize_repo_path(mut repo: DaemonRepoConfig, boundary: &Boundary) -> Da
     repo
 }
 
-fn config_repo_key(repo: &DaemonRepoConfig, boundary: &Boundary) -> String {
-    repo.repo_key
-        .clone()
-        .unwrap_or_else(|| default_repo_key(&boundary.canonical_path, &boundary.target))
+fn config_repo_key(repo: &DaemonRepoConfig, boundary: &Boundary) -> Result<String> {
+    match repo.repo_key.clone() {
+        Some(repo_key) => Ok(repo_key),
+        None => default_repo_key(&boundary.canonical_path, &boundary.target),
+    }
 }
 
-fn repository_baseline(repo: &DaemonRepoConfig) -> RepositoryBaseline {
-    RepositoryBaseline {
+fn repository_baseline(repo: &DaemonRepoConfig) -> Result<RepositoryBaseline> {
+    Ok(RepositoryBaseline {
         repo_path: repo.repo_path.clone(),
-        repo_key: repo.repo_key.clone().unwrap_or_else(|| {
-            default_repo_key(&repo.repo_path, repo.target.as_deref().unwrap_or("main"))
-        }),
+        repo_key: match repo.repo_key.clone() {
+            Some(repo_key) => repo_key,
+            None => default_repo_key(&repo.repo_path, repo.target.as_deref().unwrap_or("main"))?,
+        },
         target: repo.target.clone().unwrap_or_else(|| "main".into()),
         remote: repo.remote.clone(),
         workspace_root: repo.workspace_root.clone(),
         signoff: repo.signoff.clone(),
         communication: repo.communication.clone(),
-    }
+    })
 }
 
-fn matches_baseline(repo: &DaemonRepoConfig, baseline: &RepositoryBaseline) -> bool {
-    repo.repo_key.as_deref() == Some(baseline.repo_key.as_str())
+fn matches_baseline(repo: &DaemonRepoConfig, baseline: &RepositoryBaseline) -> Result<bool> {
+    Ok(repo.repo_key.as_deref() == Some(baseline.repo_key.as_str())
         && repo.target.as_deref().unwrap_or("main") == baseline.target
-        && repository_baseline(repo) == *baseline
+        && repository_baseline(repo)? == *baseline)
 }
 
 fn validate_daemon_config(
@@ -1644,12 +1853,15 @@ fn validate_daemon_config(
             canonical_path: canonical_repo_path.clone(),
             target: target.clone(),
         };
-        let repo_key = repo
+        let repo_key = match repo
             .repo_key
             .clone()
             .map(|key| require_exact_nonblank(&key, "repo_key").map(str::to_string))
             .transpose()?
-            .unwrap_or_else(|| default_repo_key(&canonical_repo_path, &target));
+        {
+            Some(repo_key) => repo_key,
+            None => default_repo_key(&canonical_repo_path, &target)?,
+        };
         if repo_key.rsplit_once("::").map(|(_, scope)| scope) != Some(boundary.target.as_str()) {
             anyhow::bail!(
                 "repo_key {repo_key} does not match configured target {}",
@@ -2183,10 +2395,7 @@ fn publish_generation(
         .with_context(|| format!("create generation directory {}", temporary.display()))?;
     let result = (|| -> Result<()> {
         write_generation_file(&temporary.join("iq.yaml"), config)?;
-        write_generation_file(
-            &temporary.join("threadmill-manager-state.json"),
-            manager_state,
-        )?;
+        write_generation_file(&temporary.join("iq-manager-state.json"), manager_state)?;
         write_generation_file(&temporary.join("action"), action)?;
         write_generation_file(&temporary.join("manifest.json"), manifest_bytes)?;
         File::open(&temporary)
@@ -2233,7 +2442,7 @@ fn verify_existing_generation(
     }
     let expected_names = [
         "iq.yaml",
-        "threadmill-manager-state.json",
+        "iq-manager-state.json",
         "action",
         "manifest.json",
     ];
@@ -2273,7 +2482,7 @@ fn validate_manifest(manifest: &GenerationManifest) -> Result<()> {
             manifest.version
         );
     }
-    let expected_paths = ["iq.yaml", "threadmill-manager-state.json", "action"];
+    let expected_paths = ["iq.yaml", "iq-manager-state.json", "action"];
     if manifest.files.len() != expected_paths.len()
         || expected_paths
             .iter()
@@ -2366,7 +2575,7 @@ fn run_daemon_config(
             remote,
             repo.workspace_root,
             owner.clone(),
-        );
+        )?;
         let integrator = Integrator::new_with_policy(
             options,
             IntegrationPolicy {

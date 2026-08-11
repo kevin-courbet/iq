@@ -1,28 +1,61 @@
 # IQ
 
-IQ is a durable, repository-native integration queue. It serializes completed branches into a target branch, runs repository-owned validation and signoff policy, preserves conflicted integration workspaces, and lands only the exact validated candidate.
+IQ is a standalone durable Git integration coordinator. It serializes work for one physical target, validates the exact candidate, applies explicit signoff policy, lands with an exact lease, and reconciles all external effects from SQLite state.
 
-IQ uses Rift copy-on-write snapshots for integration workspaces. Managed repositories must be initialized Rift roots before IQ starts. Terminal and orphan IQ workspaces are removed automatically; IQ then runs global Rift garbage collection so removed Rift trash is not recoverable.
+IQ uses Rift for integration, seed, and development workspaces. Registered target checkouts are integration-only. A repository must be a primary Rift root on a supported same-filesystem layout.
 
-Provision each repository once and configure an external workspace root on the same filesystem:
+Registration persists the configured remote name and canonical fetch and push URL identities before the first fetch. Later registered operations reject any remote name, fetch URL, or push URL change before policy loading or remote mutation.
 
-```sh
-rift init --here /path/to/repo
+## Composition
+
+Each target commit must contain strict policy at `.iq/config.json`:
+
+```json
+{
+  "version": 1,
+  "integration": {
+    "validation": {"command": "task validate"},
+    "signoff": {"mode": "none"}
+  }
+}
 ```
 
-IQ snapshots with Rift's complete copy-on-write mode so dependencies and build artifacts are physically reused, skips repository Rift hooks, and resets tracked state to the exact queued base SHA before integration.
+Required signoff is explicit:
 
-IQ is standalone and opt-in. Consumers such as Threadmill and Spindle provide repository paths, validation commands, signoff policy, communication transports, and service installation policy. They do not embed IQ source.
-
-## Development
-
-```sh
-cargo test --locked
-cargo clippy --all-targets --all-features -- -D warnings
-cargo fmt --check
+```json
+{
+  "version": 1,
+  "integration": {
+    "validation": {"command": "task validate"},
+    "signoff": {
+      "mode": "required",
+      "command": "./ci/iq-signoff",
+      "contexts": ["linux", "macos"]
+    }
+  }
+}
 ```
 
-## CLI
+IQ rejects absent, blank, unknown, or unsupported policy. It does not infer commands from repository languages or tools. The signoff command receives `IQ_SIGNOFF_SHA` and must print `{"sha":"<exact-sha>","contexts":{"<context>":"success"}}`.
+
+```sh
+iq repo init --path /path/to/repo --target main --remote origin
+iq repo list
+iq dev-workspace create --repo-key '/path/to/repo::main' --name feature
+iq submit --workspace <workspace-id>
+iq integrate --next --repo-path /path/to/repo --repo-key '/path/to/repo::main'
+iq cleanup --repo-key '/path/to/repo::main'
+```
+
+Local submission refs under `refs/iq/submissions/` are immutable. Local items apply the exact persisted development-base-to-submission change as a one-parent candidate. Target movement creates a new candidate from that same change and invalidates validation and signoff evidence. Empty changes are blocked.
+
+Every PR/MR landing requires a passing post-signoff provider snapshot before target mutation. For registered repositories, a PR/MR URL remains provider metadata and a provider gate. IQ fetches the final target and then requires the snapshot to contain the queued head and that exact base. IQ lands the exact validated candidate itself with a compare-and-set Git push; it does not delegate target mutation to the provider merge API.
+
+`--next` and `--resume` are mutually exclusive. Explicit resume accepts only the oldest active item for that repository queue.
+
+See [Composition Workspaces](docs/composition-workspaces.md) for the lifecycle and recovery contract.
+
+## Existing Queue Commands
 
 ```sh
 iq enqueue --repo-path /path/to/repo --source feature --head <sha>
@@ -35,120 +68,14 @@ iq daemon --config /path/to/iq.yaml
 iq doctor --config /path/to/iq.yaml
 ```
 
-Threadmill can stage app-owned daemon configuration without implementing IQ's YAML
-format:
+Queue state is host-local. The default database is under `IQ/IntegrationQueues` on macOS and `iq/integration-queues` under the XDG state directory on Linux. The state root must be an absolute non-empty path. On first use, IQ locks a verified state-root directory handle, repeats old/new root checks, and atomically moves the former Threadmill state directory after it validates the standalone schema, active leases, canonical UTF-8 repository paths, database identity, and Rift ownership markers. Each supported schema upgrade rejects active leases and validates its final schema before its transaction commits. IQ rejects ambiguous, symlinked, raced, incomplete, or unverifiable state.
+
+The daemon, communication, forced-command, and config-reconciliation interfaces remain available. Repository operation leases and filesystem locks are scoped to one operation, so an idle daemon does not exclude composition commands.
+
+## Development
 
 ```sh
-iq config reconcile \
-  --current-config /path/to/iq.yaml \
-  --desired-inventory /path/to/threadmill-inventory.json \
-  --current-manager-state /path/to/threadmill-manager-state.json \
-  --staged-directory /path/to/generation-uuid \
-  --reconcile-lock /path/to/threadmill-reconcile.lock \
-  --workspace-root /path/to/stable/iq-workspaces \
-  --bootstrap
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --locked
 ```
-
-`--current-manager-state` may be absent only with explicit `--bootstrap`. Bootstrap is
-for first reconciliation; host installer persists its own initialized marker. Reconcile
-refuses an existing staged directory unless it is a complete digest-identical retry. It
-publishes one generation directory containing exactly `iq.yaml`,
-`threadmill-manager-state.json`, `action`, and strict machine-readable `manifest.json`.
-`action` contains
-exactly `start\n` when effective config has repositories, or `stop\n` when effective
-config is empty. Empty `repos: []` plus empty manager state is valid reconciliation
-output; only daemon's standalone non-empty-config invariant is skipped for that result.
-The advisory lock is held from input reads through generation publication.
-
-Shell consumers can verify a generation without parsing its manifest:
-
-```sh
-iq config verify-generation \
-  --generation /path/to/generation-uuid \
-  --current-config /path/to/iq.yaml \
-  --current-manager-state /path/to/threadmill-manager-state.json \
-  --reconcile-lock /path/to/threadmill-reconcile.lock
-```
-
-`verify-generation` acquires same symlink-safe advisory lock, validates strict manifest
-version/file inventory/digests, and compares exact current config/state presence and
-bytes against manifest CAS bases. Success emits `{ "verified": true }`; any manifest,
-file, lock, or input drift exits nonzero with no publication side effect.
-
-`manifest.json` contains `version: 1`, tagged `current_config` and
-`current_manager_state` snapshots (`present` with exact SHA-256 bytes, or `absent` with
-the fixed absent-input digest `SHA-256("iq-reconcile:absent-input:v1")`), and SHA-256
-digests for each other generation file.
-Threadmill host installation must compare manifest base snapshots immediately before
-immutable release/current publication (CAS); IQ's reconcile lock serializes staging but
-does not replace that host install lock. A complete matching destination is idempotent;
-any mismatch is rejected. File and temporary-directory fsync failures before rename fail
-without publication. Parent fsync after successful rename is best-effort and reported as
-a warning because publication already committed.
-
-The desired inventory is strict JSON:
-
-```json
-{
-  "manager_id": "threadmill",
-  "repositories": [
-    {
-      "repo_path": "/workspaces/project",
-      "target": "main",
-      "validation": {"mode": "explicit", "command": "task validate"}
-    },
-    {
-      "repo_path": "/workspaces/other",
-      "target": "main",
-      "validation": {"mode": "auto"}
-    }
-  ]
-}
-```
-
-Manager state is strict JSON and records only Threadmill-owned logical boundaries:
-
-```json
-{
-  "manager_id": "threadmill",
-  "boundaries": [
-    {
-      "repo_path": "/workspaces/project",
-      "target": "main",
-      "repo_key": "/workspaces/project::main",
-      "ownership": {
-        "kind": "adopted",
-        "original_validation": {"kind": "auto"},
-        "last_applied_validation": {"kind": "explicit", "command": "task validate"}
-      }
-    }
-  ]
-}
-```
-
-`repo_path` is required absolute and canonicalized before matching; relative paths are
-rejected consistently by daemon, doctor, and reconcile. New entries receive a repo key
-derived from canonical path and target plus a fixed-length SHA-256 workspace directory
-below supplied workspace root. Workspace identity resolves from deepest existing canonical
-ancestor and rejects `.`/`..` aliases. Existing matching entries retain `repo_key`,
-`workspace_root`, `remote`, `signoff`, and `communication`; only `validation_command`
-follows desired intent.
-
-Each boundary is either `adopted` or `created`:
-
-- `adopted` records pre-existing validation as `original_validation` and tracks
-  `last_applied_validation`. Removing boundary restores original validation and retains
-  config entry.
-- `created` records exact non-validation `baseline` plus `last_applied_validation`.
-  Removing boundary deletes entry only when baseline and app validation still match.
-
-For both variants, externally changing app-owned validation fails reconciliation instead
-of overwriting it. Created-entry policy changes also fail because deletion could erase
-consumer policy. Adopted-entry policy changes remain untouched. `auto` removes
-`validation_command` so daemon derives safe default. Config, manager state, and action
-outputs publish atomically after one source snapshot race check. Desired validation is
-strictly tagged JSON: `{ "mode": "auto" }` or `{ "mode": "explicit", "command": "..." }`;
-aliases and string shorthand are rejected. Manager IDs, targets, and commands must not
-have surrounding whitespace.
-
-Queue state is host-local. Run commands on the host that owns the target repository queue.

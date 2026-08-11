@@ -1,4 +1,5 @@
 pub mod communication;
+pub mod composition;
 
 pub mod core {
     use serde::{Deserialize, Serialize};
@@ -17,6 +18,26 @@ pub mod core {
         Integrated,
         Blocked,
         Cancelled,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    pub enum QueueSource {
+        RemoteBranch {
+            branch: String,
+        },
+        LocalSubmission {
+            submission_id: String,
+            commit_sha: String,
+        },
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum LandingPolicy {
+        Provider,
+        Direct,
+        Squash,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -162,6 +183,12 @@ pub mod core {
         Credentials => "credentials",
         Provider => "provider",
     });
+
+    enum_text!(LandingPolicy {
+        Provider => "provider",
+        Direct => "direct",
+        Squash => "squash",
+    });
 }
 
 pub mod sqlite {
@@ -173,13 +200,22 @@ pub mod sqlite {
     };
     use serde::{Deserialize, Serialize};
     use serde_json::Value;
-    use std::fs;
-    use std::os::unix::fs::MetadataExt;
+    use std::collections::HashMap;
+    use std::ffi::CString;
+    use std::fmt;
+    use std::fs::{self, OpenOptions};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::str::FromStr;
     use uuid::Uuid;
 
-    use crate::core::{BlockedPhase, BlockedReason, BlockedState, QueueStatus, StateMachine};
+    use crate::core::{
+        BlockedPhase, BlockedReason, BlockedState, LandingPolicy, QueueSource, QueueStatus,
+        StateMachine,
+    };
 
     #[derive(Clone, Debug)]
     pub struct EnqueueRequest {
@@ -197,6 +233,29 @@ pub mod sqlite {
         pub path: String,
         pub rift_id: String,
         pub source_rift_id: String,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct RiftWorkspaceRootOwner {
+        pub version: u32,
+        pub queue_database_id: String,
+        pub repo_key: String,
+        pub source: PathBuf,
+        pub source_rift_id: String,
+        pub registry_identity: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacyRiftWorkspaceRootOwner {
+        version: u32,
+        queue_database_id: String,
+        queue_database_path: PathBuf,
+        repo_key: String,
+        source: PathBuf,
+        source_rift_id: String,
+        registry_identity: String,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -245,7 +304,196 @@ pub mod sqlite {
         pub landed_commit_sha: Option<String>,
         pub producer_metadata: Value,
         pub validation_evidence: Value,
-        pub landing_fenced: bool,
+        pub landing: LandingState,
+        pub source: QueueSource,
+        pub landing_policy: LandingPolicy,
+        pub replacement: ReplacementState,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+    pub enum LandingState {
+        Ready,
+        Uncertain {
+            candidate_sha: String,
+            expected_target_sha: String,
+        },
+        Landed {
+            candidate_sha: String,
+            commit_sha: String,
+        },
+    }
+
+    impl LandingState {
+        pub fn is_uncertain(&self) -> bool {
+            matches!(self, Self::Uncertain { .. })
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct RegisteredRemote {
+        pub name: String,
+        pub fetch_url: String,
+        pub push_url: String,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "state", rename_all = "snake_case")]
+    pub enum ReplacementState {
+        None,
+        CleanupPending {
+            old_attempt_id: String,
+            old_workspace: WorkspaceIdentity,
+        },
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct RegisteredRepository {
+        pub key: String,
+        pub integration_path: PathBuf,
+        pub target_branch: String,
+        pub remote: RegisteredRemote,
+        pub seed: WorkspaceState,
+        pub workspace_root: PathBuf,
+        pub checkout_reconciliation: CheckoutReconciliationState,
+        pub seed_refresh: SeedRefreshState,
+        pub policy_target_sha: String,
+        pub policy_snapshot_json: String,
+        pub policy_digest: String,
+        pub created_at: String,
+        pub updated_at: String,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "state", rename_all = "snake_case")]
+    pub enum CleanupState {
+        Ready,
+        Pending,
+        Failed { message: String },
+        Complete { completed_at: String },
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "state", rename_all = "snake_case")]
+    pub enum SeedRefreshState {
+        Ready { target_sha: String },
+        Pending { target_sha: String },
+        Failed { target_sha: String, message: String },
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "state", rename_all = "snake_case")]
+    pub enum CheckoutReconciliationState {
+        Ready { target_sha: String },
+        Pending { target_sha: String },
+        Failed { target_sha: String, message: String },
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum DevelopmentWorkspaceStatus {
+        Creating,
+        Active,
+        Submitted,
+        CleanupPending,
+        CleanupFailed,
+        Removed,
+    }
+
+    impl fmt::Display for DevelopmentWorkspaceStatus {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(match self {
+                Self::Creating => "creating",
+                Self::Active => "active",
+                Self::Submitted => "submitted",
+                Self::CleanupPending => "cleanup_pending",
+                Self::CleanupFailed => "cleanup_failed",
+                Self::Removed => "removed",
+            })
+        }
+    }
+
+    impl FromStr for DevelopmentWorkspaceStatus {
+        type Err = String;
+
+        fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+            match value {
+                "creating" => Ok(Self::Creating),
+                "active" => Ok(Self::Active),
+                "submitted" => Ok(Self::Submitted),
+                "cleanup_pending" => Ok(Self::CleanupPending),
+                "cleanup_failed" => Ok(Self::CleanupFailed),
+                "removed" => Ok(Self::Removed),
+                _ => Err(format!("unknown development workspace status: {value}")),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct DevelopmentWorkspace {
+        pub id: String,
+        pub repo_key: String,
+        pub name: String,
+        pub identity: Option<WorkspaceIdentity>,
+        pub path: PathBuf,
+        pub branch: String,
+        pub base_sha: String,
+        pub status: DevelopmentWorkspaceStatus,
+        pub cleanup: CleanupState,
+        pub created_at: String,
+        pub updated_at: String,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct LocalSubmission {
+        pub id: String,
+        pub queue_item_id: String,
+        pub repo_key: String,
+        pub workspace_id: String,
+        pub base_sha: String,
+        pub commit_sha: String,
+        pub private_ref: String,
+        pub staging_ref: String,
+        pub replaces_item_id: Option<String>,
+        pub state: LocalSubmissionState,
+        pub created_at: String,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum LocalSubmissionState {
+        Creating,
+        Queued,
+        Replaced,
+        Cancelled,
+        Integrated,
+    }
+
+    impl fmt::Display for LocalSubmissionState {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(match self {
+                Self::Creating => "creating",
+                Self::Queued => "queued",
+                Self::Replaced => "replaced",
+                Self::Cancelled => "cancelled",
+                Self::Integrated => "integrated",
+            })
+        }
+    }
+
+    impl FromStr for LocalSubmissionState {
+        type Err = String;
+
+        fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+            match value {
+                "creating" => Ok(Self::Creating),
+                "queued" => Ok(Self::Queued),
+                "replaced" => Ok(Self::Replaced),
+                "cancelled" => Ok(Self::Cancelled),
+                "integrated" => Ok(Self::Integrated),
+                _ => Err(format!("unknown local submission state: {value}")),
+            }
+        }
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -307,6 +555,34 @@ pub mod sqlite {
         pub validation_command: Option<String>,
         pub validation_exit_code: Option<i64>,
         pub validation_log_path: Option<String>,
+        pub policy_target_sha: Option<String>,
+        pub policy_snapshot_json: Option<String>,
+        pub policy_digest: Option<String>,
+        pub signoff_evidence_json: Option<String>,
+        pub moved_base: MovedBaseState,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "state", rename_all = "snake_case")]
+    pub enum MovedBaseState {
+        None,
+        Pending {
+            target_sha: String,
+            source_sha: String,
+        },
+        Applied {
+            target_sha: String,
+            source_sha: String,
+            candidate_sha: String,
+        },
+    }
+
+    pub(crate) enum MovedTargetPolicy<'a> {
+        Trusted {
+            snapshot_json: &'a str,
+            digest: &'a str,
+        },
+        Host,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -314,6 +590,24 @@ pub mod sqlite {
         Active,
         Cancelled,
         Lost(String),
+    }
+
+    enum MutationAuthority<'a> {
+        External,
+        RepositoryLease {
+            repo_key: &'a str,
+            owner_id: &'a str,
+        },
+    }
+
+    struct CanonicalPathUpdate {
+        stored: String,
+        canonical: String,
+    }
+
+    struct V2RepositoryPathUpdates {
+        queue: Vec<CanonicalPathUpdate>,
+        workspace_roots: Vec<CanonicalPathUpdate>,
     }
 
     #[derive(Clone)]
@@ -335,17 +629,119 @@ pub mod sqlite {
         const WRITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
         const AUTHORITY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
 
-        pub fn default_db_path() -> PathBuf {
-            if cfg!(target_os = "macos") {
-                let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-                PathBuf::from(home)
-                    .join("Library/Application Support/Threadmill/IntegrationQueues/queues.db")
-            } else if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
-                PathBuf::from(state_home).join("threadmill/integration-queues/queues.db")
+        pub fn default_db_path() -> Result<PathBuf> {
+            let (state_root, legacy_directory, iq_directory) = if cfg!(target_os = "macos") {
+                let home = std::env::var_os("HOME").context("HOME is required for IQ state")?;
+                let root = PathBuf::from(home).join("Library/Application Support");
+                (
+                    root.clone(),
+                    root.join("Threadmill/IntegrationQueues"),
+                    root.join("IQ/IntegrationQueues"),
+                )
             } else {
-                let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-                PathBuf::from(home).join(".local/state/threadmill/integration-queues/queues.db")
+                let root = if let Some(state_home) = std::env::var_os("XDG_STATE_HOME") {
+                    PathBuf::from(state_home)
+                } else {
+                    let home = std::env::var_os("HOME").context("HOME is required for IQ state")?;
+                    PathBuf::from(home).join(".local/state")
+                };
+                (
+                    root.clone(),
+                    root.join("threadmill/integration-queues"),
+                    root.join("iq/integration-queues"),
+                )
+            };
+            if state_root.as_os_str().is_empty() || !state_root.is_absolute() {
+                anyhow::bail!(
+                    "IQ state root must be a non-empty absolute path: {}",
+                    state_root.display()
+                );
             }
+            let state_root_exists = path_entry_exists(&state_root)?;
+            if !state_root_exists {
+                fs::create_dir_all(&state_root)
+                    .with_context(|| format!("create IQ state root {}", state_root.display()))?;
+            }
+            require_real_directory(&state_root, "IQ state root")?;
+            let state_directory = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(&state_root)
+                .with_context(|| format!("open IQ state root {}", state_root.display()))?;
+            verify_open_directory(&state_root, &state_directory, "IQ state root")?;
+            let before_lock = inspect_state_layout(&legacy_directory, &iq_directory);
+            let lock = open_lock_at(&state_directory, ".iq-state-migration.lock")?;
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("acquire IQ state migration lock");
+            }
+            verify_open_directory(&state_root, &state_directory, "IQ state root")?;
+            let locked_layout = inspect_state_layout(&legacy_directory, &iq_directory);
+            let layout = match (before_lock, locked_layout) {
+                (Ok(before), Ok(locked)) if before == locked => locked,
+                (Ok(_), Ok(_)) | (Err(_), Ok(_)) => {
+                    anyhow::bail!("IQ state roots changed while acquiring the migration lock")
+                }
+                (_, Err(error)) => return Err(error),
+            };
+            let legacy_exists = layout.legacy.is_some();
+            if legacy_exists {
+                let legacy_db = legacy_directory.join("queues.db");
+                let legacy_db = legacy_db.canonicalize()?;
+                let connection = Connection::open_with_flags(
+                    &legacy_db,
+                    OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+                )?;
+                let active_leases: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM repo_leases WHERE expires_at>?1",
+                    params![now()],
+                    |row| row.get(0),
+                )?;
+                if active_leases != 0 {
+                    anyhow::bail!(
+                        "legacy IQ state has {active_leases} active repository operation lease(s); stop legacy IQ processes before migration"
+                    );
+                }
+                Self::reconcile_workspace_owner_markers(&connection, &legacy_db, false)?;
+                connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+                drop(connection);
+                drop(Self::open(&legacy_db)?);
+                let connection = Connection::open_with_flags(
+                    &legacy_db,
+                    OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+                )?;
+                Self::reconcile_workspace_owner_markers(&connection, &legacy_db, true)?;
+                connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+                drop(connection);
+                let iq_parent = iq_directory
+                    .parent()
+                    .context("IQ state directory has no parent")?;
+                fs::create_dir_all(iq_parent)
+                    .with_context(|| format!("create IQ state parent {}", iq_parent.display()))?;
+                require_real_directory(iq_parent, "IQ state parent")?;
+                fs::rename(&legacy_directory, &iq_directory).with_context(|| {
+                    format!(
+                        "atomically migrate IQ state {} to {}",
+                        legacy_directory.display(),
+                        iq_directory.display()
+                    )
+                })?;
+                OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                    .open(iq_parent)?
+                    .sync_all()?;
+                if let Some(legacy_parent) = legacy_directory.parent() {
+                    OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                        .open(legacy_parent)?
+                        .sync_all()?;
+                }
+            }
+            let database = iq_directory.join("queues.db");
+            Self::open(&database)?;
+            Ok(database)
         }
 
         pub fn open(path: &Path) -> Result<Self> {
@@ -387,6 +783,38 @@ pub mod sqlite {
             conn.busy_timeout(Self::MIGRATION_BUSY_TIMEOUT)?;
             conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.pragma_update(None, "foreign_keys", "ON")?;
+            let existing_tables: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+                [],
+                |row| row.get(0),
+            )?;
+            if existing_tables > 0 {
+                let metadata_exists: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='queue_metadata')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if !metadata_exists {
+                    anyhow::bail!("existing IQ database has no standalone schema identity");
+                }
+                let version: Option<String> = conn
+                    .query_row(
+                        "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                match version.as_deref() {
+                    Some("2") => Self::migrate_released_v2(&mut conn)?,
+                    Some("3") => Self::migrate_standalone_v3(&mut conn, &path)?,
+                    Some("4") => Self::migrate_standalone_v4(&mut conn)?,
+                    Some("5") => Self::migrate_standalone_v5(&mut conn)?,
+                    Some("6") => Self::migrate_standalone_v6(&mut conn)?,
+                    Some("7") => Self::validate_standalone_v7(&conn)?,
+                    Some(version) => anyhow::bail!("unsupported IQ schema version {version}"),
+                    None => anyhow::bail!("existing IQ database has no standalone schema version"),
+                }
+            }
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute_batch(SCHEMA)?;
             tx.execute(
@@ -402,135 +830,25 @@ pub mod sqlite {
                 .optional()?;
             if workspace_schema_version
                 .as_deref()
-                .is_some_and(|version| !matches!(version, "1" | "2"))
+                .is_some_and(|version| version != "7")
             {
                 anyhow::bail!(
                     "unsupported workspace schema version {}",
                     workspace_schema_version.as_deref().unwrap_or_default()
                 );
             }
-            let columns = {
-                let mut statement = tx.prepare("PRAGMA table_info(queue_items)")?;
-                let columns = statement
-                    .query_map([], |row| row.get::<_, String>(1))?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                columns
-            };
-            if !columns.iter().any(|column| column == "landing_fenced") {
-                tx.execute(
-                    "ALTER TABLE queue_items ADD COLUMN landing_fenced INTEGER NOT NULL DEFAULT 0",
-                    [],
-                )?;
-            }
-            if !columns
-                .iter()
-                .any(|column| column == "integration_workspace_rift_id")
-            {
-                tx.execute(
-                    "ALTER TABLE queue_items ADD COLUMN integration_workspace_rift_id TEXT",
-                    [],
-                )?;
-            }
-            let workspace_root_columns = {
-                let mut statement = tx.prepare("PRAGMA table_info(workspace_roots)")?;
-                let columns = statement
-                    .query_map([], |row| row.get::<_, String>(1))?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                columns
-            };
-            if !workspace_root_columns
-                .iter()
-                .any(|column| column == "generation")
-            {
-                tx.execute(
-                    "ALTER TABLE workspace_roots ADD COLUMN generation INTEGER NOT NULL DEFAULT 0",
-                    [],
-                )?;
-            }
-            if !columns
-                .iter()
-                .any(|column| column == "integration_workspace_source_rift_id")
-            {
-                tx.execute(
-                    "ALTER TABLE queue_items ADD COLUMN integration_workspace_source_rift_id TEXT",
-                    [],
-                )?;
-            }
-            if !columns
-                .iter()
-                .any(|column| column == "integration_workspace_cleaned_at")
-            {
-                tx.execute(
-                    "ALTER TABLE queue_items ADD COLUMN integration_workspace_cleaned_at TEXT",
-                    [],
-                )?;
-            }
-            if workspace_schema_version.is_none() {
-                let legacy_workspaces = {
-                    let mut statement = tx.prepare(
-                    "SELECT id,integration_workspace_path FROM queue_items WHERE integration_workspace_path IS NOT NULL AND integration_workspace_rift_id IS NULL",
-                )?;
-                    let rows = statement
-                        .query_map([], |row| {
-                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                        })?
-                        .collect::<std::result::Result<Vec<_>, _>>()?;
-                    rows
-                };
-                for (item_id, workspace) in &legacy_workspaces {
-                    let workspace_path = Path::new(workspace);
-                    if !workspace_path.is_absolute() {
-                        anyhow::bail!(
-                        "legacy workspace for item {item_id} uses relative path {workspace}; resolve it before upgrading"
-                    );
-                    }
-                    let workspace_exists = match std::fs::symlink_metadata(workspace_path) {
-                        Ok(_) => true,
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-                        Err(error) => {
-                            return Err(error).with_context(|| {
-                                format!("inspect legacy workspace {workspace} for item {item_id}")
-                            })
-                        }
-                    };
-                    if workspace_exists {
-                        anyhow::bail!(
-                        "legacy Git workspace for item {item_id} still exists at {workspace}; remove it while IQ is stopped before upgrading"
-                    );
-                    }
-                }
-                tx.execute(
-                "UPDATE queue_items SET integration_workspace_path=NULL,integration_workspace_cleaned_at=COALESCE(integration_workspace_cleaned_at,?1) WHERE integration_workspace_path IS NOT NULL AND integration_workspace_rift_id IS NULL AND status IN ('integrated','cancelled')",
-                params![now()],
-                )?;
-                tx.execute(
-                "UPDATE queue_items SET status='blocked',blocked_phase=CASE
-                   WHEN status IN ('ready','merging','merged') THEN 'merging'
-                   WHEN status IN ('validating','validated') THEN 'validating'
-                   WHEN status='integrating' THEN 'integrating'
-                   ELSE COALESCE(blocked_phase,'merging')
-                 END,
-                 blocked_reason='needs-agent-fix',
-                 blocked_message='legacy Git workspace was removed during Rift migration; requeue from an exact source head',
-                 integration_workspace_path=NULL,
-                 updated_at=?1
-                 WHERE integration_workspace_path IS NOT NULL
-                   AND integration_workspace_rift_id IS NULL
-                   AND status NOT IN ('integrated','cancelled')",
-                params![now()],
-                )?;
-                tx.execute(
-                    "INSERT INTO queue_metadata (key,value) VALUES ('workspace_schema_version','2')",
-                    [],
-                )?;
-            } else if workspace_schema_version.as_deref() == Some("1") {
-                tx.execute(
-                    "UPDATE queue_metadata SET value='2' WHERE key='workspace_schema_version'",
-                    [],
-                )?;
-            }
+            tx.execute_batch(COMPOSITION_SCHEMA)?;
+            tx.execute_batch(QUEUE_SOURCE_TRIGGERS)?;
+            tx.execute_batch(REGISTERED_CHECKOUT_TRIGGERS)?;
+            tx.execute_batch(LANDING_STATE_TRIGGERS)?;
+            tx.execute_batch(REGISTERED_REMOTE_TRIGGERS)?;
+            tx.execute(
+                "INSERT INTO queue_metadata (key,value) VALUES ('workspace_schema_version','7') ON CONFLICT(key) DO UPDATE SET value='7'",
+                [],
+            )?;
             tx.execute_batch(WORKSPACE_STATE_TRIGGERS)?;
             tx.commit()?;
+            Self::validate_standalone_v7(&conn)?;
             let metadata = fs::symlink_metadata(&path)
                 .with_context(|| format!("inspect queue db {}", path.display()))?;
             if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -549,6 +867,769 @@ pub mod sqlite {
                 database_dev: metadata.dev(),
                 database_ino: metadata.ino(),
             })
+        }
+
+        fn validate_standalone_v7(conn: &Connection) -> Result<()> {
+            let foreign_key_errors: i64 =
+                conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get(0)
+                })?;
+            if foreign_key_errors != 0 {
+                anyhow::bail!("IQ schema version 7 has {foreign_key_errors} foreign-key errors");
+            }
+            let local_source_foreign_key: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_list('queue_items') WHERE \"table\"='local_submissions' AND \"from\"='submission_id' AND \"to\"='id'",
+                [],
+                |row| row.get(0),
+            )?;
+            if local_source_foreign_key != 1 {
+                anyhow::bail!("IQ schema version 7 lacks the exact local submission foreign key");
+            }
+            let source_triggers: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name IN ('queue_items_local_source_insert','queue_items_local_source_update','local_submission_identity_immutable')",
+                [],
+                |row| row.get(0),
+            )?;
+            if source_triggers != 3 {
+                anyhow::bail!("IQ schema version 7 lacks exact queue source constraints");
+            }
+            let checkout_triggers: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name IN ('registered_checkout_state_insert','registered_checkout_state_update')",
+                [],
+                |row| row.get(0),
+            )?;
+            if checkout_triggers != 2 {
+                anyhow::bail!("IQ schema version 7 lacks registered checkout state constraints");
+            }
+            let identity_triggers: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name IN ('registered_repository_remote_insert','registered_repository_remote_update','registered_remote_identity_immutable','registered_remote_identity_delete','queue_items_landing_state_insert','queue_items_landing_state_update')",
+                [],
+                |row| row.get(0),
+            )?;
+            if identity_triggers != 6 {
+                anyhow::bail!("IQ schema version 7 lacks remote or landing identity constraints");
+            }
+            let base_column: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('local_submissions') WHERE name='base_sha' AND \"notnull\"=1",
+                [],
+                |row| row.get(0),
+            )?;
+            if base_column != 1 {
+                anyhow::bail!("IQ schema version 7 lacks immutable submission base identity");
+            }
+            let malformed: i64 = conn.query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM local_submissions WHERE
+                     length(base_sha) NOT IN (40,64) OR base_sha GLOB '*[^0-9A-Fa-f]*' OR
+                     length(commit_sha) NOT IN (40,64) OR commit_sha GLOB '*[^0-9A-Fa-f]*') +
+                   (SELECT COUNT(*) FROM registered_repositories WHERE
+                     json_valid(checkout_reconciliation_json)=0 OR
+                     json_extract(checkout_reconciliation_json,'$.state') NOT IN ('ready','pending','failed') OR
+                     length(json_extract(checkout_reconciliation_json,'$.target_sha')) NOT IN (40,64) OR
+                     json_extract(checkout_reconciliation_json,'$.target_sha') GLOB '*[^0-9A-Fa-f]*' OR
+                     (json_extract(checkout_reconciliation_json,'$.state')='failed' AND COALESCE(json_extract(checkout_reconciliation_json,'$.message'),'')='') OR
+                     json_valid(seed_refresh_json)=0 OR
+                     json_extract(seed_refresh_json,'$.state') NOT IN ('ready','pending','failed') OR
+                     length(json_extract(seed_refresh_json,'$.target_sha')) NOT IN (40,64) OR
+                     json_extract(seed_refresh_json,'$.target_sha') GLOB '*[^0-9A-Fa-f]*' OR
+                     (json_extract(seed_refresh_json,'$.state')='failed' AND COALESCE(json_extract(seed_refresh_json,'$.message'),'')='')) +
+                    (SELECT COUNT(*) FROM integration_attempts WHERE json_valid(moved_base_json)=0) +
+                    (SELECT COUNT(*) FROM queue_items item WHERE
+                      json_valid(item.landing_state_json)=0 OR NOT (
+                        (json_extract(item.landing_state_json,'$.state')='ready' AND item.status!='integrated') OR
+                        (json_extract(item.landing_state_json,'$.state')='uncertain' AND (item.status='integrating' OR (item.status='blocked' AND item.blocked_phase='integrating')) AND
+                         length(json_extract(item.landing_state_json,'$.candidate_sha')) IN (40,64) AND json_extract(item.landing_state_json,'$.candidate_sha') NOT GLOB '*[^0-9A-Fa-f]*' AND
+                         length(json_extract(item.landing_state_json,'$.expected_target_sha')) IN (40,64) AND json_extract(item.landing_state_json,'$.expected_target_sha') NOT GLOB '*[^0-9A-Fa-f]*') OR
+                        (json_extract(item.landing_state_json,'$.state')='landed' AND item.status='integrated' AND
+                         length(json_extract(item.landing_state_json,'$.candidate_sha')) IN (40,64) AND json_extract(item.landing_state_json,'$.candidate_sha') NOT GLOB '*[^0-9A-Fa-f]*' AND
+                         item.landed_commit_sha=json_extract(item.landing_state_json,'$.commit_sha'))
+                      )) +
+                    (SELECT COUNT(*) FROM registered_remote_identities WHERE repo_key='' OR target_branch='' OR remote_name='' OR fetch_url='' OR push_url='') +
+                    (SELECT COUNT(*) FROM registered_repositories repository WHERE NOT EXISTS (
+                      SELECT 1 FROM registered_remote_identities identity
+                      WHERE identity.repo_key=repository.repo_key
+                        AND identity.integration_path=repository.integration_path
+                        AND identity.target_branch=repository.target_branch
+                        AND identity.remote_name=repository.remote
+                    ))",
+                [],
+                |row| row.get(0),
+            )?;
+            if malformed != 0 {
+                anyhow::bail!("IQ schema version 7 contains {malformed} malformed durable row(s)");
+            }
+            Ok(())
+        }
+
+        fn migrate_released_v2(conn: &mut Connection) -> Result<()> {
+            let invalid_rows: i64 = conn.query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM queue_items item WHERE
+                     item.id='' OR item.repo_key='' OR item.repo_path='' OR item.source_branch='' OR item.target_branch='' OR
+                     length(item.current_head_sha) NOT IN (40,64) OR item.current_head_sha GLOB '*[^0-9A-Fa-f]*' OR
+                     json_valid(item.producer_metadata_json)=0 OR json_valid(item.validation_evidence_json)=0 OR
+                     (item.conflict_json IS NOT NULL AND json_valid(item.conflict_json)=0) OR
+                     item.status NOT IN ('ready','merging','merged','validating','validated','integrating','blocked','integrated','cancelled') OR
+                     NOT (
+                       (item.integration_workspace_cleaned_at IS NULL AND item.integration_workspace_path IS NULL AND item.integration_workspace_rift_id IS NULL AND item.integration_workspace_source_rift_id IS NULL AND item.status IN ('ready','merging','blocked','cancelled')) OR
+                       (item.integration_workspace_cleaned_at IS NULL AND item.integration_workspace_path IS NOT NULL AND item.integration_workspace_rift_id IS NULL AND item.integration_workspace_source_rift_id IS NULL AND item.status IN ('merging','cancelled')) OR
+                       (item.integration_workspace_cleaned_at IS NULL AND item.integration_workspace_path IS NOT NULL AND item.integration_workspace_rift_id IS NOT NULL AND item.integration_workspace_source_rift_id IS NOT NULL AND item.status IN ('ready','merging','merged','validating','validated','integrating','blocked','integrated','cancelled')) OR
+                       (item.integration_workspace_cleaned_at IS NOT NULL AND item.status IN ('integrated','cancelled') AND item.integration_workspace_path IS NULL AND item.integration_workspace_rift_id IS NULL AND item.integration_workspace_source_rift_id IS NULL)
+                     ) OR
+                     (item.current_attempt_id IS NOT NULL AND NOT EXISTS (
+                       SELECT 1 FROM integration_attempts attempt WHERE attempt.id=item.current_attempt_id AND attempt.item_id=item.id
+                     ))) +
+                   (SELECT COUNT(*) FROM integration_attempts attempt WHERE
+                     attempt.id='' OR attempt.attempt_number<1 OR
+                     length(attempt.source_head_sha) NOT IN (40,64) OR attempt.source_head_sha GLOB '*[^0-9A-Fa-f]*' OR
+                     (attempt.target_base_sha IS NOT NULL AND (length(attempt.target_base_sha) NOT IN (40,64) OR attempt.target_base_sha GLOB '*[^0-9A-Fa-f]*')) OR
+                     (attempt.merge_commit_sha IS NOT NULL AND (length(attempt.merge_commit_sha) NOT IN (40,64) OR attempt.merge_commit_sha GLOB '*[^0-9A-Fa-f]*')) OR
+                     (attempt.validated_commit_sha IS NOT NULL AND (length(attempt.validated_commit_sha) NOT IN (40,64) OR attempt.validated_commit_sha GLOB '*[^0-9A-Fa-f]*')) OR
+                     (attempt.landed_commit_sha IS NOT NULL AND (length(attempt.landed_commit_sha) NOT IN (40,64) OR attempt.landed_commit_sha GLOB '*[^0-9A-Fa-f]*')) OR
+                     (attempt.validation_exit_code IS NULL) != (attempt.validation_log_path IS NULL)) +
+                   (SELECT COUNT(*) FROM queue_events event WHERE event.id='' OR event.event_type='' OR event.message='') +
+                   (SELECT COUNT(*) FROM prompts prompt WHERE prompt.id='' OR prompt.question='' OR prompt.status='') +
+                   (SELECT COUNT(*) FROM communication_bindings binding WHERE
+                     binding.id='' OR binding.repo_key='' OR binding.transport_id='' OR binding.transport_kind='' OR binding.endpoint_fingerprint='' OR binding.marker='' OR
+                     (binding.external_ref_json IS NOT NULL AND json_valid(binding.external_ref_json)=0)) +
+                   (SELECT COUNT(*) FROM communication_response_receipts receipt WHERE receipt.binding_id='' OR receipt.external_response_id='' OR receipt.prompt_id='' OR receipt.actor='' OR receipt.disposition='') +
+                   (SELECT COUNT(*) FROM workspace_roots root WHERE root.repo_key='' OR root.source_path='' OR root.source_rift_id='' OR root.workspace_root='' OR root.registry_identity='' OR root.generation<0) +
+                   (SELECT COUNT(*) FROM workspace_gc_debt debt WHERE debt.registry_identity='')",
+                [],
+                |row| row.get(0),
+            )?;
+            if invalid_rows != 0 {
+                anyhow::bail!(
+                    "released IQ schema version 2 contains {invalid_rows} malformed durable row(s)"
+                );
+            }
+            conn.pragma_update(None, "foreign_keys", "OFF")?;
+            conn.pragma_update(None, "legacy_alter_table", "ON")?;
+            let migration = (|| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let active_leases: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM repo_leases WHERE expires_at>?1",
+                    params![now()],
+                    |row| row.get(0),
+                )?;
+                if active_leases != 0 {
+                    anyhow::bail!(
+                        "released IQ schema version 2 has {active_leases} active repository operation lease(s)"
+                    );
+                }
+                let path_updates = Self::validated_v2_repository_paths(&tx)?;
+                for update in path_updates.queue {
+                    tx.execute(
+                        "UPDATE queue_items SET repo_path=?1 WHERE repo_path=?2",
+                        params![update.canonical, update.stored],
+                    )?;
+                }
+                for update in path_updates.workspace_roots {
+                    tx.execute(
+                        "UPDATE workspace_roots SET source_path=?1 WHERE source_path=?2",
+                        params![update.canonical, update.stored],
+                    )?;
+                }
+                tx.execute_batch(
+                    r#"
+DROP INDEX IF EXISTS queue_items_active_identity;
+ALTER TABLE queue_items RENAME TO queue_items_v2;
+ALTER TABLE integration_attempts RENAME TO integration_attempts_v2;
+"#,
+                )?;
+                tx.execute_batch(SCHEMA)?;
+                tx.execute_batch(COMPOSITION_SCHEMA)?;
+                tx.execute_batch(
+                    r#"INSERT INTO queue_items (
+  id,repo_key,repo_path,source_branch,target_branch,pr_url,producer_metadata_json,validation_evidence_json,status,current_head_sha,current_attempt_id,blocked_phase,blocked_reason,blocked_message,retry_after,prompt_id,conflict_json,integration_workspace_path,integration_workspace_rift_id,integration_workspace_source_rift_id,integration_workspace_cleaned_at,target_sha,source_sha,landed_commit_sha,landing_state_json,source_kind,source_ref,submission_id,landing_policy,replacement_json,created_at,updated_at
+)
+SELECT
+  id,repo_key,repo_path,source_branch,target_branch,pr_url,producer_metadata_json,validation_evidence_json,status,current_head_sha,current_attempt_id,blocked_phase,blocked_reason,blocked_message,retry_after,prompt_id,conflict_json,integration_workspace_path,integration_workspace_rift_id,integration_workspace_source_rift_id,integration_workspace_cleaned_at,target_sha,source_sha,landed_commit_sha,
+  CASE
+    WHEN status='integrated' THEN json_object('state','landed','candidate_sha',(SELECT validated_commit_sha FROM integration_attempts_v2 WHERE id=queue_items_v2.current_attempt_id),'commit_sha',landed_commit_sha)
+    WHEN landing_fenced=1 THEN json_object('state','uncertain','candidate_sha',(SELECT validated_commit_sha FROM integration_attempts_v2 WHERE id=queue_items_v2.current_attempt_id),'expected_target_sha',(SELECT target_base_sha FROM integration_attempts_v2 WHERE id=queue_items_v2.current_attempt_id))
+    ELSE json_object('state','ready')
+  END,
+  'remote_branch',source_branch,NULL,CASE WHEN pr_url IS NULL THEN 'direct' ELSE 'provider' END,NULL,created_at,updated_at
+FROM queue_items_v2;
+INSERT INTO integration_attempts (
+  id,item_id,attempt_number,source_head_sha,target_base_sha,merge_commit_sha,validated_commit_sha,landed_commit_sha,validation_command,validation_exit_code,validation_log_path,policy_target_sha,policy_snapshot_json,policy_digest,signoff_evidence_json,moved_base_json,started_at,finished_at,result
+)
+SELECT
+  id,item_id,attempt_number,source_head_sha,target_base_sha,merge_commit_sha,validated_commit_sha,landed_commit_sha,validation_command,validation_exit_code,validation_log_path,NULL,NULL,NULL,NULL,'{"state":"none"}',started_at,finished_at,result
+FROM integration_attempts_v2;
+DROP TABLE integration_attempts_v2;
+DROP TABLE queue_items_v2;
+UPDATE queue_metadata SET value='7' WHERE key='workspace_schema_version';"#,
+                )?;
+                Self::migrate_registered_remote_identities(&tx)?;
+                tx.execute_batch(QUEUE_SOURCE_TRIGGERS)?;
+                tx.execute_batch(REGISTERED_CHECKOUT_TRIGGERS)?;
+                tx.execute_batch(LANDING_STATE_TRIGGERS)?;
+                tx.execute_batch(REGISTERED_REMOTE_TRIGGERS)?;
+                tx.execute_batch(WORKSPACE_STATE_TRIGGERS)?;
+                Self::validate_standalone_v7(&tx)?;
+                tx.commit()?;
+                Ok::<(), anyhow::Error>(())
+            })();
+            conn.pragma_update(None, "legacy_alter_table", "OFF")?;
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            migration?;
+            Ok(())
+        }
+
+        fn validated_v2_repository_paths(conn: &Connection) -> Result<V2RepositoryPathUpdates> {
+            let mut queue_statement = conn.prepare(
+                "SELECT DISTINCT CAST(repo_path AS BLOB),target_branch,repo_key FROM queue_items",
+            )?;
+            let queue_rows = queue_statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let mut bindings = HashMap::<String, (String, String)>::new();
+            let mut physical_targets = HashMap::<(String, String), String>::new();
+            let mut queue_paths = HashMap::<String, String>::new();
+            for (stored, target, repo_key) in queue_rows {
+                let stored = String::from_utf8(stored)
+                    .context("version 2 queue repository path is not valid UTF-8")?;
+                let canonical = Self::canonical_git_root(&stored, "version 2 queue repository")?;
+                if let Some(existing) =
+                    bindings.insert(repo_key.clone(), (canonical.clone(), target.clone()))
+                {
+                    if existing != (canonical.clone(), target.clone()) {
+                        anyhow::bail!(
+                            "version 2 repo_key {repo_key} maps to multiple repository targets"
+                        );
+                    }
+                }
+                if let Some(existing_key) =
+                    physical_targets.insert((canonical.clone(), target.clone()), repo_key.clone())
+                {
+                    if existing_key != repo_key {
+                        anyhow::bail!(
+                            "version 2 repository target {canonical}::{target} has multiple repo_key values"
+                        );
+                    }
+                }
+                queue_paths.insert(stored, canonical);
+            }
+
+            let mut root_statement = conn.prepare(
+                "SELECT DISTINCT CAST(source_path AS BLOB),repo_key FROM workspace_roots",
+            )?;
+            let root_rows = root_statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let mut root_paths = HashMap::<String, String>::new();
+            for (stored, repo_key) in root_rows {
+                let stored = String::from_utf8(stored)
+                    .context("version 2 Rift source path is not valid UTF-8")?;
+                let canonical = Self::canonical_git_root(&stored, "version 2 Rift source")?;
+                if let Some((queue_path, _)) = bindings.get(&repo_key) {
+                    if queue_path != &canonical {
+                        anyhow::bail!(
+                            "version 2 workspace root for {repo_key} has source {canonical}, expected {queue_path}"
+                        );
+                    }
+                }
+                root_paths.insert(stored, canonical);
+            }
+            Ok(V2RepositoryPathUpdates {
+                queue: queue_paths
+                    .into_iter()
+                    .map(|(stored, canonical)| CanonicalPathUpdate { stored, canonical })
+                    .collect(),
+                workspace_roots: root_paths
+                    .into_iter()
+                    .map(|(stored, canonical)| CanonicalPathUpdate { stored, canonical })
+                    .collect(),
+            })
+        }
+
+        fn canonical_git_root(stored: &str, label: &str) -> Result<String> {
+            if stored.is_empty() {
+                anyhow::bail!("{label} path must not be empty");
+            }
+            let path = Path::new(stored);
+            if !path.is_absolute() {
+                anyhow::bail!("{label} path must be absolute: {stored}");
+            }
+            let canonical = path
+                .canonicalize()
+                .with_context(|| format!("resolve {label} path {stored}"))?;
+            require_real_directory(&canonical, label)?;
+            let output = Command::new("git")
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .args(["rev-parse", "--show-toplevel"])
+                .current_dir(&canonical)
+                .output()
+                .with_context(|| format!("verify {label} Git root {}", canonical.display()))?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "{label} is not a verifiable Git repository {}: {}",
+                    canonical.display(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            let top_level = PathBuf::from(String::from_utf8(output.stdout)?);
+            let top_level = top_level
+                .as_os_str()
+                .to_str()
+                .context("Git top-level output is not valid UTF-8")?
+                .trim();
+            if Path::new(top_level).canonicalize()? != canonical {
+                anyhow::bail!(
+                    "{label} path {} is not the canonical Git root",
+                    canonical.display()
+                );
+            }
+            canonical
+                .to_str()
+                .map(str::to_string)
+                .context("canonical repository path is not valid UTF-8")
+        }
+
+        fn migrate_standalone_v3(conn: &mut Connection, database_path: &Path) -> Result<()> {
+            conn.pragma_update(None, "foreign_keys", "OFF")?;
+            conn.pragma_update(None, "legacy_alter_table", "ON")?;
+            let migration = (|| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                Self::reject_active_migration_leases(&tx, "3")?;
+                Self::reconcile_workspace_owner_markers(&tx, database_path, true)?;
+                let invalid_seed_state: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM registered_repositories WHERE json_extract(seed_refresh_json,'$.state')!='ready'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if invalid_seed_state != 0 {
+                    anyhow::bail!(
+                        "unpublished IQ schema version 3 has {invalid_seed_state} unresolved seed refresh row(s)"
+                    );
+                }
+                let invalid_sources: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM queue_items item WHERE NOT (
+                        (item.source_kind='remote_branch' AND item.source_ref IS NOT NULL AND item.submission_id IS NULL AND item.source_ref=item.source_branch AND ((item.landing_policy='direct' AND item.pr_url IS NULL) OR (item.landing_policy='provider' AND item.pr_url IS NOT NULL))) OR
+                        (item.source_kind='local_submission' AND item.source_ref IS NOT NULL AND item.submission_id IS NOT NULL AND item.source_ref=item.source_branch AND item.landing_policy='squash' AND item.pr_url IS NULL AND EXISTS (
+                            SELECT 1 FROM local_submissions submission
+                            WHERE submission.id=item.submission_id
+                              AND submission.repo_key=item.repo_key
+                              AND submission.commit_sha=item.current_head_sha
+                              AND submission.private_ref=item.source_ref
+                        ))
+                    )",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if invalid_sources != 0 {
+                    anyhow::bail!(
+                        "standalone version 3 contains {invalid_sources} invalid queue source rows"
+                    );
+                }
+                tx.execute_batch(
+                    r#"
+DROP INDEX IF EXISTS queue_items_active_identity;
+ALTER TABLE queue_items RENAME TO queue_items_v3;
+ALTER TABLE local_submissions RENAME TO local_submissions_v3;
+ALTER TABLE integration_attempts ADD COLUMN moved_base_json TEXT NOT NULL DEFAULT '{"state":"none"}';
+"#,
+                )?;
+                tx.execute_batch(SCHEMA)?;
+                tx.execute_batch(COMPOSITION_SCHEMA)?;
+                tx.execute(
+                    r#"INSERT INTO local_submissions (
+  id,queue_item_id,repo_key,workspace_id,base_sha,commit_sha,private_ref,staging_ref,replaces_item_id,state,created_at
+)
+SELECT
+  submission.id,
+  COALESCE(
+    (SELECT item.id FROM queue_items_v3 item WHERE item.submission_id=submission.id LIMIT 1),
+    (SELECT item.id
+       FROM queue_items_v3 item
+       JOIN local_submissions_v3 current_submission ON current_submission.id=item.submission_id
+      WHERE current_submission.workspace_id=submission.workspace_id
+      ORDER BY item.created_at DESC,item.id DESC LIMIT 1)
+  ),
+  submission.repo_key,
+  submission.workspace_id,
+  workspace.base_sha,
+  submission.commit_sha,
+  submission.private_ref,
+  'refs/iq/staging/' || submission.id,
+  NULL,
+  CASE
+    WHEN EXISTS(SELECT 1 FROM queue_items_v3 item WHERE item.submission_id=submission.id AND item.status='integrated') THEN 'integrated'
+    WHEN EXISTS(SELECT 1 FROM queue_items_v3 item WHERE item.submission_id=submission.id AND item.status='cancelled') THEN 'cancelled'
+    WHEN EXISTS(SELECT 1 FROM queue_items_v3 item WHERE item.submission_id=submission.id) THEN 'queued'
+    ELSE 'replaced'
+  END,
+  submission.created_at
+FROM local_submissions_v3 submission
+JOIN development_workspaces workspace ON workspace.id=submission.workspace_id"#,
+                    [],
+                )?;
+                tx.execute_batch(
+                    r#"INSERT INTO queue_items (
+  id,repo_key,repo_path,source_branch,target_branch,pr_url,producer_metadata_json,validation_evidence_json,status,current_head_sha,current_attempt_id,blocked_phase,blocked_reason,blocked_message,retry_after,prompt_id,conflict_json,integration_workspace_path,integration_workspace_rift_id,integration_workspace_source_rift_id,integration_workspace_cleaned_at,target_sha,source_sha,landed_commit_sha,landing_state_json,source_kind,source_ref,submission_id,landing_policy,replacement_json,created_at,updated_at
+)
+SELECT
+  id,repo_key,repo_path,source_branch,target_branch,pr_url,producer_metadata_json,validation_evidence_json,status,current_head_sha,current_attempt_id,blocked_phase,blocked_reason,blocked_message,retry_after,prompt_id,conflict_json,integration_workspace_path,integration_workspace_rift_id,integration_workspace_source_rift_id,integration_workspace_cleaned_at,target_sha,source_sha,landed_commit_sha,
+  CASE
+    WHEN status='integrated' THEN json_object('state','landed','candidate_sha',(SELECT validated_commit_sha FROM integration_attempts WHERE id=queue_items_v3.current_attempt_id),'commit_sha',landed_commit_sha)
+    WHEN landing_fenced=1 THEN json_object('state','uncertain','candidate_sha',(SELECT validated_commit_sha FROM integration_attempts WHERE id=queue_items_v3.current_attempt_id),'expected_target_sha',(SELECT target_base_sha FROM integration_attempts WHERE id=queue_items_v3.current_attempt_id))
+    ELSE json_object('state','ready')
+  END,
+  source_kind,source_ref,submission_id,landing_policy,replacement_json,created_at,updated_at
+FROM queue_items_v3;
+DROP TABLE queue_items_v3;
+DROP TABLE local_submissions_v3;
+ALTER TABLE registered_repositories ADD COLUMN checkout_reconciliation_json TEXT NOT NULL DEFAULT '{"state":"ready","target_sha":""}';
+UPDATE registered_repositories
+SET checkout_reconciliation_json=json_object('state','ready','target_sha',policy_target_sha);
+UPDATE registered_repositories
+SET seed_refresh_json=json_object('state','ready','target_sha',policy_target_sha);"#,
+                )?;
+                tx.execute(
+                    "INSERT INTO queue_metadata (key,value) VALUES ('workspace_schema_version','7') ON CONFLICT(key) DO UPDATE SET value='7'",
+                    [],
+                )?;
+                Self::migrate_registered_remote_identities(&tx)?;
+                tx.execute_batch(QUEUE_SOURCE_TRIGGERS)?;
+                tx.execute_batch(REGISTERED_CHECKOUT_TRIGGERS)?;
+                tx.execute_batch(LANDING_STATE_TRIGGERS)?;
+                tx.execute_batch(REGISTERED_REMOTE_TRIGGERS)?;
+                tx.execute_batch(WORKSPACE_STATE_TRIGGERS)?;
+                Self::validate_standalone_v7(&tx)?;
+                tx.commit()?;
+                Ok::<(), anyhow::Error>(())
+            })();
+            conn.pragma_update(None, "legacy_alter_table", "OFF")?;
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            migration?;
+            Ok(())
+        }
+
+        fn migrate_standalone_v4(conn: &mut Connection) -> Result<()> {
+            conn.pragma_update(None, "foreign_keys", "OFF")?;
+            conn.pragma_update(None, "legacy_alter_table", "ON")?;
+            let migration = (|| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                Self::reject_active_migration_leases(&tx, "4")?;
+                let invalid_seed_state: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM registered_repositories WHERE json_extract(seed_refresh_json,'$.state')!='ready'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if invalid_seed_state != 0 {
+                    anyhow::bail!(
+                        "unpublished IQ schema version 4 has {invalid_seed_state} unresolved seed refresh row(s)"
+                    );
+                }
+                tx.execute_batch(
+                    r#"
+ALTER TABLE local_submissions RENAME TO local_submissions_v4;
+"#,
+                )?;
+                tx.execute_batch(COMPOSITION_SCHEMA)?;
+                tx.execute_batch(
+                    r#"INSERT INTO local_submissions (
+  id,queue_item_id,repo_key,workspace_id,base_sha,commit_sha,private_ref,staging_ref,replaces_item_id,state,created_at
+)
+SELECT
+  submission.id,submission.queue_item_id,submission.repo_key,submission.workspace_id,workspace.base_sha,submission.commit_sha,submission.private_ref,submission.staging_ref,submission.replaces_item_id,submission.state,submission.created_at
+FROM local_submissions_v4 submission
+JOIN development_workspaces workspace ON workspace.id=submission.workspace_id;
+DROP TABLE local_submissions_v4;
+ALTER TABLE registered_repositories ADD COLUMN checkout_reconciliation_json TEXT NOT NULL DEFAULT '{"state":"ready","target_sha":""}';
+UPDATE registered_repositories
+SET checkout_reconciliation_json=json_object('state','ready','target_sha',policy_target_sha);
+UPDATE registered_repositories
+SET seed_refresh_json=json_object('state','ready','target_sha',policy_target_sha);
+UPDATE queue_metadata SET value='7' WHERE key='workspace_schema_version';"#,
+                )?;
+                Self::migrate_queue_landing_state(&tx)?;
+                Self::migrate_registered_remote_identities(&tx)?;
+                tx.execute_batch(QUEUE_SOURCE_TRIGGERS)?;
+                tx.execute_batch(REGISTERED_CHECKOUT_TRIGGERS)?;
+                tx.execute_batch(LANDING_STATE_TRIGGERS)?;
+                tx.execute_batch(REGISTERED_REMOTE_TRIGGERS)?;
+                tx.execute_batch(WORKSPACE_STATE_TRIGGERS)?;
+                Self::validate_standalone_v7(&tx)?;
+                tx.commit()?;
+                Ok::<(), anyhow::Error>(())
+            })();
+            conn.pragma_update(None, "legacy_alter_table", "OFF")?;
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            migration?;
+            Ok(())
+        }
+
+        fn migrate_standalone_v5(conn: &mut Connection) -> Result<()> {
+            conn.pragma_update(None, "foreign_keys", "OFF")?;
+            conn.pragma_update(None, "legacy_alter_table", "ON")?;
+            let migration = (|| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                Self::reject_active_migration_leases(&tx, "5")?;
+                let malformed_seed_targets: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM registered_repositories WHERE
+                   json_valid(seed_refresh_json)=0 OR
+                   length(json_extract(seed_refresh_json,'$.target_sha')) NOT IN (40,64) OR
+                   json_extract(seed_refresh_json,'$.target_sha') GLOB '*[^0-9A-Fa-f]*'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if malformed_seed_targets != 0 {
+                    anyhow::bail!(
+                        "unpublished IQ schema version 5 has {malformed_seed_targets} invalid seed target row(s)"
+                    );
+                }
+                tx.execute_batch(
+                    r#"ALTER TABLE registered_repositories ADD COLUMN checkout_reconciliation_json TEXT NOT NULL DEFAULT '{"state":"ready","target_sha":""}';
+UPDATE registered_repositories
+SET checkout_reconciliation_json=json_object('state','ready','target_sha',json_extract(seed_refresh_json,'$.target_sha'));
+UPDATE queue_metadata SET value='7' WHERE key='workspace_schema_version';"#,
+                )?;
+                tx.execute_batch(COMPOSITION_SCHEMA)?;
+                Self::migrate_queue_landing_state(&tx)?;
+                Self::migrate_registered_remote_identities(&tx)?;
+                tx.execute_batch(QUEUE_SOURCE_TRIGGERS)?;
+                tx.execute_batch(REGISTERED_CHECKOUT_TRIGGERS)?;
+                tx.execute_batch(LANDING_STATE_TRIGGERS)?;
+                tx.execute_batch(REGISTERED_REMOTE_TRIGGERS)?;
+                tx.execute_batch(WORKSPACE_STATE_TRIGGERS)?;
+                Self::validate_standalone_v7(&tx)?;
+                tx.commit()?;
+                Ok::<(), anyhow::Error>(())
+            })();
+            conn.pragma_update(None, "legacy_alter_table", "OFF")?;
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            migration
+        }
+
+        fn migrate_standalone_v6(conn: &mut Connection) -> Result<()> {
+            conn.pragma_update(None, "foreign_keys", "OFF")?;
+            conn.pragma_update(None, "legacy_alter_table", "ON")?;
+            let migration = (|| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                Self::reject_active_migration_leases(&tx, "6")?;
+                tx.execute_batch(COMPOSITION_SCHEMA)?;
+                Self::migrate_queue_landing_state(&tx)?;
+                Self::migrate_registered_remote_identities(&tx)?;
+                tx.execute(
+                    "UPDATE queue_metadata SET value='7' WHERE key='workspace_schema_version'",
+                    [],
+                )?;
+                tx.execute_batch(QUEUE_SOURCE_TRIGGERS)?;
+                tx.execute_batch(REGISTERED_CHECKOUT_TRIGGERS)?;
+                tx.execute_batch(LANDING_STATE_TRIGGERS)?;
+                tx.execute_batch(REGISTERED_REMOTE_TRIGGERS)?;
+                tx.execute_batch(WORKSPACE_STATE_TRIGGERS)?;
+                Self::validate_standalone_v7(&tx)?;
+                tx.commit()?;
+                Ok::<(), anyhow::Error>(())
+            })();
+            conn.pragma_update(None, "legacy_alter_table", "OFF")?;
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            migration
+        }
+
+        fn migrate_queue_landing_state(conn: &Connection) -> Result<()> {
+            conn.execute_batch(
+                r#"
+DROP INDEX IF EXISTS queue_items_active_identity;
+ALTER TABLE queue_items RENAME TO queue_items_v6;
+"#,
+            )?;
+            conn.execute_batch(SCHEMA)?;
+            conn.execute_batch(
+                r#"INSERT INTO queue_items (
+  id,repo_key,repo_path,source_branch,target_branch,pr_url,producer_metadata_json,validation_evidence_json,status,current_head_sha,current_attempt_id,blocked_phase,blocked_reason,blocked_message,retry_after,prompt_id,conflict_json,integration_workspace_path,integration_workspace_rift_id,integration_workspace_source_rift_id,integration_workspace_cleaned_at,target_sha,source_sha,landed_commit_sha,landing_state_json,source_kind,source_ref,submission_id,landing_policy,replacement_json,created_at,updated_at
+)
+SELECT
+  id,repo_key,repo_path,source_branch,target_branch,pr_url,producer_metadata_json,validation_evidence_json,status,current_head_sha,current_attempt_id,blocked_phase,blocked_reason,blocked_message,retry_after,prompt_id,conflict_json,integration_workspace_path,integration_workspace_rift_id,integration_workspace_source_rift_id,integration_workspace_cleaned_at,target_sha,source_sha,landed_commit_sha,
+  CASE
+    WHEN status='integrated' THEN json_object('state','landed','candidate_sha',(SELECT validated_commit_sha FROM integration_attempts WHERE id=queue_items_v6.current_attempt_id),'commit_sha',landed_commit_sha)
+    WHEN landing_fenced=1 THEN json_object('state','uncertain','candidate_sha',(SELECT validated_commit_sha FROM integration_attempts WHERE id=queue_items_v6.current_attempt_id),'expected_target_sha',(SELECT target_base_sha FROM integration_attempts WHERE id=queue_items_v6.current_attempt_id))
+    ELSE json_object('state','ready')
+  END,
+  source_kind,source_ref,submission_id,landing_policy,replacement_json,created_at,updated_at
+FROM queue_items_v6;
+DROP TABLE queue_items_v6;"#,
+            )?;
+            Ok(())
+        }
+
+        fn migrate_registered_remote_identities(conn: &Connection) -> Result<()> {
+            conn.execute_batch(COMPOSITION_SCHEMA)?;
+            let mut statement = conn.prepare(
+                "SELECT repo_key,integration_path,target_branch,remote,created_at FROM registered_repositories",
+            )?;
+            let repositories = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(statement);
+            for (repo_key, path, target, remote_name, created_at) in repositories {
+                let path = PathBuf::from(std::ffi::OsString::from_vec(path));
+                let canonical = path
+                    .canonicalize()
+                    .with_context(|| format!("resolve registered repository {}", path.display()))?;
+                if canonical != path {
+                    anyhow::bail!(
+                        "registered repository path is not canonical: {}",
+                        path.display()
+                    );
+                }
+                let remote = crate::composition::resolve_remote_identity(&path, &remote_name)
+                    .with_context(|| format!("resolve registered remote for {repo_key}"))?;
+                conn.execute(
+                    "INSERT INTO registered_remote_identities(repo_key,integration_path,target_branch,remote_name,fetch_url,push_url,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    params![repo_key,path_bytes(&path),target,remote.name,remote.fetch_url,remote.push_url,created_at],
+                )?;
+            }
+            Ok(())
+        }
+
+        fn reject_active_migration_leases(conn: &Connection, version: &str) -> Result<()> {
+            let active_leases: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM repo_leases WHERE expires_at>?1",
+                params![now()],
+                |row| row.get(0),
+            )?;
+            if active_leases != 0 {
+                anyhow::bail!(
+                    "standalone IQ schema version {version} has {active_leases} active repository operation lease(s)"
+                );
+            }
+            Ok(())
+        }
+
+        fn reconcile_workspace_owner_markers(
+            conn: &Connection,
+            expected_legacy_database: &Path,
+            rewrite_legacy: bool,
+        ) -> Result<()> {
+            let metadata_exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='queue_metadata')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !metadata_exists {
+                anyhow::bail!("legacy state has no standalone IQ schema identity");
+            }
+            let version: String = conn.query_row(
+                "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
+                [],
+                |row| row.get(0),
+            )?;
+            if !matches!(version.as_str(), "2" | "3" | "4" | "5" | "6" | "7") {
+                anyhow::bail!(
+                    "legacy state schema version {version} cannot migrate to IQ-owned state"
+                );
+            }
+            let database_id: String = conn.query_row(
+                "SELECT value FROM queue_metadata WHERE key='database_id'",
+                [],
+                |row| row.get(0),
+            )?;
+            let roots_exist: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workspace_roots')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !roots_exist {
+                return Ok(());
+            }
+            let mut statement = conn.prepare(
+                "SELECT repo_key,source_path,source_rift_id,workspace_root,registry_identity FROM workspace_roots",
+            )?;
+            let roots = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for (repo_key, source, source_rift_id, root, registry_identity) in roots {
+                let marker = PathBuf::from(&root).join(".iq-workspace-owner.json");
+                require_regular_file(&marker, "IQ workspace owner marker")?;
+                let raw = fs::read(&marker)?;
+                let value: Value = serde_json::from_slice(&raw)?;
+                let marker_version = value
+                    .get("version")
+                    .and_then(Value::as_u64)
+                    .context("IQ workspace owner marker has no version")?;
+                let expected = RiftWorkspaceRootOwner {
+                    version: 3,
+                    queue_database_id: database_id.clone(),
+                    repo_key,
+                    source: PathBuf::from(source),
+                    source_rift_id,
+                    registry_identity,
+                };
+                match marker_version {
+                    3 => {
+                        let actual: RiftWorkspaceRootOwner = serde_json::from_value(value)?;
+                        if actual != expected {
+                            anyhow::bail!(
+                                "IQ workspace owner marker differs from standalone database: {}",
+                                marker.display()
+                            );
+                        }
+                    }
+                    2 => {
+                        let actual: LegacyRiftWorkspaceRootOwner = serde_json::from_value(value)?;
+                        if actual.version != 2
+                            || actual.queue_database_id != expected.queue_database_id
+                            || actual.queue_database_path != expected_legacy_database
+                            || actual.repo_key != expected.repo_key
+                            || actual.source != expected.source
+                            || actual.source_rift_id != expected.source_rift_id
+                            || actual.registry_identity != expected.registry_identity
+                        {
+                            anyhow::bail!(
+                                "legacy IQ workspace owner marker differs from standalone database: {}",
+                                marker.display()
+                            );
+                        }
+                        if !rewrite_legacy {
+                            continue;
+                        }
+                        let temporary = marker
+                            .with_file_name(format!(".iq-workspace-owner-{}.tmp", Uuid::new_v4()));
+                        fs::write(&temporary, serde_json::to_vec_pretty(&expected)?)?;
+                        OpenOptions::new().read(true).open(&temporary)?.sync_all()?;
+                        fs::rename(&temporary, &marker)?;
+                        OpenOptions::new()
+                            .read(true)
+                            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                            .open(marker.parent().context("owner marker has no parent")?)?
+                            .sync_all()?;
+                    }
+                    other => anyhow::bail!(
+                        "unsupported IQ workspace owner marker version {other}: {}",
+                        marker.display()
+                    ),
+                }
+            }
+            Ok(())
         }
 
         fn connect(&self) -> Result<Connection> {
@@ -614,8 +1695,8 @@ pub mod sqlite {
             } else {
                 let id = Uuid::new_v4().to_string();
                 tx.execute(
-                    "INSERT INTO queue_items (id,repo_key,repo_path,source_branch,target_branch,pr_url,producer_metadata_json,validation_evidence_json,status,current_head_sha,created_at,updated_at)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,'{}','ready',?8,?9,?9)",
+                    "INSERT INTO queue_items (id,repo_key,repo_path,source_branch,target_branch,pr_url,producer_metadata_json,validation_evidence_json,status,current_head_sha,source_kind,source_ref,landing_policy,created_at,updated_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,'{}','ready',?8,'remote_branch',?4,?10,?9,?9)",
                     params![
                         id,
                         request.repo_key,
@@ -626,6 +1707,7 @@ pub mod sqlite {
                         request.producer_metadata.to_string(),
                         request.current_head_sha,
                         now,
+                        if request.pr_url.is_some() { "provider" } else { "direct" },
                     ],
                 )?;
                 Self::record_event_tx(&tx, &id, "item_enqueued", "item enqueued")?;
@@ -678,6 +1760,25 @@ pub mod sqlite {
         }
 
         pub fn claim_next_ready(&self, repo_key: &str) -> Result<Option<(QueueItem, Attempt)>> {
+            self.claim_next_ready_with_authority(repo_key, MutationAuthority::External)
+        }
+
+        pub(crate) fn claim_next_ready_owned(
+            &self,
+            repo_key: &str,
+            owner_id: &str,
+        ) -> Result<Option<(QueueItem, Attempt)>> {
+            self.claim_next_ready_with_authority(
+                repo_key,
+                MutationAuthority::RepositoryLease { repo_key, owner_id },
+            )
+        }
+
+        fn claim_next_ready_with_authority(
+            &self,
+            repo_key: &str,
+            authority: MutationAuthority<'_>,
+        ) -> Result<Option<(QueueItem, Attempt)>> {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let item: Option<QueueItem> = tx
@@ -691,6 +1792,7 @@ pub mod sqlite {
                 tx.commit()?;
                 return Ok(None);
             };
+            Self::require_mutation_authority(&tx, &item.repo_key, authority)?;
             if item.status != QueueStatus::Ready {
                 tx.commit()?;
                 return Ok(None);
@@ -707,7 +1809,7 @@ pub mod sqlite {
                 params![attempt_id, item.id, attempt_number, item.current_head_sha, now],
             )?;
             tx.execute(
-                "UPDATE queue_items SET status='merging',current_attempt_id=?1,landing_fenced=0,blocked_phase=NULL,blocked_reason=NULL,blocked_message=NULL,prompt_id=NULL,updated_at=?2 WHERE id=?3",
+                r#"UPDATE queue_items SET status='merging',current_attempt_id=?1,landing_state_json='{"state":"ready"}',blocked_phase=NULL,blocked_reason=NULL,blocked_message=NULL,prompt_id=NULL,updated_at=?2 WHERE id=?3"#,
                 params![attempt_id, now, item.id],
             )?;
             Self::record_event_tx(
@@ -734,6 +1836,29 @@ pub mod sqlite {
         }
 
         pub fn transition_item(&self, item_id: &str, target: QueueStatus) -> Result<QueueItem> {
+            self.transition_item_with_authority(item_id, target, MutationAuthority::External)
+        }
+
+        pub(crate) fn transition_item_owned(
+            &self,
+            item_id: &str,
+            target: QueueStatus,
+            repo_key: &str,
+            owner_id: &str,
+        ) -> Result<QueueItem> {
+            self.transition_item_with_authority(
+                item_id,
+                target,
+                MutationAuthority::RepositoryLease { repo_key, owner_id },
+            )
+        }
+
+        fn transition_item_with_authority(
+            &self,
+            item_id: &str,
+            target: QueueStatus,
+            authority: MutationAuthority<'_>,
+        ) -> Result<QueueItem> {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let item = required_row(
@@ -745,22 +1870,62 @@ pub mod sqlite {
                 "queue item",
                 item_id,
             )?;
+            Self::require_mutation_authority(&tx, &item.repo_key, authority)?;
             StateMachine
                 .transition(item.status, target)
                 .map_err(anyhow::Error::msg)?;
-            if target == QueueStatus::Cancelled && item.landing_fenced {
+            if target == QueueStatus::Cancelled && item.landing.is_uncertain() {
                 anyhow::bail!(
-                    "item {item_id} has crossed the landing fence and cannot be cancelled"
+                    "item {item_id} has an uncertain landing outcome and cannot be cancelled"
                 );
             }
             if target == QueueStatus::Cancelled {
+                let replacement_creating: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM local_submissions WHERE replaces_item_id=?1 AND state='creating')",
+                    params![item_id],
+                    |row| row.get(0),
+                )?;
+                if replacement_creating {
+                    anyhow::bail!(
+                        "item has an incomplete immutable replacement; finish that submission before cancellation"
+                    );
+                }
                 tx.execute(
                     "UPDATE prompts SET status='cancelled' WHERE item_id=?1 AND status='open'",
                     params![item_id],
                 )?;
+                if let QueueSource::LocalSubmission { submission_id, .. } = &item.source {
+                    let workspace_id: String = tx.query_row(
+                        "SELECT workspace_id FROM local_submissions WHERE id=?1",
+                        params![submission_id],
+                        |row| row.get(0),
+                    )?;
+                    let changed = tx.execute(
+                        "UPDATE development_workspaces SET status='active',updated_at=?1 WHERE id=?2 AND status='submitted'",
+                        params![now(), workspace_id],
+                    )?;
+                    if changed != 1 {
+                        anyhow::bail!(
+                            "cancelled local submission workspace cannot return to reusable state"
+                        );
+                    }
+                    let changed = tx.execute(
+                        "UPDATE local_submissions SET state='cancelled' WHERE id=?1 AND state='queued'",
+                        params![submission_id],
+                    )?;
+                    if changed != 1 {
+                        anyhow::bail!("cancelled local submission is not queued");
+                    }
+                }
+                if let Some(attempt_id) = item.current_attempt_id.as_deref() {
+                    tx.execute(
+                        "UPDATE integration_attempts SET result='cancelled',finished_at=?1 WHERE id=?2 AND result IS NULL",
+                        params![now(), attempt_id],
+                    )?;
+                }
             }
             tx.execute(
-                "UPDATE queue_items SET status=?1,updated_at=?2 WHERE id=?3",
+                "UPDATE queue_items SET status=?1,replacement_json=CASE WHEN ?1='cancelled' THEN NULL ELSE replacement_json END,updated_at=?2 WHERE id=?3",
                 params![target.to_string(), now(), item_id],
             )?;
             Self::record_event_tx(
@@ -771,6 +1936,28 @@ pub mod sqlite {
             )?;
             tx.commit()?;
             self.get_item(item_id)
+        }
+
+        fn require_mutation_authority(
+            tx: &rusqlite::Transaction<'_>,
+            item_repo_key: &str,
+            authority: MutationAuthority<'_>,
+        ) -> Result<()> {
+            let MutationAuthority::RepositoryLease { repo_key, owner_id } = authority else {
+                return Ok(());
+            };
+            if item_repo_key != repo_key {
+                anyhow::bail!("repository mutation authority does not match queue item");
+            }
+            let authorized: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM repo_leases WHERE repo_key=?1 AND owner_id=?2 AND expires_at>?3)",
+                params![repo_key, owner_id, now()],
+                |row| row.get(0),
+            )?;
+            if !authorized {
+                anyhow::bail!("repository operation lease is not owned by {owner_id}");
+            }
+            Ok(())
         }
 
         pub(crate) fn authorize_execution_start(
@@ -807,20 +1994,55 @@ pub mod sqlite {
             reason: BlockedReason,
             message: &str,
         ) -> Result<String> {
-            self.block_item_from_status(item_id, phase.into(), phase, reason, message)
+            self.block_item_from_status(
+                item_id,
+                phase.into(),
+                phase,
+                reason,
+                message,
+                MutationAuthority::External,
+            )
         }
 
-        pub(crate) fn block_integrating_recovery(
+        pub(crate) fn block_item_owned(
             &self,
             item_id: &str,
             phase: BlockedPhase,
             reason: BlockedReason,
             message: &str,
+            repo_key: &str,
+            owner_id: &str,
+        ) -> Result<String> {
+            self.block_item_from_status(
+                item_id,
+                phase.into(),
+                phase,
+                reason,
+                message,
+                MutationAuthority::RepositoryLease { repo_key, owner_id },
+            )
+        }
+
+        pub(crate) fn block_integrating_recovery_owned(
+            &self,
+            item_id: &str,
+            phase: BlockedPhase,
+            reason: BlockedReason,
+            message: &str,
+            repo_key: &str,
+            owner_id: &str,
         ) -> Result<String> {
             if !matches!(phase, BlockedPhase::Merging | BlockedPhase::Validating) {
                 anyhow::bail!("integrating recovery may only resume merging or validating");
             }
-            self.block_item_from_status(item_id, QueueStatus::Integrating, phase, reason, message)
+            self.block_item_from_status(
+                item_id,
+                QueueStatus::Integrating,
+                phase,
+                reason,
+                message,
+                MutationAuthority::RepositoryLease { repo_key, owner_id },
+            )
         }
 
         fn block_item_from_status(
@@ -830,6 +2052,7 @@ pub mod sqlite {
             phase: BlockedPhase,
             reason: BlockedReason,
             message: &str,
+            authority: MutationAuthority<'_>,
         ) -> Result<String> {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -842,6 +2065,7 @@ pub mod sqlite {
                 "queue item",
                 item_id,
             )?;
+            Self::require_mutation_authority(&tx, &item.repo_key, authority)?;
             if item.status != expected_status {
                 anyhow::bail!(
                     "item {item_id} in status {} cannot block in {phase}",
@@ -1027,12 +2251,17 @@ pub mod sqlite {
             {
                 anyhow::bail!("item {item_id} is not blocked for agent fix")
             }
+            if !matches!(item.source, QueueSource::RemoteBranch { .. }) {
+                anyhow::bail!(
+                    "local submissions are immutable; use submit --replace for an agent fix"
+                );
+            }
             tx.execute(
                 "UPDATE prompts SET status='superseded' WHERE item_id=?1 AND status='open'",
                 params![item_id],
             )?;
             tx.execute(
-                "UPDATE queue_items SET status='ready',current_head_sha=?1,landing_fenced=0,blocked_phase=NULL,blocked_reason=NULL,blocked_message=NULL,prompt_id=NULL,updated_at=?2 WHERE id=?3",
+                r#"UPDATE queue_items SET status='ready',current_head_sha=?1,landing_state_json='{"state":"ready"}',blocked_phase=NULL,blocked_reason=NULL,blocked_message=NULL,prompt_id=NULL,updated_at=?2 WHERE id=?3"#,
                 params![new_head, now(), item_id],
             )?;
             Self::record_event_tx(&tx, item_id, "agent_requeued", "agent fix marked ready")?;
@@ -1091,10 +2320,13 @@ pub mod sqlite {
         pub fn update_current_head(&self, item_id: &str, new_head: &str) -> Result<QueueItem> {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute(
-                "UPDATE queue_items SET current_head_sha=?1,updated_at=?2 WHERE id=?3",
+            let changed = tx.execute(
+                "UPDATE queue_items SET current_head_sha=?1,updated_at=?2 WHERE id=?3 AND source_kind='remote_branch'",
                 params![new_head, now(), item_id],
             )?;
+            if changed != 1 {
+                anyhow::bail!("only a remote branch queue source can update its current head");
+            }
             Self::record_event_tx(
                 &tx,
                 item_id,
@@ -1138,6 +2370,46 @@ pub mod sqlite {
             Ok(can_acquire)
         }
 
+        pub(crate) fn acquire_repo_operation_lease(
+            &self,
+            repo_key: &str,
+            owner_id: &str,
+            ttl_seconds: i64,
+            repository: &Path,
+            target: &str,
+        ) -> Result<bool> {
+            self.validate_repository_binding(repo_key, repository, target)?;
+            self.acquire_repo_lease(repo_key, owner_id, ttl_seconds)
+        }
+
+        pub(crate) fn validate_repository_binding(
+            &self,
+            repo_key: &str,
+            repository: &Path,
+            target: &str,
+        ) -> Result<()> {
+            let conn = self.connect_read_only()?;
+            let repository_text = path_text(repository)?;
+            let invalid: i64 = conn.query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM queue_items WHERE repo_key=?1 AND (repo_path!=?2 OR target_branch!=?3)) +
+                   (SELECT COUNT(*) FROM queue_items WHERE repo_key!=?1 AND repo_path=?2 AND target_branch=?3) +
+                   (SELECT COUNT(*) FROM registered_repositories WHERE repo_key=?1 AND (integration_path!=?4 OR target_branch!=?3)) +
+                   (SELECT COUNT(*) FROM registered_repositories WHERE repo_key!=?1 AND integration_path=?4 AND target_branch=?3) +
+                   (SELECT COUNT(*) FROM registered_remote_identities WHERE repo_key=?1 AND (integration_path!=?4 OR target_branch!=?3)) +
+                   (SELECT COUNT(*) FROM registered_remote_identities WHERE repo_key!=?1 AND integration_path=?4 AND target_branch=?3) +
+                   (SELECT COUNT(*) FROM workspace_roots WHERE repo_key=?1 AND source_path!=?2)",
+                params![repo_key, repository_text, target, path_bytes(repository)],
+                |row| row.get(0),
+            )?;
+            if invalid != 0 {
+                anyhow::bail!(
+                    "repository queue {repo_key} has {invalid} durable repository binding conflict(s)"
+                );
+            }
+            Ok(())
+        }
+
         pub fn heartbeat_repo_lease(
             &self,
             repo_key: &str,
@@ -1162,6 +2434,14 @@ pub mod sqlite {
             ttl_seconds: i64,
         ) -> Result<bool> {
             self.heartbeat_repo_lease(repo_key, owner_id, ttl_seconds)
+        }
+
+        pub fn release_repo_lease(&self, repo_key: &str, owner_id: &str) -> Result<bool> {
+            let conn = self.connect()?;
+            Ok(conn.execute(
+                "DELETE FROM repo_leases WHERE repo_key=?1 AND owner_id=?2",
+                params![repo_key, owner_id],
+            )? == 1)
         }
 
         pub fn register_workspace_root(
@@ -1249,6 +2529,37 @@ pub mod sqlite {
             .optional()
             .map(|generation| generation.unwrap_or(0))
             .context("read workspace root generation")
+        }
+
+        pub fn workspace_root_path(&self, repo_key: &str) -> Result<Option<PathBuf>> {
+            let conn = self.connect_read_only()?;
+            conn.query_row(
+                "SELECT workspace_root FROM workspace_roots WHERE repo_key=?1",
+                params![repo_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map(|path| path.map(PathBuf::from))
+            .map_err(Into::into)
+        }
+
+        pub fn advance_workspace_generation(&self, repo_key: &str) -> Result<i64> {
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx.execute(
+                "UPDATE workspace_roots SET generation=generation+1 WHERE repo_key=?1",
+                params![repo_key],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("repository queue {repo_key} has no registered workspace root");
+            }
+            let generation = tx.query_row(
+                "SELECT generation FROM workspace_roots WHERE repo_key=?1",
+                params![repo_key],
+                |row| row.get(0),
+            )?;
+            tx.commit()?;
+            Ok(generation)
         }
 
         pub fn database_id(&self) -> Result<String> {
@@ -1644,26 +2955,135 @@ pub mod sqlite {
             Ok(())
         }
 
+        pub fn update_attempt_policy(
+            &self,
+            attempt_id: &str,
+            target_sha: &str,
+            snapshot_json: &str,
+            digest: &str,
+        ) -> Result<()> {
+            let conn = self.connect()?;
+            let changed = conn.execute(
+                "UPDATE integration_attempts SET policy_target_sha=?1,policy_snapshot_json=?2,policy_digest=?3,validation_command=NULL,validation_exit_code=NULL,validation_log_path=NULL,validated_commit_sha=NULL,signoff_evidence_json=NULL WHERE id=?4",
+                params![target_sha,snapshot_json,digest,attempt_id],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("integration attempt disappeared during policy snapshot");
+            }
+            Ok(())
+        }
+
+        pub fn update_attempt_signoff(&self, attempt_id: &str, evidence: &Value) -> Result<()> {
+            let conn = self.connect()?;
+            let changed = conn.execute(
+                "UPDATE integration_attempts SET signoff_evidence_json=?1 WHERE id=?2",
+                params![evidence.to_string(), attempt_id],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("integration attempt disappeared during signoff");
+            }
+            Ok(())
+        }
+
+        pub(crate) fn begin_moved_base_reconciliation(
+            &self,
+            attempt_id: &str,
+            target_sha: &str,
+            source_sha: &str,
+            policy: MovedTargetPolicy<'_>,
+        ) -> Result<()> {
+            let conn = self.connect()?;
+            let moved = serde_json::to_string(&MovedBaseState::Pending {
+                target_sha: target_sha.to_string(),
+                source_sha: source_sha.to_string(),
+            })?;
+            let (policy_target, policy_snapshot, policy_digest) = match policy {
+                MovedTargetPolicy::Trusted {
+                    snapshot_json,
+                    digest,
+                } => (Some(target_sha), Some(snapshot_json), Some(digest)),
+                MovedTargetPolicy::Host => (None, None, None),
+            };
+            let changed = conn.execute(
+                "UPDATE integration_attempts SET target_base_sha=?1,merge_commit_sha=NULL,validated_commit_sha=NULL,validation_command=NULL,validation_exit_code=NULL,validation_log_path=NULL,policy_target_sha=?2,policy_snapshot_json=?3,policy_digest=?4,signoff_evidence_json=NULL,moved_base_json=?5 WHERE id=?6",
+                params![target_sha,policy_target,policy_snapshot,policy_digest,moved,attempt_id],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("integration attempt disappeared during moved-base intent");
+            }
+            Ok(())
+        }
+
+        pub(crate) fn complete_moved_base_reconciliation(
+            &self,
+            attempt_id: &str,
+            candidate_sha: &str,
+        ) -> Result<()> {
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let raw: String = required_row(
+                tx.query_row(
+                    "SELECT moved_base_json FROM integration_attempts WHERE id=?1",
+                    params![attempt_id],
+                    |row| row.get(0),
+                ),
+                "integration attempt",
+                attempt_id,
+            )?;
+            let pending: MovedBaseState =
+                serde_json::from_str(&raw).context("parse pending moved-base reconciliation")?;
+            let MovedBaseState::Pending {
+                target_sha,
+                source_sha,
+            } = pending
+            else {
+                anyhow::bail!("integration attempt has no pending moved-base reconciliation");
+            };
+            let applied = serde_json::to_string(&MovedBaseState::Applied {
+                target_sha,
+                source_sha,
+                candidate_sha: candidate_sha.to_string(),
+            })?;
+            tx.execute(
+                "UPDATE integration_attempts SET merge_commit_sha=?1,moved_base_json=?2 WHERE id=?3",
+                params![candidate_sha, applied, attempt_id],
+            )?;
+            tx.commit()?;
+            Ok(())
+        }
+
         pub fn mark_integrated(
             &self,
             item_id: &str,
             attempt_id: &str,
             landed_commit_sha: &str,
+            remote_target_sha: &str,
+            repo_key: &str,
+            owner_id: &str,
         ) -> Result<QueueItem> {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let item: (String, Option<String>, bool) = required_row(
+            let item: (String, Option<String>, String, String) = required_row(
                 tx.query_row(
-                    "SELECT status,current_attempt_id,landing_fenced FROM queue_items WHERE id=?1",
+                    "SELECT status,current_attempt_id,landing_state_json,repo_key FROM queue_items WHERE id=?1",
                     params![item_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 ),
                 "queue item",
                 item_id,
             )?;
+            Self::require_mutation_authority(
+                &tx,
+                &item.3,
+                MutationAuthority::RepositoryLease { repo_key, owner_id },
+            )?;
+            let landing: LandingState = serde_json::from_str(&item.2)
+                .context("parse landing state while marking integrated")?;
+            let LandingState::Uncertain { candidate_sha, .. } = landing else {
+                anyhow::bail!("item {item_id} has no uncertain landing to mark");
+            };
             if item.0 != QueueStatus::Integrating.to_string()
                 || item.1.as_deref() != Some(attempt_id)
-                || !item.2
             {
                 anyhow::bail!(
                     "item {item_id} is no longer integrating attempt {attempt_id}; refusing to mark landed"
@@ -1673,10 +3093,58 @@ pub mod sqlite {
                 "UPDATE integration_attempts SET landed_commit_sha=?1,result='integrated',finished_at=?2 WHERE id=?3",
                 params![landed_commit_sha, now(), attempt_id],
             )?;
+            let landed = serde_json::to_string(&LandingState::Landed {
+                candidate_sha,
+                commit_sha: landed_commit_sha.to_string(),
+            })?;
             tx.execute(
-                "UPDATE queue_items SET status='integrated',landed_commit_sha=?1,updated_at=?2 WHERE id=?3",
-                params![landed_commit_sha, now(), item_id],
+                "UPDATE queue_items SET status='integrated',landed_commit_sha=?1,landing_state_json=?2,updated_at=?3 WHERE id=?4",
+                params![landed_commit_sha, landed, now(), item_id],
             )?;
+            let submission_id: Option<String> = tx.query_row(
+                "SELECT submission_id FROM queue_items WHERE id=?1 AND source_kind='local_submission'",
+                params![item_id],
+                |row| row.get(0),
+            ).optional()?;
+            if let Some(submission_id) = submission_id {
+                let changed = tx.execute(
+                    "UPDATE local_submissions SET state='integrated' WHERE id=?1 AND state='queued'",
+                    params![submission_id],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("integrated local submission is not queued");
+                }
+                let workspace_id: String = tx.query_row(
+                    "SELECT workspace_id FROM local_submissions WHERE id=?1",
+                    params![submission_id],
+                    |row| row.get(0),
+                )?;
+                let cleanup = serde_json::to_string(&CleanupState::Pending)?;
+                let changed = tx.execute(
+                    "UPDATE development_workspaces SET status='cleanup_pending',cleanup_json=?1,updated_at=?2 WHERE id=?3 AND status IN ('submitted','cleanup_pending','cleanup_failed')",
+                    params![cleanup,now(),workspace_id],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("local submission workspace cannot enter durable cleanup debt");
+                }
+            }
+            let registered: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM registered_repositories WHERE repo_key=(SELECT repo_key FROM queue_items WHERE id=?1))",
+                params![item_id],
+                |row| row.get(0),
+            )?;
+            if registered {
+                let seed_cleanup = serde_json::to_string(&SeedRefreshState::Pending {
+                    target_sha: remote_target_sha.to_string(),
+                })?;
+                let changed = tx.execute(
+                    "UPDATE registered_repositories SET seed_refresh_json=?1,updated_at=?2 WHERE repo_key=(SELECT repo_key FROM queue_items WHERE id=?3)",
+                    params![seed_cleanup,now(),item_id],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("registered repository cannot enter durable seed refresh debt");
+                }
+            }
             Self::record_event_tx(
                 &tx,
                 item_id,
@@ -1687,17 +3155,30 @@ pub mod sqlite {
             self.get_item(item_id)
         }
 
-        pub fn begin_landing(&self, item_id: &str, attempt_id: &str) -> Result<()> {
+        pub fn begin_landing(
+            &self,
+            item_id: &str,
+            attempt_id: &str,
+            candidate_sha: &str,
+            expected_target_sha: &str,
+            repo_key: &str,
+            owner_id: &str,
+        ) -> Result<()> {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let item: (String, Option<String>, bool) = required_row(
+            let item: (String, Option<String>, String, String) = required_row(
                 tx.query_row(
-                    "SELECT status,current_attempt_id,landing_fenced FROM queue_items WHERE id=?1",
+                    "SELECT status,current_attempt_id,landing_state_json,repo_key FROM queue_items WHERE id=?1",
                     params![item_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 ),
                 "queue item",
                 item_id,
+            )?;
+            Self::require_mutation_authority(
+                &tx,
+                &item.3,
+                MutationAuthority::RepositoryLease { repo_key, owner_id },
             )?;
             if item.0 != QueueStatus::Integrating.to_string()
                 || item.1.as_deref() != Some(attempt_id)
@@ -1706,18 +3187,86 @@ pub mod sqlite {
                     "item {item_id} is no longer integrating attempt {attempt_id}; refusing target mutation"
                 );
             }
-            if !item.2 {
+            let current: LandingState = serde_json::from_str(&item.2)
+                .context("parse landing state while authorizing target mutation")?;
+            let uncertain = LandingState::Uncertain {
+                candidate_sha: candidate_sha.to_string(),
+                expected_target_sha: expected_target_sha.to_string(),
+            };
+            if current == LandingState::Ready {
                 tx.execute(
-                    "UPDATE queue_items SET landing_fenced=1,updated_at=?1 WHERE id=?2",
-                    params![now(), item_id],
+                    "UPDATE queue_items SET landing_state_json=?1,updated_at=?2 WHERE id=?3",
+                    params![serde_json::to_string(&uncertain)?, now(), item_id],
                 )?;
                 Self::record_event_tx(
                     &tx,
                     item_id,
-                    "landing_fenced",
-                    "target mutation authorized; cancellation is now closed",
+                    "landing_uncertain",
+                    "target mutation started; cancellation is closed until the outcome is known",
                 )?;
+            } else if current != uncertain {
+                anyhow::bail!("item has a different durable landing outcome");
             }
+            tx.commit()?;
+            Ok(())
+        }
+
+        pub fn record_definite_landing_rejection(
+            &self,
+            item_id: &str,
+            attempt_id: &str,
+            candidate_sha: &str,
+            expected_target_sha: &str,
+            repo_key: &str,
+            owner_id: &str,
+        ) -> Result<()> {
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let (status, current_attempt_id, raw, item_repo_key): (
+                String,
+                Option<String>,
+                String,
+                String,
+            ) = required_row(
+                tx.query_row(
+                    "SELECT status,current_attempt_id,landing_state_json,repo_key FROM queue_items WHERE id=?1",
+                    params![item_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                ),
+                "queue item",
+                item_id,
+            )?;
+            Self::require_mutation_authority(
+                &tx,
+                &item_repo_key,
+                MutationAuthority::RepositoryLease { repo_key, owner_id },
+            )?;
+            let expected = LandingState::Uncertain {
+                candidate_sha: candidate_sha.to_string(),
+                expected_target_sha: expected_target_sha.to_string(),
+            };
+            let current: LandingState =
+                serde_json::from_str(&raw).context("parse rejected landing state")?;
+            if status != QueueStatus::Integrating.to_string()
+                || current_attempt_id.as_deref() != Some(attempt_id)
+                || current != expected
+            {
+                anyhow::bail!("definite rejection does not match the active landing attempt");
+            }
+            tx.execute(
+                r#"UPDATE queue_items SET landing_state_json='{"state":"ready"}',updated_at=?1 WHERE id=?2"#,
+                params![now(), item_id],
+            )?;
+            tx.execute(
+                "UPDATE integration_attempts SET validated_commit_sha=NULL,validation_command=NULL,validation_exit_code=NULL,validation_log_path=NULL,signoff_evidence_json=NULL WHERE id=?1",
+                params![attempt_id],
+            )?;
+            Self::record_event_tx(
+                &tx,
+                item_id,
+                "landing_rejected",
+                "compare-and-set rejected before target mutation; candidate evidence invalidated",
+            )?;
             tx.commit()?;
             Ok(())
         }
@@ -1804,6 +3353,629 @@ pub mod sqlite {
             Ok(())
         }
 
+        fn composition_transaction<T>(
+            &self,
+            repo_key: &str,
+            owner_id: &str,
+            operation: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+        ) -> Result<T> {
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current_time = now();
+            let changed = tx.execute(
+                "UPDATE repo_leases SET heartbeat_at=?1,expires_at=?2 WHERE repo_key=?3 AND owner_id=?4 AND expires_at>?1",
+                params![current_time, (Utc::now() + Duration::seconds(30)).to_rfc3339(), repo_key, owner_id],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("repo queue {repo_key} composition lease is not owned by {owner_id}");
+            }
+            let result = operation(&tx)?;
+            tx.commit()?;
+            Ok(result)
+        }
+
+        pub fn repository(&self, repo_key: &str) -> Result<RegisteredRepository> {
+            let conn = self.connect_read_only()?;
+            required_row(
+                conn.query_row(
+                    &format!("{REGISTERED_REPOSITORY_SELECT} WHERE repository.repo_key=?1"),
+                    params![repo_key],
+                    map_repository,
+                ),
+                "registered repository",
+                repo_key,
+            )
+        }
+
+        pub fn repository_if_exists(&self, repo_key: &str) -> Result<Option<RegisteredRepository>> {
+            let conn = self.connect_read_only()?;
+            conn.query_row(
+                &format!("{REGISTERED_REPOSITORY_SELECT} WHERE repository.repo_key=?1"),
+                params![repo_key],
+                map_repository,
+            )
+            .optional()
+            .map_err(Into::into)
+        }
+
+        pub fn repository_for_integration_path(
+            &self,
+            path: &Path,
+        ) -> Result<Option<RegisteredRepository>> {
+            let conn = self.connect_read_only()?;
+            conn.query_row(
+                &format!("{REGISTERED_REPOSITORY_SELECT} WHERE repository.integration_path=?1"),
+                params![path_bytes(path)],
+                map_repository,
+            )
+            .optional()
+            .map_err(Into::into)
+        }
+
+        pub fn list_repositories(&self) -> Result<Vec<RegisteredRepository>> {
+            let conn = self.connect_read_only()?;
+            let mut statement = conn.prepare(&format!(
+                "{REGISTERED_REPOSITORY_SELECT} ORDER BY repository.repo_key"
+            ))?;
+            let repositories = statement
+                .query_map([], map_repository)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(repositories)
+        }
+
+        pub(crate) fn registered_remote_identity(
+            &self,
+            repo_key: &str,
+        ) -> Result<Option<(PathBuf, String, RegisteredRemote)>> {
+            let conn = self.connect_read_only()?;
+            conn.query_row(
+                "SELECT integration_path,target_branch,remote_name,fetch_url,push_url FROM registered_remote_identities WHERE repo_key=?1",
+                params![repo_key],
+                |row| {
+                    Ok((
+                        row_path(row, "integration_path")?,
+                        row.get("target_branch")?,
+                        RegisteredRemote {
+                            name: row.get("remote_name")?,
+                            fetch_url: row.get("fetch_url")?,
+                            push_url: row.get("push_url")?,
+                        },
+                    ))
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+        }
+
+        pub(crate) fn save_registered_remote_intent(
+            &self,
+            repo_key: &str,
+            owner_id: &str,
+            integration_path: &Path,
+            target_branch: &str,
+            remote: &RegisteredRemote,
+        ) -> Result<()> {
+            self.composition_transaction(repo_key, owner_id, |tx| {
+                tx.execute(
+                    "INSERT OR IGNORE INTO registered_remote_identities(repo_key,integration_path,target_branch,remote_name,fetch_url,push_url,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    params![repo_key,path_bytes(integration_path),target_branch,remote.name,remote.fetch_url,remote.push_url,now()],
+                )?;
+                let persisted: (Vec<u8>, String, String, String, String) = tx.query_row(
+                    "SELECT integration_path,target_branch,remote_name,fetch_url,push_url FROM registered_remote_identities WHERE repo_key=?1",
+                    params![repo_key],
+                    |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+                )?;
+                if persisted
+                    != (
+                        path_bytes(integration_path),
+                        target_branch.to_string(),
+                        remote.name.clone(),
+                        remote.fetch_url.clone(),
+                        remote.push_url.clone(),
+                    )
+                {
+                    anyhow::bail!("registered remote identity intent differs from the current repository remote");
+                }
+                Ok(())
+            })
+        }
+
+        pub fn save_repository_intent(
+            &self,
+            owner_id: &str,
+            repository: &RegisteredRepository,
+        ) -> Result<()> {
+            self.composition_transaction(&repository.key, owner_id, |tx| {
+                let existing = tx
+                    .query_row(
+                        &format!("{REGISTERED_REPOSITORY_SELECT} WHERE repository.repo_key=?1"),
+                        params![repository.key],
+                        map_repository,
+                    )
+                    .optional()?;
+                if let Some(existing) = existing {
+                    if existing != *repository {
+                        anyhow::bail!("repository {} is already registered with different durable state", repository.key);
+                    }
+                    return Ok(());
+                }
+                tx.execute(
+                    "INSERT INTO registered_repositories (repo_key,integration_path,target_branch,remote,seed_path,seed_rift_id,seed_source_rift_id,workspace_root,checkout_reconciliation_json,seed_refresh_json,policy_target_sha,policy_snapshot_json,policy_digest,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,NULL,NULL,?6,?7,?8,?9,?10,?11,?12,?12)",
+                    params![repository.key,path_bytes(&repository.integration_path),repository.target_branch,repository.remote.name,path_bytes(Path::new(repository.seed.path().context("repository seed intent has no path")?)),path_bytes(&repository.workspace_root),serde_json::to_string(&repository.checkout_reconciliation)?,serde_json::to_string(&repository.seed_refresh)?,repository.policy_target_sha,repository.policy_snapshot_json,repository.policy_digest,repository.created_at],
+                )?;
+                Ok(())
+            })
+        }
+
+        pub fn set_repository_seed_identity(
+            &self,
+            repo_key: &str,
+            owner_id: &str,
+            identity: &WorkspaceIdentity,
+        ) -> Result<RegisteredRepository> {
+            self.composition_transaction(repo_key, owner_id, |tx| {
+                let changed = tx.execute(
+                    "UPDATE registered_repositories SET seed_path=?1,seed_rift_id=?2,seed_source_rift_id=?3,updated_at=?4 WHERE repo_key=?5 AND seed_path=?1",
+                    params![path_bytes(Path::new(&identity.path)),identity.rift_id,identity.source_rift_id,now(),repo_key],
+                )?;
+                if changed != 1 { anyhow::bail!("repository seed creation intent changed"); }
+                Ok(())
+            })?;
+            self.repository(repo_key)
+        }
+
+        pub fn update_seed_refresh(
+            &self,
+            repo_key: &str,
+            owner_id: &str,
+            state: &SeedRefreshState,
+        ) -> Result<()> {
+            self.composition_transaction(repo_key, owner_id, |tx| {
+                let changed = tx.execute(
+                    "UPDATE registered_repositories SET seed_refresh_json=?1,updated_at=?2 WHERE repo_key=?3",
+                    params![serde_json::to_string(state)?,now(),repo_key],
+                )?;
+                if changed != 1 { anyhow::bail!("registered repository disappeared"); }
+                Ok(())
+            })
+        }
+
+        pub fn update_checkout_reconciliation(
+            &self,
+            repo_key: &str,
+            owner_id: &str,
+            state: &CheckoutReconciliationState,
+        ) -> Result<()> {
+            self.composition_transaction(repo_key, owner_id, |tx| {
+                let changed = tx.execute(
+                    "UPDATE registered_repositories SET checkout_reconciliation_json=?1,updated_at=?2 WHERE repo_key=?3",
+                    params![serde_json::to_string(state)?,now(),repo_key],
+                )?;
+                if changed != 1 { anyhow::bail!("registered repository disappeared"); }
+                Ok(())
+            })
+        }
+
+        pub fn update_repository_policy(
+            &self,
+            repo_key: &str,
+            owner_id: &str,
+            target_sha: &str,
+            snapshot_json: &str,
+            digest: &str,
+        ) -> Result<()> {
+            self.composition_transaction(repo_key, owner_id, |tx| {
+                let changed = tx.execute(
+                    "UPDATE registered_repositories SET policy_target_sha=?1,policy_snapshot_json=?2,policy_digest=?3,updated_at=?4 WHERE repo_key=?5",
+                    params![target_sha,snapshot_json,digest,now(),repo_key],
+                )?;
+                if changed != 1 { anyhow::bail!("registered repository disappeared during policy refresh"); }
+                Ok(())
+            })
+        }
+
+        pub fn refresh_registered_target(
+            &self,
+            repo_key: &str,
+            owner_id: &str,
+            target_sha: &str,
+            snapshot_json: &str,
+            digest: &str,
+        ) -> Result<()> {
+            let checkout = CheckoutReconciliationState::Ready {
+                target_sha: target_sha.to_string(),
+            };
+            let seed = SeedRefreshState::Pending {
+                target_sha: target_sha.to_string(),
+            };
+            self.composition_transaction(repo_key, owner_id, |tx| {
+                let changed = tx.execute(
+                    "UPDATE registered_repositories SET checkout_reconciliation_json=?1,seed_refresh_json=?2,policy_target_sha=?3,policy_snapshot_json=?4,policy_digest=?5,updated_at=?6 WHERE repo_key=?7",
+                    params![serde_json::to_string(&checkout)?,serde_json::to_string(&seed)?,target_sha,snapshot_json,digest,now(),repo_key],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("registered repository disappeared during target refresh");
+                }
+                Ok(())
+            })
+        }
+
+        pub fn workspace(&self, id: &str) -> Result<DevelopmentWorkspace> {
+            let conn = self.connect_read_only()?;
+            required_row(
+                conn.query_row(
+                    "SELECT * FROM development_workspaces WHERE id=?1",
+                    params![id],
+                    map_development_workspace,
+                ),
+                "development workspace",
+                id,
+            )
+        }
+
+        pub fn list_development_workspaces(
+            &self,
+            repo_key: Option<&str>,
+        ) -> Result<Vec<DevelopmentWorkspace>> {
+            let conn = self.connect_read_only()?;
+            let mut statement = if repo_key.is_some() {
+                conn.prepare(
+                    "SELECT * FROM development_workspaces WHERE repo_key=?1 ORDER BY created_at,id",
+                )?
+            } else {
+                conn.prepare("SELECT * FROM development_workspaces ORDER BY created_at,id")?
+            };
+            if let Some(repo_key) = repo_key {
+                statement
+                    .query_map(params![repo_key], map_development_workspace)?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(Into::into)
+            } else {
+                statement
+                    .query_map([], map_development_workspace)?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(Into::into)
+            }
+        }
+
+        pub fn save_development_workspace(
+            &self,
+            owner_id: &str,
+            workspace: &DevelopmentWorkspace,
+        ) -> Result<()> {
+            self.composition_transaction(&workspace.repo_key, owner_id, |tx| {
+                tx.execute(
+                    "INSERT INTO development_workspaces (id,repo_key,name,path,rift_id,source_rift_id,branch,base_sha,status,cleanup_json,created_at,updated_at) VALUES (?1,?2,?3,?4,NULL,NULL,?5,?6,?7,?8,?9,?9)",
+                    params![workspace.id,workspace.repo_key,workspace.name,path_bytes(&workspace.path),workspace.branch,workspace.base_sha,workspace.status.to_string(),serde_json::to_string(&workspace.cleanup)?,workspace.created_at],
+                )?;
+                Ok(())
+            })
+        }
+
+        pub fn set_development_workspace_identity(
+            &self,
+            repo_key: &str,
+            owner_id: &str,
+            id: &str,
+            identity: &WorkspaceIdentity,
+        ) -> Result<DevelopmentWorkspace> {
+            self.composition_transaction(repo_key, owner_id, |tx| {
+                let changed = tx.execute(
+                    "UPDATE development_workspaces SET rift_id=?1,source_rift_id=?2,status='active',updated_at=?3 WHERE id=?4 AND repo_key=?5 AND status='creating' AND path=?6",
+                    params![identity.rift_id,identity.source_rift_id,now(),id,repo_key,path_bytes(Path::new(&identity.path))],
+                )?;
+                if changed != 1 { anyhow::bail!("development workspace creation intent changed"); }
+                Ok(())
+            })?;
+            self.workspace(id)
+        }
+
+        pub fn update_development_workspace_cleanup(
+            &self,
+            repo_key: &str,
+            owner_id: &str,
+            id: &str,
+            status: DevelopmentWorkspaceStatus,
+            cleanup: &CleanupState,
+        ) -> Result<DevelopmentWorkspace> {
+            self.composition_transaction(repo_key, owner_id, |tx| {
+                let changed = tx.execute(
+                    "UPDATE development_workspaces SET status=?1,cleanup_json=?2,updated_at=?3 WHERE id=?4 AND repo_key=?5",
+                    params![status.to_string(),serde_json::to_string(cleanup)?,now(),id,repo_key],
+                )?;
+                if changed != 1 { anyhow::bail!("development workspace disappeared"); }
+                Ok(())
+            })?;
+            self.workspace(id)
+        }
+
+        pub fn begin_local_submission(
+            &self,
+            repo_key: &str,
+            owner_id: &str,
+            workspace_id: &str,
+            commit_sha: &str,
+            replaces_item_id: Option<&str>,
+        ) -> Result<LocalSubmission> {
+            let mut submission_id = None;
+            self.composition_transaction(repo_key, owner_id, |tx| {
+                let existing = tx
+                    .query_row(
+                        "SELECT * FROM local_submissions WHERE workspace_id=?1 AND state='creating'",
+                        params![workspace_id],
+                        map_local_submission,
+                    )
+                    .optional()?;
+                if let Some(existing) = existing {
+                    if existing.repo_key != repo_key
+                        || existing.commit_sha != commit_sha
+                        || existing.replaces_item_id.as_deref() != replaces_item_id
+                    {
+                        anyhow::bail!(
+                            "workspace has a different incomplete immutable submission intent"
+                        );
+                    }
+                    submission_id = Some(existing.id);
+                    return Ok(());
+                }
+                let workspace = required_row(
+                    tx.query_row(
+                        "SELECT * FROM development_workspaces WHERE id=?1",
+                        params![workspace_id],
+                        map_development_workspace,
+                    ),
+                    "development workspace",
+                    workspace_id,
+                )?;
+                let expected_status = if replaces_item_id.is_some() {
+                    DevelopmentWorkspaceStatus::Submitted
+                } else {
+                    DevelopmentWorkspaceStatus::Active
+                };
+                if workspace.repo_key != repo_key || workspace.status != expected_status {
+                    anyhow::bail!("development workspace is not in the required submission state");
+                }
+                if let Some(item_id) = replaces_item_id {
+                    let item = required_row(
+                        tx.query_row(
+                            "SELECT * FROM queue_items WHERE id=?1",
+                            params![item_id],
+                            map_item,
+                        ),
+                        "queue item",
+                        item_id,
+                    )?;
+                    let old_submission_id = match &item.source {
+                        QueueSource::LocalSubmission { submission_id, .. } => submission_id,
+                        QueueSource::RemoteBranch { .. } => {
+                            anyhow::bail!("replacement item is not a local submission")
+                        }
+                    };
+                    let old_workspace_id: String = tx.query_row(
+                        "SELECT workspace_id FROM local_submissions WHERE id=?1",
+                        params![old_submission_id],
+                        |row| row.get(0),
+                    )?;
+                    if item.repo_key != repo_key
+                        || item.status != QueueStatus::Blocked
+                        || item.blocked_reason != Some(BlockedReason::NeedsAgentFix)
+                        || old_workspace_id != workspace_id
+                    {
+                        anyhow::bail!("replacement requires the original needs-agent-fix local submission");
+                    }
+                }
+                let id = Uuid::new_v4().to_string();
+                let item_id = replaces_item_id
+                    .map(str::to_string)
+                    .unwrap_or_else(|| Uuid::new_v4().to_string());
+                let private_ref = format!("refs/iq/submissions/{id}");
+                let staging_ref = format!("refs/iq/staging/{id}");
+                tx.execute(
+                    "INSERT INTO local_submissions (id,queue_item_id,repo_key,workspace_id,base_sha,commit_sha,private_ref,staging_ref,replaces_item_id,state,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'creating',?10)",
+                    params![id,item_id,repo_key,workspace_id,workspace.base_sha,commit_sha,private_ref,staging_ref,replaces_item_id,now()],
+                )?;
+                submission_id = Some(id);
+                Ok(())
+            })?;
+            self.local_submission(
+                submission_id
+                    .as_deref()
+                    .context("local submission intent did not produce an identity")?,
+            )
+        }
+
+        pub fn finalize_local_submission(
+            &self,
+            repo_key: &str,
+            owner_id: &str,
+            submission_id: &str,
+            producer_metadata: &Value,
+        ) -> Result<(LocalSubmission, QueueItem)> {
+            let mut queue_item_id = None;
+            self.composition_transaction(repo_key, owner_id, |tx| {
+                let submission = required_row(
+                    tx.query_row(
+                        "SELECT * FROM local_submissions WHERE id=?1",
+                        params![submission_id],
+                        map_local_submission,
+                    ),
+                    "local submission",
+                    submission_id,
+                )?;
+                if submission.repo_key != repo_key
+                    || submission.state != LocalSubmissionState::Creating
+                {
+                    anyhow::bail!("local submission is not an exact creation intent");
+                }
+                let repository = required_row(
+                    tx.query_row(
+                        &format!(
+                            "{REGISTERED_REPOSITORY_SELECT} WHERE repository.repo_key=?1"
+                        ),
+                        params![repo_key],
+                        map_repository,
+                    ),
+                    "registered repository",
+                    repo_key,
+                )?;
+                let timestamp = now();
+                if let Some(item_id) = submission.replaces_item_id.as_deref() {
+                    let item = required_row(
+                        tx.query_row(
+                            "SELECT * FROM queue_items WHERE id=?1",
+                            params![item_id],
+                            map_item,
+                        ),
+                        "queue item",
+                        item_id,
+                    )?;
+                    let old_submission_id = match &item.source {
+                        QueueSource::LocalSubmission { submission_id, .. } => submission_id,
+                        QueueSource::RemoteBranch { .. } => {
+                            anyhow::bail!("replacement item is not a local submission")
+                        }
+                    };
+                    if item.repo_key != repo_key
+                        || item.status != QueueStatus::Blocked
+                        || item.blocked_reason != Some(BlockedReason::NeedsAgentFix)
+                    {
+                        anyhow::bail!("local replacement target changed before finalization");
+                    }
+                    let old_attempt_id = item
+                        .current_attempt_id
+                        .as_deref()
+                        .context("replacement target has no active integration attempt")?;
+                    let replacement = match &item.workspace {
+                        WorkspaceState::Retained { identity } => ReplacementState::CleanupPending {
+                            old_attempt_id: old_attempt_id.to_string(),
+                            old_workspace: identity.clone(),
+                        },
+                        WorkspaceState::CreationIntent { .. } => anyhow::bail!("replacement cannot discard an incomplete integration workspace"),
+                        _ => ReplacementState::None,
+                    };
+                    let (status, current_attempt, workspace_path, workspace_rift, workspace_source, replacement_json) = match &replacement {
+                        ReplacementState::None => ("ready", None, None, None, None, None),
+                        ReplacementState::CleanupPending { .. } => (
+                            "blocked",
+                            item.current_attempt_id.as_deref(),
+                            item.workspace.path(),
+                            item.workspace.identity().map(|identity| identity.rift_id.as_str()),
+                            item.workspace.identity().map(|identity| identity.source_rift_id.as_str()),
+                            Some(serde_json::to_string(&replacement)?),
+                        ),
+                    };
+                    let changed = tx.execute(
+                        r#"UPDATE queue_items SET source_branch=?1,source_ref=?1,submission_id=?2,current_head_sha=?3,repo_path=?4,target_branch=?5,status=?6,current_attempt_id=?7,integration_workspace_path=?8,integration_workspace_rift_id=?9,integration_workspace_source_rift_id=?10,replacement_json=?11,landing_state_json='{"state":"ready"}',conflict_json=NULL,target_sha=NULL,source_sha=NULL,landed_commit_sha=NULL,validation_evidence_json='{}',updated_at=?12 WHERE id=?13 AND repo_key=?14 AND status='blocked'"#,
+                        params![submission.private_ref,submission.id,submission.commit_sha,path_text(&repository.integration_path)?,repository.target_branch,status,current_attempt,workspace_path,workspace_rift,workspace_source,replacement_json,timestamp,item_id,repo_key],
+                    )?;
+                    if changed != 1 { anyhow::bail!("local replacement state changed concurrently"); }
+                    let changed = tx.execute(
+                        "UPDATE local_submissions SET state='replaced' WHERE id=?1 AND state='queued'",
+                        params![old_submission_id],
+                    )?;
+                    if changed != 1 { anyhow::bail!("old local submission is not queued"); }
+                    if matches!(replacement, ReplacementState::None) {
+                        let changed = tx.execute(
+                            "UPDATE integration_attempts SET result='superseded',finished_at=?1 WHERE id=?2 AND item_id=?3 AND finished_at IS NULL AND result IS NULL",
+                            params![timestamp,old_attempt_id,item_id],
+                        )?;
+                        if changed != 1 { anyhow::bail!("old integration attempt cannot be superseded"); }
+                    }
+                    tx.execute("UPDATE prompts SET status='superseded' WHERE item_id=?1 AND status='open'",params![item_id])?;
+                    Self::record_event_tx(tx,item_id,"local_submission_replaced",if matches!(replacement, ReplacementState::None) { "immutable local submission replaced" } else { "immutable local submission replaced; old integration Rift cleanup is pending" })?;
+                } else {
+                    tx.execute(
+                        "INSERT INTO queue_items (id,repo_key,repo_path,source_branch,target_branch,pr_url,producer_metadata_json,validation_evidence_json,status,current_head_sha,source_kind,source_ref,submission_id,landing_policy,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,NULL,?6,'{}','ready',?7,'local_submission',?4,?8,'squash',?9,?9)",
+                        params![submission.queue_item_id,repo_key,path_text(&repository.integration_path)?,submission.private_ref,repository.target_branch,producer_metadata.to_string(),submission.commit_sha,submission.id,timestamp],
+                    )?;
+                    let changed = tx.execute(
+                        "UPDATE development_workspaces SET status='submitted',updated_at=?1 WHERE id=?2 AND repo_key=?3 AND status='active'",
+                        params![timestamp,submission.workspace_id,repo_key],
+                    )?;
+                    if changed != 1 { anyhow::bail!("development workspace is not active"); }
+                    Self::record_event_tx(tx,&submission.queue_item_id,"item_enqueued","immutable local submission enqueued")?;
+                }
+                let changed = tx.execute(
+                    "UPDATE local_submissions SET state='queued' WHERE id=?1 AND state='creating'",
+                    params![submission.id],
+                )?;
+                if changed != 1 { anyhow::bail!("local submission intent changed before finalization"); }
+                queue_item_id = Some(submission.queue_item_id);
+                Ok(())
+            })?;
+            let queue_item_id = queue_item_id
+                .context("local submission finalization did not produce a queue item identity")?;
+            Ok((
+                self.local_submission(submission_id)?,
+                self.get_item(&queue_item_id)?,
+            ))
+        }
+
+        pub fn finish_replacement_cleanup(
+            &self,
+            repo_key: &str,
+            owner_id: &str,
+            item_id: &str,
+            old_attempt_id: &str,
+        ) -> Result<QueueItem> {
+            self.composition_transaction(repo_key, owner_id, |tx| {
+                let item = required_row(tx.query_row("SELECT * FROM queue_items WHERE id=?1",params![item_id],map_item),"queue item",item_id)?;
+                let ReplacementState::CleanupPending { old_attempt_id: expected, .. } = &item.replacement else {
+                    anyhow::bail!("queue item has no replacement cleanup debt");
+                };
+                if expected != old_attempt_id { anyhow::bail!("replacement cleanup attempt identity changed"); }
+                let changed = tx.execute("UPDATE integration_attempts SET result='superseded',finished_at=?1 WHERE id=?2 AND item_id=?3 AND finished_at IS NULL AND result IS NULL",params![now(),old_attempt_id,item_id])?;
+                if changed != 1 { anyhow::bail!("old integration attempt cannot be superseded after cleanup"); }
+                let changed = tx.execute(
+                    "UPDATE queue_items SET status='ready',current_attempt_id=NULL,integration_workspace_path=NULL,integration_workspace_rift_id=NULL,integration_workspace_source_rift_id=NULL,replacement_json=NULL,blocked_phase=NULL,blocked_reason=NULL,blocked_message=NULL,prompt_id=NULL,updated_at=?1 WHERE id=?2 AND repo_key=?3 AND status='blocked'",
+                    params![now(),item_id,repo_key],
+                )?;
+                if changed != 1 { anyhow::bail!("replacement cleanup state changed concurrently"); }
+                tx.execute("UPDATE prompts SET status='superseded' WHERE item_id=?1 AND status='open'",params![item_id])?;
+                Self::record_event_tx(tx,item_id,"local_submission_replacement_cleanup_complete","old integration Rift cleanup completed")?;
+                Ok(())
+            })?;
+            self.get_item(item_id)
+        }
+
+        pub fn local_submission(&self, id: &str) -> Result<LocalSubmission> {
+            let conn = self.connect_read_only()?;
+            required_row(
+                conn.query_row(
+                    "SELECT * FROM local_submissions WHERE id=?1",
+                    params![id],
+                    map_local_submission,
+                ),
+                "local submission",
+                id,
+            )
+        }
+
+        pub fn creating_local_submission(
+            &self,
+            workspace_id: &str,
+        ) -> Result<Option<LocalSubmission>> {
+            let conn = self.connect_read_only()?;
+            conn.query_row(
+                "SELECT * FROM local_submissions WHERE workspace_id=?1 AND state='creating'",
+                params![workspace_id],
+                map_local_submission,
+            )
+            .optional()
+            .map_err(Into::into)
+        }
+
+        pub fn integrated_submission_sha(&self, workspace_id: &str) -> Result<Option<String>> {
+            let conn = self.connect_read_only()?;
+            conn.query_row(
+                "SELECT ls.commit_sha FROM local_submissions ls JOIN queue_items qi ON qi.submission_id=ls.id WHERE ls.workspace_id=?1 AND qi.status='integrated' ORDER BY ls.created_at DESC LIMIT 1",
+                params![workspace_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+        }
+
         pub fn set_conflict_metadata(
             &self,
             item_id: &str,
@@ -1862,7 +4034,7 @@ pub mod sqlite {
 
     impl SqliteQueueReader {
         const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-        const COMMAND_AUTHORITY_RESERVE: Duration = Duration::seconds(1);
+        const COMMAND_AUTHORITY_RESERVE: Duration = Duration::milliseconds(100);
 
         pub fn open(path: &Path) -> Result<Self> {
             let path = if path.is_absolute() {
@@ -1898,7 +4070,7 @@ pub mod sqlite {
                     .collect::<std::result::Result<Vec<_>, _>>()?;
                 columns
             };
-            if !columns.iter().any(|column| column == "landing_fenced")
+            if !columns.iter().any(|column| column == "landing_state_json")
                 || !columns
                     .iter()
                     .any(|column| column == "integration_workspace_rift_id")
@@ -1920,7 +4092,7 @@ pub mod sqlite {
                     |row| row.get(0),
                 )
                 .optional()?;
-            if workspace_schema_version.as_deref() != Some("2") {
+            if workspace_schema_version.as_deref() != Some("7") {
                 anyhow::bail!(
                     "queue database workspace schema is missing or unsupported; restart the IQ daemon"
                 );
@@ -2163,7 +4335,7 @@ pub mod sqlite {
             let conn = self.connect(Self::BUSY_TIMEOUT)?;
             required_row(
                 conn.query_row(
-                    "SELECT id,item_id,attempt_number,source_head_sha,target_base_sha,merge_commit_sha,validated_commit_sha,landed_commit_sha,validation_command,validation_exit_code,validation_log_path FROM integration_attempts WHERE id=?1",
+                    "SELECT id,item_id,attempt_number,source_head_sha,target_base_sha,merge_commit_sha,validated_commit_sha,landed_commit_sha,validation_command,validation_exit_code,validation_log_path,policy_target_sha,policy_snapshot_json,policy_digest,signoff_evidence_json,moved_base_json FROM integration_attempts WHERE id=?1",
                     params![attempt_id],
                     |row| {
                         Ok(Attempt {
@@ -2178,6 +4350,12 @@ pub mod sqlite {
                             validation_command: row.get(8)?,
                             validation_exit_code: row.get(9)?,
                             validation_log_path: row.get(10)?,
+                            policy_target_sha: row.get(11)?,
+                            policy_snapshot_json: row.get(12)?,
+                            policy_digest: row.get(13)?,
+                            signoff_evidence_json: row.get(14)?,
+                            moved_base: serde_json::from_str(&row.get::<_, String>(15)?)
+                                .map_err(|error| map_json_error("moved_base_json", error))?,
                         })
                     },
                 ),
@@ -2197,6 +4375,267 @@ pub mod sqlite {
                 "prompt",
                 prompt_id,
             )
+        }
+    }
+
+    fn path_text(path: &Path) -> Result<&str> {
+        path.to_str().context("Git path is not valid UTF-8")
+    }
+
+    fn path_entry_exists(path: &Path) -> Result<bool> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error).with_context(|| format!("inspect {}", path.display())),
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct StatePathIdentity {
+        dev: u64,
+        ino: u64,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct StateDirectoryIdentity {
+        directory: StatePathIdentity,
+        database: StatePathIdentity,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct StateLayout {
+        legacy: Option<StateDirectoryIdentity>,
+        iq: Option<StateDirectoryIdentity>,
+    }
+
+    fn inspect_state_layout(legacy: &Path, iq: &Path) -> Result<StateLayout> {
+        let legacy_identity = inspect_state_directory(legacy, "legacy IQ state directory")?;
+        let iq_identity = inspect_state_directory(iq, "IQ state directory")?;
+        if legacy_identity.is_some() && iq_identity.is_some() {
+            anyhow::bail!(
+                "both legacy and IQ state directories exist; refuse ambiguous state migration: {} and {}",
+                legacy.display(),
+                iq.display()
+            );
+        }
+        Ok(StateLayout {
+            legacy: legacy_identity,
+            iq: iq_identity,
+        })
+    }
+
+    fn inspect_state_directory(path: &Path, label: &str) -> Result<Option<StateDirectoryIdentity>> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).with_context(|| format!("inspect {label}")),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            anyhow::bail!("{label} must be a real directory: {}", path.display());
+        }
+        let database = path.join("queues.db");
+        let database_metadata = fs::symlink_metadata(&database)
+            .with_context(|| format!("inspect {label} database {}", database.display()))?;
+        if database_metadata.file_type().is_symlink() || !database_metadata.is_file() {
+            anyhow::bail!(
+                "{label} database must be a regular file: {}",
+                database.display()
+            );
+        }
+        Ok(Some(StateDirectoryIdentity {
+            directory: StatePathIdentity {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            },
+            database: StatePathIdentity {
+                dev: database_metadata.dev(),
+                ino: database_metadata.ino(),
+            },
+        }))
+    }
+
+    fn verify_open_directory(path: &Path, directory: &fs::File, label: &str) -> Result<()> {
+        let path_metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("inspect {label} path {}", path.display()))?;
+        let open_metadata = directory
+            .metadata()
+            .with_context(|| format!("inspect open {label} {}", path.display()))?;
+        if path_metadata.file_type().is_symlink()
+            || !path_metadata.is_dir()
+            || path_metadata.dev() != open_metadata.dev()
+            || path_metadata.ino() != open_metadata.ino()
+        {
+            anyhow::bail!("{label} identity changed: {}", path.display());
+        }
+        Ok(())
+    }
+
+    fn open_lock_at(directory: &fs::File, name: &str) -> Result<fs::File> {
+        let name = CString::new(name).context("state lock name contains a NUL byte")?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_CREAT | libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error()).context("open IQ state migration lock");
+        }
+        Ok(unsafe { fs::File::from_raw_fd(fd) })
+    }
+
+    fn require_real_directory(path: &Path, label: &str) -> Result<()> {
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("inspect {label} {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            anyhow::bail!("{label} must be a real directory: {}", path.display());
+        }
+        Ok(())
+    }
+
+    fn require_regular_file(path: &Path, label: &str) -> Result<()> {
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("inspect {label} {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            anyhow::bail!("{label} must be a regular file: {}", path.display());
+        }
+        Ok(())
+    }
+
+    fn path_bytes(path: &Path) -> Vec<u8> {
+        path.as_os_str().as_bytes().to_vec()
+    }
+
+    fn row_path(row: &Row<'_>, column: &str) -> rusqlite::Result<PathBuf> {
+        let bytes: Vec<u8> = row.get(column)?;
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+    }
+
+    const REGISTERED_REPOSITORY_SELECT: &str = "SELECT repository.*,identity.remote_name,identity.fetch_url,identity.push_url FROM registered_repositories repository JOIN registered_remote_identities identity ON identity.repo_key=repository.repo_key";
+
+    fn map_repository(row: &Row<'_>) -> rusqlite::Result<RegisteredRepository> {
+        let seed_path = row_path(row, "seed_path")?;
+        let seed_rift_id: Option<String> = row.get("seed_rift_id")?;
+        let seed_source_rift_id: Option<String> = row.get("seed_source_rift_id")?;
+        let seed = match (seed_rift_id, seed_source_rift_id) {
+            (None, None) => WorkspaceState::CreationIntent {
+                path: seed_path
+                    .to_str()
+                    .ok_or_else(|| map_parse_error("seed path is not valid UTF-8".into()))?
+                    .to_string(),
+            },
+            (Some(rift_id), Some(source_rift_id)) => WorkspaceState::Retained {
+                identity: WorkspaceIdentity {
+                    path: seed_path
+                        .to_str()
+                        .ok_or_else(|| map_parse_error("seed path is not valid UTF-8".into()))?
+                        .to_string(),
+                    rift_id,
+                    source_rift_id,
+                },
+            },
+            _ => return Err(map_parse_error("invalid repository seed identity".into())),
+        };
+        let seed_refresh: SeedRefreshState =
+            serde_json::from_str(&row.get::<_, String>("seed_refresh_json")?)
+                .map_err(|error| map_json_error("seed_refresh_json", error))?;
+        let seed_target = match &seed_refresh {
+            SeedRefreshState::Ready { target_sha }
+            | SeedRefreshState::Pending { target_sha }
+            | SeedRefreshState::Failed { target_sha, .. } => target_sha,
+        };
+        require_persisted_sha(seed_target, "seed refresh target")?;
+        let checkout_reconciliation: CheckoutReconciliationState =
+            serde_json::from_str(&row.get::<_, String>("checkout_reconciliation_json")?)
+                .map_err(|error| map_json_error("checkout_reconciliation_json", error))?;
+        let checkout_target = match &checkout_reconciliation {
+            CheckoutReconciliationState::Ready { target_sha }
+            | CheckoutReconciliationState::Pending { target_sha }
+            | CheckoutReconciliationState::Failed { target_sha, .. } => target_sha,
+        };
+        require_persisted_sha(checkout_target, "registered checkout target")?;
+        Ok(RegisteredRepository {
+            key: row.get("repo_key")?,
+            integration_path: row_path(row, "integration_path")?,
+            target_branch: row.get("target_branch")?,
+            remote: RegisteredRemote {
+                name: row.get("remote_name")?,
+                fetch_url: row.get("fetch_url")?,
+                push_url: row.get("push_url")?,
+            },
+            seed,
+            workspace_root: row_path(row, "workspace_root")?,
+            checkout_reconciliation,
+            seed_refresh,
+            policy_target_sha: row.get("policy_target_sha")?,
+            policy_snapshot_json: row.get("policy_snapshot_json")?,
+            policy_digest: row.get("policy_digest")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+        })
+    }
+
+    fn map_development_workspace(row: &Row<'_>) -> rusqlite::Result<DevelopmentWorkspace> {
+        let path = row_path(row, "path")?;
+        let rift_id: Option<String> = row.get("rift_id")?;
+        let source_rift_id: Option<String> = row.get("source_rift_id")?;
+        let identity = match (rift_id, source_rift_id) {
+            (None, None) => None,
+            (Some(rift_id), Some(source_rift_id)) => Some(WorkspaceIdentity {
+                path: path
+                    .to_str()
+                    .ok_or_else(|| map_parse_error("development path is not valid UTF-8".into()))?
+                    .to_string(),
+                rift_id,
+                source_rift_id,
+            }),
+            _ => return Err(map_parse_error("invalid development Rift identity".into())),
+        };
+        Ok(DevelopmentWorkspace {
+            id: row.get("id")?,
+            repo_key: row.get("repo_key")?,
+            name: row.get("name")?,
+            identity,
+            path,
+            branch: row.get("branch")?,
+            base_sha: row.get("base_sha")?,
+            status: DevelopmentWorkspaceStatus::from_str(&row.get::<_, String>("status")?)
+                .map_err(map_parse_error)?,
+            cleanup: serde_json::from_str(&row.get::<_, String>("cleanup_json")?)
+                .map_err(|error| map_json_error("cleanup_json", error))?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+        })
+    }
+
+    fn map_local_submission(row: &Row<'_>) -> rusqlite::Result<LocalSubmission> {
+        let base_sha: String = row.get("base_sha")?;
+        let commit_sha: String = row.get("commit_sha")?;
+        require_persisted_sha(&base_sha, "local submission base")?;
+        require_persisted_sha(&commit_sha, "local submission commit")?;
+        Ok(LocalSubmission {
+            id: row.get("id")?,
+            queue_item_id: row.get("queue_item_id")?,
+            repo_key: row.get("repo_key")?,
+            workspace_id: row.get("workspace_id")?,
+            base_sha,
+            commit_sha,
+            private_ref: row.get("private_ref")?,
+            staging_ref: row.get("staging_ref")?,
+            replaces_item_id: row.get("replaces_item_id")?,
+            state: LocalSubmissionState::from_str(&row.get::<_, String>("state")?)
+                .map_err(map_parse_error)?,
+            created_at: row.get("created_at")?,
+        })
+    }
+
+    fn require_persisted_sha(value: &str, label: &str) -> rusqlite::Result<()> {
+        if matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            Ok(())
+        } else {
+            Err(map_parse_error(format!("invalid {label} SHA")))
         }
     }
 
@@ -2320,7 +4759,28 @@ pub mod sqlite {
             landed_commit_sha: row.get("landed_commit_sha")?,
             producer_metadata: parse_json_value(row, "producer_metadata_json")?,
             validation_evidence,
-            landing_fenced: row.get("landing_fenced")?,
+            landing: serde_json::from_str(&row.get::<_, String>("landing_state_json")?)
+                .map_err(|error| map_json_error("landing_state_json", error))?,
+            source: match row.get::<_, String>("source_kind")?.as_str() {
+                "remote_branch" => QueueSource::RemoteBranch {
+                    branch: row.get("source_ref")?,
+                },
+                "local_submission" => QueueSource::LocalSubmission {
+                    submission_id: row.get("submission_id")?,
+                    commit_sha: row.get("current_head_sha")?,
+                },
+                value => return Err(map_parse_error(format!("unknown queue source: {value}"))),
+            },
+            landing_policy: LandingPolicy::from_str(&row.get::<_, String>("landing_policy")?)
+                .map_err(map_parse_error)?,
+            replacement: row
+                .get::<_, Option<String>>("replacement_json")?
+                .map(|value| {
+                    serde_json::from_str(&value)
+                        .map_err(|error| map_json_error("replacement_json", error))
+                })
+                .transpose()?
+                .unwrap_or(ReplacementState::None),
         })
     }
 
@@ -2442,9 +4902,19 @@ CREATE TABLE IF NOT EXISTS queue_items (
   target_sha TEXT,
   source_sha TEXT,
   landed_commit_sha TEXT,
-  landing_fenced INTEGER NOT NULL DEFAULT 0,
+  landing_state_json TEXT NOT NULL DEFAULT '{"state":"ready"}',
+  source_kind TEXT NOT NULL DEFAULT 'remote_branch',
+  source_ref TEXT,
+  submission_id TEXT,
+  landing_policy TEXT NOT NULL DEFAULT 'direct',
+  replacement_json TEXT,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(submission_id) REFERENCES local_submissions(id),
+  CHECK (
+    (source_kind='remote_branch' AND source_ref IS NOT NULL AND submission_id IS NULL AND source_ref=source_branch AND ((landing_policy='direct' AND pr_url IS NULL) OR (landing_policy='provider' AND pr_url IS NOT NULL))) OR
+    (source_kind='local_submission' AND source_ref IS NOT NULL AND submission_id IS NOT NULL AND source_ref=source_branch AND landing_policy='squash' AND pr_url IS NULL)
+  )
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS queue_items_active_identity
@@ -2463,6 +4933,11 @@ CREATE TABLE IF NOT EXISTS integration_attempts (
   validation_command TEXT,
   validation_exit_code INTEGER,
   validation_log_path TEXT,
+  policy_target_sha TEXT,
+  policy_snapshot_json TEXT,
+  policy_digest TEXT,
+  signoff_evidence_json TEXT,
+  moved_base_json TEXT NOT NULL DEFAULT '{"state":"none"}',
   started_at TEXT NOT NULL,
   finished_at TEXT,
   result TEXT,
@@ -2547,6 +5022,221 @@ CREATE TABLE IF NOT EXISTS workspace_gc_debt (
   created_at TEXT NOT NULL
 );
 "#;
+
+    const COMPOSITION_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS registered_remote_identities (
+  repo_key TEXT PRIMARY KEY,
+  integration_path BLOB NOT NULL UNIQUE,
+  target_branch TEXT NOT NULL,
+  remote_name TEXT NOT NULL,
+  fetch_url TEXT NOT NULL,
+  push_url TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  CHECK(repo_key!='' AND target_branch!='' AND remote_name!='' AND fetch_url!='' AND push_url!='')
+);
+
+CREATE TABLE IF NOT EXISTS registered_repositories (
+  repo_key TEXT PRIMARY KEY,
+  integration_path BLOB NOT NULL UNIQUE,
+  target_branch TEXT NOT NULL,
+  remote TEXT NOT NULL,
+  seed_path BLOB NOT NULL UNIQUE,
+  seed_rift_id TEXT,
+  seed_source_rift_id TEXT,
+  workspace_root BLOB NOT NULL UNIQUE,
+  checkout_reconciliation_json TEXT NOT NULL,
+  seed_refresh_json TEXT NOT NULL,
+  policy_target_sha TEXT NOT NULL,
+  policy_snapshot_json TEXT NOT NULL,
+  policy_digest TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS development_workspaces (
+  id TEXT PRIMARY KEY,
+  repo_key TEXT NOT NULL REFERENCES registered_repositories(repo_key),
+  name TEXT NOT NULL,
+  path BLOB NOT NULL UNIQUE,
+  rift_id TEXT,
+  source_rift_id TEXT,
+  branch TEXT NOT NULL UNIQUE,
+  base_sha TEXT NOT NULL,
+  status TEXT NOT NULL,
+  cleanup_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(repo_key,name)
+);
+
+CREATE TABLE IF NOT EXISTS local_submissions (
+  id TEXT PRIMARY KEY,
+  queue_item_id TEXT NOT NULL,
+  repo_key TEXT NOT NULL REFERENCES registered_repositories(repo_key),
+  workspace_id TEXT NOT NULL REFERENCES development_workspaces(id),
+  base_sha TEXT NOT NULL CHECK(length(base_sha) IN (40,64) AND base_sha NOT GLOB '*[^0-9A-Fa-f]*'),
+  commit_sha TEXT NOT NULL CHECK(length(commit_sha) IN (40,64) AND commit_sha NOT GLOB '*[^0-9A-Fa-f]*'),
+  private_ref TEXT NOT NULL UNIQUE,
+  staging_ref TEXT NOT NULL UNIQUE,
+  replaces_item_id TEXT,
+  state TEXT NOT NULL CHECK(state IN ('creating','queued','replaced','cancelled','integrated')),
+  created_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS local_submissions_creating_workspace
+ON local_submissions(workspace_id)
+WHERE state='creating';
+"#;
+
+    const LANDING_STATE_TRIGGERS: &str = r#"
+DROP TRIGGER IF EXISTS queue_items_landing_state_insert;
+DROP TRIGGER IF EXISTS queue_items_landing_state_update;
+
+CREATE TRIGGER queue_items_landing_state_insert
+BEFORE INSERT ON queue_items
+WHEN json_valid(NEW.landing_state_json)=0 OR NOT (
+  (json_extract(NEW.landing_state_json,'$.state')='ready' AND NEW.status!='integrated') OR
+  (json_extract(NEW.landing_state_json,'$.state')='uncertain' AND (NEW.status='integrating' OR (NEW.status='blocked' AND NEW.blocked_phase='integrating')) AND
+   length(json_extract(NEW.landing_state_json,'$.candidate_sha')) IN (40,64) AND json_extract(NEW.landing_state_json,'$.candidate_sha') NOT GLOB '*[^0-9A-Fa-f]*' AND
+   length(json_extract(NEW.landing_state_json,'$.expected_target_sha')) IN (40,64) AND json_extract(NEW.landing_state_json,'$.expected_target_sha') NOT GLOB '*[^0-9A-Fa-f]*') OR
+  (json_extract(NEW.landing_state_json,'$.state')='landed' AND NEW.status='integrated' AND
+   length(json_extract(NEW.landing_state_json,'$.candidate_sha')) IN (40,64) AND json_extract(NEW.landing_state_json,'$.candidate_sha') NOT GLOB '*[^0-9A-Fa-f]*' AND
+   NEW.landed_commit_sha=json_extract(NEW.landing_state_json,'$.commit_sha'))
+)
+BEGIN
+  SELECT RAISE(ABORT, 'invalid queue landing state');
+END;
+
+CREATE TRIGGER queue_items_landing_state_update
+BEFORE UPDATE OF status,blocked_phase,landed_commit_sha,landing_state_json ON queue_items
+WHEN json_valid(NEW.landing_state_json)=0 OR NOT (
+  (json_extract(NEW.landing_state_json,'$.state')='ready' AND NEW.status!='integrated') OR
+  (json_extract(NEW.landing_state_json,'$.state')='uncertain' AND (NEW.status='integrating' OR (NEW.status='blocked' AND NEW.blocked_phase='integrating')) AND
+   length(json_extract(NEW.landing_state_json,'$.candidate_sha')) IN (40,64) AND json_extract(NEW.landing_state_json,'$.candidate_sha') NOT GLOB '*[^0-9A-Fa-f]*' AND
+   length(json_extract(NEW.landing_state_json,'$.expected_target_sha')) IN (40,64) AND json_extract(NEW.landing_state_json,'$.expected_target_sha') NOT GLOB '*[^0-9A-Fa-f]*') OR
+  (json_extract(NEW.landing_state_json,'$.state')='landed' AND NEW.status='integrated' AND
+   length(json_extract(NEW.landing_state_json,'$.candidate_sha')) IN (40,64) AND json_extract(NEW.landing_state_json,'$.candidate_sha') NOT GLOB '*[^0-9A-Fa-f]*' AND
+   NEW.landed_commit_sha=json_extract(NEW.landing_state_json,'$.commit_sha'))
+)
+BEGIN
+  SELECT RAISE(ABORT, 'invalid queue landing state');
+END;
+"#;
+
+    const REGISTERED_REMOTE_TRIGGERS: &str = r#"
+DROP TRIGGER IF EXISTS registered_repository_remote_insert;
+DROP TRIGGER IF EXISTS registered_repository_remote_update;
+DROP TRIGGER IF EXISTS registered_remote_identity_immutable;
+DROP TRIGGER IF EXISTS registered_remote_identity_delete;
+
+CREATE TRIGGER registered_repository_remote_insert
+BEFORE INSERT ON registered_repositories
+WHEN NOT EXISTS (
+  SELECT 1 FROM registered_remote_identities identity
+  WHERE identity.repo_key=NEW.repo_key
+    AND identity.integration_path=NEW.integration_path
+    AND identity.target_branch=NEW.target_branch
+    AND identity.remote_name=NEW.remote
+)
+BEGIN
+  SELECT RAISE(ABORT, 'registered repository has no exact remote identity intent');
+END;
+
+CREATE TRIGGER registered_repository_remote_update
+BEFORE UPDATE OF repo_key,integration_path,target_branch,remote ON registered_repositories
+WHEN NOT EXISTS (
+  SELECT 1 FROM registered_remote_identities identity
+  WHERE identity.repo_key=NEW.repo_key
+    AND identity.integration_path=NEW.integration_path
+    AND identity.target_branch=NEW.target_branch
+    AND identity.remote_name=NEW.remote
+)
+BEGIN
+  SELECT RAISE(ABORT, 'registered repository differs from its remote identity');
+END;
+
+CREATE TRIGGER registered_remote_identity_immutable
+BEFORE UPDATE ON registered_remote_identities
+BEGIN
+  SELECT RAISE(ABORT, 'registered remote identity is immutable');
+END;
+
+CREATE TRIGGER registered_remote_identity_delete
+BEFORE DELETE ON registered_remote_identities
+WHEN EXISTS (SELECT 1 FROM registered_repositories WHERE repo_key=OLD.repo_key)
+BEGIN
+  SELECT RAISE(ABORT, 'registered remote identity is still in use');
+END;
+"#;
+
+    const REGISTERED_CHECKOUT_TRIGGERS: &str = r#"
+DROP TRIGGER IF EXISTS registered_checkout_state_insert;
+DROP TRIGGER IF EXISTS registered_checkout_state_update;
+
+CREATE TRIGGER registered_checkout_state_insert
+BEFORE INSERT ON registered_repositories
+WHEN json_valid(NEW.checkout_reconciliation_json)=0 OR
+     json_extract(NEW.checkout_reconciliation_json,'$.state') NOT IN ('ready','pending','failed') OR
+     length(json_extract(NEW.checkout_reconciliation_json,'$.target_sha')) NOT IN (40,64) OR
+     json_extract(NEW.checkout_reconciliation_json,'$.target_sha') GLOB '*[^0-9A-Fa-f]*' OR
+     (json_extract(NEW.checkout_reconciliation_json,'$.state')='failed' AND COALESCE(json_extract(NEW.checkout_reconciliation_json,'$.message'),'')='')
+BEGIN
+  SELECT RAISE(ABORT, 'invalid registered checkout reconciliation state');
+END;
+
+CREATE TRIGGER registered_checkout_state_update
+BEFORE UPDATE OF checkout_reconciliation_json ON registered_repositories
+WHEN json_valid(NEW.checkout_reconciliation_json)=0 OR
+     json_extract(NEW.checkout_reconciliation_json,'$.state') NOT IN ('ready','pending','failed') OR
+     length(json_extract(NEW.checkout_reconciliation_json,'$.target_sha')) NOT IN (40,64) OR
+     json_extract(NEW.checkout_reconciliation_json,'$.target_sha') GLOB '*[^0-9A-Fa-f]*' OR
+     (json_extract(NEW.checkout_reconciliation_json,'$.state')='failed' AND COALESCE(json_extract(NEW.checkout_reconciliation_json,'$.message'),'')='')
+BEGIN
+  SELECT RAISE(ABORT, 'invalid registered checkout reconciliation state');
+END;
+"#;
+
+    const QUEUE_SOURCE_TRIGGERS: &str = r#"
+DROP TRIGGER IF EXISTS queue_items_local_source_insert;
+DROP TRIGGER IF EXISTS queue_items_local_source_update;
+DROP TRIGGER IF EXISTS local_submission_identity_immutable;
+
+CREATE TRIGGER queue_items_local_source_insert
+BEFORE INSERT ON queue_items
+WHEN NEW.source_kind='local_submission' AND NOT EXISTS (
+  SELECT 1 FROM local_submissions submission
+  WHERE submission.id=NEW.submission_id
+    AND submission.repo_key=NEW.repo_key
+    AND submission.commit_sha=NEW.current_head_sha
+    AND submission.private_ref=NEW.source_ref
+    AND submission.queue_item_id=NEW.id
+    AND submission.state='creating'
+)
+BEGIN
+  SELECT RAISE(ABORT, 'local queue source does not match exact submission intent');
+END;
+
+CREATE TRIGGER queue_items_local_source_update
+BEFORE UPDATE OF source_kind,source_ref,submission_id,current_head_sha,repo_key,id ON queue_items
+WHEN NEW.source_kind='local_submission' AND NOT EXISTS (
+  SELECT 1 FROM local_submissions submission
+  WHERE submission.id=NEW.submission_id
+    AND submission.repo_key=NEW.repo_key
+    AND submission.commit_sha=NEW.current_head_sha
+    AND submission.private_ref=NEW.source_ref
+    AND submission.queue_item_id=NEW.id
+    AND submission.state='creating'
+)
+BEGIN
+  SELECT RAISE(ABORT, 'local queue source does not match exact submission intent');
+END;
+
+CREATE TRIGGER local_submission_identity_immutable
+BEFORE UPDATE OF id,queue_item_id,repo_key,workspace_id,base_sha,commit_sha,private_ref,staging_ref,replaces_item_id,created_at ON local_submissions
+BEGIN
+  SELECT RAISE(ABORT, 'local submission identity is immutable');
+END;
+"#;
 }
 
 pub mod integrator {
@@ -2572,8 +5262,8 @@ pub mod integrator {
 
     use crate::core::{BlockedPhase, BlockedReason, QueueStatus};
     use crate::sqlite::{
-        Attempt, ExecutionAuthority, QueueItem, SqliteQueue, SqliteQueueReader, WorkspaceIdentity,
-        WorkspaceState,
+        Attempt, ExecutionAuthority, QueueItem, RiftWorkspaceRootOwner, SqliteQueue,
+        SqliteQueueReader, WorkspaceIdentity, WorkspaceState,
     };
 
     #[derive(Clone, Debug)]
@@ -2611,20 +5301,20 @@ pub mod integrator {
         workspaces: RiftWorkspaceManager,
     }
 
-    struct RiftWorkspaceManager {
+    pub(crate) struct RiftWorkspaceManager {
         source: PathBuf,
         source_id: String,
+        source_ancestors: Vec<PathBuf>,
         root: PathBuf,
         repo_key: String,
         queue_database_id: String,
-        queue_database_path: PathBuf,
         registry_identity: String,
         registry_dev: u64,
         registry_ino: u64,
         generation: AtomicI64,
         program: String,
         database: Option<OsString>,
-        _root_lock: fs::File,
+        root_directory: fs::File,
     }
 
     struct EvidenceDirectory {
@@ -2632,19 +5322,17 @@ pub mod integrator {
         directory: fs::File,
     }
 
-    #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct RiftWorkspaceRootOwner {
-        version: u32,
-        queue_database_id: String,
-        queue_database_path: PathBuf,
-        repo_key: String,
-        source: PathBuf,
-        source_rift_id: String,
-        registry_identity: String,
-    }
-
     const RIFT_TRASH_DIRECTORY: &str = ".trash";
+
+    pub fn workspace_scope(repo_key: &str) -> String {
+        let hash = repo_key
+            .as_bytes()
+            .iter()
+            .fold(0xcbf29ce484222325_u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+            });
+        format!("{hash:016x}")
+    }
 
     fn default_rift_database_path() -> Result<PathBuf> {
         if cfg!(target_os = "macos") {
@@ -2925,6 +5613,9 @@ pub mod integrator {
     }
 
     fn acquire_root_lock(path: &Path) -> Result<fs::File> {
+        const ROOT_LOCK_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+        const ROOT_LOCK_RETRY: StdDuration = StdDuration::from_millis(10);
+
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
@@ -2936,16 +5627,23 @@ pub mod integrator {
                 path.display()
             );
         }
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if result != 0 {
-            return Err(std::io::Error::last_os_error()).with_context(|| {
-                format!(
-                    "acquire exclusive IQ workspace root lock {}",
-                    path.display()
-                )
-            });
+        let deadline = Instant::now() + ROOT_LOCK_TIMEOUT;
+        loop {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(file);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EWOULDBLOCK) || Instant::now() >= deadline {
+                return Err(error).with_context(|| {
+                    format!(
+                        "acquire exclusive IQ workspace root lock {} within {} seconds",
+                        path.display(),
+                        ROOT_LOCK_TIMEOUT.as_secs()
+                    )
+                });
+            }
+            thread::sleep(ROOT_LOCK_RETRY);
         }
-        Ok(file)
     }
 
     fn resolve_path_without_creating(path: &Path) -> Result<PathBuf> {
@@ -2978,7 +5676,6 @@ pub mod integrator {
             repo_key: String,
             database: Option<PathBuf>,
             queue_database_id: &str,
-            queue_database_path: &Path,
             workspace_generation: i64,
         ) -> Result<()> {
             if root.starts_with(&source) {
@@ -3067,9 +5764,8 @@ pub mod integrator {
                         "IQ workspace owner marker",
                     )?)
                     .with_context(|| format!("parse {}", marker.display()))?;
-                    if owner.version != 2
+                    if owner.version != 3
                         || owner.queue_database_id != queue_database_id
-                        || owner.queue_database_path != queue_database_path
                         || owner.repo_key != repo_key
                         || owner.source != source
                         || owner.source_rift_id != source_id
@@ -3171,14 +5867,54 @@ pub mod integrator {
             Ok(())
         }
 
-        fn new(
+        pub(crate) fn new(
             source: PathBuf,
             root: PathBuf,
             repo_key: String,
             database: Option<PathBuf>,
             queue_database_id: &str,
-            queue_database_path: &Path,
             workspace_generation: i64,
+        ) -> Result<Self> {
+            Self::new_with_source_requirement(
+                source,
+                root,
+                repo_key,
+                database,
+                queue_database_id,
+                workspace_generation,
+                true,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn new_child_source(
+            source: PathBuf,
+            root: PathBuf,
+            repo_key: String,
+            database: Option<PathBuf>,
+            queue_database_id: &str,
+            workspace_generation: i64,
+        ) -> Result<Self> {
+            Self::new_with_source_requirement(
+                source,
+                root,
+                repo_key,
+                database,
+                queue_database_id,
+                workspace_generation,
+                false,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn new_with_source_requirement(
+            source: PathBuf,
+            root: PathBuf,
+            repo_key: String,
+            database: Option<PathBuf>,
+            queue_database_id: &str,
+            workspace_generation: i64,
+            require_root_source: bool,
         ) -> Result<Self> {
             if root.starts_with(&source) {
                 anyhow::bail!(
@@ -3213,29 +5949,36 @@ pub mod integrator {
             let source_id = Self::read_marker_id(&source)?;
             let (database, registry_identity, registry_dev, registry_ino) =
                 resolve_rift_database(database)?;
-            let root_lock = acquire_root_lock(&root)?;
-            let manager = Self {
+            let root_directory = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+                .open(&root)
+                .with_context(|| format!("open IQ workspace root {}", root.display()))?;
+            let mut manager = Self {
                 source,
                 source_id,
+                source_ancestors: Vec::new(),
                 root,
                 repo_key,
                 queue_database_id: queue_database_id.to_string(),
-                queue_database_path: queue_database_path.to_path_buf(),
                 registry_identity,
                 registry_dev,
                 registry_ino,
                 generation: AtomicI64::new(0),
                 program: std::env::var("IQ_RIFT_CLI").unwrap_or_else(|_| "rift".into()),
                 database,
-                _root_lock: root_lock,
+                root_directory,
             };
-            manager.verify_source_root()?;
-            manager.ensure_root_owner(queue_database_id, queue_database_path)?;
-            manager.synchronize_generation(workspace_generation)?;
+            manager.source_ancestors = manager.verify_source(require_root_source)?;
+            {
+                let _root_lock = acquire_root_lock(&manager.root)?;
+                manager.ensure_root_owner()?;
+                manager.synchronize_generation_unlocked(workspace_generation)?;
+            }
             Ok(manager)
         }
 
-        fn expected_path(&self, item_id: &str) -> Result<PathBuf> {
+        pub(crate) fn expected_path(&self, item_id: &str) -> Result<PathBuf> {
             self.verify_root_identity()?;
             if item_id.is_empty()
                 || !item_id
@@ -3247,7 +5990,19 @@ pub mod integrator {
             Ok(self.root.join(item_id))
         }
 
-        fn verify_source_root(&self) -> Result<()> {
+        pub(crate) fn source_id(&self) -> &str {
+            &self.source_id
+        }
+
+        pub(crate) fn registry_identity(&self) -> &str {
+            &self.registry_identity
+        }
+
+        pub(crate) fn root(&self) -> &Path {
+            &self.root
+        }
+
+        fn verify_source(&self, require_root: bool) -> Result<Vec<PathBuf>> {
             if !self.source.join(".git").is_dir() {
                 anyhow::bail!(
                     "repository {} must be a primary Git checkout, not a linked worktree",
@@ -3267,19 +6022,24 @@ pub mod integrator {
                 [OsString::from("ancestors"), self.source.as_os_str().into()],
                 "verify Rift source root",
             )?;
-            if !String::from_utf8_lossy(&ancestors.stdout).trim().is_empty() {
+            let ancestors = String::from_utf8(ancestors.stdout)?
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+            if require_root && !ancestors.is_empty() {
                 anyhow::bail!(
                     "repository {} is a child Rift; IQ requires an independently managed Rift root",
                     self.source.display()
                 );
             }
-            Ok(())
+            Ok(ancestors)
         }
 
         fn verify_root_identity(&self) -> Result<()> {
             let path_metadata = fs::symlink_metadata(&self.root)
                 .with_context(|| format!("inspect IQ workspace root {}", self.root.display()))?;
-            let locked_metadata = self._root_lock.metadata().with_context(|| {
+            let locked_metadata = self.root_directory.metadata().with_context(|| {
                 format!("inspect locked IQ workspace root {}", self.root.display())
             })?;
             if path_metadata.file_type().is_symlink()
@@ -3293,9 +6053,8 @@ pub mod integrator {
                 );
             }
             let owner = RiftWorkspaceRootOwner {
-                version: 2,
+                version: 3,
                 queue_database_id: self.queue_database_id.clone(),
-                queue_database_path: self.queue_database_path.clone(),
                 repo_key: self.repo_key.clone(),
                 source: self.source.clone(),
                 source_rift_id: self.source_id.clone(),
@@ -3358,7 +6117,7 @@ pub mod integrator {
             Ok(())
         }
 
-        fn synchronize_generation(&self, database_generation: i64) -> Result<()> {
+        fn synchronize_generation_unlocked(&self, database_generation: i64) -> Result<()> {
             for entry in fs::read_dir(&self.root)? {
                 let entry = entry?;
                 if !entry.file_name().to_str().is_some_and(|name| {
@@ -3398,7 +6157,14 @@ pub mod integrator {
             Ok(())
         }
 
-        fn persist_generation(&self, generation: i64) -> Result<()> {
+        fn synchronize_generation(&self, database_generation: i64) -> Result<()> {
+            let _root_lock = acquire_root_lock(&self.root)?;
+            self.synchronize_generation_unlocked(database_generation)
+        }
+
+        pub(crate) fn persist_generation(&self, generation: i64) -> Result<()> {
+            let _root_lock = acquire_root_lock(&self.root)?;
+            self.verify_root_identity()?;
             let current = self.generation.load(Ordering::Acquire);
             if generation != current + 1 {
                 anyhow::bail!(
@@ -3410,16 +6176,11 @@ pub mod integrator {
             Ok(())
         }
 
-        fn ensure_root_owner(
-            &self,
-            queue_database_id: &str,
-            queue_database_path: &Path,
-        ) -> Result<()> {
+        fn ensure_root_owner(&self) -> Result<()> {
             let path = self.root.join(".iq-workspace-owner.json");
             let expected = RiftWorkspaceRootOwner {
-                version: 2,
-                queue_database_id: queue_database_id.to_string(),
-                queue_database_path: queue_database_path.to_path_buf(),
+                version: 3,
+                queue_database_id: self.queue_database_id.clone(),
                 repo_key: self.repo_key.clone(),
                 source: self.source.clone(),
                 source_rift_id: self.source_id.clone(),
@@ -3494,18 +6255,19 @@ pub mod integrator {
             match publish {
                 Ok(()) => Ok(()),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    self.ensure_root_owner(queue_database_id, queue_database_path)
+                    self.ensure_root_owner()
                 }
                 Err(error) => Err(error).with_context(|| format!("publish {}", path.display())),
             }
         }
 
-        fn create(
+        pub(crate) fn create(
             &self,
             item_id: &str,
             authorize_start: impl FnOnce(&mut dyn Write) -> Result<bool>,
             check_authority: impl FnMut() -> Result<ExecutionAuthority>,
         ) -> Result<(PathBuf, String)> {
+            let _root_lock = acquire_root_lock(&self.root)?;
             let _registry_lock = self.acquire_registry_lock()?;
             self.verify_root_identity()?;
             let expected = self.expected_path(item_id)?;
@@ -3544,7 +6306,7 @@ pub mod integrator {
             Ok((created.clone(), self.read_id(&created)?))
         }
 
-        fn list(&self) -> Result<Vec<WorkspaceIdentity>> {
+        pub(crate) fn list(&self) -> Result<Vec<WorkspaceIdentity>> {
             let output = self.run(
                 [OsString::from("list"), self.source.as_os_str().into()],
                 "list source Rifts",
@@ -3575,7 +6337,9 @@ pub mod integrator {
                         .filter(|line| !line.trim().is_empty())
                         .map(PathBuf::from)
                         .collect::<Vec<_>>();
-                    if ancestors != [self.source.clone()] {
+                    let mut expected_ancestors = vec![self.source.clone()];
+                    expected_ancestors.extend(self.source_ancestors.clone());
+                    if ancestors != expected_ancestors {
                         anyhow::bail!(
                             "Rift {} is not a direct child of source {}",
                             path.display(),
@@ -3594,7 +6358,7 @@ pub mod integrator {
                 .collect()
         }
 
-        fn remove_retained<A, C, F>(
+        pub(crate) fn remove_retained<A, C, F>(
             &self,
             identity: &WorkspaceIdentity,
             authorize_mutation: A,
@@ -3616,7 +6380,7 @@ pub mod integrator {
             )
         }
 
-        fn verify_retained(&self, identity: &WorkspaceIdentity) -> Result<PathBuf> {
+        pub(crate) fn verify_retained(&self, identity: &WorkspaceIdentity) -> Result<PathBuf> {
             if identity.source_rift_id != self.source_id {
                 anyhow::bail!(
                     "Rift source identity changed from {} to {}",
@@ -3643,7 +6407,9 @@ pub mod integrator {
                 .filter(|line| !line.trim().is_empty())
                 .map(PathBuf::from)
                 .collect::<Vec<_>>();
-            if ancestors != [self.source.clone()] {
+            let mut expected_ancestors = vec![self.source.clone()];
+            expected_ancestors.extend(self.source_ancestors.clone());
+            if ancestors != expected_ancestors {
                 anyhow::bail!(
                     "retained Rift {} is not a direct child of source {}",
                     path.display(),
@@ -3651,6 +6417,24 @@ pub mod integrator {
                 );
             }
             Ok(path)
+        }
+
+        pub(crate) fn resolve_retained(
+            &self,
+            identity: &WorkspaceIdentity,
+        ) -> Result<Option<WorkspaceIdentity>> {
+            if identity.source_rift_id != self.source_id {
+                anyhow::bail!(
+                    "Rift source identity changed from {} to {}",
+                    identity.source_rift_id,
+                    self.source_id
+                );
+            }
+            self.verify_owned_path(Path::new(&identity.path))?;
+            Ok(self
+                .list()?
+                .into_iter()
+                .find(|candidate| candidate.rift_id == identity.rift_id))
         }
 
         fn remove<A, C, F>(
@@ -3667,9 +6451,9 @@ pub mod integrator {
             C: FnMut() -> Result<ExecutionAuthority>,
             F: FnOnce() -> Result<()>,
         {
+            let _root_lock = acquire_root_lock(&self.root)?;
             let _registry_lock = self.acquire_registry_lock()?;
             self.verify_root_identity()?;
-            self.verify_owned_path(path)?;
             if let Some(expected_source_id) = expected_source_id {
                 if expected_source_id != self.source_id {
                     anyhow::bail!(
@@ -3679,65 +6463,65 @@ pub mod integrator {
                 }
             }
             let inventory = self.list()?;
-            if let Some(expected_id) = expected_id {
-                if let Some(relocated) = inventory.iter().find(|candidate| {
-                    candidate.rift_id == expected_id && Path::new(&candidate.path) != path
-                }) {
-                    anyhow::bail!(
-                        "Rift {expected_id} moved from {} to {}",
-                        path.display(),
-                        relocated.path
-                    );
-                }
-            }
-            if !entry_exists(path)? {
-                if expected_id.is_some() {
+            let removal_path = if let Some(expected_id) = expected_id {
+                let Some(actual) = inventory
+                    .iter()
+                    .find(|candidate| candidate.rift_id == expected_id)
+                else {
+                    if entry_exists(path)? {
+                        anyhow::bail!(
+                            "Rift {expected_id} is absent from source inventory but its old path is occupied: {}",
+                            path.display()
+                        );
+                    }
                     self.gc_unlocked(&mut authorize_mutation, &mut check_authority)?;
                     complete_mutation()?;
+                    return Ok(false);
+                };
+                if Path::new(&actual.path) != path && entry_exists(path)? {
+                    anyhow::bail!(
+                        "Rift {expected_id} moved to {} but its old path remains occupied: {}",
+                        actual.path,
+                        path.display(),
+                    );
                 }
-                return Ok(false);
-            }
-            self.verify_workspace_path(path)?;
-            let id = self.read_id(path)?;
+                PathBuf::from(&actual.path)
+            } else {
+                self.verify_owned_path(path)?;
+                if !entry_exists(path)? {
+                    return Ok(false);
+                }
+                path.to_path_buf()
+            };
+            self.verify_identity_workspace_path(&removal_path)?;
+            let id = self.read_id(&removal_path)?;
             if let Some(expected_id) = expected_id {
                 if id != expected_id {
                     anyhow::bail!(
                         "Rift identity mismatch at {}: found {id}, expected {expected_id}",
-                        path.display()
+                        removal_path.display()
                     );
                 }
             }
-            let canonical = path
+            let canonical = removal_path
                 .canonicalize()
-                .with_context(|| format!("resolve Rift workspace {}", path.display()))?;
+                .with_context(|| format!("resolve Rift workspace {}", removal_path.display()))?;
             if !inventory
                 .iter()
                 .any(|candidate| Path::new(&candidate.path) == canonical && candidate.rift_id == id)
             {
                 anyhow::bail!(
                     "workspace {} is not a direct Rift child of {}",
-                    path.display(),
+                    removal_path.display(),
                     self.source.display()
                 );
             }
-            let descendants = self.run(
-                [OsString::from("list"), canonical.as_os_str().into()],
-                "list integration Rift descendants",
-            )?;
-            if !String::from_utf8_lossy(&descendants.stdout)
-                .trim()
-                .is_empty()
-            {
-                anyhow::bail!(
-                    "refusing to remove IQ Rift {} with child Rifts",
-                    path.display()
-                );
-            }
+            self.require_clean_childless_rift(&canonical)?;
             self.run_supervised(
                 [OsString::from("remove"), canonical.as_os_str().into()],
                 "remove integration Rift",
                 |gate| {
-                    self.verify_workspace_path(&canonical)?;
+                    self.verify_identity_workspace_path(&canonical)?;
                     let current_id = self.read_id(&canonical)?;
                     if current_id != id {
                         anyhow::bail!(
@@ -3753,19 +6537,52 @@ pub mod integrator {
                             canonical.display()
                         );
                     }
+                    self.require_clean_childless_rift(&canonical)?;
                     authorize_mutation(gate)
                 },
                 &mut check_authority,
             )?;
             self.gc_unlocked(&mut authorize_mutation, &mut check_authority)?;
             complete_mutation()?;
-            if entry_exists(path)? {
-                anyhow::bail!("Rift workspace remained after cleanup: {}", path.display());
+            if entry_exists(&canonical)? {
+                anyhow::bail!(
+                    "Rift workspace remained after cleanup: {}",
+                    canonical.display()
+                );
             }
             Ok(true)
         }
 
-        fn gc<A, C, F>(
+        fn require_clean_childless_rift(&self, path: &Path) -> Result<()> {
+            if let Some(dirty) = workspace_dirty(path)? {
+                anyhow::bail!(
+                    "Rift workspace is dirty; preserved {}: {dirty}",
+                    path.display()
+                );
+            }
+            if crate::composition::has_git_operation(path)? {
+                anyhow::bail!(
+                    "Rift workspace has an active Git operation; preserved: {}",
+                    path.display()
+                );
+            }
+            let descendants = self.run(
+                [OsString::from("list"), path.as_os_str().into()],
+                "list integration Rift descendants",
+            )?;
+            if !String::from_utf8_lossy(&descendants.stdout)
+                .trim()
+                .is_empty()
+            {
+                anyhow::bail!(
+                    "refusing to remove IQ Rift {} with child Rifts",
+                    path.display()
+                );
+            }
+            Ok(())
+        }
+
+        pub(crate) fn gc<A, C, F>(
             &self,
             authorize_mutation: A,
             check_authority: C,
@@ -3776,6 +6593,7 @@ pub mod integrator {
             C: FnMut() -> Result<ExecutionAuthority>,
             F: FnOnce() -> Result<()>,
         {
+            let _root_lock = acquire_root_lock(&self.root)?;
             let _registry_lock = self.acquire_registry_lock()?;
             self.verify_root_identity()?;
             self.gc_unlocked(authorize_mutation, check_authority)?;
@@ -3839,19 +6657,22 @@ pub mod integrator {
 
         fn verify_workspace_path(&self, path: &Path) -> Result<()> {
             self.verify_owned_path(path)?;
+            self.verify_identity_workspace_path(path)
+        }
+
+        fn verify_identity_workspace_path(&self, path: &Path) -> Result<()> {
             let metadata = fs::symlink_metadata(path)
                 .with_context(|| format!("inspect Rift workspace {}", path.display()))?;
-            if metadata.file_type().is_symlink() {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
                 anyhow::bail!(
-                    "IQ Rift workspace must not be a symlink: {}",
+                    "Rift workspace must be a real directory: {}",
                     path.display()
                 );
             }
-            let normalized = self.normalize_owned_path(path)?;
             let canonical = path
                 .canonicalize()
                 .with_context(|| format!("resolve Rift workspace {}", path.display()))?;
-            if canonical != normalized {
+            if canonical != path {
                 anyhow::bail!(
                     "Rift workspace {} resolves to unexpected path {}",
                     path.display(),
@@ -3987,7 +6808,6 @@ pub mod integrator {
             repo_key.to_string(),
             rift_database.map(Path::to_path_buf),
             &queue_database_id,
-            queue.path(),
             workspace_generation,
         )
     }
@@ -4017,6 +6837,22 @@ pub mod integrator {
         Cancelled,
     }
 
+    fn signoff_evidence_satisfies(
+        evidence: &JsonValue,
+        candidate_sha: &str,
+        required_contexts: &[String],
+    ) -> bool {
+        evidence.get("sha").and_then(JsonValue::as_str) == Some(candidate_sha)
+            && evidence
+                .get("contexts")
+                .and_then(JsonValue::as_object)
+                .is_some_and(|contexts| {
+                    required_contexts.iter().all(|required| {
+                        contexts.get(required).and_then(JsonValue::as_str) == Some("success")
+                    })
+                })
+    }
+
     enum EvidenceCommandOutcome {
         Exited(ExitStatus),
         Cancelled(Option<ExitStatus>),
@@ -4031,6 +6867,163 @@ pub mod integrator {
     struct LeaseHeartbeat {
         stop: Option<mpsc::Sender<()>>,
         handle: Option<JoinHandle<Result<()>>>,
+    }
+
+    pub(crate) struct RepositoryOperationLease {
+        queue: SqliteQueue,
+        repo_key: String,
+        owner_id: String,
+        ttl_seconds: i64,
+        heartbeat: Option<LeaseHeartbeat>,
+        _process_lock: fs::File,
+    }
+
+    impl RepositoryOperationLease {
+        pub(crate) fn try_acquire(
+            queue: SqliteQueue,
+            repository: &Path,
+            repo_key: &str,
+            owner_id: &str,
+            ttl_seconds: i64,
+        ) -> Result<Option<Self>> {
+            let repository = repository.canonicalize().with_context(|| {
+                format!("resolve repository operation path {}", repository.display())
+            })?;
+            let (_, target) = repo_key
+                .rsplit_once("::")
+                .context("repo_key must use <canonical-repository>::<target> scope")?;
+            if target.is_empty() {
+                anyhow::bail!("repository target must not be empty");
+            }
+            repository
+                .to_str()
+                .context("canonical repository path is not valid UTF-8")?;
+            let top_level =
+                PathBuf::from(git_output(&repository, ["rev-parse", "--show-toplevel"])?);
+            if top_level.canonicalize()? != repository {
+                anyhow::bail!("repository operation path is not the canonical checkout root");
+            }
+            queue.validate_repository_binding(repo_key, &repository, target)?;
+            let git_dir =
+                PathBuf::from(git_output(&repository, ["rev-parse", "--git-common-dir"])?);
+            let git_dir = if git_dir.is_absolute() {
+                git_dir
+            } else {
+                repository.join(git_dir)
+            };
+            let process_lock = acquire_exclusive_lock(
+                &git_dir.join("iq-operation.lock"),
+                "repository operation lock",
+            );
+            let process_lock = match process_lock {
+                Ok(lock) => lock,
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.raw_os_error() == Some(libc::EWOULDBLOCK)) =>
+                {
+                    return Ok(None)
+                }
+                Err(error) => return Err(error),
+            };
+            if !queue.acquire_repo_operation_lease(
+                repo_key,
+                owner_id,
+                ttl_seconds,
+                &repository,
+                target,
+            )? {
+                return Ok(None);
+            }
+            let heartbeat = LeaseHeartbeat::start(
+                queue.clone(),
+                repo_key.to_string(),
+                owner_id.to_string(),
+                ttl_seconds,
+            );
+            Ok(Some(Self {
+                queue,
+                repo_key: repo_key.to_string(),
+                owner_id: owner_id.to_string(),
+                ttl_seconds,
+                heartbeat: Some(heartbeat),
+                _process_lock: process_lock,
+            }))
+        }
+
+        pub(crate) fn acquire(
+            queue: SqliteQueue,
+            repository: &Path,
+            repo_key: &str,
+            owner_id: &str,
+            ttl_seconds: i64,
+        ) -> Result<Self> {
+            Self::try_acquire(queue, repository, repo_key, owner_id, ttl_seconds)?
+                .with_context(|| format!("repository queue {repo_key} has an active operation"))
+        }
+
+        pub(crate) fn ensure(&self) -> Result<()> {
+            if self.queue.ensure_repo_lease_owner(
+                &self.repo_key,
+                &self.owner_id,
+                self.ttl_seconds,
+            )? {
+                Ok(())
+            } else {
+                anyhow::bail!("repository operation lease was lost for {}", self.repo_key)
+            }
+        }
+
+        pub(crate) fn authority(&self) -> Result<ExecutionAuthority> {
+            self.queue.lease_authority(&self.repo_key, &self.owner_id)
+        }
+
+        pub(crate) fn run_command<I, S>(
+            &self,
+            program: &str,
+            args: I,
+            cwd: Option<&Path>,
+            timeout: StdDuration,
+            label: &str,
+        ) -> Result<Output>
+        where
+            I: IntoIterator<Item = S>,
+            S: AsRef<OsStr>,
+        {
+            let outcome = command_output_timeout(
+                program,
+                args,
+                cwd,
+                timeout,
+                |gate| {
+                    self.ensure()?;
+                    gate.write_all(b"run\n")?;
+                    Ok(true)
+                },
+                || self.authority(),
+            )?;
+            match outcome {
+                CommandOutputOutcome::Exited(output) if output.status.success() => Ok(output),
+                CommandOutputOutcome::Exited(output) => anyhow::bail!(
+                    "{label} failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+                CommandOutputOutcome::Cancelled => {
+                    anyhow::bail!("{label} lost repository operation authority")
+                }
+            }
+        }
+    }
+
+    impl Drop for RepositoryOperationLease {
+        fn drop(&mut self) {
+            if let Some(heartbeat) = self.heartbeat.take() {
+                let _ = heartbeat.finish("repository operation");
+            }
+            let _ = self
+                .queue
+                .release_repo_lease(&self.repo_key, &self.owner_id);
+        }
     }
 
     impl LeaseHeartbeat {
@@ -4103,7 +7096,7 @@ pub mod integrator {
     impl Integrator {
         pub fn new(options: IntegratorOptions) -> Result<Self> {
             let policy = IntegrationPolicy {
-                validation_command: validation_command(&options.repo_path)?,
+                validation_command: None,
                 signoff: None,
             };
             Self::new_with_policy(options, policy)
@@ -4119,14 +7112,33 @@ pub mod integrator {
                     options.repo_path.display()
                 )
             })?;
-            if options.repo_key.rsplit_once("::").is_none() {
-                anyhow::bail!("repo_key must use <repository>::<target> scope");
+            let (_, target) = options
+                .repo_key
+                .rsplit_once("::")
+                .context("repo_key must use <canonical-repository>::<target> scope")?;
+            options
+                .repo_path
+                .to_str()
+                .context("canonical repository path is not valid UTF-8")?;
+            if target.is_empty() {
+                anyhow::bail!("repository target must not be empty");
             }
             if options.workspace_root.is_relative() {
                 options.workspace_root = std::env::current_dir()?.join(&options.workspace_root);
             }
             let queue = SqliteQueue::open(&options.queue_db)?;
             options.queue_db = queue.path().to_path_buf();
+            queue.validate_repository_binding(&options.repo_key, &options.repo_path, target)?;
+            let registered = Self::verify_registered_remote_identity_for(
+                &queue,
+                &options.repo_key,
+                &options.repo_path,
+                target,
+                &options.base_remote,
+            )?;
+            if !registered && policy.validation_command.is_none() {
+                policy.validation_command = validation_command(&options.repo_path)?;
+            }
             options.workspace_root = resolve_path_without_creating(&options.workspace_root)?;
             queue.verify_workspace_root_path(&options.repo_key, &options.workspace_root)?;
             let queue_database_id = queue.database_id()?;
@@ -4137,7 +7149,6 @@ pub mod integrator {
                 options.repo_key.clone(),
                 options.rift_database.clone(),
                 &queue_database_id,
-                &options.queue_db,
                 workspace_generation,
             )?;
             options.workspace_root = workspaces.root.clone();
@@ -4187,14 +7198,59 @@ pub mod integrator {
             })
         }
 
+        fn verify_registered_remote_identity_for(
+            queue: &SqliteQueue,
+            repo_key: &str,
+            repo_path: &Path,
+            target: &str,
+            remote_name: &str,
+        ) -> Result<bool> {
+            let Some((registered_path, registered_target, registered_remote)) =
+                queue.registered_remote_identity(repo_key)?
+            else {
+                return Ok(false);
+            };
+            if registered_path != repo_path
+                || registered_target != target
+                || registered_remote.name != remote_name
+            {
+                anyhow::bail!(
+                    "configured remote {remote_name} does not match registered repository remote {}",
+                    registered_remote.name
+                );
+            }
+            crate::composition::verify_remote_identity(repo_path, &registered_remote)?;
+            Ok(true)
+        }
+
+        fn ensure_registered_remote_identity(&self) -> Result<()> {
+            let (_, target) = self
+                .options
+                .repo_key
+                .rsplit_once("::")
+                .context("repo_key must use <canonical-repository>::<target> scope")?;
+            Self::verify_registered_remote_identity_for(
+                &self.queue,
+                &self.options.repo_key,
+                &self.options.repo_path,
+                target,
+                &self.options.base_remote,
+            )?;
+            Ok(())
+        }
+
         pub fn run_once(&self) -> Result<Option<QueueItem>> {
-            if !self.queue.acquire_repo_lease(
+            self.ensure_registered_remote_identity()?;
+            let Some(_operation) = RepositoryOperationLease::try_acquire(
+                self.queue.clone(),
+                &self.options.repo_path,
                 &self.options.repo_key,
                 &self.lease_owner_id,
                 self.options.lease_ttl_seconds,
-            )? {
+            )?
+            else {
                 return Ok(None);
-            }
+            };
             self.synchronize_workspace_generation()?;
             self.with_lease_heartbeat("workspace cleanup", || self.reconcile_workspaces())?;
             let Some(active) = self.queue.oldest_active_item(&self.options.repo_key)? else {
@@ -4207,9 +7263,12 @@ pub mod integrator {
                 return Ok(Some(active));
             }
             if active.status != QueueStatus::Ready {
-                return self.resume_item(&active.id).map(Some);
+                return self.resume_item_owned(&active.id).map(Some);
             }
-            let Some((item, attempt)) = self.queue.claim_next_ready(&self.options.repo_key)? else {
+            let Some((item, attempt)) = self
+                .queue
+                .claim_next_ready_owned(&self.options.repo_key, &self.lease_owner_id)?
+            else {
                 return Ok(None);
             };
             let item = self.with_lease_heartbeat("merging", || self.merge_item(item, &attempt))?;
@@ -4230,28 +7289,44 @@ pub mod integrator {
             &self,
             operation: impl FnOnce() -> Result<T>,
         ) -> Result<Option<T>> {
-            if !self.queue.acquire_repo_lease(
+            self.ensure_registered_remote_identity()?;
+            let Some(_operation) = RepositoryOperationLease::try_acquire(
+                self.queue.clone(),
+                &self.options.repo_path,
                 &self.options.repo_key,
                 &self.lease_owner_id,
                 self.options.lease_ttl_seconds,
-            )? {
+            )?
+            else {
                 return Ok(None);
-            }
+            };
             self.with_lease_heartbeat("communication", operation)
                 .map(Some)
         }
 
         pub fn resume_item(&self, item_id: &str) -> Result<QueueItem> {
-            if !self.queue.acquire_repo_lease(
+            self.ensure_registered_remote_identity()?;
+            let _operation = RepositoryOperationLease::acquire(
+                self.queue.clone(),
+                &self.options.repo_path,
                 &self.options.repo_key,
                 &self.lease_owner_id,
                 self.options.lease_ttl_seconds,
-            )? {
+            )?;
+            let oldest = self
+                .queue
+                .oldest_active_item(&self.options.repo_key)?
+                .context("repository queue has no active item to resume")?;
+            if oldest.id != item_id {
                 anyhow::bail!(
-                    "repo queue {} is leased by another integrator",
-                    self.options.repo_key
+                    "item {item_id} is not the oldest active item; {} must complete first",
+                    oldest.id
                 );
             }
+            self.resume_item_owned(item_id)
+        }
+
+        fn resume_item_owned(&self, item_id: &str) -> Result<QueueItem> {
             let item = self.queue.get_item(item_id)?;
             if item.repo_key != self.options.repo_key {
                 anyhow::bail!(
@@ -4345,18 +7420,12 @@ pub mod integrator {
 
         fn with_lease_heartbeat<T>(
             &self,
-            phase: &str,
+            _phase: &str,
             operation: impl FnOnce() -> Result<T>,
         ) -> Result<T> {
             self.ensure_repo_lease()?;
-            let guard = LeaseHeartbeat::start(
-                self.queue.clone(),
-                self.options.repo_key.clone(),
-                self.lease_owner_id.clone(),
-                self.options.lease_ttl_seconds,
-            );
             let result = operation();
-            let lease_result = guard.finish(phase).and_then(|_| self.ensure_repo_lease());
+            let lease_result = self.ensure_repo_lease();
             match (result, lease_result) {
                 (Ok(value), Ok(())) => Ok(value),
                 (Err(error), _) => Err(error),
@@ -4366,7 +7435,12 @@ pub mod integrator {
 
         fn transition_item_owned(&self, item_id: &str, target: QueueStatus) -> Result<QueueItem> {
             self.ensure_repo_lease()?;
-            match self.queue.transition_item(item_id, target) {
+            match self.queue.transition_item_owned(
+                item_id,
+                target,
+                &self.options.repo_key,
+                &self.lease_owner_id,
+            ) {
                 Ok(item) => Ok(item),
                 Err(error) => {
                     let current = self.queue.get_item(item_id)?;
@@ -4601,9 +7675,18 @@ pub mod integrator {
             &self,
             item_id: &str,
             attempt_id: &str,
+            candidate_sha: &str,
+            expected_target_sha: &str,
         ) -> Result<Option<QueueItem>> {
             self.ensure_repo_lease()?;
-            match self.queue.begin_landing(item_id, attempt_id) {
+            match self.queue.begin_landing(
+                item_id,
+                attempt_id,
+                candidate_sha,
+                expected_target_sha,
+                &self.options.repo_key,
+                &self.lease_owner_id,
+            ) {
                 Ok(()) => Ok(None),
                 Err(error) => {
                     if let Some(cancelled) = self.cancelled_item(item_id)? {
@@ -4623,7 +7706,14 @@ pub mod integrator {
             message: &str,
         ) -> Result<String> {
             self.ensure_repo_lease()?;
-            self.queue.block_item(item_id, phase, reason, message)
+            self.queue.block_item_owned(
+                item_id,
+                phase,
+                reason,
+                message,
+                &self.options.repo_key,
+                &self.lease_owner_id,
+            )
         }
 
         fn mark_integrated_owned(
@@ -4631,11 +7721,17 @@ pub mod integrator {
             item_id: &str,
             attempt_id: &str,
             landed_commit_sha: &str,
+            remote_target_sha: &str,
         ) -> Result<QueueItem> {
             self.ensure_repo_lease()?;
-            let item = self
-                .queue
-                .mark_integrated(item_id, attempt_id, landed_commit_sha)?;
+            let item = self.queue.mark_integrated(
+                item_id,
+                attempt_id,
+                landed_commit_sha,
+                remote_target_sha,
+                &self.options.repo_key,
+                &self.lease_owner_id,
+            )?;
             self.cleanup_terminal_item(&item)?;
             self.queue.get_item(item_id)
         }
@@ -4661,14 +7757,47 @@ pub mod integrator {
                         );
                     }
                     if entry_exists(&expected)? {
-                        self.remove_workspace(&expected, None, None)?;
+                        let actual = self
+                            .workspaces
+                            .list()?
+                            .into_iter()
+                            .find(|identity| Path::new(&identity.path) == expected)
+                            .context("terminal workspace creation path has unknown occupancy")?;
+                        self.remove_clean_terminal_workspace(&actual)?;
                     }
                 }
                 WorkspaceState::Retained { identity } => {
-                    self.remove_retained_workspace(identity)?;
+                    let actual = self.workspaces.resolve_retained(identity)?;
+                    if entry_exists(Path::new(&identity.path))?
+                        && actual
+                            .as_ref()
+                            .is_none_or(|candidate| candidate.path != identity.path)
+                    {
+                        anyhow::bail!(
+                            "terminal workspace path is occupied by an unknown entry: {}",
+                            identity.path
+                        );
+                    }
+                    if let Some(actual) = actual.as_ref() {
+                        self.remove_clean_terminal_workspace(actual)?;
+                    } else {
+                        self.remove_retained_workspace(identity)?;
+                    }
                 }
             }
             self.queue.mark_workspace_cleaned(&item.id)
+        }
+
+        fn remove_clean_terminal_workspace(&self, identity: &WorkspaceIdentity) -> Result<()> {
+            let path = Path::new(&identity.path);
+            if workspace_dirty(path)?.is_some() || crate::composition::has_git_operation(path)? {
+                anyhow::bail!(
+                    "terminal integration workspace is dirty or has an active Git operation; preserved: {}",
+                    path.display()
+                );
+            }
+            self.remove_retained_workspace(identity)?;
+            Ok(())
         }
 
         fn merge_item(&self, item: QueueItem, attempt: &Attempt) -> Result<QueueItem> {
@@ -4691,30 +7820,55 @@ pub mod integrator {
             let base_sha = git_output(&self.options.repo_path, ["rev-parse", &base_ref])?;
             self.ensure_repo_lease()?;
             self.queue.update_attempt_base(&attempt.id, &base_sha)?;
-            let source_refspec = format!(
-                "+refs/heads/{}:refs/remotes/{}/{}",
-                item.source_branch, self.options.base_remote, item.source_branch
-            );
-            let source_sha = match self.fetch_for_merge(
-                &item,
-                attempt,
-                ["fetch", &self.options.base_remote, &source_refspec],
-            ) {
-                Ok(()) => self.source_remote_sha(&item)?,
-                Err(error) => {
-                    self.block_item_owned(
-                        &item.id,
-                        BlockedPhase::Merging,
-                        BlockedReason::Infra,
-                        &format!(
-                            "failed to fetch source branch {}: {error}",
-                            item.source_branch
-                        ),
+            let source_sha = match &item.source {
+                crate::core::QueueSource::RemoteBranch { .. } => {
+                    let source_refspec = format!(
+                        "+refs/heads/{}:refs/remotes/{}/{}",
+                        item.source_branch, self.options.base_remote, item.source_branch
+                    );
+                    match self.fetch_for_merge(
+                        &item,
+                        attempt,
+                        ["fetch", &self.options.base_remote, &source_refspec],
+                    ) {
+                        Ok(()) => self.source_remote_sha(&item)?,
+                        Err(error) => {
+                            self.block_item_owned(
+                                &item.id,
+                                BlockedPhase::Merging,
+                                BlockedReason::Infra,
+                                &format!(
+                                    "failed to fetch source branch {}: {error}",
+                                    item.source_branch
+                                ),
+                            )?;
+                            return self.queue.get_item(&item.id);
+                        }
+                    }
+                }
+                crate::core::QueueSource::LocalSubmission {
+                    submission_id,
+                    commit_sha,
+                } => {
+                    let submission = self.queue.local_submission(submission_id)?;
+                    let resolved = git_output(
+                        &self.options.repo_path,
+                        ["rev-parse", &submission.private_ref],
                     )?;
-                    return self.queue.get_item(&item.id);
+                    if submission.commit_sha != *commit_sha || resolved != *commit_sha {
+                        return self.block_and_get(
+                            &item.id,
+                            BlockedPhase::Merging,
+                            BlockedReason::NeedsAgentFix,
+                            "immutable local submission ref does not match its recorded exact commit",
+                        );
+                    }
+                    resolved
                 }
             };
-            if source_sha != item.current_head_sha {
+            if matches!(item.source, crate::core::QueueSource::RemoteBranch { .. })
+                && source_sha != item.current_head_sha
+            {
                 self.ensure_repo_lease()?;
                 self.queue.record_event(
                     &item.id,
@@ -4735,13 +7889,19 @@ pub mod integrator {
 
             let workspace = self.workspaces.expected_path(&item.id)?;
             if entry_exists(&workspace)? {
-                match item.workspace.identity() {
-                    Some(identity) => {
-                        self.remove_retained_workspace(identity)?;
-                    }
-                    None => {
-                        self.remove_workspace(&workspace, None, None)?;
-                    }
+                let removal = match item.workspace.identity() {
+                    Some(identity) => self.remove_retained_workspace(identity),
+                    None => self.remove_workspace(&workspace, None, None),
+                };
+                if let Err(error) = removal {
+                    return self.block_and_get(
+                        &item.id,
+                        BlockedPhase::Merging,
+                        BlockedReason::NeedsAgentFix,
+                        &format!(
+                            "existing integration Rift cannot be safely replaced and was preserved: {error:#}"
+                        ),
+                    );
                 }
             }
             self.ensure_repo_lease()?;
@@ -4819,6 +7979,16 @@ pub mod integrator {
                     StdDuration::from_secs(60),
                     "Rift preparation",
                 )?;
+                self.run_supervised_item_command(
+                    &item.id,
+                    &attempt.id,
+                    QueueStatus::Merging,
+                    "git",
+                    ["config", "commit.gpgSign", "false"],
+                    Some(&workspace),
+                    StdDuration::from_secs(20),
+                    "Rift Git configuration",
+                )?;
                 let actual = git_output(&workspace, ["rev-parse", "HEAD"])?;
                 if actual != base_sha {
                     anyhow::bail!(
@@ -4840,23 +8010,44 @@ pub mod integrator {
                 return Err(error);
             }
 
-            let merge = self.run_supervised_item_command_output(
-                &item.id,
-                &attempt.id,
-                QueueStatus::Merging,
-                "git",
-                ["merge", "--no-ff", "--no-commit", &source_sha],
-                Some(&workspace),
-                StdDuration::from_secs(60),
-                "merge",
-            )?;
-            if !merge.status.success() {
-                let conflict_files =
-                    git_output(&workspace, ["diff", "--name-only", "--diff-filter=U"])
-                        .unwrap_or_default()
-                        .lines()
-                        .map(str::to_string)
-                        .collect::<Vec<_>>();
+            let local_squash = matches!(
+                item.source,
+                crate::core::QueueSource::LocalSubmission { .. }
+            ) && item.landing_policy == crate::core::LandingPolicy::Squash;
+            let merge = if local_squash {
+                self.apply_local_submission_patch(
+                    &item,
+                    attempt,
+                    &workspace,
+                    &base_sha,
+                    QueueStatus::Merging,
+                    "local submission patch",
+                )?
+            } else {
+                self.run_supervised_item_command_output(
+                    &item.id,
+                    &attempt.id,
+                    QueueStatus::Merging,
+                    "git",
+                    ["merge", "--no-ff", "--no-commit", source_sha.as_str()],
+                    Some(&workspace),
+                    StdDuration::from_secs(60),
+                    "merge",
+                )?
+            };
+            let conflict_files =
+                match git_output(&workspace, ["diff", "--name-only", "--diff-filter=U"]) {
+                    Ok(files) => files.lines().map(str::to_string).collect::<Vec<_>>(),
+                    Err(error) => {
+                        return self.block_and_get(
+                            &item.id,
+                            BlockedPhase::Merging,
+                            BlockedReason::Infra,
+                            &format!("failed to inspect merge conflicts: {error:#}"),
+                        )
+                    }
+                };
+            if !merge.status.success() || !conflict_files.is_empty() {
                 let conflict_json = json!({
                     "files": conflict_files,
                     "summary": String::from_utf8_lossy(&merge.stderr).trim(),
@@ -4885,21 +8076,48 @@ pub mod integrator {
                     .status
                     .success();
             let diff = git_status(&workspace, ["diff", "--cached", "--quiet"])?;
+            if local_squash && diff.status.success() {
+                return self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Merging,
+                    BlockedReason::NeedsAgentFix,
+                    "local submission is empty relative to the exact target base",
+                );
+            }
             if merge_in_progress || !diff.status.success() {
                 self.run_supervised_item_command(
                     &item.id,
                     &attempt.id,
                     QueueStatus::Merging,
                     "git",
-                    ["commit", "-m", &format!("Integrate queue item {}", item.id)],
+                    [
+                        "commit",
+                        "-m",
+                        &if local_squash {
+                            format!("Squash integrate queue item {}", item.id)
+                        } else {
+                            format!("Integrate queue item {}", item.id)
+                        },
+                    ],
                     Some(&workspace),
                     StdDuration::from_secs(60),
                     "merge commit",
                 )?;
             }
             let merge_sha = git_output(&workspace, ["rev-parse", "HEAD"])?;
+            if local_squash {
+                verify_one_parent_candidate(&workspace, &merge_sha, &base_sha)?;
+            }
             self.ensure_repo_lease()?;
-            self.queue.update_attempt_merge(&attempt.id, &merge_sha)?;
+            if matches!(
+                self.queue.get_attempt(&attempt.id)?.moved_base,
+                crate::sqlite::MovedBaseState::Pending { .. }
+            ) {
+                self.queue
+                    .complete_moved_base_reconciliation(&attempt.id, &merge_sha)?;
+            } else {
+                self.queue.update_attempt_merge(&attempt.id, &merge_sha)?;
+            }
             self.transition_item_owned(&item.id, QueueStatus::Merged)
         }
 
@@ -4985,6 +8203,18 @@ pub mod integrator {
                 git_status(&workspace, ["rev-parse", "--verify", "MERGE_HEAD"])?
                     .status
                     .success();
+            let local_squash = matches!(
+                item.source,
+                crate::core::QueueSource::LocalSubmission { .. }
+            ) && item.landing_policy == crate::core::LandingPolicy::Squash;
+            if local_squash && staged.status.success() {
+                return self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Merging,
+                    BlockedReason::NeedsAgentFix,
+                    "local submission is empty after conflict resolution",
+                );
+            }
             if merge_in_progress || !staged.status.success() {
                 self.run_supervised_item_command(
                     &item.id,
@@ -4998,8 +8228,26 @@ pub mod integrator {
                 )?;
             }
             let merge_sha = git_output(&workspace, ["rev-parse", "HEAD"])?;
+            if local_squash {
+                verify_one_parent_candidate(
+                    &workspace,
+                    &merge_sha,
+                    attempt
+                        .target_base_sha
+                        .as_deref()
+                        .context("squash attempt has no exact target base")?,
+                )?;
+            }
             self.ensure_repo_lease()?;
-            self.queue.update_attempt_merge(&attempt.id, &merge_sha)?;
+            if matches!(
+                self.queue.get_attempt(&attempt.id)?.moved_base,
+                crate::sqlite::MovedBaseState::Pending { .. }
+            ) {
+                self.queue
+                    .complete_moved_base_reconciliation(&attempt.id, &merge_sha)?;
+            } else {
+                self.queue.update_attempt_merge(&attempt.id, &merge_sha)?;
+            }
             self.queue.clear_conflict_metadata(&item.id)?;
             self.queue.record_event(
                 &item.id,
@@ -5084,6 +8332,178 @@ pub mod integrator {
             Ok(())
         }
 
+        fn policy_for_attempt(
+            &self,
+            attempt: &Attempt,
+            target_sha: &str,
+        ) -> Result<crate::composition::PolicySnapshot> {
+            if attempt.policy_target_sha.as_deref() == Some(target_sha) {
+                if let (Some(snapshot), Some(digest)) = (
+                    attempt.policy_snapshot_json.as_deref(),
+                    attempt.policy_digest.as_deref(),
+                ) {
+                    return crate::composition::verify_policy_snapshot(
+                        snapshot, digest, target_sha,
+                    );
+                }
+            }
+            let (policy, snapshot, digest) =
+                crate::composition::load_policy_at(&self.options.repo_path, target_sha)?;
+            self.ensure_repo_lease()?;
+            self.queue
+                .update_attempt_policy(&attempt.id, target_sha, &snapshot, &digest)?;
+            Ok(policy)
+        }
+
+        fn requires_trusted_policy(&self, item: &QueueItem) -> Result<bool> {
+            Ok(matches!(
+                item.source,
+                crate::core::QueueSource::LocalSubmission { .. }
+            ) || self.queue.repository_if_exists(&item.repo_key)?.is_some())
+        }
+
+        fn require_exact_policy_signoff(
+            &self,
+            item: &QueueItem,
+            attempt: &Attempt,
+            workspace: &Path,
+            candidate_sha: &str,
+        ) -> Result<Option<QueueItem>> {
+            let current = self.queue.get_attempt(&attempt.id)?;
+            let target_sha = current
+                .target_base_sha
+                .as_deref()
+                .context("signoff attempt has no exact target base")?;
+            let policy = self.policy_for_attempt(&current, target_sha)?;
+            let crate::composition::SignoffPolicy::Required { command, contexts } = policy.signoff
+            else {
+                return Ok(None);
+            };
+            if let Some(raw) = current.signoff_evidence_json.as_deref() {
+                let evidence: JsonValue = serde_json::from_str(raw)
+                    .context("parse persisted exact-SHA signoff evidence")?;
+                if signoff_evidence_satisfies(&evidence, candidate_sha, &contexts) {
+                    return Ok(None);
+                }
+            }
+            if let Some(dirty) = workspace_dirty(workspace)? {
+                return Ok(Some(self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::NeedsAgentFix,
+                    &format!("candidate is dirty before signoff: {dirty}"),
+                )?));
+            }
+            let args = vec![
+                OsString::from(format!("IQ_SIGNOFF_SHA={candidate_sha}")),
+                OsString::from("sh"),
+                OsString::from("-lc"),
+                OsString::from(command),
+            ];
+            let output = match self.run_supervised_item_command_output(
+                &item.id,
+                &attempt.id,
+                QueueStatus::Integrating,
+                "env",
+                args,
+                Some(workspace),
+                StdDuration::from_secs(3 * 60 * 60),
+                "exact-SHA signoff",
+            ) {
+                Ok(output) => output,
+                Err(error) => {
+                    return Ok(Some(self.block_and_get(
+                        &item.id,
+                        BlockedPhase::Integrating,
+                        BlockedReason::Infra,
+                        &format!("signoff command could not complete: {error:#}"),
+                    )?));
+                }
+            };
+            let log_dir = self.evidence_dir(item, attempt)?;
+            let mut log = create_file_at(
+                &log_dir.directory,
+                OsStr::new("signoff.log"),
+                "signoff evidence log",
+            )?;
+            writeln!(
+                log,
+                "--- stdout ---\n{}\n--- stderr ---\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )?;
+            if !output.status.success() {
+                return Ok(Some(self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::NeedsAgentFix,
+                    "required exact-SHA signoff command failed",
+                )?));
+            }
+            let evidence: JsonValue = match serde_json::from_slice(&output.stdout) {
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    return Ok(Some(self.block_and_get(
+                        &item.id,
+                        BlockedPhase::Integrating,
+                        BlockedReason::Infra,
+                        &format!("signoff command returned invalid JSON: {error}"),
+                    )?));
+                }
+            };
+            if !signoff_evidence_satisfies(&evidence, candidate_sha, &contexts) {
+                return Ok(Some(self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::NeedsAgentFix,
+                    "signoff evidence does not prove all required contexts on the exact candidate SHA",
+                )?));
+            }
+            if git_output(workspace, ["rev-parse", "HEAD"])? != candidate_sha
+                || workspace_dirty(workspace)?.is_some()
+            {
+                return Ok(Some(self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::NeedsAgentFix,
+                    "signoff command changed the exact candidate workspace",
+                )?));
+            }
+            self.ensure_repo_lease()?;
+            self.queue.update_attempt_signoff(&attempt.id, &evidence)?;
+            Ok(None)
+        }
+
+        fn verify_fenced_policy_evidence(&self, item: &QueueItem, attempt: &Attempt) -> Result<()> {
+            if !self.requires_trusted_policy(item)? {
+                return Ok(());
+            }
+            let current = self.queue.get_attempt(&attempt.id)?;
+            let target_sha = current
+                .target_base_sha
+                .as_deref()
+                .context("fenced attempt has no exact target base")?;
+            let policy = self.policy_for_attempt(&current, target_sha)?;
+            let crate::composition::SignoffPolicy::Required { contexts, .. } = policy.signoff
+            else {
+                return Ok(());
+            };
+            let candidate_sha = current
+                .validated_commit_sha
+                .as_deref()
+                .context("fenced attempt has no validated candidate")?;
+            let evidence: JsonValue = serde_json::from_str(
+                current
+                    .signoff_evidence_json
+                    .as_deref()
+                    .context("fenced attempt has no exact-SHA signoff evidence")?,
+            )?;
+            if !signoff_evidence_satisfies(&evidence, candidate_sha, &contexts) {
+                anyhow::bail!("fenced landing has invalid exact-SHA signoff evidence");
+            }
+            Ok(())
+        }
+
         fn validate_item(&self, item: QueueItem, attempt: &Attempt) -> Result<QueueItem> {
             let workspace = self.load_owned_workspace(&item)?;
             let item = if item.status == QueueStatus::Merged {
@@ -5096,15 +8516,34 @@ pub mod integrator {
             if item.status == QueueStatus::Cancelled {
                 return Ok(item);
             }
-            let command = match self.policy.validation_command.clone() {
-                Some(command) => command,
-                None => {
-                    return self.block_and_get(
-                        &item.id,
-                        BlockedPhase::Validating,
-                        BlockedReason::NeedsUserInput,
-                        "missing integration validation command",
-                    );
+            let target_sha = self
+                .queue
+                .get_attempt(&attempt.id)?
+                .target_base_sha
+                .context("integration attempt has no exact target base for policy")?;
+            let command = if self.requires_trusted_policy(&item)? {
+                match self.policy_for_attempt(attempt, &target_sha) {
+                    Ok(policy) => policy.validation_command,
+                    Err(error) => {
+                        return self.block_and_get(
+                            &item.id,
+                            BlockedPhase::Validating,
+                            BlockedReason::NeedsAgentFix,
+                            &format!("exact target policy is missing or invalid: {error:#}"),
+                        );
+                    }
+                }
+            } else {
+                match self.policy.validation_command.clone() {
+                    Some(command) => command,
+                    None => {
+                        return self.block_and_get(
+                            &item.id,
+                            BlockedPhase::Validating,
+                            BlockedReason::NeedsUserInput,
+                            "missing integration validation command",
+                        );
+                    }
                 }
             };
             if let Some(dirty) = workspace_dirty(&workspace)? {
@@ -5240,6 +8679,23 @@ pub mod integrator {
             if let Some(blocked) = self.enforce_item_boundary(&item)? {
                 return Ok(blocked);
             }
+            if self.requires_trusted_policy(&item)? {
+                let persisted_attempt = self.queue.get_attempt(&attempt.id)?;
+                let policy_target = persisted_attempt
+                    .target_base_sha
+                    .as_deref()
+                    .context("integration attempt has no exact policy target SHA")?;
+                if let Err(error) = self.policy_for_attempt(&persisted_attempt, policy_target) {
+                    return self.block_and_get(
+                        &item.id,
+                        BlockedPhase::Integrating,
+                        BlockedReason::NeedsAgentFix,
+                        &format!(
+                            "exact target policy is missing or invalid during integration: {error:#}"
+                        ),
+                    );
+                }
+            }
             let item = if item.status == QueueStatus::Validated {
                 self.transition_item_owned(&item.id, QueueStatus::Integrating)?
             } else if item.status != QueueStatus::Integrating {
@@ -5254,9 +8710,28 @@ pub mod integrator {
             if item.status == QueueStatus::Cancelled {
                 return Ok(item);
             }
-            if let Some(pr_url) = item.pr_url.clone() {
-                if self.policy.signoff.is_none() {
+            if item.landing.is_uncertain() {
+                if let Err(error) = self.verify_fenced_policy_evidence(&item, attempt) {
+                    return self.block_and_get(
+                        &item.id,
+                        BlockedPhase::Integrating,
+                        BlockedReason::NeedsAgentFix,
+                        &format!("fenced landing policy evidence is invalid: {error:#}"),
+                    );
+                }
+            }
+            match item.landing_policy {
+                crate::core::LandingPolicy::Provider => {
+                    let pr_url = item
+                        .pr_url
+                        .clone()
+                        .context("provider landing policy has no PR/MR URL")?;
                     return self.integrate_provider_item(item, attempt, &pr_url);
+                }
+                crate::core::LandingPolicy::Direct | crate::core::LandingPolicy::Squash => {
+                    if item.pr_url.is_some() {
+                        anyhow::bail!("non-provider landing policy cannot carry a PR/MR URL");
+                    }
                 }
             }
             let workspace = self.load_owned_workspace(&item)?;
@@ -5284,30 +8759,22 @@ pub mod integrator {
                     );
                 }
             };
-            if item.landing_fenced {
-                let fenced_candidate = attempt
-                    .validated_commit_sha
-                    .as_deref()
-                    .context("fenced landing attempt has no validated commit SHA")?;
-                let candidate_landed =
-                    git_is_ancestor(&self.options.repo_path, fenced_candidate, &remote_ref)?;
-                let source_landed = git_is_ancestor(
-                    &self.options.repo_path,
-                    item.current_head_sha.as_str(),
+            if item.landing.is_uncertain() {
+                return self.reconcile_fenced_exact_landing(
+                    &item,
+                    attempt,
                     &remote_ref,
-                )?;
-                if candidate_landed && source_landed {
-                    return self.mark_integrated_owned(&item.id, &attempt.id, fenced_candidate);
-                }
-                return self.block_and_get(
-                    &item.id,
-                    BlockedPhase::Integrating,
-                    BlockedReason::Infra,
-                    "fenced direct landing remains unresolved; retry to reconcile remote target state",
+                    &remote_sha,
                 );
             }
-            let attempt_base = self.queue.get_attempt(&attempt.id)?.target_base_sha;
-            if attempt_base.as_deref() != Some(remote_sha.as_str()) {
+            let current_attempt = self.queue.get_attempt(&attempt.id)?;
+            let needs_moved_base_reconciliation = current_attempt.target_base_sha.as_deref()
+                != Some(remote_sha.as_str())
+                || (!matches!(
+                    current_attempt.moved_base,
+                    crate::sqlite::MovedBaseState::None
+                ) && current_attempt.validated_commit_sha.is_none());
+            if needs_moved_base_reconciliation {
                 if let Some(blocked) = self.merge_moved_base(
                     &item,
                     attempt,
@@ -5339,64 +8806,78 @@ pub mod integrator {
                     &format!("candidate graph is invalid before signoff: {error}"),
                 );
             }
-            if let Some(signoff) = &self.policy.signoff {
-                if let Some(cancelled) = self.cancelled_item(&item.id)? {
-                    return Ok(cancelled);
+            if let Some(cancelled) = self.cancelled_item(&item.id)? {
+                return Ok(cancelled);
+            }
+            if self.requires_trusted_policy(&item)? {
+                if let Some(blocked) =
+                    self.require_exact_policy_signoff(&item, attempt, &workspace, &landed_sha)?
+                {
+                    return Ok(blocked);
                 }
+            } else if let Some(signoff) = &self.policy.signoff {
                 if let Some(blocked) =
                     self.sign_candidate(&item, attempt, &workspace, &landed_sha, signoff)?
                 {
                     return Ok(blocked);
                 }
+            }
+            if let Err(error) = self.fetch_target_supervised(&item, attempt) {
+                return self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::Infra,
+                    &format!("failed to fetch target after signoff: {error}"),
+                );
+            }
+            let target_after_signoff =
+                git_output(&self.options.repo_path, ["rev-parse", &remote_ref])?;
+            if target_after_signoff != remote_sha {
+                self.queue.record_event(
+                    &item.id,
+                    "target_moved_after_signoff",
+                    &format!(
+                        "target moved from {remote_sha} to {target_after_signoff}; rebuilding and invalidating evidence"
+                    ),
+                )?;
+                if let Some(blocked) = self.merge_moved_base(
+                    &item,
+                    attempt,
+                    &workspace,
+                    &target_after_signoff,
+                    "target branch moved after signoff",
+                )? {
+                    return Ok(blocked);
+                }
+                if let Some(blocked) = self.revalidate_moved_base(
+                    &item,
+                    attempt,
+                    &workspace,
+                    &target_after_signoff,
+                    "target moved after signoff",
+                )? {
+                    return Ok(blocked);
+                }
                 if let Some(cancelled) = self.cancelled_item(&item.id)? {
                     return Ok(cancelled);
                 }
-                if let Err(error) = self.fetch_target_supervised(&item, attempt) {
-                    return self.block_and_get(
-                        &item.id,
-                        BlockedPhase::Integrating,
-                        BlockedReason::Infra,
-                        &format!("failed to fetch target after signoff: {error}"),
-                    );
-                }
-                let target_after_signoff =
-                    git_output(&self.options.repo_path, ["rev-parse", &remote_ref])?;
-                if target_after_signoff != remote_sha {
-                    self.queue.record_event(
-                        &item.id,
-                        "target_moved_after_signoff",
-                        &format!(
-                            "target moved from {remote_sha} to {target_after_signoff}; rebuilding and resigning candidate"
-                        ),
-                    )?;
-                    if let Some(blocked) = self.merge_moved_base(
-                        &item,
-                        attempt,
-                        &workspace,
-                        &target_after_signoff,
-                        "target branch moved after signoff",
-                    )? {
-                        return Ok(blocked);
-                    }
-                    if let Some(blocked) = self.revalidate_moved_base(
-                        &item,
-                        attempt,
-                        &workspace,
-                        &target_after_signoff,
-                        "target moved after signoff",
-                    )? {
-                        return Ok(blocked);
-                    }
-                    if let Some(cancelled) = self.cancelled_item(&item.id)? {
-                        return Ok(cancelled);
-                    }
-                    return self.queue.get_item(&item.id);
-                }
+                return self.queue.get_item(&item.id);
             }
+            self.land_exact_candidate(&item, attempt, &workspace, &landed_sha, &remote_sha)
+        }
+
+        fn land_exact_candidate(
+            &self,
+            item: &QueueItem,
+            attempt: &Attempt,
+            workspace: &Path,
+            candidate_sha: &str,
+            expected_target_sha: &str,
+        ) -> Result<QueueItem> {
             if let Some(cancelled) = self.cancelled_item(&item.id)? {
                 return Ok(cancelled);
             }
-            if let Err(error) = self.verify_candidate_graph(&item, attempt, &workspace) {
+            if let Err(error) = self.verify_candidate_graph(item, attempt, workspace) {
                 return self.block_and_get(
                     &item.id,
                     BlockedPhase::Integrating,
@@ -5404,7 +8885,7 @@ pub mod integrator {
                     &format!("candidate graph is invalid before target push: {error}"),
                 );
             }
-            if let Some(dirty) = workspace_dirty(&workspace)? {
+            if let Some(dirty) = workspace_dirty(workspace)? {
                 return self.block_and_get(
                     &item.id,
                     BlockedPhase::Integrating,
@@ -5412,38 +8893,72 @@ pub mod integrator {
                     &format!("candidate is dirty before target push: {dirty}"),
                 );
             }
-            if let Some(cancelled) = self.begin_landing_owned(&item.id, &attempt.id)? {
+            self.ensure_registered_remote_identity()?;
+            if let Some(cancelled) =
+                self.begin_landing_owned(&item.id, &attempt.id, candidate_sha, expected_target_sha)?
+            {
                 return Ok(cancelled);
             }
             let target_ref = format!("refs/heads/{}", item.target_branch);
-            let push_ref = format!("HEAD:{target_ref}");
-            let lease = format!("--force-with-lease={target_ref}:{remote_sha}");
-            let landing_error = self
-                .run_supervised_landing_command(
-                    &item.id,
-                    &attempt.id,
-                    "git",
-                    ["push", lease.as_str(), &self.options.base_remote, &push_ref],
-                    Some(&workspace),
-                )
-                .err();
+            let remote_ref = format!(
+                "refs/remotes/{}/{}",
+                self.options.base_remote, item.target_branch
+            );
+            let push_ref = format!("{candidate_sha}:{target_ref}");
+            let lease = format!("--force-with-lease={target_ref}:{expected_target_sha}");
+            let landing_result = self.run_supervised_item_command_output(
+                &item.id,
+                &attempt.id,
+                QueueStatus::Integrating,
+                "git",
+                [
+                    "push",
+                    "--porcelain",
+                    lease.as_str(),
+                    &self.options.base_remote,
+                    &push_ref,
+                ],
+                Some(workspace),
+                StdDuration::from_secs(20),
+                "landing",
+            );
+            if landing_result
+                .as_ref()
+                .is_ok_and(definite_force_with_lease_rejection)
+            {
+                return self.recover_definite_cas_rejection(
+                    item,
+                    attempt,
+                    workspace,
+                    candidate_sha,
+                    expected_target_sha,
+                );
+            }
+            let landing_error = match landing_result {
+                Ok(output) if output.status.success() => None,
+                Ok(output) => Some(anyhow::anyhow!(
+                    "git push failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )),
+                Err(error) => Some(error),
+            };
             self.ensure_repo_lease()?;
-            if let Err(error) = self.fetch_target_supervised(&item, attempt) {
+            if let Err(error) = self.fetch_target_supervised(item, attempt) {
                 return self.block_and_get(
                     &item.id,
                     BlockedPhase::Integrating,
                     BlockedReason::Infra,
                     &match landing_error {
                         Some(landing_error) => format!(
-                            "direct landing outcome is unknown after {landing_error}; failed to fetch target for reconciliation: {error}"
+                            "exact landing outcome is unknown after {landing_error}; failed to fetch target for reconciliation: {error}"
                         ),
-                        None => format!("failed to fetch target after direct landing push: {error}"),
+                        None => format!("failed to fetch target after exact landing push: {error}"),
                     },
                 );
             }
             if let Err(error) = git(
                 &self.options.repo_path,
-                ["merge-base", "--is-ancestor", &landed_sha, &remote_ref],
+                ["merge-base", "--is-ancestor", candidate_sha, &remote_ref],
             ) {
                 return self.block_and_get(
                     &item.id,
@@ -5451,36 +8966,184 @@ pub mod integrator {
                     BlockedReason::Infra,
                     &match landing_error {
                         Some(landing_error) => format!(
-                            "direct landing failed or remained unconfirmed for {landed_sha}: {landing_error}; remote reconciliation: {error}"
+                            "exact landing failed or remained unconfirmed for {candidate_sha}: {landing_error}; remote reconciliation: {error}"
                         ),
                         None => format!(
-                            "remote target does not contain direct-landed commit {landed_sha}: {error}"
+                            "remote target does not contain exact landed commit {candidate_sha}: {error}"
                         ),
                     },
                 );
             }
-            if let Err(error) = git(
-                &self.options.repo_path,
-                [
-                    "merge-base",
-                    "--is-ancestor",
-                    item.current_head_sha.as_str(),
-                    &remote_ref,
-                ],
-            ) {
+            if matches!(item.source, crate::core::QueueSource::RemoteBranch { .. }) {
+                if let Err(error) = git(
+                    &self.options.repo_path,
+                    [
+                        "merge-base",
+                        "--is-ancestor",
+                        item.current_head_sha.as_str(),
+                        &remote_ref,
+                    ],
+                ) {
+                    return self.block_and_get(
+                        &item.id,
+                        BlockedPhase::Integrating,
+                        BlockedReason::Infra,
+                        &format!(
+                            "remote target does not contain queued source commit {}: {error}",
+                            item.current_head_sha
+                        ),
+                    );
+                }
+            }
+            let remote_target_sha =
+                git_output(&self.options.repo_path, ["rev-parse", &remote_ref])?;
+            self.reconcile_registered_checkout(item, &attempt.id, &remote_target_sha)?;
+            self.mark_integrated_owned(&item.id, &attempt.id, candidate_sha, &remote_target_sha)
+        }
+
+        fn recover_definite_cas_rejection(
+            &self,
+            item: &QueueItem,
+            attempt: &Attempt,
+            workspace: &Path,
+            candidate_sha: &str,
+            expected_target_sha: &str,
+        ) -> Result<QueueItem> {
+            self.ensure_repo_lease()?;
+            self.queue.record_definite_landing_rejection(
+                &item.id,
+                &attempt.id,
+                candidate_sha,
+                expected_target_sha,
+                &self.options.repo_key,
+                &self.lease_owner_id,
+            )?;
+            if let Some(cancelled) = self.cancelled_item(&item.id)? {
+                return Ok(cancelled);
+            }
+            if let Err(error) = self.fetch_target_supervised(item, attempt) {
                 return self.block_and_get(
                     &item.id,
                     BlockedPhase::Integrating,
                     BlockedReason::Infra,
-                    &format!(
-                        "remote target does not contain queued source commit {}: {error}",
-                        item.current_head_sha
-                    ),
+                    &format!("fetch after definite compare-and-set rejection failed: {error}"),
                 );
             }
-            self.mark_integrated_owned(&item.id, &attempt.id, &landed_sha)
+            let remote_ref = format!(
+                "refs/remotes/{}/{}",
+                self.options.base_remote, item.target_branch
+            );
+            let moved_target = git_output(&self.options.repo_path, ["rev-parse", &remote_ref])?;
+            self.queue.record_event(
+                &item.id,
+                "target_moved_during_landing",
+                &format!(
+                    "compare-and-set rejected base {expected_target_sha}; rebuilding on {moved_target}"
+                ),
+            )?;
+            if let Some(blocked) = self.merge_moved_base(
+                item,
+                attempt,
+                workspace,
+                &moved_target,
+                "definite compare-and-set rejection",
+            )? {
+                return Ok(blocked);
+            }
+            if let Some(blocked) = self.revalidate_moved_base(
+                item,
+                attempt,
+                workspace,
+                &moved_target,
+                "definite compare-and-set rejection",
+            )? {
+                return Ok(blocked);
+            }
+            if let Some(cancelled) = self.cancelled_item(&item.id)? {
+                return Ok(cancelled);
+            }
+            self.queue.get_item(&item.id)
         }
 
+        fn reconcile_fenced_exact_landing(
+            &self,
+            item: &QueueItem,
+            attempt: &Attempt,
+            remote_ref: &str,
+            remote_sha: &str,
+        ) -> Result<QueueItem> {
+            let crate::sqlite::LandingState::Uncertain {
+                candidate_sha: fenced_candidate,
+                expected_target_sha,
+            } = &item.landing
+            else {
+                anyhow::bail!("item has no uncertain exact landing to reconcile");
+            };
+            if attempt.validated_commit_sha.as_deref() != Some(fenced_candidate)
+                || attempt.target_base_sha.as_deref() != Some(expected_target_sha)
+            {
+                anyhow::bail!("uncertain landing identity differs from exact attempt evidence");
+            }
+            let candidate_landed =
+                git_is_ancestor(&self.options.repo_path, fenced_candidate, remote_ref)?;
+            let source_landed = git_is_ancestor(
+                &self.options.repo_path,
+                item.current_head_sha.as_str(),
+                remote_ref,
+            )?;
+            let source_identity_satisfied = source_landed
+                || matches!(
+                    item.source,
+                    crate::core::QueueSource::LocalSubmission { .. }
+                );
+            if candidate_landed && source_identity_satisfied {
+                self.reconcile_registered_checkout(item, &attempt.id, remote_sha)?;
+                return self.mark_integrated_owned(
+                    &item.id,
+                    &attempt.id,
+                    fenced_candidate,
+                    remote_sha,
+                );
+            }
+            self.block_and_get(
+                &item.id,
+                BlockedPhase::Integrating,
+                BlockedReason::Infra,
+                "fenced exact landing remains unresolved; retry to reconcile remote target state",
+            )
+        }
+
+        fn reconcile_registered_checkout(
+            &self,
+            item: &QueueItem,
+            attempt_id: &str,
+            target_sha: &str,
+        ) -> Result<()> {
+            let Some(repository) = self.queue.repository_if_exists(&item.repo_key)? else {
+                return Ok(());
+            };
+            crate::composition::reconcile_registered_checkout(
+                &self.queue,
+                &repository,
+                &self.lease_owner_id,
+                target_sha,
+                |path, target_sha| {
+                    self.run_supervised_item_command(
+                        &item.id,
+                        attempt_id,
+                        QueueStatus::Integrating,
+                        "git",
+                        ["reset", "--hard", target_sha],
+                        Some(path),
+                        StdDuration::from_secs(60),
+                        "registered checkout exact reset",
+                    )?;
+                    Ok(())
+                },
+            )
+        }
+
+        #[allow(dead_code)]
         fn sign_candidate(
             &self,
             item: &QueueItem,
@@ -5489,6 +9152,7 @@ pub mod integrator {
             candidate_sha: &str,
             policy: &SignoffPolicy,
         ) -> Result<Option<QueueItem>> {
+            self.ensure_registered_remote_identity()?;
             if let Some(cancelled) = self.cancelled_item(&item.id)? {
                 return Ok(Some(cancelled));
             }
@@ -5809,36 +9473,48 @@ pub mod integrator {
             if head != validated {
                 anyhow::bail!("workspace HEAD {head} differs from validated SHA {validated}");
             }
-            git(
-                workspace,
-                [
-                    "merge-base",
-                    "--is-ancestor",
-                    item.current_head_sha.as_str(),
-                    head.as_str(),
-                ],
-            )
-            .with_context(|| {
-                format!(
-                    "validated candidate {head} does not contain queued source {}",
-                    item.current_head_sha
+            if matches!(item.source, crate::core::QueueSource::RemoteBranch { .. }) {
+                git(
+                    workspace,
+                    [
+                        "merge-base",
+                        "--is-ancestor",
+                        item.current_head_sha.as_str(),
+                        head.as_str(),
+                    ],
                 )
-            })?;
+                .with_context(|| {
+                    format!(
+                        "validated candidate {head} does not contain queued source {}",
+                        item.current_head_sha
+                    )
+                })?;
+            }
             let target_base = current_attempt
                 .target_base_sha
                 .context("attempt has no target base SHA")?;
-            git(
-                workspace,
-                [
-                    "merge-base",
-                    "--is-ancestor",
-                    target_base.as_str(),
-                    head.as_str(),
-                ],
-            )
-            .with_context(|| {
-                format!("validated candidate {head} does not contain target base {target_base}")
-            })?;
+            if matches!(
+                item.source,
+                crate::core::QueueSource::LocalSubmission { .. }
+            ) {
+                if item.landing_policy != crate::core::LandingPolicy::Squash {
+                    anyhow::bail!("local submission does not use squash landing");
+                }
+                verify_one_parent_candidate(workspace, &head, &target_base)?;
+            } else {
+                git(
+                    workspace,
+                    [
+                        "merge-base",
+                        "--is-ancestor",
+                        target_base.as_str(),
+                        head.as_str(),
+                    ],
+                )
+                .with_context(|| {
+                    format!("validated candidate {head} does not contain target base {target_base}")
+                })?;
+            }
             Ok(())
         }
 
@@ -5850,17 +9526,89 @@ pub mod integrator {
             moved_base_sha: &str,
             summary_prefix: &str,
         ) -> Result<Option<QueueItem>> {
-            let source_sha = match git_output(workspace, ["rev-parse", "HEAD"]) {
-                Ok(sha) => sha,
-                Err(error) => {
-                    return Ok(Some(self.block_and_get(
-                        &item.id,
-                        BlockedPhase::Integrating,
-                        BlockedReason::Infra,
-                        &format!("cannot resolve candidate before moved-base merge: {error}"),
-                    )?));
+            let current_attempt = self.queue.get_attempt(&attempt.id)?;
+            let source_sha = match &current_attempt.moved_base {
+                crate::sqlite::MovedBaseState::Pending {
+                    target_sha,
+                    source_sha,
+                } if target_sha == moved_base_sha => source_sha.clone(),
+                crate::sqlite::MovedBaseState::Applied {
+                    target_sha,
+                    candidate_sha,
+                    ..
+                } if target_sha == moved_base_sha
+                    && git_output(workspace, ["rev-parse", "HEAD"])? == *candidate_sha
+                    && workspace_dirty(workspace)?.is_none() =>
+                {
+                    return Ok(None)
+                }
+                _ => {
+                    let source_sha = match git_output(workspace, ["rev-parse", "HEAD"]) {
+                        Ok(sha) => sha,
+                        Err(error) => {
+                            return Ok(Some(self.block_and_get(
+                                &item.id,
+                                BlockedPhase::Integrating,
+                                BlockedReason::Infra,
+                                &format!(
+                                    "cannot resolve candidate before moved-base reconciliation: {error}"
+                                ),
+                            )?));
+                        }
+                    };
+                    self.ensure_repo_lease()?;
+                    if self.requires_trusted_policy(item)? {
+                        match crate::composition::load_policy_at(
+                            &self.options.repo_path,
+                            moved_base_sha,
+                        ) {
+                            Ok((_, snapshot, digest)) => {
+                                self.queue.begin_moved_base_reconciliation(
+                                    &attempt.id,
+                                    moved_base_sha,
+                                    &source_sha,
+                                    crate::sqlite::MovedTargetPolicy::Trusted {
+                                        snapshot_json: &snapshot,
+                                        digest: &digest,
+                                    },
+                                )?
+                            }
+                            Err(error) => {
+                                return Ok(Some(self.block_and_get(
+                                    &item.id,
+                                    BlockedPhase::Validating,
+                                    BlockedReason::NeedsAgentFix,
+                                    &format!(
+                                        "exact moved-target policy is missing or invalid: {error:#}"
+                                    ),
+                                )?));
+                            }
+                        }
+                    } else {
+                        self.queue.begin_moved_base_reconciliation(
+                            &attempt.id,
+                            moved_base_sha,
+                            &source_sha,
+                            crate::sqlite::MovedTargetPolicy::Host,
+                        )?;
+                    }
+                    source_sha
                 }
             };
+            self.run_supervised_landing_command(
+                &item.id,
+                &attempt.id,
+                "git",
+                [
+                    "fetch",
+                    self.options
+                        .repo_path
+                        .to_str()
+                        .context("registered repository path is not valid UTF-8")?,
+                    moved_base_sha,
+                ],
+                Some(workspace),
+            )?;
             self.run_supervised_landing_command(
                 &item.id,
                 &attempt.id,
@@ -5868,26 +9616,80 @@ pub mod integrator {
                 ["reset", "--hard", moved_base_sha],
                 Some(workspace),
             )?;
-            let merge = self.run_supervised_item_command_output(
-                &item.id,
-                &attempt.id,
-                QueueStatus::Integrating,
-                "git",
-                ["merge", "--no-edit", &source_sha],
-                Some(workspace),
-                StdDuration::from_secs(60),
-                "moved-base merge",
-            )?;
-            if merge.status.success() {
+            let local_squash = matches!(
+                item.source,
+                crate::core::QueueSource::LocalSubmission { .. }
+            ) && item.landing_policy == crate::core::LandingPolicy::Squash;
+            let merge = if local_squash {
+                self.apply_local_submission_patch(
+                    item,
+                    attempt,
+                    workspace,
+                    moved_base_sha,
+                    QueueStatus::Integrating,
+                    "moved-base local submission patch",
+                )?
+            } else {
+                self.run_supervised_item_command_output(
+                    &item.id,
+                    &attempt.id,
+                    QueueStatus::Integrating,
+                    "git",
+                    ["merge", "--no-edit", source_sha.as_str()],
+                    Some(workspace),
+                    StdDuration::from_secs(60),
+                    "moved-base merge",
+                )?
+            };
+            let conflict_files =
+                match git_output(workspace, ["diff", "--name-only", "--diff-filter=U"]) {
+                    Ok(files) => files
+                        .lines()
+                        .filter(|line| !line.trim().is_empty())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>(),
+                    Err(error) => {
+                        return Ok(Some(self.block_and_get(
+                            &item.id,
+                            BlockedPhase::Merging,
+                            BlockedReason::Infra,
+                            &format!("failed to inspect moved-base conflicts: {error:#}"),
+                        )?))
+                    }
+                };
+            if merge.status.success() && conflict_files.is_empty() {
+                if local_squash {
+                    if git_status(workspace, ["diff", "--cached", "--quiet"])?
+                        .status
+                        .success()
+                    {
+                        return Ok(Some(self.block_and_get(
+                            &item.id,
+                            BlockedPhase::Merging,
+                            BlockedReason::NeedsAgentFix,
+                            "local submission is empty after target movement",
+                        )?));
+                    }
+                    self.run_supervised_landing_command(
+                        &item.id,
+                        &attempt.id,
+                        "git",
+                        [
+                            "commit",
+                            "-m",
+                            &format!("Squash integrate queue item {}", item.id),
+                        ],
+                        Some(workspace),
+                    )?;
+                    let candidate = git_output(workspace, ["rev-parse", "HEAD"])?;
+                    verify_one_parent_candidate(workspace, &candidate, moved_base_sha)?;
+                }
+                let candidate = git_output(workspace, ["rev-parse", "HEAD"])?;
                 self.ensure_repo_lease()?;
+                self.queue
+                    .complete_moved_base_reconciliation(&attempt.id, &candidate)?;
                 return Ok(None);
             }
-            let conflict_files = git_output(workspace, ["diff", "--name-only", "--diff-filter=U"])
-                .unwrap_or_default()
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>();
             let conflict_json = json!({
                 "files": conflict_files,
                 "summary": format!(
@@ -5912,6 +9714,39 @@ pub mod integrator {
             )?))
         }
 
+        fn apply_local_submission_patch(
+            &self,
+            item: &QueueItem,
+            attempt: &Attempt,
+            workspace: &Path,
+            target_sha: &str,
+            expected_status: QueueStatus,
+            label: &str,
+        ) -> Result<Output> {
+            let crate::core::QueueSource::LocalSubmission { submission_id, .. } = &item.source
+            else {
+                anyhow::bail!("exact local patch requested for a remote queue source");
+            };
+            let submission = self.queue.local_submission(submission_id)?;
+            self.run_supervised_item_command_output(
+                &item.id,
+                &attempt.id,
+                expected_status,
+                "git",
+                [
+                    "read-tree",
+                    "-m",
+                    "-u",
+                    submission.base_sha.as_str(),
+                    target_sha,
+                    submission.commit_sha.as_str(),
+                ],
+                Some(workspace),
+                StdDuration::from_secs(60),
+                label,
+            )
+        }
+
         fn revalidate_moved_base(
             &self,
             item: &QueueItem,
@@ -5920,15 +9755,29 @@ pub mod integrator {
             moved_base_sha: &str,
             label: &str,
         ) -> Result<Option<QueueItem>> {
-            let command = match self.policy.validation_command.clone() {
-                Some(command) => command,
-                None => {
-                    return Ok(Some(self.block_and_get(
-                        &item.id,
-                        BlockedPhase::Validating,
-                        BlockedReason::NeedsUserInput,
-                        &format!("missing integration.validation.command after {label}"),
-                    )?));
+            let command = if self.requires_trusted_policy(item)? {
+                match self.policy_for_attempt(attempt, moved_base_sha) {
+                    Ok(policy) => policy.validation_command,
+                    Err(error) => {
+                        return Ok(Some(self.block_and_get(
+                            &item.id,
+                            BlockedPhase::Validating,
+                            BlockedReason::NeedsAgentFix,
+                            &format!("exact moved-target policy is missing or invalid after {label}: {error:#}"),
+                        )?));
+                    }
+                }
+            } else {
+                match self.policy.validation_command.clone() {
+                    Some(command) => command,
+                    None => {
+                        return Ok(Some(self.block_and_get(
+                            &item.id,
+                            BlockedPhase::Validating,
+                            BlockedReason::NeedsUserInput,
+                            &format!("missing integration validation command after {label}"),
+                        )?));
+                    }
                 }
             };
             let log_dir = self.evidence_dir(item, attempt)?;
@@ -6084,8 +9933,14 @@ pub mod integrator {
                 && matches!(phase, BlockedPhase::Merging | BlockedPhase::Validating)
             {
                 self.ensure_repo_lease()?;
-                self.queue
-                    .block_integrating_recovery(item_id, phase, reason, message)
+                self.queue.block_integrating_recovery_owned(
+                    item_id,
+                    phase,
+                    reason,
+                    message,
+                    &self.options.repo_key,
+                    &self.lease_owner_id,
+                )
             } else {
                 self.block_item_owned(item_id, phase, reason, message)
             };
@@ -6106,7 +9961,31 @@ pub mod integrator {
             pr_url: &str,
         ) -> Result<QueueItem> {
             let provider = crate::providers::provider_for_url(pr_url)?;
-            if item.landing_fenced {
+            let registered = self.queue.repository_if_exists(&item.repo_key)?.is_some();
+            if item.landing.is_uncertain() && registered {
+                if let Err(error) = self.fetch_target_supervised(&item, attempt) {
+                    return self.block_and_get(
+                        &item.id,
+                        BlockedPhase::Integrating,
+                        BlockedReason::Infra,
+                        &format!(
+                            "failed to fetch target while reconciling fenced exact landing: {error}"
+                        ),
+                    );
+                }
+                let remote_ref = format!(
+                    "refs/remotes/{}/{}",
+                    self.options.base_remote, item.target_branch
+                );
+                let remote_sha = git_output(&self.options.repo_path, ["rev-parse", &remote_ref])?;
+                return self.reconcile_fenced_exact_landing(
+                    &item,
+                    attempt,
+                    &remote_ref,
+                    &remote_sha,
+                );
+            }
+            if item.landing.is_uncertain() {
                 match self.reconcile_provider_landing(&item, attempt, provider.as_ref(), pr_url) {
                     Ok(Some(integrated)) => return Ok(integrated),
                     Ok(None) => {
@@ -6140,6 +10019,14 @@ pub mod integrator {
                     return self.queue.get_item(&item.id);
                 }
             }
+            if let Err(error) = self.fetch_target_supervised(&item, attempt) {
+                return self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::Infra,
+                    &format!("failed to fetch target before provider policy check: {error}"),
+                );
+            }
             let snapshot = match provider.snapshot(pr_url) {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
@@ -6160,6 +10047,19 @@ pub mod integrator {
                     "PR/MR head does not match queued source head",
                 )?;
                 return self.queue.get_item(&item.id);
+            }
+            let remote_ref = format!(
+                "refs/remotes/{}/{}",
+                self.options.base_remote, item.target_branch
+            );
+            if git_output(&self.options.repo_path, ["rev-parse", &remote_ref])? != snapshot.base_sha
+            {
+                return self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::Provider,
+                    "provider base SHA differs from the exact fetched target",
+                );
             }
             match snapshot.gate {
                 crate::providers::ProviderGate::Pass => {}
@@ -6183,8 +10083,14 @@ pub mod integrator {
                 }
             }
 
-            let attempt_base = self.queue.get_attempt(&attempt.id)?.target_base_sha;
-            if attempt_base.as_deref() != Some(snapshot.base_sha.as_str()) {
+            let current_attempt = self.queue.get_attempt(&attempt.id)?;
+            let needs_moved_base_reconciliation = current_attempt.target_base_sha.as_deref()
+                != Some(snapshot.base_sha.as_str())
+                || (!matches!(
+                    current_attempt.moved_base,
+                    crate::sqlite::MovedBaseState::None
+                ) && current_attempt.validated_commit_sha.is_none());
+            if needs_moved_base_reconciliation {
                 let workspace = self.load_owned_workspace(&item)?;
                 if let Some(blocked) = self.merge_moved_base(
                     &item,
@@ -6209,7 +10115,217 @@ pub mod integrator {
                 }
             }
 
-            if let Some(cancelled) = self.begin_landing_owned(&item.id, &attempt.id)? {
+            let workspace = self.load_owned_workspace(&item)?;
+            let candidate_sha = git_output(&workspace, ["rev-parse", "HEAD"])?;
+            if let Err(error) = self.verify_candidate_graph(&item, attempt, &workspace) {
+                return self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::NeedsAgentFix,
+                    &format!("provider candidate graph is invalid before signoff: {error}"),
+                );
+            }
+            if self.requires_trusted_policy(&item)? {
+                if let Some(blocked) =
+                    self.require_exact_policy_signoff(&item, attempt, &workspace, &candidate_sha)?
+                {
+                    return Ok(blocked);
+                }
+            } else if let Some(signoff) = &self.policy.signoff {
+                if let Some(blocked) =
+                    self.sign_candidate(&item, attempt, &workspace, &candidate_sha, signoff)?
+                {
+                    return Ok(blocked);
+                }
+            }
+            if registered {
+                if let Err(error) = self.fetch_target_supervised(&item, attempt) {
+                    return self.block_and_get(
+                        &item.id,
+                        BlockedPhase::Integrating,
+                        BlockedReason::Infra,
+                        &format!("failed to fetch target before final provider gate: {error}"),
+                    );
+                }
+                let final_target = git_output(&self.options.repo_path, ["rev-parse", &remote_ref])?;
+                let final_snapshot = match provider.snapshot(pr_url) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        return self.block_and_get(
+                            &item.id,
+                            BlockedPhase::Integrating,
+                            BlockedReason::Provider,
+                            &format!("final provider snapshot failed: {error}"),
+                        );
+                    }
+                };
+                if final_snapshot.head_sha != item.current_head_sha {
+                    return self.block_and_get(
+                        &item.id,
+                        BlockedPhase::Integrating,
+                        BlockedReason::NeedsAgentFix,
+                        "PR/MR head moved before exact target push",
+                    );
+                }
+                if final_snapshot.base_sha != final_target {
+                    return self.block_and_get(
+                        &item.id,
+                        BlockedPhase::Integrating,
+                        BlockedReason::Provider,
+                        "final provider base differs from the exact fetched target",
+                    );
+                }
+                match final_snapshot.gate {
+                    crate::providers::ProviderGate::Pass => {}
+                    crate::providers::ProviderGate::Pending(message) => {
+                        return self.block_and_get(
+                            &item.id,
+                            BlockedPhase::Integrating,
+                            BlockedReason::Provider,
+                            &message,
+                        );
+                    }
+                    crate::providers::ProviderGate::Fail(message) => {
+                        return self.block_and_get(
+                            &item.id,
+                            BlockedPhase::Integrating,
+                            BlockedReason::NeedsAgentFix,
+                            &message,
+                        );
+                    }
+                }
+                let current_attempt = self.queue.get_attempt(&attempt.id)?;
+                if current_attempt.target_base_sha.as_deref() != Some(final_target.as_str()) {
+                    self.queue.record_event(
+                        &item.id,
+                        "target_moved_after_signoff",
+                        &format!(
+                            "target moved to {final_target}; rebuilding and invalidating evidence"
+                        ),
+                    )?;
+                    if let Some(blocked) = self.merge_moved_base(
+                        &item,
+                        attempt,
+                        &workspace,
+                        &final_target,
+                        "target branch moved before final provider gate",
+                    )? {
+                        return Ok(blocked);
+                    }
+                    if let Some(blocked) = self.revalidate_moved_base(
+                        &item,
+                        attempt,
+                        &workspace,
+                        &final_target,
+                        "target moved before final provider gate",
+                    )? {
+                        return Ok(blocked);
+                    }
+                    if let Some(cancelled) = self.cancelled_item(&item.id)? {
+                        return Ok(cancelled);
+                    }
+                    return self.queue.get_item(&item.id);
+                }
+                return self.land_exact_candidate(
+                    &item,
+                    attempt,
+                    &workspace,
+                    &candidate_sha,
+                    &final_target,
+                );
+            }
+            let signed_snapshot = match provider.snapshot(pr_url) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return self.block_and_get(
+                        &item.id,
+                        BlockedPhase::Integrating,
+                        BlockedReason::Provider,
+                        &format!("provider snapshot after signoff failed: {error}"),
+                    );
+                }
+            };
+            if signed_snapshot.head_sha != item.current_head_sha {
+                return self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::NeedsAgentFix,
+                    "PR/MR head moved after exact candidate signoff",
+                );
+            }
+            if signed_snapshot.base_sha != snapshot.base_sha {
+                if let Err(error) = self.fetch_target_supervised(&item, attempt) {
+                    return self.block_and_get(
+                        &item.id,
+                        BlockedPhase::Integrating,
+                        BlockedReason::Infra,
+                        &format!("failed to fetch provider base after signoff: {error}"),
+                    );
+                }
+                if git_output(&self.options.repo_path, ["rev-parse", &remote_ref])?
+                    != signed_snapshot.base_sha
+                {
+                    return self.block_and_get(
+                        &item.id,
+                        BlockedPhase::Integrating,
+                        BlockedReason::Provider,
+                        "provider base after signoff differs from the exact fetched target",
+                    );
+                }
+                self.queue.record_event(
+                    &item.id,
+                    "target_moved_after_signoff",
+                    &format!(
+                        "provider base moved from {} to {}; exact evidence was invalidated",
+                        snapshot.base_sha, signed_snapshot.base_sha
+                    ),
+                )?;
+                if let Some(blocked) = self.merge_moved_base(
+                    &item,
+                    attempt,
+                    &workspace,
+                    &signed_snapshot.base_sha,
+                    "PR/MR base moved after signoff",
+                )? {
+                    return Ok(blocked);
+                }
+                if let Some(blocked) = self.revalidate_moved_base(
+                    &item,
+                    attempt,
+                    &workspace,
+                    &signed_snapshot.base_sha,
+                    "PR/MR base moved after signoff",
+                )? {
+                    return Ok(blocked);
+                }
+                return self.queue.get_item(&item.id);
+            }
+            match signed_snapshot.gate {
+                crate::providers::ProviderGate::Pass => {}
+                crate::providers::ProviderGate::Pending(message) => {
+                    return self.block_and_get(
+                        &item.id,
+                        BlockedPhase::Integrating,
+                        BlockedReason::Provider,
+                        &message,
+                    );
+                }
+                crate::providers::ProviderGate::Fail(message) => {
+                    return self.block_and_get(
+                        &item.id,
+                        BlockedPhase::Integrating,
+                        BlockedReason::NeedsAgentFix,
+                        &message,
+                    );
+                }
+            }
+
+            if let Some(cancelled) = self.begin_landing_owned(
+                &item.id,
+                &attempt.id,
+                &candidate_sha,
+                &signed_snapshot.base_sha,
+            )? {
                 return Ok(cancelled);
             }
             let merge_command = provider.merge_command(pr_url, &item.current_head_sha);
@@ -6324,8 +10440,16 @@ pub mod integrator {
                     landing.commit_sha
                 )
             })?;
-            self.mark_integrated_owned(&item.id, &attempt.id, &landing.commit_sha)
-                .map(Some)
+            let remote_target_sha =
+                git_output(&self.options.repo_path, ["rev-parse", &remote_ref])?;
+            self.reconcile_registered_checkout(item, &attempt.id, &remote_target_sha)?;
+            self.mark_integrated_owned(
+                &item.id,
+                &attempt.id,
+                &landing.commit_sha,
+                &remote_target_sha,
+            )
+            .map(Some)
         }
 
         fn push_provider_resolution_branch_if_needed(
@@ -6345,6 +10469,7 @@ pub mod integrator {
             if workspace_head == item.current_head_sha {
                 return Ok(None);
             }
+            self.ensure_registered_remote_identity()?;
             let push_ref = format!("HEAD:refs/heads/{}", item.source_branch);
             self.run_supervised_landing_command(
                 &item.id,
@@ -6379,16 +10504,14 @@ pub mod integrator {
         }
 
         pub fn accept_current_workspace(&self, item_id: &str) -> Result<QueueItem> {
-            if !self.queue.acquire_repo_lease(
+            self.ensure_registered_remote_identity()?;
+            let _operation = RepositoryOperationLease::acquire(
+                self.queue.clone(),
+                &self.options.repo_path,
                 &self.options.repo_key,
                 &self.lease_owner_id,
                 self.options.lease_ttl_seconds,
-            )? {
-                anyhow::bail!(
-                    "repo queue {} is leased by another integrator",
-                    self.options.repo_key
-                );
-            }
+            )?;
             let item = self.queue.get_item(item_id)?;
             let workspace = self.load_owned_workspace(&item)?;
             let unresolved = conflict_files(&workspace)?;
@@ -6412,16 +10535,14 @@ pub mod integrator {
         }
 
         pub fn reset_workspaces(&self) -> Result<Vec<PathBuf>> {
-            if !self.queue.acquire_repo_lease(
+            self.ensure_registered_remote_identity()?;
+            let _operation = RepositoryOperationLease::acquire(
+                self.queue.clone(),
+                &self.options.repo_path,
                 &self.options.repo_key,
                 &self.lease_owner_id,
                 self.options.lease_ttl_seconds,
-            )? {
-                anyhow::bail!(
-                    "repo queue {} is leased by another integrator",
-                    self.options.repo_key
-                );
-            }
+            )?;
             self.synchronize_workspace_generation()?;
             self.with_lease_heartbeat("workspace cleanup", || self.reconcile_workspaces())
         }
@@ -6591,6 +10712,20 @@ pub mod integrator {
                             .iter()
                             .find(|candidate| candidate.rift_id == identity.rift_id);
                         match existing {
+                            Some(actual) if terminal => {
+                                if actual.path != identity.path
+                                    && entry_exists(Path::new(&identity.path))?
+                                {
+                                    anyhow::bail!(
+                                        "terminal item {} old Rift path has unknown occupancy: {}",
+                                        item.id,
+                                        identity.path
+                                    );
+                                }
+                                self.remove_clean_terminal_workspace(actual)?;
+                                removed.push(PathBuf::from(&actual.path));
+                                self.queue.mark_workspace_cleaned(&item.id)?;
+                            }
                             Some(actual) if actual.path != identity.path => anyhow::bail!(
                                 "item {} Rift {} moved from {} to {}",
                                 item.id,
@@ -6598,12 +10733,6 @@ pub mod integrator {
                                 identity.path,
                                 actual.path
                             ),
-                            Some(actual) if terminal => {
-                                if self.remove_retained_workspace(actual)? {
-                                    removed.push(expected);
-                                }
-                                self.queue.mark_workspace_cleaned(&item.id)?;
-                            }
                             Some(actual) => {
                                 retained_ids.insert(actual.rift_id.clone());
                             }
@@ -6649,6 +10778,7 @@ pub mod integrator {
             I: IntoIterator<Item = S>,
             S: AsRef<OsStr>,
         {
+            self.ensure_registered_remote_identity()?;
             self.run_supervised_item_command(
                 &item.id,
                 &attempt.id,
@@ -6664,6 +10794,7 @@ pub mod integrator {
 
         fn fetch_target_supervised(&self, item: &QueueItem, attempt: &Attempt) -> Result<()> {
             self.ensure_repo_lease()?;
+            self.ensure_registered_remote_identity()?;
             self.run_supervised_landing_command(
                 &item.id,
                 &attempt.id,
@@ -6972,6 +11103,40 @@ pub mod integrator {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
+    fn definite_force_with_lease_rejection(output: &Output) -> bool {
+        if output.status.success() {
+            return false;
+        }
+        let report = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let porcelain_rejection = report.lines().any(|line| {
+            line.starts_with("!\t")
+                && ((line.contains("[rejected]") && line.contains("(stale info)"))
+                    || (line.contains("[remote rejected]")
+                        && line.contains("(failed to update ref)")))
+        });
+        porcelain_rejection
+            && (report.contains("(stale info)")
+                || (report.contains("cannot lock ref") && report.contains("but expected")))
+    }
+
+    fn verify_one_parent_candidate(cwd: &Path, candidate: &str, base: &str) -> Result<()> {
+        let graph = git_output(cwd, ["rev-list", "--parents", "-n", "1", candidate])?;
+        let fields = graph.split_whitespace().collect::<Vec<_>>();
+        if fields.as_slice() != [candidate, base] {
+            anyhow::bail!("squash candidate {candidate} must have exactly one parent {base}");
+        }
+        let candidate_tree = git_output(cwd, ["rev-parse", &format!("{candidate}^{{tree}}")])?;
+        let base_tree = git_output(cwd, ["rev-parse", &format!("{base}^{{tree}}")])?;
+        if candidate_tree == base_tree {
+            anyhow::bail!("squash candidate is empty relative to exact target base");
+        }
+        Ok(())
+    }
+
     fn git_is_ancestor(cwd: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
         let output = git_status(cwd, ["merge-base", "--is-ancestor", ancestor, descendant])?;
         if output.status.success() {
@@ -7008,7 +11173,7 @@ pub mod integrator {
             process.current_dir(cwd);
         }
         process.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let Some((mut child, process_group)) =
+        let Some((mut child, process_group, authority_pipe)) =
             spawn_authorized(process, authorize_start, &format!("run {program}"))?
         else {
             return Ok(CommandOutputOutcome::Cancelled);
@@ -7067,6 +11232,7 @@ pub mod integrator {
                 break status;
             }
         };
+        drop(authority_pipe);
         signal_process_group(process_group, libc::SIGKILL)?;
         let stdout = stdout_thread
             .join()
@@ -7150,7 +11316,7 @@ pub mod integrator {
         for (key, value) in environment {
             process.env(key, value);
         }
-        let Some((mut child, process_group)) = spawn_authorized(
+        let Some((mut child, process_group, authority_pipe)) = spawn_authorized(
             process,
             authorize_start,
             &format!("run evidence command: {command}"),
@@ -7222,6 +11388,7 @@ pub mod integrator {
                 break status;
             }
         };
+        drop(authority_pipe);
         signal_process_group(process_group, libc::SIGKILL)?;
         stdout_thread
             .join()
@@ -7322,7 +11489,22 @@ pub mod integrator {
         let mut process = Command::new("sh");
         process
             .arg("-c")
-            .arg("IFS= read -r gate && [ \"$gate\" = run ] || exit 125\nexec \"$@\"")
+            .arg(
+                r#"IFS= read -r gate && [ "$gate" = run ] || exit 125
+exec 3<&0
+"$@" &
+command_pid=$!
+(
+  while IFS= read -r _; do :; done
+  kill -TERM -$$ 2>/dev/null || true
+) <&3 &
+watcher_pid=$!
+wait "$command_pid"
+status=$?
+kill "$watcher_pid" 2>/dev/null || true
+wait "$watcher_pid" 2>/dev/null || true
+exit "$status""#,
+            )
             .arg("iq-command-gate")
             .arg(program)
             .args(args)
@@ -7335,7 +11517,7 @@ pub mod integrator {
         mut process: Command,
         authorize_start: impl FnOnce(&mut dyn Write) -> Result<bool>,
         description: &str,
-    ) -> Result<Option<(std::process::Child, i32)>> {
+    ) -> Result<Option<(std::process::Child, i32, std::process::ChildStdin)>> {
         const CANCELLATION_GRACE: StdDuration = StdDuration::from_millis(50);
 
         let mut child = process.spawn().with_context(|| description.to_string())?;
@@ -7360,8 +11542,7 @@ pub mod integrator {
             terminate_process_group(&mut child, process_group, CANCELLATION_GRACE)?;
             return Ok(None);
         }
-        drop(gate);
-        Ok(Some((child, process_group)))
+        Ok(Some((child, process_group, gate)))
     }
 
     fn terminate_process_group(
@@ -7430,7 +11611,10 @@ pub mod integrator {
     }
 
     fn workspace_dirty(workspace: &Path) -> Result<Option<String>> {
-        let status = git_observe_output(workspace, ["status", "--porcelain"])?;
+        let status = git_observe_output(
+            workspace,
+            ["status", "--porcelain=v1", "--untracked-files=all"],
+        )?;
         if status.is_empty() {
             Ok(None)
         } else {
@@ -7444,6 +11628,7 @@ pub mod integrator {
         S: AsRef<OsStr>,
     {
         Command::new("git")
+            .args(["-c", "commit.gpgSign=false"])
             .args(args)
             .current_dir(cwd)
             .output()
@@ -7480,7 +11665,10 @@ pub mod integrator {
         if !entry_exists(workspace)? {
             return Ok(None);
         }
-        let status = match git_observe_output(workspace, ["status", "--porcelain"]) {
+        let status = match git_observe_output(
+            workspace,
+            ["status", "--porcelain=v1", "--untracked-files=all"],
+        ) {
             Ok(status) => status,
             Err(_) if !entry_exists(workspace)? => return Ok(None),
             Err(error) => return Err(error),
