@@ -5,7 +5,6 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
 use tempfile::tempdir;
 
 fn env_lock() -> &'static Mutex<()> {
@@ -186,7 +185,10 @@ fn taskfile_validate_is_preferred_default_validation_command() {
 fn integrator_refuses_to_transition_after_lease_owner_changes() {
     let fixture = GitFixture::new(false);
     let db = fixture.temp.path().join("queues.db");
-    fixture.set_validation_command("git diff --check");
+    fixture.set_validation_command(&format!(
+        "sqlite3 '{}' \"UPDATE repo_leases SET owner_id='owner-b' WHERE repo_key='fixture::main'\" && sleep 0.1 && git diff --check",
+        db.display()
+    ));
     let source_head = fixture.create_source_branch("agent/stale-owner", "feature.txt", "feature\n");
     git(&fixture.repo, ["push", "-u", "origin", "agent/stale-owner"]).unwrap();
     let queue = SqliteQueue::open(&db).unwrap();
@@ -213,27 +215,14 @@ fn integrator_refuses_to_transition_after_lease_owner_changes() {
         rift_database: Some(fixture.rift_database.clone()),
     })
     .unwrap();
-    let repo_key_for_steal = repo_key.to_string();
-    let db_for_steal = db.clone();
-    let stealer = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(50));
-        let conn = rusqlite::Connection::open(db_for_steal).unwrap();
-        conn.execute(
-            "UPDATE repo_leases SET owner_id='owner-b' WHERE repo_key=?1",
-            [repo_key_for_steal],
-        )
-        .unwrap();
-    });
-
     let result = integrator.run_once();
-    stealer.join().unwrap();
 
-    assert!(result.is_err());
+    let result = result.unwrap().unwrap();
+    assert_eq!(result.status, QueueStatus::Blocked);
+    assert_eq!(result.blocked_reason, Some(BlockedReason::Infra));
     let item = queue.get_item(&enqueued.id).unwrap();
-    assert!(matches!(
-        item.status,
-        QueueStatus::Ready | QueueStatus::Merging | QueueStatus::Merged | QueueStatus::Validating
-    ));
+    assert_eq!(item.status, QueueStatus::Blocked);
+    assert_eq!(item.blocked_reason, Some(BlockedReason::Infra));
     assert_eq!(item.landed_commit_sha, None);
 }
 
@@ -919,7 +908,10 @@ impl GitFixture {
         fs::create_dir_all(self.repo.join(".iq")).unwrap();
         fs::write(
             self.repo.join(".iq/config.json"),
-            format!(r#"{{"integration":{{"validation":{{"command":"{command}"}}}}}}"#),
+            serde_json::to_vec(&serde_json::json!({
+                "integration": {"validation": {"command": command}}
+            }))
+            .unwrap(),
         )
         .unwrap();
         git(&self.repo, ["add", ".iq/config.json"]).unwrap();
