@@ -5480,7 +5480,7 @@ pub mod integrator {
     use std::fs::{self, OpenOptions};
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
@@ -5562,6 +5562,22 @@ pub mod integrator {
     struct EvidenceDirectory {
         path: PathBuf,
         directory: fs::File,
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    struct DirectoryIdentity {
+        device: u64,
+        inode: u64,
+    }
+
+    struct EmptyDirectoryNode {
+        components: Vec<OsString>,
+        identity: DirectoryIdentity,
+        child_names: Vec<OsString>,
+    }
+
+    struct EmptyDirectoryTree {
+        nodes: Vec<EmptyDirectoryNode>,
     }
 
     const RIFT_TRASH_DIRECTORY: &str = ".trash";
@@ -5772,9 +5788,211 @@ pub mod integrator {
             )
         };
         if fd < 0 {
-            return Err(std::io::Error::last_os_error()).context("open evidence directory");
+            return Err(std::io::Error::last_os_error()).context("open directory child");
         }
         Ok(unsafe { fs::File::from_raw_fd(fd) })
+    }
+
+    fn open_directory_path(root: &fs::File, components: &[OsString]) -> Result<fs::File> {
+        let duplicate = unsafe { libc::fcntl(root.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if duplicate < 0 {
+            return Err(std::io::Error::last_os_error()).context("duplicate directory descriptor");
+        }
+        let mut directory = unsafe { fs::File::from_raw_fd(duplicate) };
+        for component in components {
+            directory = open_directory_child(&directory, component)?;
+        }
+        Ok(directory)
+    }
+
+    fn directory_identity(directory: &fs::File) -> Result<DirectoryIdentity> {
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir() {
+            anyhow::bail!("cleanup residue entry changed from a directory");
+        }
+        Ok(DirectoryIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    fn clear_errno() {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))]
+        unsafe {
+            *libc::__error() = 0;
+        }
+    }
+
+    fn directory_names(directory: &fs::File) -> Result<Vec<OsString>> {
+        let duplicate = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if duplicate < 0 {
+            return Err(std::io::Error::last_os_error()).context("duplicate residue directory");
+        }
+        if unsafe { libc::lseek(duplicate, 0, libc::SEEK_SET) } < 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(duplicate);
+            }
+            return Err(error).context("rewind residue directory");
+        }
+        let stream = unsafe { libc::fdopendir(duplicate) };
+        if stream.is_null() {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(duplicate);
+            }
+            return Err(error).context("open residue directory stream");
+        }
+        let names = (|| {
+            let mut names = Vec::new();
+            loop {
+                clear_errno();
+                let entry = unsafe { libc::readdir(stream) };
+                if entry.is_null() {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(0) {
+                        break;
+                    }
+                    return Err(error).context("read residue directory");
+                }
+                let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+                if name != b"." && name != b".." {
+                    names.push(OsString::from_vec(name.to_vec()));
+                }
+            }
+            names.sort();
+            Ok(names)
+        })();
+        let close_result = unsafe { libc::closedir(stream) };
+        let names = names?;
+        if close_result != 0 {
+            return Err(std::io::Error::last_os_error()).context("close residue directory stream");
+        }
+        Ok(names)
+    }
+
+    fn residue_path(root_path: &Path, components: &[OsString]) -> PathBuf {
+        components
+            .iter()
+            .fold(root_path.to_path_buf(), |path, component| {
+                path.join(component)
+            })
+    }
+
+    fn inspect_empty_directory_tree(
+        root: &fs::File,
+        root_path: &Path,
+        name: &OsStr,
+    ) -> Result<EmptyDirectoryTree> {
+        let mut pending = vec![vec![name.to_os_string()]];
+        let mut nodes = Vec::new();
+        while let Some(components) = pending.pop() {
+            let path = residue_path(root_path, &components);
+            let directory = open_directory_path(root, &components).with_context(|| {
+                format!(
+                    "cleanup residue contains a non-directory or symlink entry: {}",
+                    path.display()
+                )
+            })?;
+            let identity = directory_identity(&directory)?;
+            let child_names = directory_names(&directory)?;
+            for child_name in &child_names {
+                if child_name == OsStr::new(".git") || child_name == OsStr::new(".rift") {
+                    anyhow::bail!(
+                        "cleanup residue contains a Git or Rift marker: {}",
+                        path.join(child_name).display()
+                    );
+                }
+                let mut child_components = components.clone();
+                child_components.push(child_name.clone());
+                pending.push(child_components);
+            }
+            nodes.push(EmptyDirectoryNode {
+                components,
+                identity,
+                child_names,
+            });
+        }
+        let tree = EmptyDirectoryTree { nodes };
+        verify_empty_directory_tree(root, root_path, &tree)?;
+        Ok(tree)
+    }
+
+    fn verify_empty_directory_tree(
+        root: &fs::File,
+        root_path: &Path,
+        tree: &EmptyDirectoryTree,
+    ) -> Result<()> {
+        for node in &tree.nodes {
+            let path = residue_path(root_path, &node.components);
+            let directory = open_directory_path(root, &node.components)
+                .with_context(|| format!("cleanup residue changed: {}", path.display()))?;
+            if directory_identity(&directory)? != node.identity
+                || directory_names(&directory)? != node.child_names
+            {
+                anyhow::bail!(
+                    "cleanup residue identity or contents changed: {}",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_empty_directory_tree(
+        root: &fs::File,
+        root_path: &Path,
+        tree: &EmptyDirectoryTree,
+    ) -> Result<()> {
+        let mut nodes = tree.nodes.iter().collect::<Vec<_>>();
+        nodes.sort_by_key(|node| std::cmp::Reverse(node.components.len()));
+        for node in nodes {
+            let path = residue_path(root_path, &node.components);
+            let (name, parent_components) = node
+                .components
+                .split_last()
+                .context("cleanup residue node has no name")?;
+            let parent = open_directory_path(root, parent_components)
+                .with_context(|| format!("cleanup residue parent changed: {}", path.display()))?;
+            if let Some(parent_node) = tree
+                .nodes
+                .iter()
+                .find(|candidate| candidate.components == parent_components)
+            {
+                if directory_identity(&parent)? != parent_node.identity {
+                    anyhow::bail!(
+                        "cleanup residue parent identity changed during removal: {}",
+                        path.display()
+                    );
+                }
+            }
+            let directory = open_directory_child(&parent, name)
+                .with_context(|| format!("cleanup residue changed: {}", path.display()))?;
+            if directory_identity(&directory)? != node.identity
+                || !directory_names(&directory)?.is_empty()
+            {
+                anyhow::bail!(
+                    "cleanup residue identity or contents changed during removal: {}",
+                    path.display()
+                );
+            }
+            let name = child_name(name, "cleanup residue")?;
+            if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0
+            {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("remove empty cleanup residue {}", path.display()));
+            }
+        }
+        Ok(())
     }
 
     fn ensure_directory_child(parent: &fs::File, name: &OsStr) -> Result<fs::File> {
@@ -6752,10 +6970,12 @@ pub mod integrator {
                     .find(|candidate| candidate.rift_id == expected_id)
                 else {
                     if entry_exists(path)? {
-                        anyhow::bail!(
-                            "Rift {expected_id} is absent from source inventory but its old path is occupied: {}",
-                            path.display()
-                        );
+                        self.remove_empty_residue(
+                            path,
+                            expected_id,
+                            &mut authorize_mutation,
+                            &mut check_authority,
+                        )?;
                     }
                     self.gc_unlocked(&mut authorize_mutation, &mut check_authority)?;
                     complete_mutation()?;
@@ -6820,6 +7040,13 @@ pub mod integrator {
                             canonical.display()
                         );
                     }
+                    if canonical != path && entry_exists(path)? {
+                        anyhow::bail!(
+                            "Rift {id} moved to {} but its old path became occupied before removal: {}",
+                            canonical.display(),
+                            path.display()
+                        );
+                    }
                     self.require_clean_childless_rift(&canonical)?;
                     authorize_mutation(gate)
                 },
@@ -6834,6 +7061,62 @@ pub mod integrator {
                 );
             }
             Ok(true)
+        }
+
+        fn remove_empty_residue<A, C>(
+            &self,
+            path: &Path,
+            expected_id: &str,
+            authorize_mutation: &mut A,
+            check_authority: &mut C,
+        ) -> Result<()>
+        where
+            A: FnMut(&mut dyn Write) -> Result<bool>,
+            C: FnMut() -> Result<ExecutionAuthority>,
+        {
+            self.verify_owned_path(path)?;
+            if path.parent() != Some(self.root.as_path()) {
+                anyhow::bail!(
+                    "cleanup residue is not at its exact IQ-owned path: {}",
+                    path.display()
+                );
+            }
+            let name = path
+                .file_name()
+                .context("cleanup residue path has no leaf name")?;
+            let tree = inspect_empty_directory_tree(&self.root_directory, &self.root, name)?;
+            verify_empty_directory_tree(&self.root_directory, &self.root, &tree)?;
+            match check_authority()? {
+                ExecutionAuthority::Active => {}
+                ExecutionAuthority::Cancelled => {
+                    anyhow::bail!("cleanup residue removal lost mutation authority")
+                }
+                ExecutionAuthority::Lost(message) => anyhow::bail!(message),
+            }
+            let mut sink = std::io::sink();
+            if !authorize_mutation(&mut sink)? {
+                anyhow::bail!("cleanup residue removal was not authorized");
+            }
+            if self
+                .list()?
+                .iter()
+                .any(|candidate| candidate.rift_id == expected_id)
+            {
+                anyhow::bail!(
+                    "Rift {expected_id} reappeared in source inventory before residue removal"
+                );
+            }
+            match check_authority()? {
+                ExecutionAuthority::Active => {}
+                ExecutionAuthority::Cancelled => {
+                    anyhow::bail!("cleanup residue removal lost mutation authority")
+                }
+                ExecutionAuthority::Lost(message) => anyhow::bail!(message),
+            }
+            verify_empty_directory_tree(&self.root_directory, &self.root, &tree)?;
+            remove_empty_directory_tree(&self.root_directory, &self.root, &tree)?;
+            self.verify_root_identity()?;
+            Ok(())
         }
 
         fn require_clean_childless_rift(&self, path: &Path) -> Result<()> {
@@ -8040,18 +8323,9 @@ pub mod integrator {
                 }
                 WorkspaceState::Retained { identity } => {
                     let actual = self.workspaces.resolve_retained(identity)?;
-                    if entry_exists(Path::new(&identity.path))?
-                        && actual
-                            .as_ref()
-                            .is_none_or(|candidate| candidate.path != identity.path)
-                    {
-                        anyhow::bail!(
-                            "terminal workspace path is occupied by an unknown entry: {}",
-                            identity.path
-                        );
-                    }
                     if let Some(actual) = actual.as_ref() {
-                        self.remove_clean_terminal_workspace(actual)?;
+                        self.require_clean_terminal_workspace(actual)?;
+                        self.remove_retained_workspace(identity)?;
                     } else {
                         self.remove_retained_workspace(identity)?;
                     }
@@ -8061,6 +8335,12 @@ pub mod integrator {
         }
 
         fn remove_clean_terminal_workspace(&self, identity: &WorkspaceIdentity) -> Result<()> {
+            self.require_clean_terminal_workspace(identity)?;
+            self.remove_retained_workspace(identity)?;
+            Ok(())
+        }
+
+        fn require_clean_terminal_workspace(&self, identity: &WorkspaceIdentity) -> Result<()> {
             let path = Path::new(&identity.path);
             if workspace_dirty(path)?.is_some() || crate::composition::has_git_operation(path)? {
                 anyhow::bail!(
@@ -8068,7 +8348,6 @@ pub mod integrator {
                     path.display()
                 );
             }
-            self.remove_retained_workspace(identity)?;
             Ok(())
         }
 
@@ -10979,16 +11258,8 @@ pub mod integrator {
                             .find(|candidate| candidate.rift_id == identity.rift_id);
                         match existing {
                             Some(actual) if terminal => {
-                                if actual.path != identity.path
-                                    && entry_exists(Path::new(&identity.path))?
-                                {
-                                    anyhow::bail!(
-                                        "terminal item {} old Rift path has unknown occupancy: {}",
-                                        item.id,
-                                        identity.path
-                                    );
-                                }
-                                self.remove_clean_terminal_workspace(actual)?;
+                                self.require_clean_terminal_workspace(actual)?;
+                                self.remove_retained_workspace(identity)?;
                                 removed.push(PathBuf::from(&actual.path));
                                 self.queue.mark_workspace_cleaned(&item.id)?;
                             }
@@ -11003,15 +11274,7 @@ pub mod integrator {
                                 retained_ids.insert(actual.rift_id.clone());
                             }
                             None if terminal => {
-                                if entry_exists(&expected)? {
-                                    anyhow::bail!(
-                                        "terminal item {} has unknown Rift entry {}",
-                                        item.id,
-                                        expected.display()
-                                    );
-                                }
-                                // Completes the remove->gc crash window for a known IQ Rift.
-                                self.gc_workspaces()?;
+                                self.remove_retained_workspace(identity)?;
                                 self.queue.mark_workspace_cleaned(&item.id)?;
                             }
                             None => anyhow::bail!(

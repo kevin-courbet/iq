@@ -911,7 +911,13 @@ impl RepositoryManager {
                         );
                     }
                 } else if entry_exists(&workspace.path)? {
-                    manager.verify_retained(identity)?;
+                    if !matches!(
+                        workspace.status,
+                        DevelopmentWorkspaceStatus::CleanupPending
+                            | DevelopmentWorkspaceStatus::CleanupFailed
+                    ) {
+                        manager.verify_retained(identity)?;
+                    }
                 } else if !matches!(
                     workspace.status,
                     DevelopmentWorkspaceStatus::CleanupPending
@@ -975,16 +981,6 @@ impl RepositoryManager {
             );
         };
         let retained = manager.resolve_retained(identity)?;
-        if entry_exists(&workspace.path)?
-            && retained
-                .as_ref()
-                .is_none_or(|actual| actual.path != identity.path)
-        {
-            anyhow::bail!(
-                "workspace path is occupied by an unknown Rift entry: {}",
-                workspace.path.display()
-            );
-        }
         if let Some(actual) = retained.as_ref() {
             let actual_path = Path::new(&actual.path);
             if !is_clean(actual_path)? || has_git_operation(actual_path)? {
@@ -1022,10 +1018,8 @@ impl RepositoryManager {
                 DevelopmentWorkspaceStatus::CleanupPending,
                 &CleanupState::Pending,
             )?;
-            self.remove_rift(guard, manager, actual)?;
-        } else {
-            self.remove_rift(guard, manager, identity)?;
         }
+        self.remove_rift(guard, manager, identity)?;
         self.queue.update_development_workspace_cleanup(
             &repository.key,
             &self.owner_id,
@@ -1100,18 +1094,7 @@ impl RepositoryManager {
             else {
                 continue;
             };
-            let old_path = Path::new(&old_workspace.path);
             let retained = manager.resolve_retained(old_workspace)?;
-            if entry_exists(old_path)?
-                && retained
-                    .as_ref()
-                    .is_none_or(|actual| actual.path != old_workspace.path)
-            {
-                anyhow::bail!(
-                    "old integration workspace path is occupied by an unknown entry: {}",
-                    old_path.display()
-                );
-            }
             if let Some(actual) = retained.as_ref() {
                 let path = Path::new(&actual.path);
                 if !is_clean(path)? || has_git_operation(path)? {
@@ -1119,7 +1102,7 @@ impl RepositoryManager {
                     continue;
                 }
             }
-            self.remove_rift(guard, &manager, retained.as_ref().unwrap_or(old_workspace))?;
+            self.remove_rift(guard, &manager, old_workspace)?;
             self.queue.finish_replacement_cleanup(
                 &repository.key,
                 &self.owner_id,
