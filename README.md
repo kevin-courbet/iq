@@ -51,6 +51,8 @@ iq integrate --next --repo-path /path/to/repo --repo-key '/path/to/repo::main'
 iq cleanup --repo-key '/path/to/repo::main'
 ```
 
+Normal cleanup preserves non-empty residue. If a terminal cleanup workspace's exact Rift is absent, `iq dev-workspace remove <workspace-id> --discard-residue` deletes only the residue at its exact IQ-owned path. It rejects symlinks, special entries, and `.git` or `.rift` markers at any depth.
+
 Local submission refs under `refs/iq/submissions/` are immutable. Local items apply the exact persisted development-base-to-submission change as a one-parent candidate. Target movement creates a new candidate from that same change and invalidates validation and signoff evidence. Empty changes are blocked.
 
 Every PR/MR landing requires a passing post-signoff provider snapshot before target mutation. For registered repositories, a PR/MR URL remains provider metadata and a provider gate. IQ fetches the final target and then requires the snapshot to contain the queued head and that exact base. IQ lands the exact validated candidate itself with a compare-and-set Git push; it does not delegate target mutation to the provider merge API.

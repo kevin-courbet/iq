@@ -13,11 +13,13 @@ use std::process::{Command, Output};
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::integrator::{git_output, RepositoryOperationLease, RiftWorkspaceManager};
+use crate::integrator::{
+    git_output, RepositoryOperationLease, ResidueDiscardRequest, RiftWorkspaceManager,
+};
 use crate::sqlite::{
     CheckoutReconciliationState, CleanupState, DevelopmentWorkspace, DevelopmentWorkspaceStatus,
-    QueueItem, RegisteredRemote, RegisteredRepository, ReplacementState, SeedRefreshState,
-    SqliteQueue, WorkspaceIdentity, WorkspaceState,
+    QueueItem, RegisteredRemote, RegisteredRepository, ReplacementState, ResidueDiscardState,
+    SeedRefreshState, SqliteQueue, WorkspaceIdentity, WorkspaceState,
 };
 
 const LEASE_SECONDS: i64 = 30;
@@ -98,6 +100,101 @@ pub struct DevelopmentWorkspaceObservation {
 
 struct RepositoryGuard {
     operation: RepositoryOperationLease,
+}
+
+struct DurableDiscardIdentity {
+    quarantine_name: String,
+    inspected_identity: Option<(u64, u64, [u8; 32])>,
+    pending_child_move: Option<crate::sqlite::ResidueChildMove>,
+}
+
+fn discard_identity(discard: &ResidueDiscardState) -> DurableDiscardIdentity {
+    match discard {
+        ResidueDiscardState::Pending { quarantine_name }
+        | ResidueDiscardState::FailedPending {
+            quarantine_name, ..
+        } => DurableDiscardIdentity {
+            quarantine_name: quarantine_name.clone(),
+            inspected_identity: None,
+            pending_child_move: None,
+        },
+        ResidueDiscardState::Inspected {
+            quarantine_name,
+            device,
+            inode,
+            tree_digest,
+            child_move,
+        }
+        | ResidueDiscardState::FailedInspected {
+            quarantine_name,
+            device,
+            inode,
+            tree_digest,
+            child_move,
+            ..
+        } => DurableDiscardIdentity {
+            quarantine_name: quarantine_name.clone(),
+            inspected_identity: Some((*device, *inode, *tree_digest)),
+            pending_child_move: child_move.clone(),
+        },
+    }
+}
+
+fn failed_discard_state(
+    cleanup: &CleanupState,
+    quarantine_name: &str,
+    message: String,
+) -> ResidueDiscardState {
+    match cleanup {
+        CleanupState::ResidueDiscard { discard } => match discard_identity(discard)
+            .inspected_identity
+        {
+            Some((device, inode, tree_digest)) => ResidueDiscardState::FailedInspected {
+                quarantine_name: quarantine_name.to_string(),
+                device,
+                inode,
+                tree_digest,
+                child_move: match discard.as_ref() {
+                    ResidueDiscardState::Inspected { child_move, .. }
+                    | ResidueDiscardState::FailedInspected { child_move, .. } => child_move.clone(),
+                    _ => None,
+                },
+                message,
+            },
+            None => ResidueDiscardState::FailedPending {
+                quarantine_name: quarantine_name.to_string(),
+                message,
+            },
+        },
+        _ => ResidueDiscardState::FailedPending {
+            quarantine_name: quarantine_name.to_string(),
+            message,
+        },
+    }
+}
+
+fn require_discard_authority(
+    workspace: &DevelopmentWorkspace,
+    repo_key: &str,
+    identity: &WorkspaceIdentity,
+    quarantine_name: &str,
+) -> Result<()> {
+    if workspace.repo_key != repo_key
+        || !matches!(
+            workspace.status,
+            DevelopmentWorkspaceStatus::CleanupPending | DevelopmentWorkspaceStatus::CleanupFailed
+        )
+        || workspace.identity.as_ref() != Some(identity)
+    {
+        anyhow::bail!("workspace residue-discard lifecycle authority changed");
+    }
+    let CleanupState::ResidueDiscard { discard } = &workspace.cleanup else {
+        anyhow::bail!("workspace residue-discard authorization disappeared");
+    };
+    if discard_identity(discard).quarantine_name != quarantine_name {
+        anyhow::bail!("workspace residue-discard quarantine identity changed");
+    }
+    Ok(())
 }
 
 impl RepositoryGuard {
@@ -520,6 +617,162 @@ impl RepositoryManager {
         self.remove_workspace_locked(&guard, &repository, &manager, &workspace)
     }
 
+    pub fn discard_workspace_residue(&self, id: &str) -> Result<DevelopmentWorkspace> {
+        let workspace = self.queue.workspace(id)?;
+        let repository = self.queue.repository(&workspace.repo_key)?;
+        verify_remote_identity(&repository.integration_path, &repository.remote)?;
+        let guard = RepositoryGuard::acquire(
+            self.queue.clone(),
+            &repository.integration_path,
+            &repository.key,
+            &self.owner_id,
+        )?;
+        let manager = self.development_manager(&repository)?;
+        self.discard_workspace_residue_locked(&guard, &repository, &manager, id, true)
+    }
+
+    fn discard_workspace_residue_locked(
+        &self,
+        guard: &RepositoryGuard,
+        repository: &RegisteredRepository,
+        manager: &RiftWorkspaceManager,
+        id: &str,
+        authorize_new: bool,
+    ) -> Result<DevelopmentWorkspace> {
+        let mut workspace = self.queue.workspace(id)?;
+        if workspace.repo_key != repository.key {
+            anyhow::bail!("workspace repository identity changed");
+        }
+        if !matches!(
+            workspace.status,
+            DevelopmentWorkspaceStatus::CleanupPending | DevelopmentWorkspaceStatus::CleanupFailed
+        ) {
+            anyhow::bail!(
+                "workspace {} in status {} cannot discard residue",
+                workspace.id,
+                workspace.status
+            );
+        }
+        let identity = workspace
+            .identity
+            .clone()
+            .context("workspace residue discard requires a durable Rift identity")?;
+        let expected_path = manager.expected_path(&workspace.id)?;
+        if workspace.path != expected_path || Path::new(&identity.path) != expected_path {
+            anyhow::bail!(
+                "workspace residue is not at its exact expected IQ-owned path: {}",
+                workspace.path.display()
+            );
+        }
+        let durable_discard = match &workspace.cleanup {
+            CleanupState::ResidueDiscard { discard } => discard_identity(discard),
+            _ if authorize_new => {
+                let quarantine_name = manager.new_residue_quarantine_name(&workspace.id)?;
+                workspace = self.queue.update_development_workspace_cleanup(
+                    &repository.key,
+                    &self.owner_id,
+                    &workspace.id,
+                    DevelopmentWorkspaceStatus::CleanupPending,
+                    &CleanupState::ResidueDiscard {
+                        discard: Box::new(ResidueDiscardState::Pending {
+                            quarantine_name: quarantine_name.clone(),
+                        }),
+                    },
+                )?;
+                DurableDiscardIdentity {
+                    quarantine_name,
+                    inspected_identity: None,
+                    pending_child_move: None,
+                }
+            }
+            _ => anyhow::bail!(
+                "workspace {} has no durable residue-discard authorization",
+                workspace.id
+            ),
+        };
+        let DurableDiscardIdentity {
+            quarantine_name,
+            inspected_identity,
+            pending_child_move,
+        } = durable_discard;
+        let operation_result = manager.discard_retained_residue(
+            ResidueDiscardRequest {
+                identity: &identity,
+                quarantine_name: &quarantine_name,
+                inspected_identity,
+                pending_child_move,
+            },
+            |device, inode, tree_digest, child_move| {
+                guard.ensure()?;
+                let current = self.queue.workspace(&workspace.id)?;
+                require_discard_authority(&current, &repository.key, &identity, &quarantine_name)?;
+                self.queue.update_development_workspace_cleanup(
+                    &repository.key,
+                    &self.owner_id,
+                    &workspace.id,
+                    DevelopmentWorkspaceStatus::CleanupPending,
+                    &CleanupState::ResidueDiscard {
+                        discard: Box::new(ResidueDiscardState::Inspected {
+                            quarantine_name: quarantine_name.clone(),
+                            device,
+                            inode,
+                            tree_digest,
+                            child_move: child_move.cloned(),
+                        }),
+                    },
+                )?;
+                Ok(())
+            },
+            |gate| {
+                guard.ensure()?;
+                let current = self.queue.workspace(&workspace.id)?;
+                require_discard_authority(&current, &repository.key, &identity, &quarantine_name)?;
+                self.queue
+                    .record_workspace_gc_debt(manager.registry_identity())?;
+                gate.write_all(b"run\n")?;
+                Ok(true)
+            },
+            || self.queue.lease_authority(&repository.key, &self.owner_id),
+            || {
+                guard.ensure()?;
+                if entry_exists(&workspace.path)? {
+                    anyhow::bail!(
+                        "workspace path became occupied during residue discard: {}",
+                        workspace.path.display()
+                    );
+                }
+                self.queue.complete_development_workspace_cleanup(
+                    &repository.key,
+                    &self.owner_id,
+                    &workspace.id,
+                    manager.registry_identity(),
+                )?;
+                Ok(())
+            },
+        );
+        match operation_result {
+            Ok(()) => self.queue.workspace(&workspace.id),
+            Err(error) => {
+                let current = self.queue.workspace(&workspace.id)?;
+                if current.status == DevelopmentWorkspaceStatus::Removed {
+                    return Err(error);
+                }
+                let discard =
+                    failed_discard_state(&current.cleanup, &quarantine_name, format!("{error:#}"));
+                self.queue.update_development_workspace_cleanup(
+                    &repository.key,
+                    &self.owner_id,
+                    &workspace.id,
+                    DevelopmentWorkspaceStatus::CleanupFailed,
+                    &CleanupState::ResidueDiscard {
+                        discard: Box::new(discard),
+                    },
+                )?;
+                Err(error)
+            }
+        }
+    }
+
     pub fn cleanup_repo(&self, repo_key: &str) -> Result<Vec<DevelopmentWorkspace>> {
         let repository = self.queue.repository(repo_key)?;
         verify_remote_identity(&repository.integration_path, &repository.remote)?;
@@ -940,6 +1193,15 @@ impl RepositoryManager {
         manager: &RiftWorkspaceManager,
         workspace: &DevelopmentWorkspace,
     ) -> Result<DevelopmentWorkspace> {
+        if matches!(workspace.cleanup, CleanupState::ResidueDiscard { .. }) {
+            return self.discard_workspace_residue_locked(
+                guard,
+                repository,
+                manager,
+                &workspace.id,
+                false,
+            );
+        }
         if workspace.status == DevelopmentWorkspaceStatus::Removed {
             if entry_exists(&workspace.path)? {
                 anyhow::bail!(

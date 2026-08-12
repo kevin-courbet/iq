@@ -205,6 +205,9 @@ enum DevWorkspaceCommand {
     },
     Remove {
         id: String,
+        /// Delete safe file residue after the exact Rift is absent.
+        #[arg(long)]
+        discard_residue: bool,
     },
 }
 
@@ -411,7 +414,17 @@ fn main() -> Result<()> {
                     print_json(&manager.workspaces(repo_key.as_deref())?)?
                 }
                 DevWorkspaceCommand::Status { id } => print_json(&manager.workspace_status(&id)?)?,
-                DevWorkspaceCommand::Remove { id } => print_json(&manager.remove_workspace(&id)?)?,
+                DevWorkspaceCommand::Remove {
+                    id,
+                    discard_residue,
+                } => {
+                    let workspace = if discard_residue {
+                        manager.discard_workspace_residue(&id)?
+                    } else {
+                        manager.remove_workspace(&id)?
+                    };
+                    print_json(&workspace)?;
+                }
             }
         }
         Command::Submit { workspace, replace } => {
