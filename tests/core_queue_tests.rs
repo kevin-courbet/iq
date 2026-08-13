@@ -1,7 +1,10 @@
 use iq::core::{BlockedPhase, BlockedReason, QueueStatus};
 use iq::issue_backends::{issue_adapter_for_provider, IssueProvider, IssueSyncTarget};
 use iq::providers::{provider_for_url, ProviderGate};
-use iq::sqlite::{EnqueueRequest, SqliteQueue, SqliteQueueReader};
+use iq::sqlite::{
+    EnqueueRequest, ReplacementState, SqliteQueue, SqliteQueueReader, WorkspaceIdentity,
+    WorkspaceState,
+};
 use rusqlite::{params, Connection};
 use std::fs;
 use std::sync::{Mutex, OnceLock};
@@ -56,6 +59,266 @@ fn sqlite_enqueue_is_idempotent_but_rejects_active_head_changes() {
     assert!(changed.is_err());
     assert_eq!(queue.get_item(&first.id).unwrap().current_head_sha, "111");
     assert_eq!(queue.list_items().unwrap().len(), 1);
+}
+
+#[test]
+fn replacement_cleanup_preserves_terminal_attempt_and_clears_matching_debt() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("queues.db");
+    let queue = SqliteQueue::open(&db).unwrap();
+    let repo_key = "repo::main";
+    let owner_id = "owner";
+    let item = queue
+        .enqueue(EnqueueRequest {
+            repo_key: repo_key.into(),
+            repo_path: "/repo".into(),
+            source_branch: "agent/one".into(),
+            target_branch: "main".into(),
+            current_head_sha: "111".into(),
+            pr_url: None,
+            producer_metadata: serde_json::json!({}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
+        })
+        .unwrap();
+    let (_, attempt) = queue.claim_next_ready(repo_key).unwrap().unwrap();
+    let identity = WorkspaceIdentity {
+        path: "/workspaces/old".into(),
+        rift_id: "old-rift".into(),
+        source_rift_id: "source-rift".into(),
+    };
+    queue
+        .set_workspace_intent(&item.id, &identity.path)
+        .unwrap();
+    queue
+        .set_workspace_identity(
+            &item.id,
+            &identity.path,
+            &identity.rift_id,
+            &identity.source_rift_id,
+        )
+        .unwrap();
+
+    let terminal_at = "2026-08-13T00:00:00Z";
+    let replacement = ReplacementState::CleanupPending {
+        old_attempt_id: attempt.id.clone(),
+        old_workspace: identity,
+    };
+    let connection = Connection::open(&db).unwrap();
+    connection
+        .execute(
+            "UPDATE integration_attempts SET result='cancelled',finished_at=?1 WHERE id=?2",
+            params![terminal_at, attempt.id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE queue_items SET status='blocked',blocked_phase='merging',blocked_reason='needs_agent_fix',blocked_message='replace source',replacement_json=?1 WHERE id=?2",
+            params![serde_json::to_string(&replacement).unwrap(), item.id],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(queue.acquire_repo_lease(repo_key, owner_id, 60).unwrap());
+
+    let cleaned = queue
+        .finish_replacement_cleanup(repo_key, owner_id, &item.id, &attempt.id)
+        .unwrap();
+
+    assert_eq!(cleaned.status, QueueStatus::Ready);
+    assert_eq!(cleaned.current_attempt_id, None);
+    assert_eq!(cleaned.workspace, WorkspaceState::NotCreated);
+    assert_eq!(cleaned.replacement, ReplacementState::None);
+    assert_eq!(cleaned.blocked_phase, None);
+    assert_eq!(cleaned.blocked_reason, None);
+    let connection = Connection::open(&db).unwrap();
+    let terminal: (String, String) = connection
+        .query_row(
+            "SELECT result,finished_at FROM integration_attempts WHERE id=?1",
+            params![attempt.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(terminal, ("cancelled".into(), terminal_at.into()));
+    let replacement_json: Option<String> = connection
+        .query_row(
+            "SELECT replacement_json FROM queue_items WHERE id=?1",
+            params![item.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(replacement_json, None);
+}
+
+#[test]
+fn replacement_cleanup_clears_stale_debt_without_reopening_integrated_item() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("queues.db");
+    let queue = SqliteQueue::open(&db).unwrap();
+    let repo_key = "repo::main";
+    let owner_id = "owner";
+    let item = queue
+        .enqueue(EnqueueRequest {
+            repo_key: repo_key.into(),
+            repo_path: "/repo".into(),
+            source_branch: "agent/one".into(),
+            target_branch: "main".into(),
+            current_head_sha: "111".into(),
+            pr_url: None,
+            producer_metadata: serde_json::json!({}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
+        })
+        .unwrap();
+    let (_, attempt) = queue.claim_next_ready(repo_key).unwrap().unwrap();
+    let identity = WorkspaceIdentity {
+        path: "/workspaces/old".into(),
+        rift_id: "old-rift".into(),
+        source_rift_id: "source-rift".into(),
+    };
+    let replacement = ReplacementState::CleanupPending {
+        old_attempt_id: attempt.id.clone(),
+        old_workspace: identity,
+    };
+    let landed_sha = "2222222222222222222222222222222222222222";
+    let terminal_at = "2026-08-13T00:00:00Z";
+    let connection = Connection::open(&db).unwrap();
+    connection
+        .execute(
+            "UPDATE integration_attempts SET result='integrated',finished_at=?1,landed_commit_sha=?2 WHERE id=?3",
+            params![terminal_at, landed_sha, attempt.id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE queue_items SET status='integrated',landed_commit_sha=?1,landing_state_json=?2,integration_workspace_cleaned_at=?3,replacement_json=?4 WHERE id=?5",
+            params![landed_sha, serde_json::json!({"state":"landed","candidate_sha":landed_sha,"commit_sha":landed_sha}).to_string(), terminal_at, serde_json::to_string(&replacement).unwrap(), item.id],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(queue.acquire_repo_lease(repo_key, owner_id, 60).unwrap());
+
+    let cleaned = queue
+        .finish_replacement_cleanup(repo_key, owner_id, &item.id, &attempt.id)
+        .unwrap();
+
+    assert_eq!(cleaned.status, QueueStatus::Integrated);
+    assert_eq!(
+        cleaned.current_attempt_id.as_deref(),
+        Some(attempt.id.as_str())
+    );
+    assert_eq!(cleaned.landed_commit_sha.as_deref(), Some(landed_sha));
+    assert_eq!(cleaned.replacement, ReplacementState::None);
+    let connection = Connection::open(&db).unwrap();
+    let terminal: (String, String) = connection
+        .query_row(
+            "SELECT result,finished_at FROM integration_attempts WHERE id=?1",
+            params![attempt.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(terminal, ("integrated".into(), terminal_at.into()));
+}
+
+#[test]
+fn replacement_cleanup_rejects_unknown_terminal_attempt_without_clearing_debt() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("queues.db");
+    let queue = SqliteQueue::open(&db).unwrap();
+    let repo_key = "repo::main";
+    let owner_id = "owner";
+    let item = queue
+        .enqueue(EnqueueRequest {
+            repo_key: repo_key.into(),
+            repo_path: "/repo".into(),
+            source_branch: "agent/one".into(),
+            target_branch: "main".into(),
+            current_head_sha: "111".into(),
+            pr_url: None,
+            producer_metadata: serde_json::json!({}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
+        })
+        .unwrap();
+    let (_, attempt) = queue.claim_next_ready(repo_key).unwrap().unwrap();
+    let replacement = ReplacementState::CleanupPending {
+        old_attempt_id: attempt.id.clone(),
+        old_workspace: WorkspaceIdentity {
+            path: "/workspaces/old".into(),
+            rift_id: "old-rift".into(),
+            source_rift_id: "source-rift".into(),
+        },
+    };
+    let connection = Connection::open(&db).unwrap();
+    connection
+        .execute(
+            "UPDATE integration_attempts SET result='unknown',finished_at='2026-08-13T00:00:00Z' WHERE id=?1",
+            params![attempt.id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE queue_items SET status='blocked',blocked_phase='merging',blocked_reason='needs_agent_fix',blocked_message='replace source',replacement_json=?1 WHERE id=?2",
+            params![serde_json::to_string(&replacement).unwrap(), item.id],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(queue.acquire_repo_lease(repo_key, owner_id, 60).unwrap());
+
+    assert!(queue
+        .finish_replacement_cleanup(repo_key, owner_id, &item.id, &attempt.id)
+        .is_err());
+    let unchanged = queue.get_item(&item.id).unwrap();
+    assert_eq!(unchanged.status, QueueStatus::Blocked);
+    assert_eq!(unchanged.replacement, replacement);
+}
+
+#[test]
+fn replacement_cleanup_rejects_partial_terminal_attempt_without_clearing_debt() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("queues.db");
+    let queue = SqliteQueue::open(&db).unwrap();
+    let repo_key = "repo::main";
+    let owner_id = "owner";
+    let item = queue
+        .enqueue(EnqueueRequest {
+            repo_key: repo_key.into(),
+            repo_path: "/repo".into(),
+            source_branch: "agent/one".into(),
+            target_branch: "main".into(),
+            current_head_sha: "111".into(),
+            pr_url: None,
+            producer_metadata: serde_json::json!({}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
+        })
+        .unwrap();
+    let (_, attempt) = queue.claim_next_ready(repo_key).unwrap().unwrap();
+    let replacement = ReplacementState::CleanupPending {
+        old_attempt_id: attempt.id.clone(),
+        old_workspace: WorkspaceIdentity {
+            path: "/workspaces/old".into(),
+            rift_id: "old-rift".into(),
+            source_rift_id: "source-rift".into(),
+        },
+    };
+    let connection = Connection::open(&db).unwrap();
+    connection
+        .execute(
+            "UPDATE integration_attempts SET result='cancelled',finished_at=NULL WHERE id=?1",
+            params![attempt.id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE queue_items SET status='blocked',blocked_phase='merging',blocked_reason='needs_agent_fix',blocked_message='replace source',replacement_json=?1 WHERE id=?2",
+            params![serde_json::to_string(&replacement).unwrap(), item.id],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(queue.acquire_repo_lease(repo_key, owner_id, 60).unwrap());
+
+    assert!(queue
+        .finish_replacement_cleanup(repo_key, owner_id, &item.id, &attempt.id)
+        .is_err());
+    let unchanged = queue.get_item(&item.id).unwrap();
+    assert_eq!(unchanged.status, QueueStatus::Blocked);
+    assert_eq!(unchanged.replacement, replacement);
 }
 
 #[test]

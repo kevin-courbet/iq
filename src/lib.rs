@@ -3735,12 +3735,53 @@ DROP TABLE queue_items_v6;"#,
                     anyhow::bail!("queue item has no replacement cleanup debt");
                 };
                 if expected != old_attempt_id { anyhow::bail!("replacement cleanup attempt identity changed"); }
-                let changed = tx.execute("UPDATE integration_attempts SET result='superseded',finished_at=?1 WHERE id=?2 AND item_id=?3 AND finished_at IS NULL AND result IS NULL",params![now(),old_attempt_id,item_id])?;
-                if changed != 1 { anyhow::bail!("old integration attempt cannot be superseded after cleanup"); }
-                let changed = tx.execute(
-                    "UPDATE queue_items SET status='ready',current_attempt_id=NULL,integration_workspace_path=NULL,integration_workspace_rift_id=NULL,integration_workspace_source_rift_id=NULL,replacement_json=NULL,blocked_phase=NULL,blocked_reason=NULL,blocked_message=NULL,prompt_id=NULL,updated_at=?1 WHERE id=?2 AND repo_key=?3 AND status='blocked'",
-                    params![now(),item_id,repo_key],
-                )?;
+                if item.status == QueueStatus::Blocked {
+                    let changed = tx.execute("UPDATE integration_attempts SET result='superseded',finished_at=?1 WHERE id=?2 AND item_id=?3 AND finished_at IS NULL AND result IS NULL",params![now(),old_attempt_id,item_id])?;
+                    if changed == 0 {
+                        let (finished_at, result) = tx
+                            .query_row(
+                                "SELECT finished_at,result FROM integration_attempts WHERE id=?1 AND item_id=?2",
+                                params![old_attempt_id,item_id],
+                                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)),
+                            )
+                            .optional()?
+                            .context("old integration attempt disappeared after cleanup")?;
+                        if finished_at.is_none()
+                            || !matches!(result.as_deref(), Some("cancelled" | "superseded"))
+                        {
+                            anyhow::bail!("old integration attempt terminal state is incompatible with replacement cleanup");
+                        }
+                    }
+                } else {
+                    let (finished_at, result) = tx
+                        .query_row(
+                            "SELECT finished_at,result FROM integration_attempts WHERE id=?1 AND item_id=?2",
+                            params![old_attempt_id,item_id],
+                            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)),
+                        )
+                        .optional()?
+                        .context("old integration attempt disappeared after cleanup")?;
+                    let valid_terminal = finished_at.is_some()
+                        && matches!(
+                            (item.status, result.as_deref()),
+                            (QueueStatus::Integrated, Some("integrated"))
+                                | (QueueStatus::Cancelled, Some("cancelled"))
+                        );
+                    if !valid_terminal {
+                        anyhow::bail!("old integration attempt terminal state is incompatible with replacement cleanup");
+                    }
+                }
+                let changed = if item.status == QueueStatus::Blocked {
+                    tx.execute(
+                        "UPDATE queue_items SET status='ready',current_attempt_id=NULL,integration_workspace_path=NULL,integration_workspace_rift_id=NULL,integration_workspace_source_rift_id=NULL,replacement_json=NULL,blocked_phase=NULL,blocked_reason=NULL,blocked_message=NULL,prompt_id=NULL,updated_at=?1 WHERE id=?2 AND repo_key=?3 AND status='blocked'",
+                        params![now(),item_id,repo_key],
+                    )?
+                } else {
+                    tx.execute(
+                        "UPDATE queue_items SET replacement_json=NULL,updated_at=?1 WHERE id=?2 AND repo_key=?3 AND status=?4 AND current_attempt_id=?5",
+                        params![now(),item_id,repo_key,item.status.to_string(),old_attempt_id],
+                    )?
+                };
                 if changed != 1 { anyhow::bail!("replacement cleanup state changed concurrently"); }
                 tx.execute("UPDATE prompts SET status='superseded' WHERE item_id=?1 AND status='open'",params![item_id])?;
                 Self::record_event_tx(tx,item_id,"local_submission_replacement_cleanup_complete","old integration Rift cleanup completed")?;
