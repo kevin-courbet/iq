@@ -2024,7 +2024,11 @@ pub fn migrate_v8_to_v9(
     for item in active {
         let project = crate::composition::load_project_control_only(Path::new(&item.repo_path))?;
         crate::state_repository::repository(&project.state_repository)?.verify()?;
-        let runner = system_config.runner_snapshot(project.model.as_deref())?;
+        let runner = item
+            .claimed
+            .as_ref()
+            .map(|_| system_config.runner_snapshot(project.model.as_deref()))
+            .transpose()?;
         conversions.push((item, runner, project.state_repository));
     }
     let backup = verified_backup(connection, database_path)?;
@@ -2032,7 +2036,18 @@ pub fn migrate_v8_to_v9(
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(V9_SCHEMA)?;
         for (item, runner, state_repository) in &conversions {
-            convert_item(&transaction, item, runner, state_repository)?;
+            bind_item_state_repository(&transaction, item, state_repository)?;
+            if let Some(claimed) = &item.claimed {
+                convert_item(
+                    &transaction,
+                    item,
+                    claimed,
+                    runner
+                        .as_ref()
+                        .context("claimed v8 item has no runner snapshot")?,
+                    state_repository,
+                )?;
+            }
         }
         transaction.execute(
             "UPDATE prompts SET status='superseded',answer='schema_v9_agent_first' WHERE status='open'",
@@ -2047,8 +2062,8 @@ pub fn migrate_v8_to_v9(
             "UPDATE queue_metadata SET value='9' WHERE key='workspace_schema_version'",
             [],
         )?;
-        let active_count: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM queue_items WHERE status NOT IN ('integrated','cancelled')",
+        let claimed_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM queue_items WHERE status NOT IN ('integrated','cancelled') AND current_attempt_id IS NOT NULL",
             [],
             |row| row.get(0),
         )?;
@@ -2056,8 +2071,10 @@ pub fn migrate_v8_to_v9(
             transaction.query_row("SELECT COUNT(*) FROM integration_efforts", [], |row| {
                 row.get(0)
             })?;
-        if active_count != effort_count {
-            anyhow::bail!("schema v9 conversion did not create exactly one effort per active item");
+        if claimed_count != effort_count {
+            anyhow::bail!(
+                "schema v9 conversion did not create exactly one effort per claimed active item"
+            );
         }
         let foreign_keys: i64 =
             transaction.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
@@ -2221,6 +2238,12 @@ fn reject_migration_authority(connection: &Connection) -> Result<()> {
 struct V8ActiveItem {
     id: String,
     repo_path: String,
+    claimed: Option<V8ClaimedItem>,
+    created_at: String,
+}
+
+#[derive(Clone, Debug)]
+struct V8ClaimedItem {
     attempt_id: String,
     target_sha: String,
     source_sha: String,
@@ -2231,7 +2254,6 @@ struct V8ActiveItem {
     blocked_phase: Option<String>,
     blocked_reason: Option<String>,
     blocked_message: Option<String>,
-    created_at: String,
     updated_at: String,
 }
 
@@ -2254,29 +2276,69 @@ fn active_v8_items(connection: &Connection) -> Result<Vec<V8ActiveItem>> {
                     )
                 })
             };
-            let attempt_id = required(row.get(2)?, "attempt identity")?;
-            let target_sha = required(row.get(3)?, "target SHA")?;
-            let source_sha = required(row.get(4)?, "source SHA")?;
-            required(row.get(5)?, "base SHA")?;
+            let attempt_id: Option<String> = row.get(2)?;
+            let target_sha: Option<String> = row.get(3)?;
+            let source_sha: Option<String> = row.get(4)?;
+            let base_sha: Option<String> = row.get(5)?;
+            let workspace_path: Option<String> = row.get(8)?;
+            let workspace_rift_id: Option<String> = row.get(9)?;
+            let workspace_source_rift_id: Option<String> = row.get(10)?;
+            let claimed = if let Some(attempt_id) = attempt_id {
+                let target_sha = required(target_sha, "target SHA")?;
+                let source_sha = required(source_sha, "source SHA")?;
+                required(base_sha, "base SHA")?;
+                Some(V8ClaimedItem {
+                    attempt_id,
+                    target_sha,
+                    source_sha,
+                    source_kind: row.get(6)?,
+                    landing_policy: row.get(7)?,
+                    workspace: WorkspaceIdentity {
+                        path: required(workspace_path, "retained Rift path")?,
+                        rift_id: required(workspace_rift_id, "retained Rift ID")?,
+                        source_rift_id: required(workspace_source_rift_id, "source Rift ID")?,
+                    },
+                    status: row.get(11)?,
+                    blocked_phase: row.get(12)?,
+                    blocked_reason: row.get(13)?,
+                    blocked_message: row.get(14)?,
+                    updated_at: row.get(16)?,
+                })
+            } else {
+                let status: String = row.get(11)?;
+                if status != "ready" {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Null,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("unclaimed v8 item {id} has non-ready status {status}"),
+                        )),
+                    ));
+                }
+                if target_sha.is_some()
+                    || source_sha.is_some()
+                    || base_sha.is_some()
+                    || workspace_path.is_some()
+                    || workspace_rift_id.is_some()
+                    || workspace_source_rift_id.is_some()
+                {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Null,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("unclaimed v8 item {id} has claimed integration state"),
+                        )),
+                    ));
+                }
+                None
+            };
             Ok(V8ActiveItem {
-                id: id.clone(),
+                id,
                 repo_path: row.get(1)?,
-                attempt_id,
-                target_sha,
-                source_sha,
-                source_kind: row.get(6)?,
-                landing_policy: row.get(7)?,
-                workspace: WorkspaceIdentity {
-                    path: required(row.get(8)?, "retained Rift path")?,
-                    rift_id: required(row.get(9)?, "retained Rift ID")?,
-                    source_rift_id: required(row.get(10)?, "source Rift ID")?,
-                },
-                status: row.get(11)?,
-                blocked_phase: row.get(12)?,
-                blocked_reason: row.get(13)?,
-                blocked_message: row.get(14)?,
+                claimed,
                 created_at: row.get(15)?,
-                updated_at: row.get(16)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2286,17 +2348,18 @@ fn active_v8_items(connection: &Connection) -> Result<Vec<V8ActiveItem>> {
 fn convert_item(
     transaction: &rusqlite::Transaction<'_>,
     item: &V8ActiveItem,
+    claimed: &V8ClaimedItem,
     runner: &RunnerSnapshot,
     state_repository: &StateRepositorySnapshot,
 ) -> Result<()> {
-    crate::control_domain::require_sha(&item.target_sha, "converted target SHA")?;
-    crate::control_domain::require_sha(&item.source_sha, "converted source SHA")?;
+    crate::control_domain::require_sha(&claimed.target_sha, "converted target SHA")?;
+    crate::control_domain::require_sha(&claimed.source_sha, "converted source SHA")?;
     let conflict_prompt: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM prompts WHERE item_id=?1 AND status='open' AND blocked_phase='merging')",
         params![item.id],
         |row| row.get(0),
     )?;
-    let state = match item.status.as_str() {
+    let state = match claimed.status.as_str() {
         "ready" | "merging" => {
             IntegrationEffortState::AgentReady(AgentReady { next_cycle: 1 })
         }
@@ -2307,12 +2370,12 @@ fn convert_item(
             IntegrationEffortState::AgentReady(AgentReady { next_cycle: 1 })
         }
         "blocked" => {
-            match item.blocked_reason.as_deref() {
+            match claimed.blocked_reason.as_deref() {
                 Some("provider") => anyhow::bail!(
                     "provider-blocked v8 item has no durable v9 candidate operation authority"
                 ),
                 Some("infra" | "dependency" | "credentials") => {
-                    if item.blocked_phase.as_deref() != Some("merging") {
+                    if claimed.blocked_phase.as_deref() != Some("merging") {
                         anyhow::bail!("non-merging v8 infrastructure blocker requires unavailable candidate authority");
                     }
                     IntegrationEffortState::InfrastructureBlocked(
@@ -2321,10 +2384,10 @@ fn convert_item(
                                 crate::control_domain::InfrastructureBlocker {
                                     component:
                                         crate::control_domain::InfrastructureComponent::Filesystem,
-                                    operation: item.blocked_phase.clone().context("infrastructure-blocked v8 item has no exact phase")?,
+                                    operation: claimed.blocked_phase.clone().context("infrastructure-blocked v8 item has no exact phase")?,
                                     cause:
                                         crate::control_domain::InfrastructureCause::Unavailable {
-                                            detail: item.blocked_message.clone().context("infrastructure-blocked v8 item has no exact evidence")?,
+                                            detail: claimed.blocked_message.clone().context("infrastructure-blocked v8 item has no exact evidence")?,
                                         },
                                 },
                             ),
@@ -2344,10 +2407,26 @@ fn convert_item(
     state.validate_for_count(0)?;
     transaction.execute(
         "INSERT INTO integration_efforts(id,item_id,attempt_id,target_sha,source_sha,source_variant,landing_variant,workspace_json,runner_snapshot_json,state_repository_json,failed_cycles,state,state_json,blocker_kind,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,?11,?12,?13,?14,?15)",
-        params![effort_id,item.id,item.attempt_id,item.target_sha,item.source_sha,item.source_kind,item.landing_policy,serde_json::to_string(&item.workspace)?,serde_json::to_string(runner)?,serde_json::to_string(state_repository)?,state.name(),serde_json::to_string(&state)?,state.blocker().map(IntegrationBlocker::kind),item.created_at,item.updated_at],
+        params![effort_id,item.id,claimed.attempt_id,claimed.target_sha,claimed.source_sha,claimed.source_kind,claimed.landing_policy,serde_json::to_string(&claimed.workspace)?,serde_json::to_string(runner)?,serde_json::to_string(state_repository)?,state.name(),serde_json::to_string(&state)?,state.blocker().map(IntegrationBlocker::kind),item.created_at,claimed.updated_at],
     )?;
     let effort = required_effort(transaction, &effort_id)?;
     project_queue_state(transaction, &effort, &state)?;
+    append_event_raw(
+        transaction,
+        &item.id,
+        Some(&effort_id),
+        "schema_v9_converted",
+        serde_json::json!({"old_status":claimed.status}),
+        false,
+    )?;
+    Ok(())
+}
+
+fn bind_item_state_repository(
+    transaction: &rusqlite::Transaction<'_>,
+    item: &V8ActiveItem,
+    state_repository: &StateRepositorySnapshot,
+) -> Result<()> {
     let (provider, repository, visibility, reservation_state) = match state_repository {
         StateRepositorySnapshot::Local => (None, None, None, "none"),
         StateRepositorySnapshot::GithubIssue(issue) => (
@@ -2378,17 +2457,17 @@ fn convert_item(
         ),
     };
     transaction.execute(
-        "INSERT INTO item_state_repository_bindings(item_id,snapshot_json,provider,repository,visibility,reservation_state,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        "INSERT OR IGNORE INTO item_state_repository_bindings(item_id,snapshot_json,provider,repository,visibility,reservation_state,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
         params![item.id,serde_json::to_string(state_repository)?,provider,repository,visibility,reservation_state,item.created_at],
     )?;
-    append_event_raw(
-        transaction,
-        &item.id,
-        Some(&effort_id),
-        "schema_v9_converted",
-        serde_json::json!({"old_status":item.status}),
-        false,
+    let stored: String = transaction.query_row(
+        "SELECT snapshot_json FROM item_state_repository_bindings WHERE item_id=?1",
+        params![item.id],
+        |row| row.get(0),
     )?;
+    if serde_json::from_str::<StateRepositorySnapshot>(&stored)?.validate()? != *state_repository {
+        anyhow::bail!("existing item repository snapshot differs from schema-v9 conversion");
+    }
     Ok(())
 }
 

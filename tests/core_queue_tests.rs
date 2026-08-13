@@ -168,14 +168,17 @@ fn schema_v9_migration_preserves_terminal_attempt_policy_as_opaque_history() {
 }
 
 #[test]
-fn schema_v9_migration_rejects_ambiguous_active_items() {
+fn schema_v9_migration_preserves_unclaimed_ready_items_without_efforts() {
     let temp = tempdir().unwrap();
+    let repository = temp.path().join("repo");
+    fs::create_dir(&repository).unwrap();
+    iq::integrator::git(&repository, ["init"]).unwrap();
     let db = temp.path().join("queues.db");
     let queue = SqliteQueue::open(&db).unwrap();
-    queue
+    let item = queue
         .enqueue(EnqueueRequest {
             repo_key: "repo::main".into(),
-            repo_path: "/repo".into(),
+            repo_path: repository.to_string_lossy().into_owned(),
             source_branch: "agent/one".into(),
             target_branch: "main".into(),
             current_head_sha: "111".into(),
@@ -191,11 +194,15 @@ fn schema_v9_migration_rejects_ambiguous_active_items() {
     drop(connection);
     let system_config = write_system_config(temp.path());
 
-    let error = match SqliteQueue::migrate_v8(&db, &system_config) {
-        Ok(_) => panic!("nonterminal queue migrated"),
-        Err(error) => format!("{error:#}"),
-    };
-    assert!(error.contains("lacks attempt identity"), "{error}");
+    let migrated = SqliteQueue::migrate_v8(&db, &system_config).unwrap();
+    let migrated_item = migrated.get_item(&item.id).unwrap();
+    assert_eq!(migrated_item.status, QueueStatus::Ready);
+    assert!(migrated_item.current_attempt_id.is_none());
+    assert!(iq::control_store::ControlStore::open(&db)
+        .unwrap()
+        .effort_for_item(&item.id)
+        .unwrap()
+        .is_none());
     let connection = Connection::open(&db).unwrap();
     let version: String = connection
         .query_row(
@@ -204,7 +211,7 @@ fn schema_v9_migration_rejects_ambiguous_active_items() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "8");
+    assert_eq!(version, "9");
 }
 
 #[test]

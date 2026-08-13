@@ -11,6 +11,7 @@ use iq::control_domain::{
 };
 use iq::control_store::ControlStore;
 use sha2::Digest;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -440,7 +441,7 @@ fn explicit_v8_migration_creates_verified_private_backup() {
 }
 
 #[test]
-fn active_v8_conflict_migrates_to_one_exact_agent_ready_effort() {
+fn v8_ready_local_submission_and_claimed_conflict_migrate_with_exact_authority() {
     let temp = tempdir().unwrap();
     let repository = temp.path().join("repo");
     std::fs::create_dir(&repository).unwrap();
@@ -448,6 +449,12 @@ fn active_v8_conflict_migrates_to_one_exact_agent_ready_effort() {
     let database = temp.path().join("queue.db");
     let target_sha = sha('1');
     let source_sha = sha('2');
+    let ready_sha = sha('3');
+    let ready_base_sha = sha('4');
+    let ready_item_id = "4b6d66b7-d46d-442d-8704-fc909e110478";
+    let ready_workspace_id = "workspace-v8-ready";
+    let ready_submission_id = "submission-v8-ready";
+    let ready_private_ref = "refs/iq/submissions/v8-ready";
     let item_id = "arbitrary-eight-conflict-item";
     let attempt_id = "attempt-v8";
     let prompt_id = "prompt-v8";
@@ -465,6 +472,22 @@ fn active_v8_conflict_migrates_to_one_exact_agent_ready_effort() {
     connection
         .execute_batch(include_str!("fixtures/schema-v8-active.sql"))
         .unwrap();
+    connection.execute(
+        "INSERT INTO registered_repositories(repo_key,integration_path,target_branch,remote,seed_path,workspace_root,checkout_reconciliation_json,seed_refresh_json,created_at,updated_at) VALUES('fixture::main',?1,'main','origin',?2,?3,?4,?5,'2025-12-31T00:00:00Z','2025-12-31T00:00:00Z')",
+        rusqlite::params![repository.as_os_str().as_bytes(),temp.path().join("seed").as_os_str().as_bytes(),temp.path().join("development-workspaces").as_os_str().as_bytes(),serde_json::json!({"state":"ready","target_sha":ready_base_sha}).to_string(),serde_json::json!({"state":"ready","target_sha":ready_base_sha}).to_string()],
+    ).unwrap();
+    connection.execute(
+        "INSERT INTO development_workspaces(id,repo_key,name,path,branch,base_sha,status,cleanup_json,created_at,updated_at) VALUES(?1,'fixture::main','ready-local',?2,'iq-ready-local',?3,'submitted','{\"state\":\"pending\"}','2025-12-31T00:00:00Z','2025-12-31T00:00:00Z')",
+        rusqlite::params![ready_workspace_id,temp.path().join("ready-development-workspace").as_os_str().as_bytes(),ready_base_sha],
+    ).unwrap();
+    connection.execute(
+        "INSERT INTO local_submissions(id,queue_item_id,repo_key,workspace_id,base_sha,commit_sha,private_ref,staging_ref,state,created_at) VALUES(?1,?2,'fixture::main',?3,?4,?5,?6,'refs/iq/staging/v8-ready','queued','2025-12-31T00:00:00Z')",
+        rusqlite::params![ready_submission_id,ready_item_id,ready_workspace_id,ready_base_sha,ready_sha,ready_private_ref],
+    ).unwrap();
+    connection.execute(
+        "INSERT INTO queue_items(id,repo_key,repo_path,source_branch,target_branch,producer_metadata_json,validation_evidence_json,status,current_head_sha,landing_state_json,source_kind,source_ref,submission_id,landing_policy,created_at,updated_at) VALUES(?1,'fixture::main',?2,?3,'main','{\"worker\":\"W-ready\"}','[]','ready',?4,'{\"state\":\"ready\"}','local_submission',?3,?5,'squash','2025-12-31T00:00:00Z','2025-12-31T00:00:00Z')",
+        rusqlite::params![ready_item_id,repository.to_str().unwrap(),ready_private_ref,ready_sha,ready_submission_id],
+    ).unwrap();
     connection
         .execute(
             "INSERT INTO queue_items(id,repo_key,repo_path,source_branch,target_branch,producer_metadata_json,validation_evidence_json,status,current_head_sha,current_attempt_id,blocked_phase,blocked_reason,blocked_message,prompt_id,conflict_json,integration_workspace_path,integration_workspace_rift_id,integration_workspace_source_rift_id,target_sha,source_sha,landing_state_json,source_kind,source_ref,landing_policy,created_at,updated_at) VALUES(?1,'fixture::main',?2,'agent/conflict','main','{\"worker\":\"W001\"}','[]','blocked',?3,?4,'merging','needs_user_input','legacy conflict',?5,?6,?7,'rift-1','source-rift-1',?8,?3,'{\"state\":\"ready\"}','remote_branch','agent/conflict','direct','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
@@ -484,11 +507,37 @@ fn active_v8_conflict_migrates_to_one_exact_agent_ready_effort() {
     std::fs::write(&system, system_config(temp.path())).unwrap();
 
     let migrated = iq::sqlite::SqliteQueue::migrate_v8(&database, &system).unwrap();
-    let effort = ControlStore::open(migrated.path())
-        .unwrap()
-        .effort_for_item(item_id)
-        .unwrap()
+    let store = ControlStore::open(migrated.path()).unwrap();
+    assert!(store.effort_for_item(ready_item_id).unwrap().is_none());
+    let ready = migrated.get_item(ready_item_id).unwrap();
+    assert_eq!(ready.id, ready_item_id);
+    assert_eq!(ready.status, iq::core::QueueStatus::Ready);
+    assert_eq!(ready.current_attempt_id, None);
+    assert_eq!(ready.target_sha, None);
+    assert_eq!(ready.source_sha, None);
+    assert!(ready.workspace.identity().is_none());
+    let migrated_connection = rusqlite::Connection::open(&database).unwrap();
+    let ready_created_at: String = migrated_connection
+        .query_row(
+            "SELECT created_at FROM queue_items WHERE id=?1",
+            [ready_item_id],
+            |row| row.get(0),
+        )
         .unwrap();
+    assert_eq!(ready_created_at, "2025-12-31T00:00:00Z");
+    let submission = migrated.local_submission(ready_submission_id).unwrap();
+    assert_eq!(submission.queue_item_id, ready_item_id);
+    assert_eq!(submission.workspace_id, ready_workspace_id);
+    assert_eq!(submission.commit_sha, ready_sha);
+    assert_eq!(submission.private_ref, ready_private_ref);
+    assert_eq!(submission.state, iq::sqlite::LocalSubmissionState::Queued);
+    let workspace = migrated.workspace(ready_workspace_id).unwrap();
+    assert_eq!(
+        workspace.status,
+        iq::sqlite::DevelopmentWorkspaceStatus::Submitted
+    );
+
+    let effort = store.effort_for_item(item_id).unwrap().unwrap();
 
     assert_eq!(effort.attempt_id, attempt_id);
     assert_eq!(effort.target_sha, target_sha);
@@ -513,14 +562,7 @@ fn active_v8_conflict_migrates_to_one_exact_agent_ready_effort() {
         8
     );
     assert_eq!(migrated.get_prompt(prompt_id).unwrap().status, "superseded");
-    assert_eq!(
-        ControlStore::open(migrated.path())
-            .unwrap()
-            .inbox(10)
-            .unwrap()
-            .len(),
-        1
-    );
+    assert_eq!(store.inbox(10).unwrap().len(), 1);
 }
 
 #[test]

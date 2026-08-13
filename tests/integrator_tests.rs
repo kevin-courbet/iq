@@ -1,6 +1,7 @@
 use iq::composition::{
     load_local_policy, RepositoryInitOptions, RepositoryManager, SignoffPolicy, ValidationPolicy,
 };
+use iq::control_store::ControlStore;
 use iq::core::{BlockedPhase, BlockedReason, QueueStatus};
 use iq::integrator::{
     git, git_output, HostSignoffPolicy, IntegrationPolicy, Integrator, IntegratorOptions,
@@ -87,6 +88,120 @@ fn direct_landing_integrates_only_after_remote_target_contains_landed_commit() {
         ],
     )
     .unwrap();
+}
+
+#[test]
+fn migrated_ready_item_creates_exact_attempt_effort_and_runner_when_claimed() {
+    let _guard = env_lock().lock().unwrap();
+    let fixture = GitFixture::new(false);
+    std::env::set_var("IQ_RIFT_DATABASE", &fixture.rift_database);
+    let setup_db = fixture.temp.path().join("setup.db");
+    let queue = SqliteQueue::open(&setup_db).unwrap();
+    let manager = RepositoryManager::new(queue.clone());
+    let repository = manager
+        .init(
+            &fixture.repo,
+            RepositoryInitOptions {
+                target_branch: "main".into(),
+                remote: "origin".into(),
+                seed_path: Some(fixture.temp.path().join("seed-root/seed")),
+                workspace_root: Some(fixture.temp.path().join("development-workspaces")),
+            },
+        )
+        .unwrap();
+    let target_head = git_output(&fixture.repo, ["rev-parse", "HEAD"]).unwrap();
+    let workspace = manager
+        .create_workspace(&repository.key, "migrated-ready")
+        .unwrap();
+    fs::write(
+        workspace.path.join("migrated-ready.txt"),
+        "migrated ready\n",
+    )
+    .unwrap();
+    git(&workspace.path, ["add", "migrated-ready.txt"]).unwrap();
+    git(&workspace.path, ["commit", "-m", "migrated ready"]).unwrap();
+    let (submission, item) = manager.submit(&workspace.id, None).unwrap();
+    let source_head = submission.commit_sha.clone();
+    drop(queue);
+    let db = fixture.temp.path().join("queues.db");
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(include_str!("fixtures/schema-v8-active.sql"))
+        .unwrap();
+    connection
+        .execute("ATTACH DATABASE ?1 AS setup", [setup_db.to_str().unwrap()])
+        .unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO registered_remote_identities SELECT * FROM setup.registered_remote_identities;\
+             INSERT INTO registered_repositories SELECT * FROM setup.registered_repositories;\
+             INSERT INTO development_workspaces SELECT * FROM setup.development_workspaces;\
+             INSERT INTO local_submissions SELECT * FROM setup.local_submissions;\
+             INSERT INTO queue_items SELECT * FROM setup.queue_items;\
+             INSERT INTO queue_events SELECT * FROM setup.queue_events;\
+             UPDATE queue_metadata SET value=(SELECT value FROM setup.queue_metadata WHERE key='database_id') WHERE key='database_id';\
+             DETACH DATABASE setup;",
+        )
+        .unwrap();
+    drop(connection);
+    let system_path = fixture.temp.path().join("system.yaml");
+    fs::write(
+        &system_path,
+        format!(
+            "integration_agent:\n  runner: opencode\n  executable: {}\n  agent: iq-integration\n  model: test/model\n  cycle_timeout_seconds: 30\n  max_log_bytes: 1048576\n  max_result_bytes: 1048576\n  max_processes: 16\n  memory_bytes: 268435456\n  cpu_seconds: 30\n  writable_bytes: 16777216\n  open_files: 128\n  credential_env: IQ_TEST_MODEL_KEY\ncontrol_plane:\n  unix_socket: {}/control.sock\n  max_request_bytes: 4096\n  max_free_text_bytes: 1024\n  max_response_bytes: 4096\n  max_concurrent_clients: 2\n  max_client_queue_bytes: 4096\n  max_stream_backlog_events: 100\n  client_idle_seconds: 5\nnotifications:\n  backends: []\n  max_attempts: 2\n  max_event_age_seconds: 60\n  projection_debt_alert_seconds: 60\n",
+            fixture.runner.display(),
+            fixture.temp.path().display()
+        ),
+    )
+    .unwrap();
+
+    let migrated = SqliteQueue::migrate_v8(&db, &system_path).unwrap();
+    let store = ControlStore::open(&db).unwrap();
+    assert!(store.effort_for_item(&item.id).unwrap().is_none());
+    assert!(migrated
+        .get_item(&item.id)
+        .unwrap()
+        .current_attempt_id
+        .is_none());
+    let expected_runner = fixture.system_config().runner_snapshot(None).unwrap();
+    let integrator = fixture
+        .integrator(IntegratorOptions {
+            repo_key: repository.key,
+            repo_path: fixture.repo.clone(),
+            queue_db: db,
+            owner_id: "test-migrated-ready".into(),
+            lease_ttl_seconds: 30,
+            base_remote: "origin".into(),
+            workspace_root: fixture.temp.path().join("workspaces"),
+            rift_database: Some(fixture.rift_database.clone()),
+            system_config: fixture.system_config(),
+        })
+        .unwrap();
+
+    let claimed = integrator.run_once().unwrap().unwrap();
+    let attempt_id = claimed.current_attempt_id.as_deref().unwrap();
+    let attempt = migrated.get_attempt(attempt_id).unwrap();
+    let effort = store.effort_for_item(&item.id).unwrap().unwrap();
+
+    assert_eq!(attempt.item_id, item.id);
+    assert_eq!(attempt.source_head_sha, source_head);
+    assert_eq!(effort.attempt_id, attempt.id);
+    assert_eq!(effort.item_id, item.id);
+    assert_eq!(effort.target_sha, target_head);
+    assert_eq!(effort.source_sha, attempt.source_head_sha);
+    assert_eq!(effort.source_variant, "local_submission");
+    assert_eq!(effort.landing_variant, "squash");
+    assert_eq!(effort.runner, expected_runner);
+    let connection = rusqlite::Connection::open(migrated.path()).unwrap();
+    let effort_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM integration_efforts WHERE item_id=?1",
+            [&item.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(effort_count, 1);
+    std::env::remove_var("IQ_RIFT_DATABASE");
 }
 
 #[test]
