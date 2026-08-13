@@ -1,7 +1,7 @@
 use iq::core::{BlockedPhase, BlockedReason, QueueStatus};
 use iq::issue_backends::{issue_adapter_for_provider, IssueProvider, IssueSyncTarget};
 use iq::providers::{provider_for_url, ProviderGate};
-use iq::sqlite::{EnqueueRequest, SqliteQueue};
+use iq::sqlite::{EnqueueRequest, SqliteQueue, SqliteQueueReader};
 use rusqlite::{params, Connection};
 use std::fs;
 use std::sync::{Mutex, OnceLock};
@@ -165,6 +165,52 @@ fn schema_v9_migration_preserves_terminal_attempt_policy_as_opaque_history() {
         .unwrap();
     assert_eq!(version, "9");
     assert!(temp.path().join("queues.db.schema-v8.backup").exists());
+}
+
+#[test]
+fn schema_v9_migration_enables_read_only_queue_access() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("queues.db");
+    let item_id = "terminal-v8-item";
+    let attempt_id = "terminal-v8-attempt";
+    let connection = Connection::open(&db).unwrap();
+    connection
+        .execute_batch(include_str!("fixtures/schema-v8-active.sql"))
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO queue_items(id,repo_key,repo_path,source_branch,target_branch,producer_metadata_json,validation_evidence_json,status,current_head_sha,current_attempt_id,landing_state_json,source_kind,source_ref,landing_policy,created_at,updated_at) VALUES(?1,'fixture::main','/repo','agent/terminal','main','{}','[]','cancelled','111',?2,'{\"state\":\"ready\"}','remote_branch','agent/terminal','direct','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            params![item_id, attempt_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO integration_attempts(id,item_id,attempt_number,source_head_sha,started_at) VALUES(?1,?2,1,'111','2026-01-01T00:00:00Z')",
+            params![attempt_id, item_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = match SqliteQueueReader::open(&db) {
+        Ok(_) => panic!("schema v8 reader opened without migration"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(
+        error.contains(
+            "IQ schema version 8 requires explicit migration with a verified system configuration path"
+        ),
+        "{error}"
+    );
+
+    let system_config = write_system_config(temp.path());
+    drop(SqliteQueue::migrate_v8(&db, &system_config).unwrap());
+    let reader = SqliteQueueReader::open(&db).unwrap();
+
+    let items = reader.list_items().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, item_id);
+    assert_eq!(reader.get_item(item_id).unwrap().id, item_id);
+    assert_eq!(reader.get_attempt(attempt_id).unwrap().id, attempt_id);
 }
 
 #[test]

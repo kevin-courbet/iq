@@ -683,6 +683,20 @@ pub mod sqlite {
         database_ino: u64,
     }
 
+    fn require_current_schema_version(version: Option<&str>) -> Result<()> {
+        match version {
+            Some("2" | "3" | "4" | "5" | "6" | "7") => {
+                anyhow::bail!("IQ schema must first be upgraded to version 8 by the prior release")
+            }
+            Some("8") => anyhow::bail!(
+                "IQ schema version 8 requires explicit migration with a verified system configuration path"
+            ),
+            Some("9") => Ok(()),
+            Some(version) => anyhow::bail!("unsupported IQ schema version {version}"),
+            None => anyhow::bail!("existing IQ database has no standalone schema version"),
+        }
+    }
+
     impl SqliteQueue {
         const MIGRATION_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
         const WRITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
@@ -863,17 +877,7 @@ pub mod sqlite {
                         |row| row.get(0),
                     )
                     .optional()?;
-                match version.as_deref() {
-                    Some("2" | "3" | "4" | "5" | "6" | "7") => anyhow::bail!(
-                        "IQ schema must first be upgraded to version 8 by the prior release"
-                    ),
-                    Some("8") => anyhow::bail!(
-                        "IQ schema version 8 requires explicit migration with a verified system configuration path"
-                    ),
-                    Some("9") => {},
-                    Some(version) => anyhow::bail!("unsupported IQ schema version {version}"),
-                    None => anyhow::bail!("existing IQ database has no standalone schema version"),
-                }
+                require_current_schema_version(version.as_deref())?;
             }
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute_batch(SCHEMA)?;
@@ -3754,6 +3758,22 @@ DROP TABLE queue_items_v6;"#,
             let conn = reader
                 .connect(Self::BUSY_TIMEOUT)
                 .with_context(|| format!("open existing queue db {}", path.display()))?;
+            let metadata_exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='queue_metadata')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !metadata_exists {
+                anyhow::bail!("existing IQ database has no standalone schema identity");
+            }
+            let workspace_schema_version: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            require_current_schema_version(workspace_schema_version.as_deref())?;
             let columns = {
                 let mut statement = conn.prepare("PRAGMA table_info(queue_items)")?;
                 let columns = statement
@@ -3772,21 +3792,7 @@ DROP TABLE queue_items_v6;"#,
                     .iter()
                     .any(|column| column == "integration_workspace_cleaned_at")
             {
-                anyhow::bail!(
-                    "queue database migration required; restart the IQ daemon before using read-only commands"
-                );
-            }
-            let workspace_schema_version: Option<String> = conn
-                .query_row(
-                    "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if workspace_schema_version.as_deref() != Some("8") {
-                anyhow::bail!(
-                    "queue database workspace schema is missing or unsupported; restart the IQ daemon"
-                );
+                anyhow::bail!("IQ schema version 9 is missing required queue columns");
             }
             Ok(reader)
         }
