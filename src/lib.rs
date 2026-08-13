@@ -368,6 +368,22 @@ pub mod sqlite {
         pub updated_at: String,
     }
 
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct WorkspaceRootIdentity {
+        pub path: PathBuf,
+        pub source: PathBuf,
+        pub source_rift_id: String,
+        pub scope: String,
+        pub registry_identity: String,
+        pub generation: i64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum DeletedCycleSandboxRepair {
+        Authorized,
+        PreservedDurableAuthority,
+    }
+
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
     #[serde(tag = "state", rename_all = "snake_case")]
     pub enum CleanupState {
@@ -2636,6 +2652,53 @@ DROP TABLE queue_items_v6;"#,
             .map_err(Into::into)
         }
 
+        pub fn workspace_root_identity(
+            &self,
+            repo_key: &str,
+            workspace_root: &Path,
+        ) -> Result<Option<WorkspaceRootIdentity>> {
+            let conn = self.connect_read_only()?;
+            conn.query_row(
+                "SELECT workspace_root,source_path,source_rift_id,repo_key,registry_identity,generation FROM workspace_roots WHERE repo_key=?1 AND workspace_root=?2",
+                params![repo_key,workspace_root.to_str().context("IQ workspace root is not valid UTF-8")?],
+                |row| {
+                    Ok(WorkspaceRootIdentity {
+                        path: PathBuf::from(row.get::<_, String>(0)?),
+                        source: PathBuf::from(row.get::<_, String>(1)?),
+                        source_rift_id: row.get(2)?,
+                        scope: row.get(3)?,
+                        registry_identity: row.get(4)?,
+                        generation: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+        }
+
+        pub fn registered_workspace_root_identity(
+            &self,
+            repo_key: &str,
+        ) -> Result<Option<WorkspaceRootIdentity>> {
+            let conn = self.connect_read_only()?;
+            conn.query_row(
+                "SELECT workspace_root,source_path,source_rift_id,repo_key,registry_identity,generation FROM workspace_roots WHERE repo_key=?1",
+                params![repo_key],
+                |row| {
+                    Ok(WorkspaceRootIdentity {
+                        path: PathBuf::from(row.get::<_, String>(0)?),
+                        source: PathBuf::from(row.get::<_, String>(1)?),
+                        source_rift_id: row.get(2)?,
+                        scope: row.get(3)?,
+                        registry_identity: row.get(4)?,
+                        generation: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+        }
+
         pub fn advance_workspace_generation(&self, repo_key: &str) -> Result<i64> {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2676,6 +2739,59 @@ DROP TABLE queue_items_v6;"#,
                 params![registry_identity, now()],
             )?;
             Ok(())
+        }
+
+        pub fn authorize_deleted_cycle_sandbox_repair(
+            &self,
+            repo_key: &str,
+            workspace_root: &Path,
+            cycle_id: &str,
+        ) -> Result<DeletedCycleSandboxRepair> {
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let live: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM integration_cycles cycle JOIN integration_efforts effort ON effort.id=cycle.effort_id JOIN queue_items item ON item.id=effort.item_id WHERE item.repo_key=?1 AND cycle.id=?2 AND cycle.status IN ('starting','running')) OR EXISTS(SELECT 1 FROM integration_efforts effort JOIN queue_items item ON item.id=effort.item_id WHERE item.repo_key=?1 AND effort.state IN ('agent_launching','agent_running') AND json_extract(effort.state_json,'$.payload.cycle_id')=?2)",
+                params![repo_key,cycle_id],
+                |row| row.get(0),
+            )?;
+            if live {
+                tx.commit()?;
+                return Ok(DeletedCycleSandboxRepair::PreservedDurableAuthority);
+            }
+            let cycle_exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM integration_cycles cycle JOIN integration_efforts effort ON effort.id=cycle.effort_id JOIN queue_items item ON item.id=effort.item_id WHERE item.repo_key=?1 AND cycle.id=?2)",
+                params![repo_key,cycle_id],
+                |row| row.get(0),
+            )?;
+            if cycle_exists {
+                tx.commit()?;
+                return Ok(DeletedCycleSandboxRepair::PreservedDurableAuthority);
+            }
+            let key = format!("deleted_cycle_sandbox_repair:{repo_key}:{cycle_id}");
+            let value = serde_json::json!({
+                "version": 1,
+                "repo_key": repo_key,
+                "workspace_root": workspace_root,
+                "cycle_id": cycle_id,
+                "state": "authorized"
+            });
+            let value = serde_json::to_string(&value)?;
+            tx.execute(
+                "INSERT INTO queue_metadata(key,value) VALUES(?1,?2) ON CONFLICT(key) DO NOTHING",
+                params![key, value],
+            )?;
+            let persisted: String = tx.query_row(
+                "SELECT value FROM queue_metadata WHERE key=?1",
+                params![key],
+                |row| row.get(0),
+            )?;
+            if persisted != value {
+                anyhow::bail!(
+                    "deleted-cycle sandbox repair authority differs from durable metadata"
+                );
+            }
+            tx.commit()?;
+            Ok(DeletedCycleSandboxRepair::Authorized)
         }
 
         pub fn clear_workspace_gc_debt(&self, registry_identity: &str) -> Result<()> {
@@ -5185,6 +5301,29 @@ pub mod integrator {
         Ok(true)
     }
 
+    fn sandbox_cycle_id(path: &Path) -> Result<Option<String>> {
+        let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+            return Ok(None);
+        };
+        let Some(cycle_id) = name.strip_prefix(".iq-agent-sandbox-") else {
+            return Ok(None);
+        };
+        let parsed = Uuid::parse_str(cycle_id)
+            .with_context(|| format!("IQ agent sandbox has malformed cycle identity: {name}"))?;
+        if parsed.to_string() != cycle_id {
+            anyhow::bail!("IQ agent sandbox has non-canonical cycle identity: {name}");
+        }
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("inspect IQ agent sandbox {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            anyhow::bail!(
+                "IQ agent sandbox must be a real directory: {}",
+                path.display()
+            );
+        }
+        Ok(Some(cycle_id.to_string()))
+    }
+
     #[cfg(target_os = "linux")]
     fn mount_id(path: &Path) -> Result<u64> {
         let path_bytes = std::ffi::CString::new(path.as_os_str().as_bytes())
@@ -6236,7 +6375,9 @@ pub mod integrator {
                         ) {
                             continue;
                         }
-                        if is_rift_workspace_root_entry(&path)? {
+                        if is_rift_workspace_root_entry(&path)?
+                            || sandbox_cycle_id(&path)?.is_some()
+                        {
                             continue;
                         }
                         if !listed.contains(&path) {
@@ -7569,6 +7710,139 @@ pub mod integrator {
         )
     }
 
+    pub(crate) fn verify_terminal_workspace_root(
+        queue_database: &Path,
+        repo_key: &str,
+        root: &crate::sqlite::WorkspaceRootIdentity,
+    ) -> Result<()> {
+        let marker = root.path.join(".iq-workspace-owner.json");
+        let queue_database_id = SqliteQueueReader::open(queue_database)?.database_id()?;
+        let owner: crate::sqlite::RiftWorkspaceRootOwner =
+            serde_json::from_slice(&read_regular_file(&marker, "IQ workspace owner marker")?)?;
+        if owner.version != 3
+            || owner.queue_database_id != queue_database_id
+            || owner.repo_key != repo_key
+            || owner.source_rift_id != root.source_rift_id
+        {
+            anyhow::bail!(
+                "terminal cycle workspace root owner differs from durable authority: {}",
+                root.path.display()
+            );
+        }
+        let generation_path = root.path.join(".iq-workspace-generation");
+        let generation = String::from_utf8(read_regular_file(
+            &generation_path,
+            "IQ workspace generation",
+        )?)?
+        .trim()
+        .parse::<i64>()
+        .context("parse IQ workspace generation")?;
+        if generation < 0 {
+            anyhow::bail!("terminal cycle workspace root generation must not be negative");
+        }
+        if root.scope != repo_key
+            || owner.source != root.source
+            || owner.registry_identity != root.registry_identity
+        {
+            anyhow::bail!(
+                "terminal cycle workspace root {} differs from persisted root authority",
+                root.path.display()
+            );
+        }
+        if generation != root.generation {
+            anyhow::bail!(
+                "terminal cycle workspace root generation {generation} differs from persisted generation {}",
+                root.generation
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cleanup_terminal_agent_artifacts(
+        queue: &SqliteQueue,
+        repo_key: &str,
+        repair_deleted_cycles: bool,
+    ) -> Result<()> {
+        let store = crate::control_store::ControlStore::open(queue.path())?;
+        let cycles = store.terminal_cycle_artifacts(repo_key)?;
+        let mut roots = HashSet::new();
+        for cycle in cycles {
+            let durable_root = Path::new(&cycle.workspace.path)
+                .parent()
+                .context("terminal cycle workspace has no parent root")?;
+            let canonical_root = durable_root.canonicalize().with_context(|| {
+                format!(
+                    "resolve terminal cycle workspace root {}",
+                    durable_root.display()
+                )
+            })?;
+            if canonical_root != durable_root {
+                anyhow::bail!(
+                    "terminal cycle workspace root {} resolves to unexpected path {}",
+                    durable_root.display(),
+                    canonical_root.display()
+                );
+            }
+            let workspace_root = queue
+                .workspace_root_identity(repo_key, &canonical_root)?
+                .with_context(|| {
+                    format!(
+                        "terminal cycle cleanup has no persisted workspace root authority for {}",
+                        canonical_root.display()
+                    )
+                })?;
+            verify_terminal_workspace_root(queue.path(), repo_key, &workspace_root)?;
+            crate::agent_runner::cleanup_terminal_cycle_artifacts(&workspace_root, &cycle)?;
+            roots.insert(workspace_root.path);
+        }
+        if repair_deleted_cycles {
+            let repair_root = queue
+                .registered_workspace_root_identity(repo_key)?
+                .context("deleted-cycle repair has no persisted workspace root authority")?;
+            verify_terminal_workspace_root(queue.path(), repo_key, &repair_root)?;
+            let canonical_root = repair_root.path.canonicalize().with_context(|| {
+                format!(
+                    "resolve deleted-cycle repair root {}",
+                    repair_root.path.display()
+                )
+            })?;
+            if canonical_root != repair_root.path {
+                anyhow::bail!(
+                    "deleted-cycle repair root {} resolves to unexpected path {}",
+                    repair_root.path.display(),
+                    canonical_root.display()
+                );
+            }
+            roots.insert(repair_root.path);
+            for root in roots {
+                let workspace_root = queue
+                    .workspace_root_identity(repo_key, &root)?
+                    .context("deleted-cycle repair lost persisted workspace root authority")?;
+                verify_terminal_workspace_root(queue.path(), repo_key, &workspace_root)?;
+                let mut sandboxes = Vec::new();
+                for entry in fs::read_dir(&root)? {
+                    let path = entry?.path();
+                    let Some(cycle_id) = sandbox_cycle_id(&path)? else {
+                        continue;
+                    };
+                    sandboxes.push((path, cycle_id));
+                }
+                sandboxes.sort_by(|left, right| left.1.cmp(&right.1));
+                for (path, cycle_id) in sandboxes {
+                    match queue
+                        .authorize_deleted_cycle_sandbox_repair(repo_key, &root, &cycle_id)?
+                    {
+                        crate::sqlite::DeletedCycleSandboxRepair::Authorized => {
+                            crate::agent_runner::remove_sandbox_export(&path.join("export"))?
+                        }
+                        crate::sqlite::DeletedCycleSandboxRepair::PreservedDurableAuthority => {}
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[derive(Debug, Deserialize)]
     struct GitHubCommitStatus {
         context: String,
@@ -8026,6 +8300,7 @@ pub mod integrator {
             else {
                 return Ok(None);
             };
+            cleanup_terminal_agent_artifacts(&self.queue, &self.options.repo_key, false)?;
             self.synchronize_workspace_generation()?;
             self.with_lease_heartbeat("workspace cleanup", || self.reconcile_workspaces())?;
             let Some(active) = self.queue.oldest_active_item(&self.options.repo_key)? else {
@@ -8147,17 +8422,23 @@ pub mod integrator {
                         return self.run_agent_cycle(item, &attempt)
                     }
                     crate::control_domain::IntegrationEffortState::AgentLaunching(launch) => {
-                        if crate::agent_runner::systemd_unit_main_pid(
-                            &effort.runner.sandbox.systemctl,
-                            &launch.unit_name,
-                        )?
-                        .is_some()
-                        {
+                        if matches!(
+                            crate::agent_runner::systemd_unit_state(
+                                &effort.runner.sandbox.systemctl,
+                                &launch.unit_name,
+                            )?,
+                            crate::agent_runner::SystemdUnitState::Loaded { .. }
+                        ) {
                             crate::agent_runner::stop_systemd_unit(
                                 &effort.runner.sandbox.systemctl,
                                 &launch.unit_name,
                             )?;
                         }
+                        let workspace = self.load_owned_workspace(&item)?;
+                        crate::agent_runner::quarantine_restart_artifacts(
+                            &workspace,
+                            &launch.cycle_id,
+                        )?;
                         self.control_store
                             .reset_prepared_launch(&effort.id, &launch.cycle_id)?;
                         return self.run_agent_cycle(item, &attempt);
@@ -11880,6 +12161,7 @@ pub mod integrator {
                 &self.lease_owner_id,
                 self.options.lease_ttl_seconds,
             )?;
+            cleanup_terminal_agent_artifacts(&self.queue, &self.options.repo_key, false)?;
             self.synchronize_workspace_generation()?;
             self.with_lease_heartbeat("workspace cleanup", || self.reconcile_workspaces())
         }
@@ -11924,7 +12206,7 @@ pub mod integrator {
                 ) {
                     continue;
                 }
-                if is_rift_workspace_root_entry(&path)? {
+                if is_rift_workspace_root_entry(&path)? || sandbox_cycle_id(&path)?.is_some() {
                     continue;
                 }
                 if !inventory_paths.contains(&path) {

@@ -803,6 +803,7 @@ impl RepositoryManager {
             repo_key,
             &self.owner_id,
         )?;
+        self.cleanup_terminal_agent_artifacts(repo_key)?;
         self.reconcile_seed(&guard, &repository)?;
         let repository = self.queue.repository(repo_key)?;
         let manager = self.development_manager(&repository)?;
@@ -826,6 +827,10 @@ impl RepositoryManager {
         }
         seed_result?;
         Ok(results)
+    }
+
+    fn cleanup_terminal_agent_artifacts(&self, repo_key: &str) -> Result<()> {
+        crate::integrator::cleanup_terminal_agent_artifacts(&self.queue, repo_key, true)
     }
 
     fn root_manager(

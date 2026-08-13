@@ -681,16 +681,47 @@ pub fn remove_protocol_cycle(workspace: &Path, cycle_id: &str) -> Result<()> {
         Err(error) => return Err(error).context("open protocol root for removal"),
     };
     verify_private_directory(&root_file, "protocol root")?;
+    remove_protocol_quarantines(workspace, &root_file, cycle_id)?;
     let cycle_file = match open_directory_at(&root_file, cycle_id) {
         Ok(file) => file,
         Err(error) if is_not_found(&error) => return Ok(()),
         Err(error) => return Err(error).context("open protocol cycle for removal"),
     };
     verify_private_directory(&cycle_file, "protocol cycle")?;
-    let quarantine = format!(".remove-{cycle_id}-{}", Uuid::new_v4());
+    let quarantine = format!(".remove-{cycle_id}");
     rename_at(&root_file, cycle_id, &quarantine)?;
     root_file.sync_all()?;
-    fs::remove_dir_all(workspace.join(".iq-agent-protocol").join(&quarantine))?;
+    remove_protocol_quarantine(workspace, &root_file, &quarantine)
+}
+
+fn remove_protocol_quarantines(workspace: &Path, root_file: &File, cycle_id: &str) -> Result<()> {
+    let prefix = format!(".remove-{cycle_id}-");
+    let deterministic = format!(".remove-{cycle_id}");
+    let root = workspace.join(".iq-agent-protocol");
+    let mut quarantines = Vec::new();
+    for entry in fs::read_dir(&root)? {
+        let name = entry?.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let legacy = name.strip_prefix(&prefix).is_some_and(|suffix| {
+            Uuid::parse_str(suffix).is_ok_and(|identity| identity.to_string() == suffix)
+        });
+        if name == deterministic || legacy {
+            quarantines.push(name.to_string());
+        }
+    }
+    quarantines.sort();
+    for quarantine in quarantines {
+        remove_protocol_quarantine(workspace, root_file, &quarantine)?;
+    }
+    Ok(())
+}
+
+fn remove_protocol_quarantine(workspace: &Path, root_file: &File, name: &str) -> Result<()> {
+    let quarantine_file = open_directory_at(root_file, name)?;
+    verify_private_directory(&quarantine_file, "protocol cycle quarantine")?;
+    fs::remove_dir_all(workspace.join(".iq-agent-protocol").join(name))?;
     root_file.sync_all()?;
     Ok(())
 }

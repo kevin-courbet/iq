@@ -88,6 +88,109 @@ fn protocol_rejects_unknown_fields_and_identity_changes() {
 }
 
 #[test]
+fn interrupted_protocol_cycle_delete_retries_exact_quarantine_only() {
+    let temp = tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let protocol = iq::agent_protocol::protocol_directory(&workspace, "cycle-1").unwrap();
+    let blocked = protocol.join("blocked");
+    std::fs::create_dir(&blocked).unwrap();
+    std::fs::write(blocked.join("result"), "result").unwrap();
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let unrelated = workspace
+        .join(".iq-agent-protocol")
+        .join(".remove-cycle-1-not-a-uuid");
+    std::fs::create_dir(&unrelated).unwrap();
+    std::fs::set_permissions(&unrelated, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(iq::agent_protocol::remove_protocol_cycle(&workspace, "cycle-1").is_err());
+    let quarantine = workspace.join(".iq-agent-protocol/.remove-cycle-1");
+    assert!(!protocol.exists());
+    assert!(quarantine.is_dir());
+    std::fs::set_permissions(
+        quarantine.join("blocked"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+
+    iq::agent_protocol::remove_protocol_cycle(&workspace, "cycle-1").unwrap();
+    iq::agent_protocol::remove_protocol_cycle(&workspace, "cycle-1").unwrap();
+    assert!(!quarantine.exists());
+    assert!(unrelated.is_dir());
+}
+
+#[test]
+fn terminal_cleanup_rejects_replacement_rift_before_artifact_removal() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("workspaces");
+    let workspace = root.join("item-1");
+    let sandbox = root.join(".iq-agent-sandbox-cycle-1");
+    std::fs::create_dir_all(workspace.join(".iq-agent-protocol/cycle-1")).unwrap();
+    std::fs::write(workspace.join(".rift"), "BBBBBBBBBBBBBBBBBBBBBBBBBB\n").unwrap();
+    std::fs::create_dir_all(sandbox.join("export")).unwrap();
+    let artifacts = iq::control_store::TerminalCycleArtifacts {
+        item_id: "item-1".into(),
+        cycle_id: "cycle-1".into(),
+        workspace: iq::sqlite::WorkspaceIdentity {
+            path: workspace.to_string_lossy().into_owned(),
+            rift_id: "AAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            source_rift_id: "source-rift".into(),
+        },
+    };
+
+    let error = iq::agent_runner::cleanup_terminal_cycle_artifacts(
+        &iq::sqlite::WorkspaceRootIdentity {
+            path: root,
+            source: Path::new("/source").to_path_buf(),
+            source_rift_id: "source-rift".into(),
+            scope: "fixture::main".into(),
+            registry_identity: "registry".into(),
+            generation: 0,
+        },
+        &artifacts,
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("Rift identity differs"));
+    assert!(sandbox.is_dir());
+    assert!(workspace.join(".iq-agent-protocol/cycle-1").is_dir());
+}
+
+#[test]
+fn terminal_cleanup_removes_exact_sandbox_when_original_rift_is_absent() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("workspaces");
+    std::fs::create_dir(&root).unwrap();
+    let sandbox = root.join(".iq-agent-sandbox-cycle-1");
+    let unrelated = root.join(".iq-agent-sandbox-other-cycle");
+    std::fs::create_dir_all(sandbox.join("export")).unwrap();
+    std::fs::create_dir_all(unrelated.join("export")).unwrap();
+    let artifacts = iq::control_store::TerminalCycleArtifacts {
+        item_id: "item-1".into(),
+        cycle_id: "cycle-1".into(),
+        workspace: iq::sqlite::WorkspaceIdentity {
+            path: root.join("item-1").to_string_lossy().into_owned(),
+            rift_id: "AAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            source_rift_id: "source-rift".into(),
+        },
+    };
+    let root_identity = iq::sqlite::WorkspaceRootIdentity {
+        path: root,
+        source: Path::new("/source").to_path_buf(),
+        source_rift_id: "source-rift".into(),
+        scope: "fixture::main".into(),
+        registry_identity: "registry".into(),
+        generation: 0,
+    };
+
+    iq::agent_runner::cleanup_terminal_cycle_artifacts(&root_identity, &artifacts).unwrap();
+    iq::agent_runner::cleanup_terminal_cycle_artifacts(&root_identity, &artifacts).unwrap();
+
+    assert!(!sandbox.exists());
+    assert!(unrelated.is_dir());
+}
+
+#[test]
 fn encoded_paths_preserve_non_utf8_and_reject_escape() {
     let path = EncodedPath::from_bytes(b"src/\xffname").unwrap();
     assert_eq!(path.to_bytes().unwrap(), b"src/\xffname");
@@ -1810,8 +1913,8 @@ fn systemd_unit_lookup_distinguishes_loaded_missing_and_failed_queries() {
     .unwrap();
     std::fs::set_permissions(&loaded, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(
-        iq::agent_runner::systemd_unit_main_pid(&loaded, "iq-agent-cycle-1").unwrap(),
-        Some(42)
+        iq::agent_runner::systemd_unit_state(&loaded, "iq-agent-cycle-1").unwrap(),
+        iq::agent_runner::SystemdUnitState::Loaded { main_pid: Some(42) }
     );
 
     let missing = temp.path().join("systemctl-missing");
@@ -1822,14 +1925,14 @@ fn systemd_unit_lookup_distinguishes_loaded_missing_and_failed_queries() {
     .unwrap();
     std::fs::set_permissions(&missing, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(
-        iq::agent_runner::systemd_unit_main_pid(&missing, "iq-agent-cycle-1").unwrap(),
-        None
+        iq::agent_runner::systemd_unit_state(&missing, "iq-agent-cycle-1").unwrap(),
+        iq::agent_runner::SystemdUnitState::Missing
     );
 
     let failed = temp.path().join("systemctl-failed");
     std::fs::write(&failed, "#!/bin/sh\nprintf 'bus unavailable' >&2\nexit 1\n").unwrap();
     std::fs::set_permissions(&failed, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let error = iq::agent_runner::systemd_unit_main_pid(&failed, "iq-agent-cycle-1")
+    let error = iq::agent_runner::systemd_unit_state(&failed, "iq-agent-cycle-1")
         .unwrap_err()
         .to_string();
     assert!(error.contains("inspect prepared systemd unit failed"));

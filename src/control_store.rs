@@ -83,6 +83,13 @@ pub struct IntegrationEffort {
     pub updated_at: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalCycleArtifacts {
+    pub item_id: String,
+    pub cycle_id: String,
+    pub workspace: WorkspaceIdentity,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DurableEvent {
@@ -297,6 +304,27 @@ impl ControlStore {
             .context("read integration effort")
     }
 
+    pub fn terminal_cycle_artifacts(&self, repo_key: &str) -> Result<Vec<TerminalCycleArtifacts>> {
+        let connection = self.connect(false)?;
+        let mut statement = connection.prepare(
+            "SELECT item.id,cycle.id,effort.workspace_json FROM queue_items item JOIN integration_efforts effort ON effort.item_id=item.id JOIN integration_cycles cycle ON cycle.effort_id=effort.id WHERE item.repo_key=?1 AND item.status IN ('integrated','cancelled') AND effort.state IN ('integrated','cancelled') AND cycle.status NOT IN ('starting','running') ORDER BY item.created_at,cycle.cycle_number",
+        )?;
+        let artifacts = statement
+            .query_map(params![repo_key], |row| {
+                let workspace: String = row.get(2)?;
+                let workspace: crate::sqlite::WorkspaceIdentity =
+                    serde_json::from_str(&workspace).map_err(json_error)?;
+                Ok(TerminalCycleArtifacts {
+                    item_id: row.get(0)?,
+                    cycle_id: row.get(1)?,
+                    workspace,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("read terminal cycle artifacts")?;
+        Ok(artifacts)
+    }
+
     pub fn agent_evidence(
         &self,
         effort_id: &str,
@@ -486,22 +514,23 @@ impl ControlStore {
         if launch.cycle_id != cycle_id {
             anyhow::bail!("launch reset differs from prepared cycle");
         }
+        let failure = crate::control_domain::CycleFailure::Interrupted;
         let changed = transaction.execute(
-            "DELETE FROM integration_cycles WHERE id=?1 AND effort_id=?2 AND status='starting'",
-            params![cycle_id, effort_id],
+            "UPDATE integration_cycles SET status='failed',failure_json=?1,finished_at=?2 WHERE id=?3 AND effort_id=?4 AND status='starting'",
+            params![serde_json::to_string(&failure)?,now(),cycle_id,effort_id],
         )?;
         if changed != 1 {
             anyhow::bail!("prepared cycle authority changed before reset");
         }
         let state = IntegrationEffortState::AgentReady(AgentReady {
-            next_cycle: launch.cycle_number,
+            next_cycle: next_cycle_number(&transaction, effort_id)?,
         });
         update_state(&transaction, &effort, &state)?;
         append_event(
             &transaction,
             &effort,
             "agent_launch_reset",
-            serde_json::json!({"cycle_id":cycle_id,"operation_id":launch.launch_operation_id}),
+            serde_json::json!({"cycle_id":cycle_id,"operation_id":launch.launch_operation_id,"failure":failure}),
             false,
         )?;
         transaction.commit()?;
@@ -1898,17 +1927,17 @@ impl ControlStore {
         for debt in &debts {
             let resolved = match &debt.authority {
                 RunnerTerminationAuthority::Launching(launching) => {
-                    let main_pid = crate::agent_runner::systemd_unit_main_pid(
+                    let unit = crate::agent_runner::systemd_unit_state(
                         &debt.runner.sandbox.systemctl,
                         &launching.unit_name,
                     )?;
-                    if main_pid.is_some() {
+                    if matches!(unit, crate::agent_runner::SystemdUnitState::Loaded { .. }) {
                         crate::agent_runner::stop_systemd_unit(
                             &debt.runner.sandbox.systemctl,
                             &launching.unit_name,
                         )?;
                     }
-                    main_pid.is_some() || startup
+                    !matches!(unit, crate::agent_runner::SystemdUnitState::Missing) || startup
                 }
                 RunnerTerminationAuthority::Running(running) => {
                     crate::agent_runner::terminate_exact_process(

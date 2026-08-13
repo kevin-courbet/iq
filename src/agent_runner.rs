@@ -401,7 +401,13 @@ impl OpenCodeRunner {
     }
 }
 
-pub fn systemd_unit_main_pid(systemctl: &Path, unit_name: &str) -> Result<Option<u32>> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SystemdUnitState {
+    Missing,
+    Loaded { main_pid: Option<u32> },
+}
+
+pub fn systemd_unit_state(systemctl: &Path, unit_name: &str) -> Result<SystemdUnitState> {
     verify_sandbox_helper(systemctl, "systemctl")?;
     crate::control_domain::require_exact_text(unit_name, "systemd unit name")?;
     let output = Command::new(systemctl)
@@ -430,13 +436,15 @@ pub fn systemd_unit_main_pid(systemctl: &Path, unit_name: &str) -> Result<Option
         }
     }
     if load_state == Some("not-found") {
-        return Ok(None);
+        return Ok(SystemdUnitState::Missing);
     }
     if load_state != Some("loaded") {
         anyhow::bail!("prepared systemd unit has an unexpected load state");
     }
     let pid = pid.context("prepared systemd unit has no MainPID property")?;
-    Ok((pid != 0).then_some(pid))
+    Ok(SystemdUnitState::Loaded {
+        main_pid: (pid != 0).then_some(pid),
+    })
 }
 
 pub fn stop_systemd_unit(systemctl: &Path, unit_name: &str) -> Result<()> {
@@ -575,10 +583,64 @@ pub fn read_restart_result(
 
 pub fn quarantine_restart_artifacts(retained_rift: &Path, cycle_id: &str) -> Result<()> {
     let export = restart_export_directory(retained_rift, cycle_id)?;
-    if export.exists() {
-        remove_sandbox_export(&export)?;
+    let sandbox_root = export
+        .parent()
+        .context("restart sandbox export has no parent")?;
+    match fs::symlink_metadata(sandbox_root) {
+        Ok(_) => remove_sandbox_export(&export)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect restart sandbox root"),
     }
     crate::agent_protocol::remove_protocol_cycle(retained_rift, cycle_id)?;
+    Ok(())
+}
+
+pub fn cleanup_terminal_cycle_artifacts(
+    workspace_root: &crate::sqlite::WorkspaceRootIdentity,
+    artifacts: &crate::control_store::TerminalCycleArtifacts,
+) -> Result<()> {
+    let workspace = Path::new(&artifacts.workspace.path);
+    if !workspace_root.path.is_absolute()
+        || !workspace.is_absolute()
+        || workspace.parent() != Some(workspace_root.path.as_path())
+        || workspace.file_name() != Some(OsStr::new(&artifacts.item_id))
+        || artifacts.workspace.source_rift_id != workspace_root.source_rift_id
+    {
+        anyhow::bail!("terminal cycle artifacts differ from the owned workspace root");
+    }
+    crate::control_domain::require_exact_text(&artifacts.cycle_id, "cycle ID")?;
+    if artifacts.cycle_id.as_bytes().contains(&b'/') {
+        anyhow::bail!("cycle ID is not a valid path component");
+    }
+    let workspace_exists = match fs::symlink_metadata(workspace) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            anyhow::bail!("terminal cycle workspace is not a regular directory")
+        }
+        Ok(_) => {
+            let marker = workspace.join(".rift");
+            let actual = fs::read_to_string(&marker)
+                .with_context(|| format!("read Rift identity marker {}", marker.display()))?;
+            if actual.trim() != artifacts.workspace.rift_id {
+                anyhow::bail!(
+                    "terminal cycle workspace Rift identity differs from durable authority"
+                );
+            }
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error).context("inspect terminal cycle workspace"),
+    };
+    let sandbox = workspace_root
+        .path
+        .join(format!(".iq-agent-sandbox-{}", artifacts.cycle_id));
+    match fs::symlink_metadata(&sandbox) {
+        Ok(_) => remove_sandbox_export(&sandbox.join("export"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect terminal cycle sandbox root"),
+    }
+    if workspace_exists {
+        crate::agent_protocol::remove_protocol_cycle(workspace, &artifacts.cycle_id)?;
+    }
     Ok(())
 }
 

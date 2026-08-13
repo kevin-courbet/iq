@@ -11,12 +11,38 @@ use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::Path;
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use tempfile::tempdir;
 
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+struct FixtureEnvironment {
+    _guard: MutexGuard<'static, ()>,
+    model_key: Option<std::ffi::OsString>,
+}
+
+impl FixtureEnvironment {
+    fn acquire() -> Self {
+        let guard = env_lock().lock().unwrap();
+        let model_key = std::env::var_os("IQ_TEST_MODEL_KEY");
+        std::env::set_var("IQ_TEST_MODEL_KEY", "fixture-model-key");
+        Self {
+            _guard: guard,
+            model_key,
+        }
+    }
+}
+
+impl Drop for FixtureEnvironment {
+    fn drop(&mut self) {
+        match self.model_key.take() {
+            Some(value) => std::env::set_var("IQ_TEST_MODEL_KEY", value),
+            None => std::env::remove_var("IQ_TEST_MODEL_KEY"),
+        }
+    }
 }
 
 fn track_ignored_file(repo: &Path, path: &str) {
@@ -92,7 +118,6 @@ fn direct_landing_integrates_only_after_remote_target_contains_landed_commit() {
 
 #[test]
 fn migrated_ready_item_creates_exact_attempt_effort_and_runner_when_claimed() {
-    let _guard = env_lock().lock().unwrap();
     let fixture = GitFixture::new(false);
     std::env::set_var("IQ_RIFT_DATABASE", &fixture.rift_database);
     let setup_db = fixture.temp.path().join("setup.db");
@@ -382,7 +407,6 @@ fn tracked_local_policy_is_rejected_before_landing() {
 
 #[test]
 fn registered_attempt_snapshots_local_policy_once() {
-    let _guard = env_lock().lock().unwrap();
     let fixture = GitFixture::new(false);
     std::env::set_var("IQ_RIFT_DATABASE", &fixture.rift_database);
     let first_sha = fixture.create_source_branch("agent/first", "first.txt", "first\n");
@@ -475,9 +499,9 @@ fn registered_attempt_snapshots_local_policy_once() {
         })
         .unwrap();
     let integrator = Integrator::new(IntegratorOptions {
-        repo_key: repository.key,
+        repo_key: repository.key.clone(),
         repo_path: fixture.repo.clone(),
-        queue_db: db,
+        queue_db: db.clone(),
         owner_id: "test-integrator".into(),
         lease_ttl_seconds: 30,
         base_remote: "origin".into(),
@@ -490,6 +514,170 @@ fn registered_attempt_snapshots_local_policy_once() {
     let integrated = integrator.run_once().unwrap().unwrap();
     assert_eq!(integrated.id, first.id);
     assert_eq!(integrated.status, QueueStatus::Integrated);
+    let store = ControlStore::open(&db).unwrap();
+    let artifacts = store
+        .terminal_cycle_artifacts(&repository.key)
+        .unwrap()
+        .into_iter()
+        .find(|cycle| cycle.item_id == integrated.id)
+        .unwrap();
+    assert!(!Path::new(&artifacts.workspace.path).exists());
+    let unrelated_development = manager
+        .create_workspace(&repository.key, "unrelated-active")
+        .unwrap();
+    let development_sentinel = unrelated_development.path.join("unrelated.txt");
+    fs::write(&development_sentinel, "unrelated\n").unwrap();
+    let integration_root = fixture.temp.path().join("integration-workspaces");
+    let sandbox = integration_root.join(format!(".iq-agent-sandbox-{}", artifacts.cycle_id));
+    fs::create_dir_all(sandbox.join("export")).unwrap();
+    let unknown = integration_root.join("unrelated-unknown-entry");
+
+    integrator.reset_workspaces().unwrap();
+    assert!(!sandbox.exists());
+    assert_eq!(
+        fs::read_to_string(&development_sentinel).unwrap(),
+        "unrelated\n"
+    );
+    integrator.reset_workspaces().unwrap();
+    assert_eq!(
+        fs::read_to_string(&development_sentinel).unwrap(),
+        "unrelated\n"
+    );
+    fs::create_dir_all(sandbox.join("export")).unwrap();
+    fs::create_dir(&unknown).unwrap();
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    let persisted_root: (String, String, String, String, i64) = connection
+        .query_row(
+            "SELECT source_path,source_rift_id,workspace_root,registry_identity,generation FROM workspace_roots WHERE repo_key=?1",
+            [&repository.key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!(Path::new(&persisted_root.2), integration_root);
+    connection
+        .execute(
+            "DELETE FROM workspace_roots WHERE repo_key=?1",
+            [&repository.key],
+        )
+        .unwrap();
+    let absent_row_error = format!("{:#}", integrator.reset_workspaces().unwrap_err());
+    assert!(
+        absent_row_error.contains("no persisted workspace root authority"),
+        "{absent_row_error}"
+    );
+    assert!(sandbox.is_dir());
+    assert!(unknown.is_dir());
+    connection
+        .execute(
+            "INSERT INTO workspace_roots(repo_key,source_path,source_rift_id,workspace_root,registry_identity,generation) VALUES(?1,?2,?3,?4,?5,?6)",
+            rusqlite::params![repository.key,persisted_root.0,persisted_root.1,persisted_root.2,persisted_root.3,persisted_root.4],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE workspace_roots SET source_rift_id='mismatched-source' WHERE repo_key=?1",
+            [&repository.key],
+        )
+        .unwrap();
+    let mismatched_row_error = format!("{:#}", integrator.reset_workspaces().unwrap_err());
+    assert!(
+        mismatched_row_error.contains("owner differs from durable authority"),
+        "{mismatched_row_error}"
+    );
+    assert!(sandbox.is_dir());
+    assert!(unknown.is_dir());
+    connection
+        .execute(
+            "UPDATE workspace_roots SET source_rift_id=?1 WHERE repo_key=?2",
+            rusqlite::params![persisted_root.1, repository.key],
+        )
+        .unwrap();
+    let owner_marker = integration_root.join(".iq-workspace-owner.json");
+    let owner_bytes = fs::read(&owner_marker).unwrap();
+    fs::remove_file(&owner_marker).unwrap();
+    let unowned_error = format!("{:#}", integrator.reset_workspaces().unwrap_err());
+    assert!(
+        unowned_error.contains("IQ workspace owner marker"),
+        "{unowned_error}"
+    );
+    assert!(sandbox.is_dir());
+    assert!(unknown.is_dir());
+
+    fs::write(&owner_marker, &owner_bytes).unwrap();
+    let mut mismatched_owner: serde_json::Value = serde_json::from_slice(&owner_bytes).unwrap();
+    mismatched_owner["repo_key"] = serde_json::json!("other::main");
+    fs::write(
+        &owner_marker,
+        serde_json::to_vec(&mismatched_owner).unwrap(),
+    )
+    .unwrap();
+    let mismatched_error = format!("{:#}", integrator.reset_workspaces().unwrap_err());
+    assert!(
+        mismatched_error.contains("owner differs from durable authority"),
+        "{mismatched_error}"
+    );
+    assert!(sandbox.is_dir());
+    assert!(unknown.is_dir());
+
+    fs::write(&owner_marker, owner_bytes).unwrap();
+    fs::remove_dir(&unknown).unwrap();
+    integrator.reset_workspaces().unwrap();
+    assert!(!sandbox.exists());
+    let deleted_cycle_id = uuid::Uuid::new_v4().to_string();
+    let deleted_sandbox = integration_root.join(format!(".iq-agent-sandbox-{deleted_cycle_id}"));
+    fs::create_dir_all(deleted_sandbox.join("export")).unwrap();
+    let durable_cycle_id = artifacts.cycle_id.clone();
+    connection
+        .execute(
+            "UPDATE integration_cycles SET status='starting',failure_json=NULL,finished_at=NULL WHERE id=?1",
+            [&durable_cycle_id],
+        )
+        .unwrap();
+    let durable_sandbox = integration_root.join(format!(".iq-agent-sandbox-{durable_cycle_id}"));
+    fs::create_dir_all(durable_sandbox.join("export")).unwrap();
+    let malformed_sandbox = integration_root.join(".iq-agent-sandbox-not-a-uuid");
+    fs::create_dir_all(malformed_sandbox.join("export")).unwrap();
+    fs::create_dir(&unknown).unwrap();
+    assert!(unknown.is_dir());
+    let malformed_error = format!("{:#}", manager.cleanup_repo(&repository.key).unwrap_err());
+    assert!(
+        malformed_error.contains("malformed cycle identity"),
+        "{malformed_error}"
+    );
+    assert!(deleted_sandbox.is_dir());
+    assert!(durable_sandbox.is_dir());
+    fs::remove_dir_all(&malformed_sandbox).unwrap();
+
+    manager.cleanup_repo(&repository.key).unwrap();
+    assert!(!deleted_sandbox.exists());
+    assert!(durable_sandbox.is_dir());
+    assert!(unknown.is_dir());
+    let repair_key = format!(
+        "deleted_cycle_sandbox_repair:{}:{}",
+        repository.key, deleted_cycle_id
+    );
+    let repair: String = connection
+        .query_row(
+            "SELECT value FROM queue_metadata WHERE key=?1",
+            [&repair_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&repair).unwrap()["state"],
+        "authorized"
+    );
+    manager.cleanup_repo(&repository.key).unwrap();
+    assert!(!deleted_sandbox.exists());
+    assert!(durable_sandbox.is_dir());
+    connection
+        .execute(
+            "UPDATE integration_cycles SET status='failed',failure_json=json_object('kind','interrupted'),finished_at='2026-01-01T00:00:00Z' WHERE id=?1",
+            [&durable_cycle_id],
+        )
+        .unwrap();
+    fs::remove_dir(&unknown).unwrap();
+    fs::remove_dir_all(&durable_sandbox).unwrap();
     let attempt = queue
         .get_attempt(integrated.current_attempt_id.as_deref().unwrap())
         .unwrap();
@@ -719,7 +907,6 @@ fn daemon_run_holds_later_ready_item_behind_oldest_blocked_item() {
 
 #[test]
 fn guidance_answer_starts_new_agent_process_and_lands_exact_validated_candidate() {
-    let _guard = env_lock().lock().unwrap();
     let fixture = GitFixture::new(true);
     let provider = fixture.temp.path().join("fail-provider");
     let provider_log = fixture.temp.path().join("provider-called");
@@ -979,6 +1166,96 @@ fn ten_invalid_runner_processes_create_one_cycle_limit_and_never_start_eleven() 
 }
 
 #[test]
+fn launching_restart_removes_cycle_artifacts_before_replacement_and_integration() {
+    let fixture = GitFixture::new(true);
+    let source_head =
+        fixture.create_source_branch("agent/launch-restart", "feature.txt", "feature\n");
+    let db = fixture.temp.path().join("queues.db");
+    let queue = SqliteQueue::open(&db).unwrap();
+    let item = queue
+        .enqueue(EnqueueRequest {
+            repo_key: "fixture::main".into(),
+            repo_path: fixture.repo.to_string_lossy().to_string(),
+            source_branch: "agent/launch-restart".into(),
+            target_branch: "main".into(),
+            current_head_sha: source_head,
+            pr_url: None,
+            producer_metadata: serde_json::json!({"worker":"W-launch-restart"}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
+        })
+        .unwrap();
+    let workspace_root = fixture.temp.path().join("workspaces");
+    let integrator = fixture
+        .integrator(IntegratorOptions {
+            repo_key: "fixture::main".into(),
+            repo_path: fixture.repo.clone(),
+            queue_db: db.clone(),
+            owner_id: "test-launch-restart".into(),
+            lease_ttl_seconds: 30,
+            base_remote: "origin".into(),
+            workspace_root: workspace_root.clone(),
+            rift_database: Some(fixture.rift_database.clone()),
+            system_config: fixture.system_config(),
+        })
+        .unwrap();
+
+    std::env::remove_var("IQ_TEST_MODEL_KEY");
+    let error = integrator.run_once().unwrap_err();
+    assert!(
+        format!("{error:#}").contains("required model credential IQ_TEST_MODEL_KEY is unavailable")
+    );
+    let store = ControlStore::open(&db).unwrap();
+    let effort = store.effort_for_item(&item.id).unwrap().unwrap();
+    let iq::control_domain::IntegrationEffortState::AgentLaunching(launch) = &effort.state else {
+        panic!("failed pre-start launch did not retain launch authority")
+    };
+    let interrupted_cycle_id = launch.cycle_id.clone();
+    let retained = Path::new(&effort.workspace.path);
+    let sandbox = retained
+        .parent()
+        .unwrap()
+        .join(format!(".iq-agent-sandbox-{}", launch.cycle_id));
+    let protocol = launch.protocol_directory.clone();
+    assert!(sandbox.is_dir());
+    assert!(protocol.is_dir());
+
+    std::env::set_var("IQ_TEST_MODEL_KEY", "fixture-model-key");
+    let candidate = integrator.resume_item(&item.id).unwrap();
+    assert_eq!(candidate.status, QueueStatus::Merged);
+    assert!(!sandbox.exists());
+    assert!(!protocol.exists());
+    let interrupted: (String, String) = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row(
+            "SELECT status,failure_json FROM integration_cycles WHERE id=?1",
+            [&interrupted_cycle_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(interrupted.0, "failed");
+    assert_eq!(
+        serde_json::from_str::<iq::control_domain::CycleFailure>(&interrupted.1).unwrap(),
+        iq::control_domain::CycleFailure::Interrupted
+    );
+
+    let integrated = integrator.run_once().unwrap().unwrap();
+    assert_eq!(integrated.status, QueueStatus::Integrated);
+    assert!(store
+        .terminal_cycle_artifacts("fixture::main")
+        .unwrap()
+        .iter()
+        .any(|cycle| cycle.cycle_id == interrupted_cycle_id));
+    iq::integrator::verify_rift_workspace_config(
+        &fixture.repo,
+        &workspace_root,
+        "fixture::main",
+        Some(&fixture.rift_database),
+        &db,
+    )
+    .unwrap();
+}
+
+#[test]
 fn target_moved_merge_conflict_blocks_with_conflict_metadata() {
     let fixture = GitFixture::new(true);
     let source_head =
@@ -1211,7 +1488,6 @@ fn unsupported_provider_url_blocks_the_authoritative_effort() {
 
 #[test]
 fn pr_provider_landing_blocks_when_provider_does_not_land_queued_head() {
-    let _guard = env_lock().lock().unwrap();
     let fixture = GitFixture::new(true);
     let source_head = fixture.create_source_branch("agent/not-landed", "feature.txt", "feature\n");
     git(&fixture.repo, ["push", "-u", "origin", "agent/not-landed"]).unwrap();
@@ -1322,6 +1598,7 @@ fn attempt_candidate(queue: &SqliteQueue, item: &iq::sqlite::QueueItem) -> Strin
 }
 
 struct GitFixture {
+    _environment: FixtureEnvironment,
     temp: tempfile::TempDir,
     remote: std::path::PathBuf,
     repo: std::path::PathBuf,
@@ -1332,6 +1609,7 @@ struct GitFixture {
 
 impl GitFixture {
     fn new(_include_validation: bool) -> Self {
+        let environment = FixtureEnvironment::acquire();
         let temp = tempfile::Builder::new()
             .prefix(".iq-integrator-test-")
             .tempdir_in(env!("CARGO_MANIFEST_DIR"))
@@ -1446,8 +1724,8 @@ os.replace(temporary, result_path)
             permissions.set_mode(0o755);
             fs::set_permissions(&runner, permissions).unwrap();
         }
-        std::env::set_var("IQ_TEST_MODEL_KEY", "fixture-model-key");
         Self {
+            _environment: environment,
             temp,
             remote,
             repo,
