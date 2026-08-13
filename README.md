@@ -1,6 +1,6 @@
 # IQ
 
-IQ is a standalone durable Git integration coordinator. It serializes work for one physical target, validates the exact candidate, applies explicit signoff policy, lands with an exact lease, and reconciles all external effects from SQLite state.
+IQ is a standalone durable Git integration coordinator. It serializes work for one physical target, uses a sandboxed local integration agent for every item, builds and validates the exact candidate, applies explicit signoff policy, lands with an exact lease, and reconciles all external effects from SQLite state.
 
 IQ uses Rift for integration, seed, and development workspaces. Registered target checkouts are integration-only. A repository must be a primary Rift root on a supported same-filesystem layout.
 
@@ -12,11 +12,13 @@ Registration persists the configured remote name and canonical fetch and push UR
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "integration": {
     "validation": {"command": "task validate"},
-    "signoff": {"mode": "none"}
-  }
+    "signoff": {"mode": "none"},
+    "agent": {"model": "openai/gpt-5.6-sol"}
+  },
+  "state_repository": {"kind": "local"}
 }
 ```
 
@@ -24,7 +26,7 @@ Required signoff is explicit:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "integration": {
     "validation": {"command": "task validate"},
     "signoff": {
@@ -32,6 +34,12 @@ Required signoff is explicit:
       "command": "./ci/iq-signoff",
       "contexts": ["linux", "macos"]
     }
+  },
+  "state_repository": {
+    "kind": "gitlab_issue",
+    "visibility": "full",
+    "repository": "group/project",
+    "allowed_responders": ["maintainer"]
   }
 }
 ```
@@ -47,7 +55,7 @@ iq repo init --path /path/to/repo --target main --remote origin
 iq repo list
 iq dev-workspace create --repo-key '/path/to/repo::main' --name feature
 iq submit --workspace <workspace-id>
-iq integrate --next --repo-path /path/to/repo --repo-key '/path/to/repo::main'
+iq integrate --system-config /etc/iq/system.yaml --next --repo-path /path/to/repo --repo-key '/path/to/repo::main'
 iq cleanup --repo-key '/path/to/repo::main'
 ```
 
@@ -61,7 +69,22 @@ Every PR/MR landing requires a passing post-signoff provider snapshot before tar
 
 See [Composition Workspaces](docs/composition-workspaces.md) for the lifecycle and recovery contract.
 
-## Existing Queue Commands
+## Control Plane
+
+The daemon serves version 1 framed JSON only on the configured Unix socket. `inbox`, `show`, `answer`, and `watch` use this API. Local answers use `SO_PEERCRED`; callers cannot supply actor identity.
+
+```sh
+iq inbox --config /etc/iq/system.yaml
+iq show <item-id> --config /etc/iq/system.yaml
+iq answer --config /etc/iq/system.yaml --external-id <id> --request <id> --effort <id> --attempt <id> --cycle <id> --target-sha <sha> --source-sha <sha> --answer '<text>'
+iq watch --json --config /etc/iq/system.yaml --cursor 0
+```
+
+System configuration selects the exact OpenCode executable, credential environment name, agent, default model, cycle timeout, process, memory, CPU, writable-byte, protocol, log, and API bounds. It does not require runtime command or path manifests. The automatic failed-cycle limit is always 10. Project policy can override only the model.
+
+The Linux runner uses an unprivileged mount namespace, Bubblewrap, a user-systemd scope, and a size-bounded tmpfs overlay over the retained Rift. Normal runtime trees are read-only. The configured model credential is passed directly to OpenCode. Repository remote credentials are not deliberately mounted. IQ imports only a bounded staged patch whose paths and staged-tree digest match the typed result. Btrfs qgroups and persistent filesystem quotas are not required.
+
+## Queue Commands
 
 ```sh
 iq enqueue --repo-path /path/to/repo --source feature --head <sha>
@@ -70,11 +93,11 @@ iq events <item-id>
 iq retry <item-id>
 iq requeue <item-id> --head <sha>
 iq cancel <item-id>
-iq daemon --config /path/to/iq.yaml
-iq doctor --config /path/to/iq.yaml
+iq daemon --config /path/to/iq.yaml --system-config /etc/iq/system.yaml
+iq doctor --config /path/to/iq.yaml --system-config /etc/iq/system.yaml
 ```
 
-Queue state is host-local. The default database is under `IQ/IntegrationQueues` on macOS and `iq/integration-queues` under the XDG state directory on Linux. The state root must be an absolute non-empty path. On first use, IQ locks a verified state-root directory handle, repeats old/new root checks, and atomically moves the former Threadmill state directory after it validates the standalone schema, active leases, canonical UTF-8 repository paths, database identity, and Rift ownership markers. Each supported schema upgrade requires no active leases and no nonterminal queue items, then validates its final schema before its transaction commits. IQ rejects ambiguous, symlinked, raced, incomplete, or unverifiable state.
+Queue state is host-local. Runtime accepts schema v9 only. Upgrade schema v8 explicitly with `iq migrate --system-config /etc/iq/system.yaml`. IQ first creates a mode-0600 SQLite online backup in the same protected state directory, syncs and verifies it, and then converts active items in one immediate transaction. Migration requires no active repository or daemon lease and does not infer missing runner or repository identity.
 
 The daemon, communication, forced-command, and config-reconciliation interfaces remain available. Repository operation leases and filesystem locks are scoped to one operation, so an idle daemon does not exclude composition commands.
 

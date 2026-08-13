@@ -12,6 +12,8 @@ The agent stages an integrated tree and returns a typed result. It never commits
 
 OpenCode is the first OS-sandboxed local runner. The runner boundary permits future local runner implementations without changing integration-effort, candidate, state-repository, local API, notification, or landing contracts. Runner, agent, and default model are system configuration. A project can override only the model. Ten failed automatic cycles is a fixed limit; it is not configurable.
 
+ADR 0006 supersedes the runner isolation and threat boundary in this decision. The lifecycle authority and correctness decisions in this ADR remain unchanged.
+
 SQLite is the sole durable queue, integration-effort, decision, event, projection-debt, and notification-delivery authority. Each project uses exactly one tagged state repository: `local`, `github_issue`, or `gitlab_issue`; the default is `local`. GitHub and GitLab use one issue per queue item. Full visibility projects every durable lifecycle transition. Minimal visibility projects every typed integration blocker.
 
 The local API and notifications are separate contracts. The local API uses a verified Unix-domain socket and peer credentials for reads, answers, and the durable event stream. Notifications are bounded, best-effort attention signals over durable events. They cannot accept answers or become state authority.

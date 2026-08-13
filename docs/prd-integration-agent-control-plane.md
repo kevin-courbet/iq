@@ -56,12 +56,19 @@ integration_agent:
   max_processes: 64
   memory_bytes: 4294967296
   cpu_seconds: 1800
+  writable_bytes: 8589934592
+  open_files: 4096
+  credential_env: OPENAI_API_KEY
 
 control_plane:
-  unix_socket: ~/.local/state/iq/control.sock
+  unix_socket: /home/user/.local/state/iq/control.sock
   max_request_bytes: 262144
   max_free_text_bytes: 16384
+  max_response_bytes: 1048576
+  max_concurrent_clients: 32
+  max_client_queue_bytes: 1048576
   max_stream_backlog_events: 10000
+  client_idle_seconds: 60
 ```
 
 Example project policy:
@@ -157,15 +164,15 @@ A cycle starts only after sandbox admission and runner launch succeed. A consume
 
 ### OpenCode Runner Sandbox And Restart
 
-Threat model: repository content, agent output, and the OpenCode child process are untrusted. They can try path traversal, symlink escape, credential access, process escape, resource exhaustion, remote Git mutation, or IQ-state mutation. Prompt permissions are not a security control.
+ADR 0006 defines IQ as solo local tooling. The runner boundary provides basic process isolation and resource bounds, not security hardening against a malicious repository, agent, or child tool.
 
-- [ ] The OpenCode runner executes in an OS-enforced sandbox. IQ fails before cycle start with `infrastructure(configuration|sandbox|runner)` when all required controls are not available.
-- [ ] The retained integration Rift is the only writable mount. Required repository documents and approved OpenCode runtime/config files are read-only mounts.
-- [ ] IQ SQLite files, registered integration checkout, source development workspace, other Rifts, SSH agents, SSH/Git credential files and helpers, Git config that contains credentials, and arbitrary home state are absent from the sandbox namespace.
-- [ ] Only the model credential needed by the selected runner is passed to that runner process. It is absent from protocol files, logs, child Git config, and result output.
-- [ ] Network is available only because OpenCode needs its model API. Repository remote credentials and credential helpers are absent, so the runner cannot authenticate a push or provider action.
+- [ ] The OpenCode runner executes with Bubblewrap, an unprivileged user and mount namespace, and a user-systemd scope. IQ fails before cycle start with `infrastructure(configuration|sandbox|runner)` when these controls are not available.
+- [ ] The retained integration Rift uses a bounded writable tmpfs overlay. Normal runtime trees are mounted read-only without a command or path manifest.
+- [ ] IQ does not deliberately mount its SQLite files, other workspaces, host home, SSH agents, or repository remote credentials.
+- [ ] IQ reads the configured model credential from the named environment variable and passes it directly to OpenCode. Child tools can inherit it.
+- [ ] Btrfs qgroups, persistent filesystem quotas, exact runtime closure, credential proxying, and credential isolation from child tools are not required.
 - [ ] OS controls enforce process count, memory, CPU, wall time, open files, writable bytes, and output bytes. IQ kills the complete process group on cancellation, timeout, target movement, or authority loss.
-- [ ] IQ opens input/result paths relative to verified directory descriptors, rejects symlinks and non-regular files, verifies device/inode and Rift identity before and after execution, and rejects path traversal and hard-link escape.
+- [ ] IQ opens input/result paths relative to verified directory descriptors, rejects symlinks and non-regular files, verifies result and Rift identity before and after execution, and rejects path traversal and hard-link escape.
 - [ ] Post-run checks reject writes outside the retained Rift, changed Git remotes/config, commits or refs made by the agent, untracked protocol artifacts, unresolved index entries for `resolved`, and staged identity that differs from the reported result.
 - [ ] IQ persists runner PID, process start identity from the OS, process-group identity, sandbox identity, started time, input SHA-256 digest, result temporary/final path identity, and atomic result state `absent`, `writing`, or `complete`.
 - [ ] Loss of queue or repository lease authority terminates OpenCode before any result can be accepted.
@@ -225,7 +232,7 @@ Threat model: repository content, agent output, and the OpenCode child process a
 - [ ] A separate `local` repository case proves no GitHub or GitLab issue is created and a peer-credential-authenticated local answer resumes the effort.
 - [ ] Cycle acceptance proves cycles 1 through 9 retry automatically, the 10th failed consumed cycle creates one cycle-limit blocker and one alert, and no cycle 11 starts.
 - [ ] Restart acceptance injects a crash at runner launch, atomic result rename, candidate record, validation evidence record, issue projection, answer receipt, notification delivery, landing command, and landing reconciliation. Each restart produces one valid state and no duplicate authority or event.
-- [ ] Sandbox acceptance tries DB, registered checkout, source workspace, other Rift, home, SSH agent, Git credential, symlink, hard-link, path traversal, fork, memory, output, timeout, and remote-push access. Each forbidden capability fails without changing protected state.
+- [ ] Sandbox acceptance proves the retained Rift overlay, read-only runtime trees, process/memory/CPU/wall/log/result/writable bounds, process-group termination, protocol path checks, and no deliberate repository-credential mount.
 - [ ] Notification tests invoke each backend command through an automated fake executable and assert arguments, payload bounds, retries, and dedupe. One manual WSLg test and one manual Windows test confirm a visible toast on a supported host.
 
 ## Technical Approach
@@ -300,8 +307,8 @@ flowchart LR
 
 - Add versioned protocol types, atomic protocol files, OpenCode runner adapter, OS sandbox, process supervision, limits, authority cancellation, and restart reconciliation.
 - Route every item through the runner; accept clean `resolved` with no edits.
-- Add exact post-run path, symlink, Git graph/config/ref, staged-tree, and identity checks.
-- **Verify:** run all protocol variants and precedence cases; run sandbox denial cases; inject crashes after process spawn, input rename, result write, result rename, lease loss, timeout, cancellation, and restart reconciliation.
+- Add post-run path, symlink, Git graph/config/ref, staged-tree, and identity checks.
+- **Verify:** run all protocol variants and precedence cases; run basic sandbox and resource-bound cases; inject crashes after process spawn, input rename, result write, result rename, lease loss, timeout, cancellation, and restart reconciliation.
 
 ### Phase 4: Automatic Repair And Gates
 

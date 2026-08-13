@@ -1,15 +1,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use iq::communication::{build_transports, CommunicationConfig, DecisionCommunicator};
 use iq::composition::{RepositoryInitOptions, RepositoryManager};
-use iq::core::QueueSource;
 use iq::integrator::{
     verify_rift_workspace_config, workspace_status, HostSignoffPolicy, IntegrationPolicy,
     Integrator, IntegratorOptions, SignoffPolicy,
-};
-use iq::issue_backends::{
-    issue_adapter_for_provider, IssueBackendAdapter, IssueProvider, IssueSyncTarget,
-    MarkdownIssueBackend,
 };
 use iq::sqlite::{Attempt, EnqueueRequest, QueueItem, SqliteQueue, SqliteQueueReader};
 use serde::{Deserialize, Serialize};
@@ -36,6 +30,10 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    Migrate {
+        #[arg(long)]
+        system_config: PathBuf,
+    },
     Repo {
         #[command(subcommand)]
         command: RepoCommand,
@@ -57,6 +55,8 @@ enum Command {
         workspace: Option<String>,
     },
     Integrate {
+        #[arg(long)]
+        system_config: PathBuf,
         #[arg(long, conflicts_with = "resume", required_unless_present = "resume")]
         next: bool,
         #[arg(long, conflicts_with = "next", required_unless_present = "next")]
@@ -93,25 +93,62 @@ enum Command {
         remote: String,
     },
     List,
+    Inbox {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+    Show {
+        item: String,
+        #[arg(long)]
+        config: PathBuf,
+    },
+    Watch {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        cursor: u64,
+        #[arg(long, default_value_t = 1000)]
+        limit: u32,
+        #[arg(long)]
+        json: bool,
+    },
     Answer {
-        prompt: String,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        external_id: String,
+        #[arg(long)]
+        request: String,
+        #[arg(long)]
+        effort: String,
+        #[arg(long)]
+        attempt: String,
+        #[arg(long)]
+        cycle: String,
+        #[arg(long)]
+        target_sha: String,
+        #[arg(long)]
+        source_sha: String,
+        #[arg(long)]
+        candidate_sha: Option<String>,
         #[arg(long)]
         answer: String,
-        #[arg(long, default_value = "user")]
-        answered_by: String,
     },
     Cancel {
         item: String,
     },
-    Requeue {
-        item: String,
-        #[arg(long)]
-        head: String,
-        #[arg(long, default_value = "origin")]
-        remote: String,
-    },
     Retry {
         item: String,
+        #[arg(long)]
+        config: PathBuf,
+    },
+    Notify {
+        #[command(subcommand)]
+        command: NotifyCommand,
+        #[arg(long)]
+        system_config: PathBuf,
     },
     Events {
         item: String,
@@ -128,13 +165,11 @@ enum Command {
         #[command(subcommand)]
         command: WorkspaceCommand,
     },
-    Issue {
-        #[command(subcommand)]
-        command: IssueCommand,
-    },
     Daemon {
         #[arg(long)]
         config: PathBuf,
+        #[arg(long)]
+        system_config: PathBuf,
         #[arg(long)]
         owner: Option<String>,
         #[arg(long)]
@@ -147,6 +182,8 @@ enum Command {
     Doctor {
         #[arg(long)]
         config: PathBuf,
+        #[arg(long)]
+        system_config: PathBuf,
     },
     Config {
         #[command(subcommand)]
@@ -243,6 +280,12 @@ enum ConfigCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum NotifyCommand {
+    Dispatch,
+    Redeliver { delivery_id: i64 },
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "iq")]
 struct RemoteCli {
@@ -274,11 +317,6 @@ enum RemoteCommand {
         #[arg(long, value_enum, default_value_t = EvidencePhaseArg::All)]
         phase: EvidencePhaseArg,
     },
-    Requeue {
-        item: String,
-        #[arg(long)]
-        head: String,
-    },
     Retry {
         item: String,
     },
@@ -298,21 +336,10 @@ enum WorkspaceCommand {
         #[arg(long)]
         owner: Option<String>,
     },
-    AcceptCurrent {
-        item: String,
-        #[arg(long)]
-        repo_path: PathBuf,
-        #[arg(long)]
-        repo_key: Option<String>,
-        #[arg(long, default_value = "origin")]
-        remote: String,
-        #[arg(long)]
-        workspace_root: Option<PathBuf>,
-        #[arg(long)]
-        owner: Option<String>,
-    },
     Reset {
         #[arg(long)]
+        system_config: PathBuf,
+        #[arg(long)]
         repo_path: PathBuf,
         #[arg(long)]
         repo_key: Option<String>,
@@ -322,29 +349,6 @@ enum WorkspaceCommand {
         workspace_root: Option<PathBuf>,
         #[arg(long)]
         owner: Option<String>,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum IssueCommand {
-    Sync {
-        item: String,
-        #[arg(long)]
-        provider: IssueProviderArg,
-        #[arg(long)]
-        repo: String,
-        #[arg(long)]
-        issue: Option<String>,
-    },
-    IngestAnswers {
-        #[arg(long)]
-        provider: IssueProviderArg,
-        #[arg(long)]
-        repo: String,
-        #[arg(long)]
-        issue: String,
-        #[arg(long)]
-        best_effort: bool,
     },
 }
 
@@ -369,12 +373,6 @@ struct EvidenceFile {
     content: String,
 }
 
-#[derive(Copy, Clone, Debug, ValueEnum)]
-enum IssueProviderArg {
-    Github,
-    Gitlab,
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let db_path = match cli.queue_db {
@@ -382,6 +380,10 @@ fn main() -> Result<()> {
         None => SqliteQueue::default_db_path()?,
     };
     match cli.command {
+        Command::Migrate { system_config } => {
+            let queue = SqliteQueue::migrate_v8(&db_path, &system_config)?;
+            print_json(&json!({"schema_version": 9, "database": queue.path()}))?;
+        }
         Command::Repo { command } => {
             let manager = RepositoryManager::new(SqliteQueue::open(&db_path)?);
             match command {
@@ -428,8 +430,14 @@ fn main() -> Result<()> {
             }
         }
         Command::Submit { workspace, replace } => {
-            let manager = RepositoryManager::new(SqliteQueue::open(&db_path)?);
-            print_json(&manager.submit(&workspace, replace.as_deref())?)?;
+            let queue = SqliteQueue::open(&db_path)?;
+            let manager = RepositoryManager::new(queue.clone());
+            let (submission, item) = manager.submit(&workspace, replace.as_deref())?;
+            iq::state_repository::reserve_full_issue(
+                &iq::control_store::ControlStore::open(queue.path())?,
+                &item.id,
+            )?;
+            print_json(&(submission, item))?;
         }
         Command::Cleanup {
             repo_key,
@@ -452,6 +460,7 @@ fn main() -> Result<()> {
         }
         Command::Integrate {
             next: _,
+            system_config,
             resume,
             repo_path,
             repo_key,
@@ -460,15 +469,19 @@ fn main() -> Result<()> {
             workspace_root,
             owner,
         } => {
-            let integrator = Integrator::new(integrator_options(
-                db_path,
-                repo_path,
-                repo_key,
-                &target,
-                remote,
-                workspace_root,
-                owner,
-            )?)?;
+            let system = iq::agent_config::SystemConfig::load(&system_config)?;
+            let integrator = Integrator::new(integrator_options_with_system_config(
+                integrator_options(
+                    db_path,
+                    repo_path,
+                    repo_key,
+                    &target,
+                    remote,
+                    workspace_root,
+                    owner,
+                )?,
+                &system,
+            ))?;
             if let Some(item) = resume {
                 print_json(&integrator.resume_item(&item)?)?;
             } else {
@@ -492,6 +505,9 @@ fn main() -> Result<()> {
                 None => default_repo_key(&repo_path, &target)?,
             };
             validate_branch_handoff(&repo_path, &remote, &source, &target, &head)?;
+            let state_repository =
+                iq::composition::load_project_control_only(&repo_path)?.state_repository;
+            iq::state_repository::repository(&state_repository)?.verify()?;
             let item = queue.enqueue(EnqueueRequest {
                 repo_key,
                 repo_path: repo_path
@@ -503,45 +519,120 @@ fn main() -> Result<()> {
                 current_head_sha: head,
                 pr_url,
                 producer_metadata: json!({ "producer": producer }),
+                state_repository,
             })?;
+            iq::state_repository::reserve_full_issue(
+                &iq::control_store::ControlStore::open(queue.path())?,
+                &item.id,
+            )?;
             print_json(&item)?;
         }
         Command::List => {
             let queue = SqliteQueueReader::open(&db_path)?;
             print_json(&queue.list_items()?)?;
         }
-        Command::Answer {
-            prompt,
-            answer,
-            answered_by,
+        Command::Inbox { config, limit } => {
+            let system = iq::agent_config::SystemConfig::load(&config)?;
+            print_json(&iq::control_api::request(
+                &system.control_plane.unix_socket,
+                &iq::control_api::ApiRequest::Inbox { limit },
+                system.control_plane.max_response_bytes,
+            )?)?;
+        }
+        Command::Show { item, config } => {
+            let system = iq::agent_config::SystemConfig::load(&config)?;
+            print_json(&iq::control_api::request(
+                &system.control_plane.unix_socket,
+                &iq::control_api::ApiRequest::Show { item_id: item },
+                system.control_plane.max_response_bytes,
+            )?)?;
+        }
+        Command::Watch {
+            config,
+            cursor,
+            limit,
+            json,
         } => {
-            let queue = SqliteQueue::open(&db_path)?;
-            print_json(&queue.answer_prompt(&prompt, &answer, &answered_by)?)?;
+            let system = iq::agent_config::SystemConfig::load(&config)?;
+            iq::control_api::watch(
+                &system.control_plane.unix_socket,
+                cursor,
+                limit,
+                system.control_plane.max_response_bytes,
+                |response| {
+                    if json {
+                        print_json(response)
+                    } else {
+                        print_json(&response.result)
+                    }
+                },
+            )?;
+        }
+        Command::Answer {
+            config,
+            external_id,
+            request,
+            effort,
+            attempt,
+            cycle,
+            target_sha,
+            source_sha,
+            candidate_sha,
+            answer,
+        } => {
+            let system = iq::agent_config::SystemConfig::load(&config)?;
+            print_json(&iq::control_api::request(
+                &system.control_plane.unix_socket,
+                &iq::control_api::ApiRequest::Answer {
+                    answer: iq::control_store::AnswerCommand {
+                        external_id,
+                        request_id: request,
+                        effort_id: effort,
+                        attempt_id: attempt,
+                        cycle_id: cycle,
+                        target_sha,
+                        source_sha,
+                        candidate_sha,
+                        answer,
+                    },
+                },
+                system.control_plane.max_response_bytes,
+            )?)?;
         }
         Command::Cancel { item } => {
             let queue = SqliteQueue::open(&db_path)?;
-            print_json(&queue.transition_item(&item, iq::core::QueueStatus::Cancelled)?)?;
-        }
-        Command::Requeue { item, head, remote } => {
-            let queue = SqliteQueue::open(&db_path)?;
-            let queued = queue.get_item(&item)?;
-            if matches!(queued.source, QueueSource::LocalSubmission { .. }) {
-                anyhow::bail!(
-                    "local submissions are immutable; use submit --replace for an agent fix"
-                );
+            let store = iq::control_store::ControlStore::open(queue.path())?;
+            if let Some(effort) = store.effort_for_item(&item)? {
+                let cancelled = store.cancel(&effort.id, "local_cli", "operator_cancelled")?;
+                store.reconcile_cancelled_runner_terminations(false)?;
+                print_json(&cancelled)?;
+            } else {
+                print_json(&queue.transition_item(&item, iq::core::QueueStatus::Cancelled)?)?;
             }
-            validate_branch_handoff(
-                std::path::Path::new(&queued.repo_path),
-                &remote,
-                &queued.source_branch,
-                &queued.target_branch,
-                &head,
-            )?;
-            print_json(&queue.requeue_agent_fix(&item, &head)?)?;
         }
-        Command::Retry { item } => {
-            let queue = SqliteQueue::open(&db_path)?;
-            print_json(&queue.retry_blocked(&item)?)?;
+        Command::Retry { item, config } => {
+            let system = iq::agent_config::SystemConfig::load(&config)?;
+            print_json(&iq::control_api::request(
+                &system.control_plane.unix_socket,
+                &iq::control_api::ApiRequest::Retry { item_id: item },
+                system.control_plane.max_response_bytes,
+            )?)?;
+        }
+        Command::Notify {
+            command,
+            system_config,
+        } => {
+            let system = iq::agent_config::SystemConfig::load(&system_config)?;
+            let dispatcher =
+                iq::notifications::NotificationDispatcher::new(&db_path, system.notifications);
+            match command {
+                NotifyCommand::Dispatch => {
+                    print_json(&json!({"processed":dispatcher.dispatch_once()?}))?
+                }
+                NotifyCommand::Redeliver { delivery_id } => print_json(
+                    &json!({"delivery_id":dispatcher.redeliver(delivery_id,"local_cli")?}),
+                )?,
+            }
         }
         Command::Events { item } => {
             let queue = SqliteQueueReader::open(&db_path)?;
@@ -581,106 +672,47 @@ fn main() -> Result<()> {
                 let queue = SqliteQueueReader::open(&db_path)?;
                 print_json(&workspace_status(&queue, &repo_key)?)?;
             }
-            WorkspaceCommand::AcceptCurrent {
-                item,
-                repo_path,
-                repo_key,
-                remote,
-                workspace_root,
-                owner,
-            } => {
-                let integrator = Integrator::new(integrator_options(
-                    db_path,
-                    repo_path,
-                    repo_key,
-                    "main",
-                    remote,
-                    workspace_root,
-                    owner,
-                )?)?;
-                print_json(&integrator.accept_current_workspace(&item)?)?;
-            }
             WorkspaceCommand::Reset {
+                system_config,
                 repo_path,
                 repo_key,
                 remote,
                 workspace_root,
                 owner,
             } => {
-                let integrator = Integrator::new(integrator_options(
-                    db_path,
-                    repo_path,
-                    repo_key,
-                    "main",
-                    remote,
-                    workspace_root,
-                    owner,
-                )?)?;
+                let system = iq::agent_config::SystemConfig::load(&system_config)?;
+                let integrator = Integrator::new(integrator_options_with_system_config(
+                    integrator_options(
+                        db_path,
+                        repo_path,
+                        repo_key,
+                        "main",
+                        remote,
+                        workspace_root,
+                        owner,
+                    )?,
+                    &system,
+                ))?;
                 print_json(&integrator.reset_workspaces()?)?;
-            }
-        },
-        Command::Issue { command } => match command {
-            IssueCommand::Sync {
-                item,
-                provider,
-                repo,
-                issue,
-            } => {
-                let queue = SqliteQueueReader::open(&db_path)?;
-                let item_row = queue.get_item(&item)?;
-                let events = queue.events(&item)?;
-                let prompts = queue.prompts_for_item(&item)?;
-                let provider = IssueProvider::from(provider);
-                let projection = MarkdownIssueBackend {
-                    provider: provider.clone(),
-                }
-                .project_item(&item_row, &events, &prompts);
-                let result = issue_adapter_for_provider(provider)?
-                    .sync_projection(&IssueSyncTarget { repo, issue }, &projection)?;
-                print_json(&result)?;
-            }
-            IssueCommand::IngestAnswers {
-                provider,
-                repo,
-                issue,
-                best_effort,
-            } => {
-                let queue = SqliteQueue::open(&db_path)?;
-                let answers = issue_adapter_for_provider(provider.into())?.ingest_prompt_answers(
-                    &IssueSyncTarget {
-                        repo,
-                        issue: Some(issue),
-                    },
-                )?;
-                let mut applied = Vec::new();
-                let mut had_error = false;
-                for answer in answers {
-                    match queue.answer_prompt(
-                        &answer.prompt_id,
-                        &answer.answer,
-                        answer.answered_by.as_deref().unwrap_or("issue-comment"),
-                    ) {
-                        Ok(item) => applied.push(json!({"prompt_id": answer.prompt_id, "item_id": item.id, "status": item.status})),
-                        Err(error) => {
-                            had_error = true;
-                            applied.push(json!({"prompt_id": answer.prompt_id, "error": error.to_string()}));
-                        }
-                    }
-                }
-                print_json(&applied)?;
-                if had_error && !best_effort {
-                    anyhow::bail!("failed to apply one or more issue prompt answers");
-                }
             }
         },
         Command::Daemon {
             config,
+            system_config,
             owner,
             ready_file,
             once,
             interval_seconds,
         } => {
-            run_daemon_config(db_path, &config, owner, ready_file, once, interval_seconds)?;
+            run_daemon_config(
+                db_path,
+                &config,
+                &system_config,
+                owner,
+                ready_file,
+                once,
+                interval_seconds,
+            )?;
         }
         Command::RemoteExec {
             repo_path,
@@ -689,7 +721,10 @@ fn main() -> Result<()> {
             remote,
             workspace_root,
         } => run_remote_exec(db_path, repo_path, repo_key, target, remote, workspace_root)?,
-        Command::Doctor { config } => run_doctor(&db_path, &config)?,
+        Command::Doctor {
+            config,
+            system_config,
+        } => run_doctor(&db_path, &config, &system_config)?,
         Command::Config { command } => match command {
             ConfigCommand::Reconcile {
                 current_config,
@@ -724,7 +759,19 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_doctor(queue_db: &std::path::Path, config_path: &std::path::Path) -> Result<()> {
+fn run_doctor(
+    queue_db: &std::path::Path,
+    config_path: &std::path::Path,
+    system_config_path: &std::path::Path,
+) -> Result<()> {
+    let system_config = iq::agent_config::SystemConfig::load(system_config_path)?;
+    let runner_snapshot = system_config.runner_snapshot(None)?;
+    iq::agent_config::verify_executable(&runner_snapshot.executable)?;
+    let notification_health = iq::notifications::NotificationDispatcher::new(
+        queue_db,
+        system_config.notifications.clone(),
+    )
+    .health();
     let config = read_daemon_config(config_path)?;
     let queue = SqliteQueue::open(queue_db)?;
     let repository_manager = RepositoryManager::new(queue.clone());
@@ -745,15 +792,18 @@ fn run_doctor(queue_db: &std::path::Path, config_path: &std::path::Path) -> Resu
                 "registered repository {repo_key} rejects daemon validation and signoff settings"
             );
         }
-        let workspace_root = integrator_options(
-            queue_db.to_path_buf(),
-            canonical_repo_path.clone(),
-            Some(repo_key.clone()),
-            &target,
-            remote.clone(),
-            repo.workspace_root.clone(),
-            Some("iq-doctor".into()),
-        )?
+        let workspace_root = integrator_options_with_system_config(
+            integrator_options(
+                queue_db.to_path_buf(),
+                canonical_repo_path.clone(),
+                Some(repo_key.clone()),
+                &target,
+                remote.clone(),
+                repo.workspace_root.clone(),
+                Some("iq-doctor".into()),
+            )?,
+            &system_config,
+        )
         .workspace_root;
         verify_rift_workspace_config(
             &canonical_repo_path,
@@ -817,17 +867,6 @@ fn run_doctor(queue_db: &std::path::Path, config_path: &std::path::Path) -> Resu
                 );
             }
         }
-        let communication_transport_count = if let Some(communication) = &repo.communication {
-            let transports = build_transports(&communication.transports)?;
-            for transport in &transports {
-                transport.verify().with_context(|| {
-                    format!("verify communication transport {}", transport.id())
-                })?;
-            }
-            transports.len()
-        } else {
-            0
-        };
         let validation_report = if registered {
             let policy = repository_manager.inspect_local_policy(&repo_key)?;
             json!({
@@ -857,9 +896,22 @@ fn run_doctor(queue_db: &std::path::Path, config_path: &std::path::Path) -> Resu
             "target": target,
             "remote": remote,
             "validation": validation_report,
-            "communication_transports": communication_transport_count,
         }));
     }
+    results.push(json!({
+        "integration_agent": {
+            "runner": runner_snapshot.kind,
+            "executable": runner_snapshot.executable.path,
+            "sandbox": runner_snapshot.sandbox,
+            "cycle_limit": iq::control_domain::AUTOMATIC_CYCLE_LIMIT,
+        },
+        "control_socket": system_config.control_plane.unix_socket,
+        "notifications": notification_health.iter().map(|health| json!({
+            "backend": health.backend,
+            "status": if health.available { "available" } else { "degraded" },
+            "detail": health.detail,
+        })).collect::<Vec<_>>(),
+    }));
     print_json(&results)
 }
 
@@ -885,6 +937,9 @@ fn run_remote_exec(
             let queue = SqliteQueue::open(&db_path)?;
             let repo_path = canonical_repo_path(&repo_path, "remote enqueue repository")?;
             validate_branch_handoff(&repo_path, &remote, &source, &target, &head)?;
+            let state_repository =
+                iq::composition::load_project_control_only(&repo_path)?.state_repository;
+            iq::state_repository::repository(&state_repository)?.verify()?;
             let item = queue.enqueue(EnqueueRequest {
                 repo_key,
                 repo_path: repo_path
@@ -896,7 +951,12 @@ fn run_remote_exec(
                 current_head_sha: head,
                 pr_url,
                 producer_metadata: json!({ "producer": producer }),
+                state_repository,
             })?;
+            iq::state_repository::reserve_full_issue(
+                &iq::control_store::ControlStore::open(queue.path())?,
+                &item.id,
+            )?;
             print_json(&item)?;
         }
         RemoteCommand::List => {
@@ -926,24 +986,8 @@ fn run_remote_exec(
             let queued = require_remote_item(&queue, &item, &repo_key)?;
             print_json(&read_evidence(&queue, &queued, phase)?)?;
         }
-        RemoteCommand::Requeue { item, head } => {
-            let queue = SqliteQueue::open(&db_path)?;
-            let queued = queue.get_item(&item)?;
-            require_remote_item_scope(&queued, &repo_key)?;
-            validate_branch_handoff(
-                &repo_path,
-                &remote,
-                &queued.source_branch,
-                &queued.target_branch,
-                &head,
-            )?;
-            print_json(&queue.requeue_agent_fix(&item, &head)?)?;
-        }
-        RemoteCommand::Retry { item } => {
-            let queue = SqliteQueue::open(&db_path)?;
-            let queued = queue.get_item(&item)?;
-            require_remote_item_scope(&queued, &repo_key)?;
-            print_json(&queue.retry_blocked(&item)?)?;
+        RemoteCommand::Retry { .. } => {
+            anyhow::bail!("remote retry requires the authenticated Unix control API")
         }
     }
     Ok(())
@@ -1048,7 +1092,43 @@ fn integrator_options(
         base_remote: remote,
         workspace_root,
         rift_database: None,
+        system_config: iq::agent_config::SystemConfig {
+            integration_agent: iq::agent_config::IntegrationAgentConfig {
+                runner: iq::control_domain::RunnerKind::Opencode,
+                executable: PathBuf::from("/invalid"),
+                agent: "unconfigured".into(),
+                model: "unconfigured".into(),
+                cycle_timeout_seconds: 1,
+                max_log_bytes: 1,
+                max_result_bytes: 1,
+                max_processes: 1,
+                memory_bytes: 1,
+                cpu_seconds: 1,
+                writable_bytes: 1,
+                open_files: 1,
+                credential_env: "UNCONFIGURED".into(),
+            },
+            control_plane: iq::agent_config::ControlPlaneConfig {
+                unix_socket: PathBuf::from("/invalid"),
+                max_request_bytes: 1,
+                max_free_text_bytes: 1,
+                max_response_bytes: 1,
+                max_concurrent_clients: 1,
+                max_client_queue_bytes: 1,
+                max_stream_backlog_events: 1,
+                client_idle_seconds: 1,
+            },
+            notifications: Default::default(),
+        },
     })
+}
+
+fn integrator_options_with_system_config(
+    mut options: IntegratorOptions,
+    system_config: &iq::agent_config::SystemConfig,
+) -> IntegratorOptions {
+    options.system_config = system_config.clone();
+    options
 }
 
 fn workspace_scope(repo_key: &str) -> String {
@@ -1296,8 +1376,8 @@ struct DaemonRepoConfig {
     validation: ValidationConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     signoff: Option<SignoffPolicy>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    communication: Option<CommunicationConfig>,
+    #[serde(default)]
+    state_repository: iq::control_domain::StateRepositorySnapshot,
 }
 
 #[derive(Debug, Clone)]
@@ -1375,7 +1455,7 @@ struct RepositoryBaseline {
     remote: Option<String>,
     workspace_root: Option<PathBuf>,
     signoff: Option<SignoffPolicy>,
-    communication: Option<CommunicationConfig>,
+    state_repository: iq::control_domain::StateRepositorySnapshot,
 }
 
 #[derive(Debug, Serialize)]
@@ -1617,7 +1697,7 @@ fn reconcile_config(
             )),
             validation: ValidationConfig::None,
             signoff: None,
-            communication: None,
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
         };
         let next_validation = validate_validation_config(intent)?;
         effective_repos.push(apply_validation_state(repo.clone(), &next_validation)?);
@@ -1830,7 +1910,7 @@ fn repository_baseline(repo: &DaemonRepoConfig) -> Result<RepositoryBaseline> {
         remote: repo.remote.clone(),
         workspace_root: repo.workspace_root.clone(),
         signoff: repo.signoff.clone(),
-        communication: repo.communication.clone(),
+        state_repository: repo.state_repository.clone(),
     })
 }
 
@@ -1907,10 +1987,7 @@ fn validate_daemon_config(
             anyhow::bail!("signoff requires validation mode command");
         }
         validate_signoff(repo.signoff.as_ref())?;
-        if let Some(communication) = &repo.communication {
-            build_transports(&communication.transports)
-                .context("validate communication transports")?;
-        }
+        repo.state_repository.clone().validate()?;
         repos.push(ValidatedDaemonRepo {
             repo: repo.clone(),
             canonical_repo_path,
@@ -2550,13 +2627,36 @@ fn require_exact_nonblank<'a>(value: &'a str, field: &str) -> Result<&'a str> {
 fn run_daemon_config(
     db_path: PathBuf,
     config_path: &std::path::Path,
+    system_config_path: &std::path::Path,
     owner: Option<String>,
     ready_file: Option<PathBuf>,
     once: bool,
     interval_seconds: u64,
 ) -> Result<()> {
+    let system_config = iq::agent_config::SystemConfig::load(system_config_path)?;
     let config = read_daemon_config(config_path)?;
     let queue = SqliteQueue::open(&db_path)?;
+    let control_store = iq::control_store::ControlStore::open(&db_path)?;
+    control_store.reconcile_cancelled_runner_terminations(true)?;
+    let notifications = iq::notifications::NotificationDispatcher::new(
+        &db_path,
+        system_config.notifications.clone(),
+    );
+    notifications.configure()?;
+    let api = iq::control_api::ControlApiServer::bind(
+        system_config.control_plane.clone(),
+        control_store,
+    )?;
+    notifications.mark_started_unknown_after_restart()?;
+    let startup_store = iq::control_store::ControlStore::open(&db_path)?;
+    iq::state_repository::process_issue_reservation_outbox(&startup_store, 1000)?;
+    if !once {
+        std::thread::spawn(move || {
+            if let Err(error) = api.serve() {
+                eprintln!("IQ control API stopped: {error:#}");
+            }
+        });
+    }
     let mut runners = Vec::new();
     for validated in config.repos {
         let ValidatedDaemonRepo {
@@ -2573,15 +2673,18 @@ fn run_daemon_config(
                 "registered repository {repo_key} rejects daemon validation and signoff settings"
             );
         }
-        let options = integrator_options(
-            db_path.clone(),
-            canonical_repo_path,
-            Some(repo_key.clone()),
-            &target,
-            remote,
-            repo.workspace_root,
-            owner.clone(),
-        )?;
+        let options = integrator_options_with_system_config(
+            integrator_options(
+                db_path.clone(),
+                canonical_repo_path,
+                Some(repo_key.clone()),
+                &target,
+                remote,
+                repo.workspace_root,
+                owner.clone(),
+            )?,
+            &system_config,
+        );
         let policy = match validation {
             ValidationConfig::Command { command } => IntegrationPolicy::Validation {
                 command,
@@ -2593,48 +2696,42 @@ fn run_daemon_config(
             ValidationConfig::None => IntegrationPolicy::NoValidation,
         };
         let integrator = Integrator::new_with_policy(options, policy)?;
-        let communicator = repo
-            .communication
-            .map(|communication| {
-                DecisionCommunicator::new(
-                    &db_path,
-                    repo_key.clone(),
-                    build_transports(&communication.transports)?,
-                )
-            })
-            .transpose()?;
-        runners.push((repo_key, integrator, communicator));
-    }
-    for (_, _, communicator) in &runners {
-        if let Some(communicator) = communicator {
-            communicator.verify()?;
-        }
+        runners.push((repo_key, integrator));
     }
     if let Some(path) = ready_file.as_deref() {
         write_ready_file(path)?;
     }
     loop {
         let mut results = Vec::new();
-        for (repo_key, integrator, communicator) in &runners {
+        for (repo_key, integrator) in &runners {
             let cycle = || -> Result<Option<QueueItem>> {
-                let mut result = integrator.run_once()?;
-                if let Some(communicator) = communicator {
-                    if let Some(cycle) = integrator.with_repo_lease(|| communicator.sync())? {
-                        for error in cycle.errors {
-                            eprintln!("{error}");
-                        }
-                        if cycle.applied_responses > 0 {
-                            result = integrator.run_once()?;
-                            if let Some(followup) =
-                                integrator.with_repo_lease(|| communicator.sync())?
-                            {
-                                for error in followup.errors {
-                                    eprintln!("{error}");
-                                }
-                            }
-                        }
+                let store = iq::control_store::ControlStore::open(&db_path)?;
+                iq::state_repository::process_issue_reservation_outbox(&store, 1000)?;
+                for effort in store.inbox(1000)? {
+                    if let Err(error) =
+                        iq::state_repository::ingest_answers(&store, &effort.item_id)
+                    {
+                        eprintln!(
+                            "state repository answer ingestion failed for {}: {error:#}",
+                            effort.item_id
+                        );
                     }
                 }
+                for item_id in store.projection_items(1000)? {
+                    if let Err(error) = iq::state_repository::project_item(&store, &item_id) {
+                        eprintln!("state repository projection failed for {item_id}: {error:#}");
+                    }
+                }
+                store.alert_exhausted_projection_debt(
+                    system_config.notifications.projection_debt_alert_seconds,
+                )?;
+                let result = integrator.run_once()?;
+                for item_id in store.projection_items(1000)? {
+                    if let Err(error) = iq::state_repository::project_item(&store, &item_id) {
+                        eprintln!("state repository projection failed for {item_id}: {error:#}");
+                    }
+                }
+                while notifications.dispatch_once()? != 0 {}
                 Ok(result)
             };
             match cycle() {
@@ -2680,15 +2777,6 @@ fn read_daemon_config(config_path: &std::path::Path) -> Result<ValidatedDaemonCo
     let config: DaemonConfig = serde_yaml::from_str(&contents)
         .with_context(|| format!("parse daemon config {}", config_path.display()))?;
     validate_daemon_config(&config, true)
-}
-
-impl From<IssueProviderArg> for IssueProvider {
-    fn from(value: IssueProviderArg) -> Self {
-        match value {
-            IssueProviderArg::Github => IssueProvider::GitHub,
-            IssueProviderArg::Gitlab => IssueProvider::GitLab,
-        }
-    }
 }
 
 #[cfg(test)]

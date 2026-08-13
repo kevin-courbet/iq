@@ -1,57 +1,15 @@
-use iq::core::{BlockedPhase, BlockedReason, BlockedState, QueueStatus, StateMachine};
-use iq::issue_backends::{
-    issue_adapter_for_provider, IssueBackendAdapter, IssueProvider, IssueSyncTarget,
-    MarkdownIssueBackend,
-};
+use iq::core::{BlockedPhase, BlockedReason, QueueStatus};
+use iq::issue_backends::{issue_adapter_for_provider, IssueProvider, IssueSyncTarget};
 use iq::providers::{provider_for_url, ProviderGate};
 use iq::sqlite::{EnqueueRequest, SqliteQueue};
 use rusqlite::{params, Connection};
 use std::fs;
-use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use tempfile::tempdir;
 
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
-}
-
-#[test]
-fn state_machine_rejects_invalid_transition_and_resumes_by_block_reason() {
-    let machine = StateMachine;
-
-    assert!(machine
-        .transition(QueueStatus::Ready, QueueStatus::Validated)
-        .is_err());
-    assert!(machine
-        .transition(QueueStatus::Ready, QueueStatus::Merging)
-        .is_ok());
-    assert!(machine
-        .transition(QueueStatus::Merging, QueueStatus::Blocked)
-        .is_ok());
-    assert!(machine
-        .transition(QueueStatus::Blocked, QueueStatus::Merging)
-        .is_err());
-    assert!(machine
-        .transition(QueueStatus::Blocked, QueueStatus::Ready)
-        .is_err());
-    assert_eq!(
-        machine
-            .resume_target(&BlockedState {
-                phase: BlockedPhase::Merging,
-                reason: BlockedReason::NeedsUserInput,
-                prompt_id: Some("prompt-1".into()),
-            })
-            .unwrap(),
-        QueueStatus::Merging
-    );
-    assert!(machine
-        .resume_target(&BlockedState {
-            phase: BlockedPhase::Merging,
-            reason: BlockedReason::NeedsAgentFix,
-            prompt_id: None,
-        })
-        .is_err());
 }
 
 #[test]
@@ -68,6 +26,7 @@ fn sqlite_enqueue_is_idempotent_but_rejects_active_head_changes() {
             current_head_sha: "111".into(),
             pr_url: None,
             producer_metadata: serde_json::json!({"worker":"W001"}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
         })
         .unwrap();
     let repeated = queue
@@ -79,6 +38,7 @@ fn sqlite_enqueue_is_idempotent_but_rejects_active_head_changes() {
             current_head_sha: "111".into(),
             pr_url: None,
             producer_metadata: serde_json::json!({"worker":"W001"}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
         })
         .unwrap();
     let changed = queue.enqueue(EnqueueRequest {
@@ -89,122 +49,13 @@ fn sqlite_enqueue_is_idempotent_but_rejects_active_head_changes() {
         current_head_sha: "222".into(),
         pr_url: None,
         producer_metadata: serde_json::json!({"worker":"W001","attempt":2}),
+        state_repository: iq::control_domain::StateRepositorySnapshot::Local,
     });
 
     assert_eq!(first.id, repeated.id);
     assert!(changed.is_err());
     assert_eq!(queue.get_item(&first.id).unwrap().current_head_sha, "111");
     assert_eq!(queue.list_items().unwrap().len(), 1);
-}
-
-#[test]
-fn blocked_user_prompt_answer_resumes_phase_but_agent_fix_requires_requeue() {
-    let temp = tempdir().unwrap();
-    let queue = SqliteQueue::open(&temp.path().join("queues.db")).unwrap();
-    let item = queue
-        .enqueue(EnqueueRequest {
-            repo_key: "repo::main".into(),
-            repo_path: "/repo".into(),
-            source_branch: "agent/one".into(),
-            target_branch: "main".into(),
-            current_head_sha: "111".into(),
-            pr_url: None,
-            producer_metadata: serde_json::json!({"worker":"W001"}),
-        })
-        .unwrap();
-    let item = queue
-        .transition_item(&item.id, QueueStatus::Merging)
-        .unwrap();
-
-    let prompt_id = queue
-        .block_item(
-            &item.id,
-            BlockedPhase::Merging,
-            BlockedReason::NeedsUserInput,
-            "resolve conflict",
-        )
-        .unwrap();
-    let generic_resume = queue.transition_item(&item.id, QueueStatus::Merging);
-    assert!(generic_resume.is_err());
-    assert_eq!(
-        queue.get_item(&item.id).unwrap().status,
-        QueueStatus::Blocked
-    );
-    assert!(queue.retry_blocked(&item.id).is_err());
-    let resumed = queue
-        .answer_prompt(&prompt_id, "use source", "user")
-        .unwrap();
-    assert_eq!(resumed.status, QueueStatus::Merging);
-    queue
-        .set_workspace_intent(&item.id, "/workspaces/item")
-        .unwrap();
-    queue
-        .set_workspace_identity(&item.id, "/workspaces/item", "rift-id", "source-rift-id")
-        .unwrap();
-    let validating = queue
-        .transition_item(&item.id, QueueStatus::Merged)
-        .unwrap();
-    let validating = queue
-        .transition_item(&validating.id, QueueStatus::Validating)
-        .unwrap();
-
-    queue
-        .block_item(
-            &validating.id,
-            BlockedPhase::Validating,
-            BlockedReason::NeedsAgentFix,
-            "validation failed",
-        )
-        .unwrap();
-    let still_blocked = queue.answer_prompt(&prompt_id, "ignored duplicate", "user");
-    assert!(still_blocked.is_err());
-    let generic_requeue = queue.transition_item(&item.id, QueueStatus::Ready);
-    assert!(generic_requeue.is_err());
-    assert_eq!(
-        queue.get_item(&item.id).unwrap().status,
-        QueueStatus::Blocked
-    );
-    assert!(queue.retry_blocked(&item.id).is_err());
-    let ready = queue.requeue_agent_fix(&item.id, "333").unwrap();
-    assert_eq!(ready.status, QueueStatus::Ready);
-    assert_eq!(ready.current_head_sha, "333");
-}
-
-#[test]
-fn retrying_infrastructure_block_uses_typed_operation() {
-    let temp = tempdir().unwrap();
-    let queue = SqliteQueue::open(&temp.path().join("queues.db")).unwrap();
-    let item = queue
-        .enqueue(EnqueueRequest {
-            repo_key: "repo::main".into(),
-            repo_path: "/repo".into(),
-            source_branch: "agent/one".into(),
-            target_branch: "main".into(),
-            current_head_sha: "111".into(),
-            pr_url: None,
-            producer_metadata: serde_json::json!({"worker":"W001"}),
-        })
-        .unwrap();
-    queue
-        .transition_item(&item.id, QueueStatus::Merging)
-        .unwrap();
-    queue
-        .block_item(
-            &item.id,
-            BlockedPhase::Merging,
-            BlockedReason::Infra,
-            "workspace unavailable",
-        )
-        .unwrap();
-
-    assert!(queue
-        .transition_item(&item.id, QueueStatus::Merging)
-        .is_err());
-    let retrying = queue.retry_blocked(&item.id).unwrap();
-
-    assert_eq!(retrying.status, QueueStatus::Merging);
-    assert_eq!(retrying.blocked_reason, None);
-    assert_eq!(retrying.blocked_phase, None);
 }
 
 #[test]
@@ -221,6 +72,7 @@ fn sqlite_read_fails_on_corrupt_persisted_json_fields() {
             current_head_sha: "111".into(),
             pr_url: None,
             producer_metadata: serde_json::json!({"worker":"W001"}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
         })
         .unwrap();
     queue
@@ -259,7 +111,7 @@ fn sqlite_read_fails_on_corrupt_persisted_json_fields() {
 }
 
 #[test]
-fn schema_v8_preserves_terminal_attempt_policy_as_opaque_history() {
+fn schema_v9_migration_preserves_terminal_attempt_policy_as_opaque_history() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("queues.db");
     let queue = SqliteQueue::open(&db).unwrap();
@@ -272,6 +124,7 @@ fn schema_v8_preserves_terminal_attempt_policy_as_opaque_history() {
             current_head_sha: "111".into(),
             pr_url: None,
             producer_metadata: serde_json::json!({"worker":"W001"}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
         })
         .unwrap();
     let (_, attempt) = queue.claim_next_ready("repo::main").unwrap().unwrap();
@@ -281,16 +134,17 @@ fn schema_v8_preserves_terminal_attempt_policy_as_opaque_history() {
     drop(queue);
 
     let connection = Connection::open(&db).unwrap();
-    mark_database_as_v7(&connection);
+    mark_database_as_v8(&connection);
     connection
         .execute(
-            "UPDATE integration_attempts SET policy_target_sha='legacy-target',policy_snapshot_json='opaque legacy policy',policy_digest='opaque legacy digest' WHERE id=?1",
+            "UPDATE integration_attempts SET policy_snapshot_json='opaque legacy policy',policy_digest='opaque legacy digest' WHERE id=?1",
             params![attempt.id],
         )
         .unwrap();
     drop(connection);
+    let system_config = write_system_config(temp.path());
 
-    let migrated = SqliteQueue::open(&db).unwrap();
+    let migrated = SqliteQueue::migrate_v8(&db, &system_config).unwrap();
     let migrated_attempt = migrated.get_attempt(&attempt.id).unwrap();
     assert_eq!(
         migrated_attempt.policy_snapshot_json.as_deref(),
@@ -309,19 +163,12 @@ fn schema_v8_preserves_terminal_attempt_policy_as_opaque_history() {
             |row| row.get(0),
         )
         .unwrap();
-    let retired_columns: i64 = connection
-        .query_row(
-            "SELECT (SELECT COUNT(*) FROM pragma_table_info('registered_repositories') WHERE name IN ('policy_target_sha','policy_snapshot_json','policy_digest')) + (SELECT COUNT(*) FROM pragma_table_info('integration_attempts') WHERE name='policy_target_sha')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(version, "8");
-    assert_eq!(retired_columns, 0);
+    assert_eq!(version, "9");
+    assert!(temp.path().join("queues.db.schema-v8.backup").exists());
 }
 
 #[test]
-fn schema_v8_rejects_nonterminal_queue_items() {
+fn schema_v9_migration_rejects_ambiguous_active_items() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("queues.db");
     let queue = SqliteQueue::open(&db).unwrap();
@@ -334,19 +181,21 @@ fn schema_v8_rejects_nonterminal_queue_items() {
             current_head_sha: "111".into(),
             pr_url: None,
             producer_metadata: serde_json::json!({"worker":"W001"}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
         })
         .unwrap();
     drop(queue);
 
     let connection = Connection::open(&db).unwrap();
-    mark_database_as_v7(&connection);
+    mark_database_as_v8(&connection);
     drop(connection);
+    let system_config = write_system_config(temp.path());
 
-    let error = match SqliteQueue::open(&db) {
+    let error = match SqliteQueue::migrate_v8(&db, &system_config) {
         Ok(_) => panic!("nonterminal queue migrated"),
         Err(error) => format!("{error:#}"),
     };
-    assert!(error.contains("1 nonterminal queue item"));
+    assert!(error.contains("lacks attempt identity"), "{error}");
     let connection = Connection::open(&db).unwrap();
     let version: String = connection
         .query_row(
@@ -355,11 +204,11 @@ fn schema_v8_rejects_nonterminal_queue_items() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "7");
+    assert_eq!(version, "8");
 }
 
 #[test]
-fn schema_v8_rejects_active_repository_leases() {
+fn schema_v9_migration_rejects_active_repository_leases() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("queues.db");
     let queue = SqliteQueue::open(&db).unwrap();
@@ -367,14 +216,15 @@ fn schema_v8_rejects_active_repository_leases() {
     drop(queue);
 
     let connection = Connection::open(&db).unwrap();
-    mark_database_as_v7(&connection);
+    mark_database_as_v8(&connection);
     drop(connection);
+    let system_config = write_system_config(temp.path());
 
-    let error = match SqliteQueue::open(&db) {
+    let error = match SqliteQueue::migrate_v8(&db, &system_config) {
         Ok(_) => panic!("active lease migrated"),
         Err(error) => format!("{error:#}"),
     };
-    assert!(error.contains("1 active repository operation lease"));
+    assert!(error.contains("no active repository-operation or daemon lease"));
     let connection = Connection::open(&db).unwrap();
     let version: String = connection
         .query_row(
@@ -383,24 +233,30 @@ fn schema_v8_rejects_active_repository_leases() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "7");
+    assert_eq!(version, "8");
 }
 
-fn mark_database_as_v7(connection: &Connection) {
+fn mark_database_as_v8(connection: &Connection) {
     connection
         .execute_batch(
-            "ALTER TABLE integration_attempts ADD COLUMN policy_target_sha TEXT;
-             ALTER TABLE registered_repositories ADD COLUMN policy_target_sha TEXT NOT NULL DEFAULT '';
-             ALTER TABLE registered_repositories ADD COLUMN policy_snapshot_json TEXT NOT NULL DEFAULT '';
-             ALTER TABLE registered_repositories ADD COLUMN policy_digest TEXT NOT NULL DEFAULT '';",
+            "CREATE TABLE communication_bindings(id TEXT PRIMARY KEY);
+             CREATE TABLE communication_response_receipts(id TEXT PRIMARY KEY);
+             UPDATE queue_metadata SET value='8' WHERE key='workspace_schema_version';",
         )
         .unwrap();
-    connection
-        .execute(
-            "UPDATE queue_metadata SET value='7' WHERE key='workspace_schema_version'",
-            [],
-        )
-        .unwrap();
+}
+
+fn write_system_config(root: &std::path::Path) -> std::path::PathBuf {
+    let path = root.join("system.yaml");
+    fs::write(
+        &path,
+        format!(
+            "integration_agent:\n  runner: opencode\n  executable: /bin/true\n  agent: iq-integration\n  model: test/model\n  cycle_timeout_seconds: 10\n  max_log_bytes: 4096\n  max_result_bytes: 4096\n  max_processes: 4\n  memory_bytes: 67108864\n  cpu_seconds: 10\n  writable_bytes: 1048576\n  open_files: 64\n  credential_env: TEST_MODEL_KEY\ncontrol_plane:\n  unix_socket: {}/control.sock\n  max_request_bytes: 4096\n  max_free_text_bytes: 1024\n  max_response_bytes: 4096\n  max_concurrent_clients: 2\n  max_client_queue_bytes: 4096\n  max_stream_backlog_events: 100\n  client_idle_seconds: 5\nnotifications:\n  backends: []\n  max_attempts: 2\n  max_event_age_seconds: 60\n  projection_debt_alert_seconds: 60\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+    path
 }
 
 #[test]
@@ -476,6 +332,7 @@ fn claim_next_ready_holds_queue_behind_oldest_active_item() {
             current_head_sha: "111".into(),
             pr_url: None,
             producer_metadata: serde_json::json!({"worker":"W001"}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
         })
         .unwrap();
     let second = queue
@@ -487,6 +344,7 @@ fn claim_next_ready_holds_queue_behind_oldest_active_item() {
             current_head_sha: "222".into(),
             pr_url: None,
             producer_metadata: serde_json::json!({"worker":"W002"}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
         })
         .unwrap();
 
@@ -496,7 +354,7 @@ fn claim_next_ready_holds_queue_behind_oldest_active_item() {
         .block_item(
             &first.id,
             BlockedPhase::Merging,
-            BlockedReason::NeedsUserInput,
+            BlockedReason::Infra,
             "resolve first before later work starts",
         )
         .unwrap();
@@ -506,57 +364,6 @@ fn claim_next_ready_holds_queue_behind_oldest_active_item() {
         queue.get_item(&second.id).unwrap().status,
         QueueStatus::Ready
     );
-}
-
-#[test]
-fn issue_backend_projection_carries_item_state_events_and_prompts() {
-    let temp = tempdir().unwrap();
-    let queue = SqliteQueue::open(&temp.path().join("queues.db")).unwrap();
-    let item = queue
-        .enqueue(EnqueueRequest {
-            repo_key: "repo::main".into(),
-            repo_path: "/repo".into(),
-            source_branch: "agent/one".into(),
-            target_branch: "main".into(),
-            current_head_sha: "111".into(),
-            pr_url: Some("https://github.com/org/repo/pull/7".into()),
-            producer_metadata: serde_json::json!({"worker":"W001"}),
-        })
-        .unwrap();
-    queue
-        .transition_item(&item.id, QueueStatus::Merging)
-        .unwrap();
-    let prompt_id = queue
-        .block_item(
-            &item.id,
-            BlockedPhase::Merging,
-            BlockedReason::NeedsUserInput,
-            "resolve conflict",
-        )
-        .unwrap();
-    let prompt = queue.get_prompt(&prompt_id).unwrap();
-    let item = queue.get_item(&item.id).unwrap();
-    let events = queue.events(&item.id).unwrap();
-
-    let projection = MarkdownIssueBackend {
-        provider: IssueProvider::GitHub,
-    }
-    .project_item(&item, &events, &[prompt]);
-
-    assert!(projection.labels.contains(&"iq:status:blocked".into()));
-    assert!(projection
-        .labels
-        .contains(&"iq:blocked:needs_user_input".into()));
-    assert!(projection.body.contains("<!-- iq:item:"));
-    assert!(projection.body.contains("agent/one"));
-    assert!(projection
-        .comments
-        .iter()
-        .any(|comment| comment.contains("<!-- iq:prompt:")));
-    assert!(projection
-        .comments
-        .iter()
-        .any(|comment| comment.contains("resolve conflict")));
 }
 
 #[test]
@@ -590,7 +397,14 @@ fn github_provider_adapter_maps_cli_checks_to_gate_state() {
 }
 
 #[test]
-fn github_issue_backend_syncs_projection_and_ingests_prompt_answers() {
+fn provider_selection_rejects_malformed_supported_host_urls() {
+    assert!(provider_for_url("https://github.com/org/repo").is_err());
+    assert!(provider_for_url("https://gitlab.com/group/project/merge_requests/7").is_err());
+    assert!(provider_for_url("ssh://github.com/org/repo/pull/7").is_err());
+}
+
+#[test]
+fn github_issue_backend_syncs_projection() {
     let _guard = env_lock().lock().unwrap();
     let temp = tempdir().unwrap();
     let fake = temp.path().join("fake-gh");
@@ -639,21 +453,10 @@ exit 0
             &projection,
         )
         .unwrap();
-    let answers = adapter
-        .ingest_prompt_answers(&IssueSyncTarget {
-            repo: "org/repo".into(),
-            issue: Some(synced.issue),
-        })
-        .unwrap();
-
     let captured = fs::read_to_string(&log).unwrap();
     assert!(captured.contains("issue create"), "{captured}");
     assert!(captured.contains("issue comment 42"), "{captured}");
     assert_eq!(synced.url, "https://github.com/org/repo/issues/42");
-    assert_eq!(answers.len(), 1);
-    assert_eq!(answers[0].prompt_id, "prompt-1");
-    assert_eq!(answers[0].answer, "use source");
-    assert_eq!(answers[0].answered_by.as_deref(), Some("octo"));
     std::env::remove_var("IQ_GITHUB_CLI");
 }
 
@@ -799,67 +602,4 @@ exit 0
         "{captured}"
     );
     std::env::remove_var("IQ_GITLAB_CLI");
-}
-
-#[test]
-fn issue_answer_ingest_exits_nonzero_on_apply_failure_unless_best_effort() {
-    let _guard = env_lock().lock().unwrap();
-    let temp = tempdir().unwrap();
-    let fake = temp.path().join("fake-gh");
-    fs::write(
-        &fake,
-        r#"#!/bin/sh
-if [ "$1 $2" = "issue view" ]; then
-  printf '%s' '{"comments":[{"body":"iq answer missing-prompt use source","author":{"login":"octo"}}]}'
-  exit 0
-fi
-exit 0
-"#,
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(&fake).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&fake, permissions).unwrap();
-    }
-    std::env::set_var("IQ_GITHUB_CLI", &fake);
-    let db = temp.path().join("queues.db");
-
-    let strict = Command::new(env!("CARGO_BIN_EXE_iq"))
-        .args([
-            "--queue-db",
-            db.to_str().unwrap(),
-            "issue",
-            "ingest-answers",
-            "--provider",
-            "github",
-            "--repo",
-            "org/repo",
-            "--issue",
-            "42",
-        ])
-        .output()
-        .unwrap();
-    assert!(!strict.status.success());
-
-    let best_effort = Command::new(env!("CARGO_BIN_EXE_iq"))
-        .args([
-            "--queue-db",
-            db.to_str().unwrap(),
-            "issue",
-            "ingest-answers",
-            "--provider",
-            "github",
-            "--repo",
-            "org/repo",
-            "--issue",
-            "42",
-            "--best-effort",
-        ])
-        .output()
-        .unwrap();
-    assert!(best_effort.status.success());
-    std::env::remove_var("IQ_GITHUB_CLI");
 }

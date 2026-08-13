@@ -7,7 +7,7 @@ use iq::integrator::{
 };
 use iq::sqlite::{EnqueueRequest, SqliteQueue};
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -51,6 +51,7 @@ fn direct_landing_integrates_only_after_remote_target_contains_landed_commit() {
             current_head_sha: source_head,
             pr_url: None,
             producer_metadata: serde_json::json!({"worker":"W001"}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
         })
         .unwrap();
 
@@ -58,12 +59,13 @@ fn direct_landing_integrates_only_after_remote_target_contains_landed_commit() {
         .integrator(IntegratorOptions {
             repo_key: repo_key.into(),
             repo_path: fixture.repo.clone(),
-            queue_db: db,
+            queue_db: db.clone(),
             owner_id: "test-integrator".into(),
             lease_ttl_seconds: 30,
             base_remote: "origin".into(),
             workspace_root: fixture.temp.path().join("workspaces"),
             rift_database: Some(fixture.rift_database.clone()),
+            system_config: fixture.system_config(),
         })
         .unwrap();
 
@@ -109,6 +111,7 @@ fn no_validation_accepts_exact_candidate_and_reports_skipped_policy() {
             current_head_sha: source_head,
             pr_url: None,
             producer_metadata: serde_json::json!({"worker":"W001"}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
         })
         .unwrap();
 
@@ -116,12 +119,13 @@ fn no_validation_accepts_exact_candidate_and_reports_skipped_policy() {
         .integrator(IntegratorOptions {
             repo_key: repo_key.into(),
             repo_path: fixture.repo.clone(),
-            queue_db: db,
+            queue_db: db.clone(),
             owner_id: "test-integrator".into(),
             lease_ttl_seconds: 30,
             base_remote: "origin".into(),
             workspace_root: fixture.temp.path().join("workspaces"),
             rift_database: Some(fixture.rift_database.clone()),
+            system_config: fixture.system_config(),
         })
         .unwrap();
 
@@ -166,7 +170,7 @@ fn local_policy_is_optional_strict_and_untracked() {
 
     fs::write(
         temp.path().join(".iq/config.json"),
-        br#"{"version":1,"integration":{"validation":{"command":"git diff --check"},"signoff":{"mode":"none"}}}"#,
+        br#"{"version":2,"integration":{"validation":{"command":"git diff --check"},"signoff":{"mode":"none"}}}"#,
     )
     .unwrap();
     let (configured, snapshot, digest) = load_local_policy(temp.path()).unwrap();
@@ -215,8 +219,9 @@ fn tracked_local_policy_is_rejected_before_landing() {
     let source_head = fixture.create_source_branch(
         "agent/tracked-policy",
         ".iq/config.json",
-        r#"{"version":1}"#,
+        r#"{"version":2}"#,
     );
+    git(&fixture.repo, ["checkout", "main"]).unwrap();
     let db = fixture.temp.path().join("queues.db");
     let queue = SqliteQueue::open(&db).unwrap();
     let item = queue
@@ -228,27 +233,35 @@ fn tracked_local_policy_is_rejected_before_landing() {
             current_head_sha: source_head,
             pr_url: None,
             producer_metadata: serde_json::json!({"worker":"W001"}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
         })
         .unwrap();
     let integrator = fixture
         .integrator(IntegratorOptions {
             repo_key: "fixture::main".into(),
             repo_path: fixture.repo.clone(),
-            queue_db: db,
+            queue_db: db.clone(),
             owner_id: "test-integrator".into(),
             lease_ttl_seconds: 30,
             base_remote: "origin".into(),
             workspace_root: fixture.temp.path().join("workspaces"),
             rift_database: Some(fixture.rift_database.clone()),
+            system_config: fixture.system_config(),
         })
         .unwrap();
 
     let blocked = integrator.run_once().unwrap().unwrap();
 
     assert_eq!(blocked.id, item.id);
-    assert_eq!(blocked.status, QueueStatus::Blocked);
-    assert_eq!(blocked.blocked_phase, Some(BlockedPhase::Integrating));
-    assert_eq!(blocked.blocked_reason, Some(BlockedReason::NeedsAgentFix));
+    let effort = iq::control_store::ControlStore::open(queue.path())
+        .unwrap()
+        .effort_for_item(&item.id)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        effort.state,
+        iq::control_domain::IntegrationEffortState::InfrastructureBlocked(_)
+    ));
     assert!(blocked.landed_commit_sha.is_none());
 }
 
@@ -287,6 +300,7 @@ fn registered_attempt_snapshots_local_policy_once() {
             base_remote: "origin".into(),
             workspace_root: fixture.temp.path().join("host-policy-workspaces"),
             rift_database: Some(fixture.rift_database.clone()),
+            system_config: fixture.system_config(),
         },
         IntegrationPolicy::Validation {
             command: "git diff --check".into(),
@@ -312,7 +326,7 @@ fn registered_attempt_snapshots_local_policy_once() {
     fs::write(
         &config_path,
         serde_json::to_vec(&serde_json::json!({
-            "version": 1,
+            "version": 2,
             "integration": {
                 "validation": {"command": command},
                 "signoff": {"mode": "none"}
@@ -330,6 +344,7 @@ fn registered_attempt_snapshots_local_policy_once() {
             current_head_sha: first_sha,
             pr_url: None,
             producer_metadata: serde_json::json!({"worker":"W001"}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
         })
         .unwrap();
     let second = queue
@@ -341,6 +356,7 @@ fn registered_attempt_snapshots_local_policy_once() {
             current_head_sha: second_sha,
             pr_url: None,
             producer_metadata: serde_json::json!({"worker":"W002"}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
         })
         .unwrap();
     let integrator = Integrator::new(IntegratorOptions {
@@ -352,6 +368,7 @@ fn registered_attempt_snapshots_local_policy_once() {
         base_remote: "origin".into(),
         workspace_root: fixture.temp.path().join("integration-workspaces"),
         rift_database: Some(fixture.rift_database.clone()),
+        system_config: fixture.system_config(),
     })
     .unwrap();
 
@@ -408,6 +425,7 @@ fn integrator_refuses_to_transition_after_lease_owner_changes() {
             current_head_sha: source_head,
             pr_url: None,
             producer_metadata: serde_json::json!({"worker":"W001"}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
         })
         .unwrap();
     let integrator = fixture
@@ -420,6 +438,7 @@ fn integrator_refuses_to_transition_after_lease_owner_changes() {
             base_remote: "origin".into(),
             workspace_root: fixture.temp.path().join("workspaces"),
             rift_database: Some(fixture.rift_database.clone()),
+            system_config: fixture.system_config(),
         })
         .unwrap();
     let result = integrator.run_once();
@@ -461,6 +480,7 @@ fn source_branch_head_mismatch_blocks_without_integrating_moved_code() {
             current_head_sha: source_head,
             pr_url: None,
             producer_metadata: serde_json::json!({"worker":"W004"}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
         })
         .unwrap();
     fs::write(fixture.repo.join("moved.txt"), "not accepted\n").unwrap();
@@ -479,6 +499,7 @@ fn source_branch_head_mismatch_blocks_without_integrating_moved_code() {
             base_remote: "origin".into(),
             workspace_root: fixture.temp.path().join("workspaces"),
             rift_database: Some(fixture.rift_database.clone()),
+            system_config: fixture.system_config(),
         })
         .unwrap();
 
@@ -502,127 +523,6 @@ fn source_branch_head_mismatch_blocks_without_integrating_moved_code() {
 }
 
 #[test]
-fn answered_merge_conflict_resumes_same_attempt_and_integrates() {
-    let fixture = GitFixture::new(true);
-    let source_head = fixture.create_source_branch("agent/conflict", "conflict.txt", "source\n");
-    git(&fixture.repo, ["push", "-u", "origin", "agent/conflict"]).unwrap();
-    fixture.commit_on_main("conflict.txt", "target\n");
-    let db = fixture.temp.path().join("queues.db");
-    let queue = SqliteQueue::open(&db).unwrap();
-    let repo_key = "fixture::main";
-    let item = queue
-        .enqueue(EnqueueRequest {
-            repo_key: repo_key.into(),
-            repo_path: fixture.repo.to_string_lossy().to_string(),
-            source_branch: "agent/conflict".into(),
-            target_branch: "main".into(),
-            current_head_sha: source_head,
-            pr_url: None,
-            producer_metadata: serde_json::json!({"worker":"W002"}),
-        })
-        .unwrap();
-
-    let integrator = fixture
-        .integrator(IntegratorOptions {
-            repo_key: repo_key.into(),
-            repo_path: fixture.repo.clone(),
-            queue_db: db.clone(),
-            owner_id: "test-integrator".into(),
-            lease_ttl_seconds: 30,
-            base_remote: "origin".into(),
-            workspace_root: fixture.temp.path().join("workspaces"),
-            rift_database: Some(fixture.rift_database.clone()),
-        })
-        .unwrap();
-    let blocked = integrator.run_once().unwrap().unwrap();
-    assert_eq!(blocked.status, QueueStatus::Blocked);
-    assert_eq!(blocked.blocked_phase, Some(BlockedPhase::Merging));
-    assert_eq!(
-        blocked.conflict.as_ref().unwrap()["files"][0],
-        "conflict.txt"
-    );
-    let prompt_id = blocked.validation_evidence["prompt_id"].as_str().unwrap();
-    let resumed = queue
-        .answer_prompt(prompt_id, "use source", "user")
-        .unwrap();
-    assert_eq!(resumed.status, QueueStatus::Merging);
-
-    let integrated = integrator.resume_item(&item.id).unwrap();
-
-    assert_eq!(integrated.status, QueueStatus::Integrated);
-    let remote_main = git_output(&fixture.repo, ["rev-parse", "refs/remotes/origin/main"]).unwrap();
-    assert_eq!(
-        integrated.landed_commit_sha.as_deref(),
-        Some(remote_main.as_str())
-    );
-}
-
-#[test]
-fn merge_resume_without_current_answered_prompt_does_not_accept_workspace_resolution() {
-    let fixture = GitFixture::new(true);
-    let source_head =
-        fixture.create_source_branch("agent/missing-answer", "conflict.txt", "source\n");
-    git(
-        &fixture.repo,
-        ["push", "-u", "origin", "agent/missing-answer"],
-    )
-    .unwrap();
-    fixture.commit_on_main("conflict.txt", "target\n");
-    let db = fixture.temp.path().join("queues.db");
-    let queue = SqliteQueue::open(&db).unwrap();
-    let repo_key = "fixture::main";
-    let item = queue
-        .enqueue(EnqueueRequest {
-            repo_key: repo_key.into(),
-            repo_path: fixture.repo.to_string_lossy().to_string(),
-            source_branch: "agent/missing-answer".into(),
-            target_branch: "main".into(),
-            current_head_sha: source_head,
-            pr_url: None,
-            producer_metadata: serde_json::json!({"worker":"W004"}),
-        })
-        .unwrap();
-
-    let integrator = fixture
-        .integrator(IntegratorOptions {
-            repo_key: repo_key.into(),
-            repo_path: fixture.repo.clone(),
-            queue_db: db.clone(),
-            owner_id: "test-integrator".into(),
-            lease_ttl_seconds: 30,
-            base_remote: "origin".into(),
-            workspace_root: fixture.temp.path().join("workspaces"),
-            rift_database: Some(fixture.rift_database.clone()),
-        })
-        .unwrap();
-    let blocked = integrator.run_once().unwrap().unwrap();
-    assert_eq!(blocked.status, QueueStatus::Blocked);
-    let workspace = blocked
-        .workspace
-        .path()
-        .map(std::path::PathBuf::from)
-        .unwrap();
-    fs::write(workspace.join("conflict.txt"), "source\n").unwrap();
-    git(&workspace, ["add", "conflict.txt"]).unwrap();
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    conn.execute(
-        "UPDATE queue_items SET status='merging',blocked_phase=NULL,blocked_reason=NULL,blocked_message=NULL,prompt_id=NULL WHERE id=?1",
-        [&blocked.id],
-    )
-    .unwrap();
-
-    let result = integrator.resume_item(&item.id);
-
-    assert!(result.is_err());
-    let remote_contents = git_output(
-        &fixture.repo,
-        ["show", "refs/remotes/origin/main:conflict.txt"],
-    )
-    .unwrap();
-    assert_eq!(remote_contents, "target");
-}
-
-#[test]
 fn daemon_run_holds_later_ready_item_behind_oldest_blocked_item() {
     let fixture = GitFixture::new(true);
     let source_head = fixture.create_source_branch("agent/conflict", "conflict.txt", "source\n");
@@ -640,6 +540,7 @@ fn daemon_run_holds_later_ready_item_behind_oldest_blocked_item() {
             current_head_sha: source_head,
             pr_url: None,
             producer_metadata: serde_json::json!({"worker":"W002"}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
         })
         .unwrap();
     let later = queue
@@ -651,6 +552,7 @@ fn daemon_run_holds_later_ready_item_behind_oldest_blocked_item() {
             current_head_sha: later_head,
             pr_url: None,
             producer_metadata: serde_json::json!({"worker":"W004"}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
         })
         .unwrap();
 
@@ -658,22 +560,42 @@ fn daemon_run_holds_later_ready_item_behind_oldest_blocked_item() {
         .integrator(IntegratorOptions {
             repo_key: repo_key.into(),
             repo_path: fixture.repo.clone(),
-            queue_db: db,
+            queue_db: db.clone(),
             owner_id: "test-integrator".into(),
             lease_ttl_seconds: 30,
             base_remote: "origin".into(),
             workspace_root: fixture.temp.path().join("workspaces"),
             rift_database: Some(fixture.rift_database.clone()),
+            system_config: fixture.system_config(),
         })
         .unwrap();
     let blocked = integrator.run_once().unwrap().unwrap();
     assert_eq!(blocked.id, first.id);
-    assert_eq!(blocked.status, QueueStatus::Blocked);
+    let effort = iq::control_store::ControlStore::open(&db)
+        .unwrap()
+        .effort_for_item(&first.id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(
+            effort.state,
+            iq::control_domain::IntegrationEffortState::GuidanceRequired(_)
+        ),
+        "{:?}",
+        effort.state
+    );
 
     let held = integrator.run_once().unwrap().unwrap();
 
     assert_eq!(held.id, first.id);
-    assert_eq!(held.status, QueueStatus::Blocked);
+    assert_eq!(
+        iq::control_store::ControlStore::open(queue.path())
+            .unwrap()
+            .inbox(10)
+            .unwrap()[0]
+            .item_id,
+        first.id
+    );
     assert_eq!(
         queue.get_item(&later.id).unwrap().status,
         QueueStatus::Ready
@@ -681,126 +603,42 @@ fn daemon_run_holds_later_ready_item_behind_oldest_blocked_item() {
 }
 
 #[test]
-fn daemon_run_resumes_oldest_answered_item_before_claiming_later_ready_item() {
-    let fixture = GitFixture::new(true);
-    let source_head = fixture.create_source_branch("agent/conflict", "conflict.txt", "source\n");
-    fixture.commit_on_main("conflict.txt", "target\n");
-    let later_head = fixture.create_source_branch("agent/later", "later.txt", "later\n");
-    let db = fixture.temp.path().join("queues.db");
-    let queue = SqliteQueue::open(&db).unwrap();
-    let repo_key = "fixture::main";
-    let first = queue
-        .enqueue(EnqueueRequest {
-            repo_key: repo_key.into(),
-            repo_path: fixture.repo.to_string_lossy().to_string(),
-            source_branch: "agent/conflict".into(),
-            target_branch: "main".into(),
-            current_head_sha: source_head,
-            pr_url: None,
-            producer_metadata: serde_json::json!({"worker":"W002"}),
-        })
-        .unwrap();
-    let later = queue
-        .enqueue(EnqueueRequest {
-            repo_key: repo_key.into(),
-            repo_path: fixture.repo.to_string_lossy().to_string(),
-            source_branch: "agent/later".into(),
-            target_branch: "main".into(),
-            current_head_sha: later_head,
-            pr_url: None,
-            producer_metadata: serde_json::json!({"worker":"W004"}),
-        })
-        .unwrap();
-
-    let integrator = fixture
-        .integrator(IntegratorOptions {
-            repo_key: repo_key.into(),
-            repo_path: fixture.repo.clone(),
-            queue_db: db.clone(),
-            owner_id: "test-integrator".into(),
-            lease_ttl_seconds: 30,
-            base_remote: "origin".into(),
-            workspace_root: fixture.temp.path().join("workspaces"),
-            rift_database: Some(fixture.rift_database.clone()),
-        })
-        .unwrap();
-    let blocked = integrator.run_once().unwrap().unwrap();
-    let prompt_id = blocked.validation_evidence["prompt_id"].as_str().unwrap();
-    queue
-        .answer_prompt(prompt_id, "use source", "user")
-        .unwrap();
-
-    let resumed = integrator.run_once().unwrap().unwrap();
-
-    assert_eq!(resumed.id, first.id);
-    assert_eq!(resumed.status, QueueStatus::Integrated);
-    assert_eq!(
-        queue.get_item(&later.id).unwrap().status,
-        QueueStatus::Ready
-    );
-}
-
-#[test]
-fn pr_backed_conflict_resolution_pushes_source_branch_before_provider_merge() {
+fn guidance_answer_starts_new_agent_process_and_lands_exact_validated_candidate() {
     let _guard = env_lock().lock().unwrap();
     let fixture = GitFixture::new(true);
-    let source_head = fixture.create_source_branch("agent/pr-conflict", "conflict.txt", "source\n");
-    git(&fixture.repo, ["push", "-u", "origin", "agent/pr-conflict"]).unwrap();
-    fixture.commit_on_main("conflict.txt", "target\n");
-    let db = fixture.temp.path().join("queues.db");
-    let queue = SqliteQueue::open(&db).unwrap();
-    let repo_key = "fixture::main";
-    let item = queue
-        .enqueue(EnqueueRequest {
-            repo_key: repo_key.into(),
-            repo_path: fixture.repo.to_string_lossy().to_string(),
-            source_branch: "agent/pr-conflict".into(),
-            target_branch: "main".into(),
-            current_head_sha: source_head.clone(),
-            pr_url: Some("https://github.com/org/repo/pull/7".into()),
-            producer_metadata: serde_json::json!({"worker":"W003"}),
-        })
-        .unwrap();
-    let fake_gh = fixture.temp.path().join("fake-gh");
-    let remote = fixture.remote.clone();
-    fs::write(
-        &fake_gh,
+    let provider = fixture.temp.path().join("fail-provider");
+    let provider_log = fixture.temp.path().join("provider-called");
+    std::fs::write(
+        &provider,
         format!(
-            r#"#!/bin/sh
-if [ "$1 $2" = "pr view" ]; then
-  if [ "$5" = "headRefOid,mergeCommit" ]; then
-    landed=$(git --git-dir={remote} rev-parse refs/heads/main)
-    head=$(git --git-dir={remote} rev-parse refs/heads/agent/pr-conflict)
-    printf '{{"headRefOid":"%s","mergeCommit":{{"oid":"%s"}}}}' "$head" "$landed"
-    exit 0
-  fi
-  head=$(git --git-dir={remote} rev-parse refs/heads/agent/pr-conflict)
-  base=$(git --git-dir={remote} rev-parse refs/heads/main)
-  printf '{{"headRefOid":"%s","baseRefOid":"%s","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","statusCheckRollup":[{{"status":"COMPLETED","conclusion":"SUCCESS"}}]}}' "$head" "$base"
-  exit 0
-fi
-if [ "$1 $2" = "pr merge" ]; then
-  git --git-dir={remote} update-ref refs/heads/main refs/heads/agent/pr-conflict
-  exit 0
-fi
-exit 2
-"#,
-            remote = remote.display()
+            "#!/bin/sh\nprintf 'called\\n' > '{}'\nexit 1\n",
+            provider_log.display()
         ),
     )
     .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(&fake_gh).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&fake_gh, permissions).unwrap();
-    }
-    std::env::set_var("IQ_GITHUB_CLI", &fake_gh);
-
+    std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var("IQ_GITHUB_CLI", &provider);
+    std::env::set_var("IQ_GITLAB_CLI", &provider);
+    let source_head =
+        fixture.create_source_branch("agent/guidance", "contract.txt", "source behavior\n");
+    fixture.commit_on_main("contract.txt", "target behavior\n");
+    let db = fixture.temp.path().join("queues.db");
+    let queue = SqliteQueue::open(&db).unwrap();
+    let item = queue
+        .enqueue(EnqueueRequest {
+            repo_key: "fixture::main".into(),
+            repo_path: fixture.repo.to_string_lossy().to_string(),
+            source_branch: "agent/guidance".into(),
+            target_branch: "main".into(),
+            current_head_sha: source_head,
+            pr_url: None,
+            producer_metadata: serde_json::json!({"worker":"W-guidance"}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
+        })
+        .unwrap();
     let integrator = fixture
         .integrator(IntegratorOptions {
-            repo_key: repo_key.into(),
+            repo_key: "fixture::main".into(),
             repo_path: fixture.repo.clone(),
             queue_db: db.clone(),
             owner_id: "test-integrator".into(),
@@ -808,25 +646,221 @@ exit 2
             base_remote: "origin".into(),
             workspace_root: fixture.temp.path().join("workspaces"),
             rift_database: Some(fixture.rift_database.clone()),
+            system_config: fixture.system_config(),
         })
         .unwrap();
+
     let blocked = integrator.run_once().unwrap().unwrap();
-    let prompt_id = blocked.validation_evidence["prompt_id"].as_str().unwrap();
-    queue
-        .answer_prompt(prompt_id, "use source", "user")
+    assert_eq!(blocked.status, QueueStatus::Blocked);
+    let store = iq::control_store::ControlStore::open(&db).unwrap();
+    let effort = store.effort_for_item(&item.id).unwrap().unwrap();
+    let iq::control_domain::IntegrationEffortState::GuidanceRequired(blocked) = &effort.state
+    else {
+        panic!(
+            "first agent cycle did not request guidance: effort={effort:?} events={:?}",
+            store.events_after(0, 100)
+        )
+    };
+    let iq::control_domain::IntegrationBlocker::SemanticGuidance(guidance) = &blocked.blocker
+    else {
+        panic!("guidance state has the wrong blocker")
+    };
+    let mut control_config = fixture.system_config().control_plane;
+    let control_temp = tempfile::Builder::new()
+        .prefix("iq-api-")
+        .tempdir_in("/tmp")
         .unwrap();
-
-    let integrated = integrator.resume_item(&item.id).unwrap();
-
-    assert_eq!(integrated.status, QueueStatus::Integrated);
-    assert_ne!(integrated.current_head_sha, source_head);
-    let source_remote = git_output(
-        &fixture.repo,
-        ["rev-parse", "refs/remotes/origin/agent/pr-conflict"],
+    std::fs::set_permissions(control_temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    control_config.unix_socket = control_temp.path().join("control.sock");
+    let socket = control_config.unix_socket.clone();
+    let server = iq::control_api::ControlApiServer::bind(
+        control_config.clone(),
+        iq::control_store::ControlStore::open(&db).unwrap(),
     )
     .unwrap();
-    assert_eq!(integrated.current_head_sha, source_remote);
+    let thread = std::thread::spawn(move || server.serve_one().unwrap());
+    let response = iq::control_api::request(
+        &socket,
+        &iq::control_api::ApiRequest::Answer {
+            answer: iq::control_store::AnswerCommand {
+                external_id: "local-guidance-answer-1".into(),
+                request_id: guidance.request_id.clone(),
+                effort_id: effort.id.clone(),
+                attempt_id: guidance.identity.attempt_id.clone(),
+                cycle_id: guidance.identity.cycle_id.clone(),
+                target_sha: guidance.identity.target_sha.clone(),
+                source_sha: guidance.identity.source_sha.clone(),
+                candidate_sha: guidance.identity.candidate_sha.clone(),
+                answer: "preserve target and source behavior".into(),
+            },
+        },
+        control_config.max_response_bytes,
+    )
+    .unwrap();
+    thread.join().unwrap();
+    assert!(response.ok, "{response:?}");
+    assert_eq!(response.result, serde_json::json!("applied"));
+
+    let candidate = integrator.run_once().unwrap().unwrap();
+    assert_eq!(candidate.status, QueueStatus::Merged);
+    let integrated = match integrator.run_once() {
+        Ok(Some(item)) => item,
+        outcome => panic!(
+            "landing outcome={outcome:?} queue={:?} effort={:?} events={:?}",
+            queue.get_item(&item.id),
+            store.effort_for_item(&item.id),
+            store.events_after(0, 100)
+        ),
+    };
+    assert_eq!(
+        integrated.status,
+        QueueStatus::Integrated,
+        "queue={integrated:?} effort={:?} events={:?}",
+        store.effort_for_item(&item.id).unwrap(),
+        store.events_after(0, 100).unwrap()
+    );
+    let attempt = queue
+        .get_attempt(integrated.current_attempt_id.as_deref().unwrap())
+        .unwrap();
+    assert_eq!(attempt.validated_commit_sha, integrated.landed_commit_sha);
+    assert_eq!(
+        integrated.landed_commit_sha.as_deref(),
+        Some(
+            git_output(&fixture.repo, ["rev-parse", "refs/remotes/origin/main"])
+                .unwrap()
+                .as_str()
+        )
+    );
+    let landed = integrated.landed_commit_sha.as_deref().unwrap();
+    assert_eq!(
+        git_output(&fixture.repo, ["show", &format!("{landed}:contract.txt")]).unwrap(),
+        "target behavior\nsource behavior"
+    );
+    assert_eq!(
+        git_output(
+            &fixture.repo,
+            [
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/iq/candidate-operations",
+            ],
+        )
+        .unwrap(),
+        ""
+    );
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    let cycles: Vec<(String, String, i64, i64)> = connection
+        .prepare(
+            "SELECT id,status,json_extract(process_json,'$.pid'),json_extract(process_json,'$.process_start_ticks') FROM integration_cycles WHERE effort_id=?1 ORDER BY cycle_number",
+        )
+        .unwrap()
+        .query_map([&effort.id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(cycles.len(), 2);
+    assert_eq!(cycles[0].1, "guidance_required");
+    assert_eq!(cycles[1].1, "resolved");
+    assert_ne!(cycles[0].0, cycles[1].0);
+    assert_ne!((cycles[0].2, cycles[0].3), (cycles[1].2, cycles[1].3));
     std::env::remove_var("IQ_GITHUB_CLI");
+    std::env::remove_var("IQ_GITLAB_CLI");
+    assert!(!provider_log.exists());
+}
+
+#[test]
+fn ten_invalid_runner_processes_create_one_cycle_limit_and_never_start_eleven() {
+    let fixture = GitFixture::new(true);
+    let source_head = fixture.create_source_branch(
+        "agent/invalid-output",
+        "force-invalid-agent",
+        "invalid identity\n",
+    );
+    let db = fixture.temp.path().join("queues.db");
+    let queue = SqliteQueue::open(&db).unwrap();
+    let item = queue
+        .enqueue(EnqueueRequest {
+            repo_key: "fixture::main".into(),
+            repo_path: fixture.repo.to_string_lossy().to_string(),
+            source_branch: "agent/invalid-output".into(),
+            target_branch: "main".into(),
+            current_head_sha: source_head,
+            pr_url: None,
+            producer_metadata: serde_json::json!({"worker":"W-invalid"}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
+        })
+        .unwrap();
+    let integrator = fixture
+        .integrator(IntegratorOptions {
+            repo_key: "fixture::main".into(),
+            repo_path: fixture.repo.clone(),
+            queue_db: db.clone(),
+            owner_id: "test-integrator".into(),
+            lease_ttl_seconds: 30,
+            base_remote: "origin".into(),
+            workspace_root: fixture.temp.path().join("workspaces"),
+            rift_database: Some(fixture.rift_database.clone()),
+            system_config: fixture.system_config(),
+        })
+        .unwrap();
+
+    let blocked = integrator.run_once().unwrap().unwrap();
+    assert_eq!(blocked.status, QueueStatus::Blocked);
+    assert_eq!(blocked.blocked_reason, Some(BlockedReason::NeedsAgentFix));
+    let store = iq::control_store::ControlStore::open(&db).unwrap();
+    let effort = store.effort_for_item(&item.id).unwrap().unwrap();
+    assert_eq!(effort.failed_cycles, 10);
+    assert!(matches!(
+        effort.state,
+        iq::control_domain::IntegrationEffortState::CycleLimitBlocked(_)
+    ));
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    let processes: Vec<(i64, i64, i64, String)> = connection
+        .prepare(
+            "SELECT cycle_number,json_extract(process_json,'$.pid'),json_extract(process_json,'$.process_start_ticks'),status FROM integration_cycles WHERE effort_id=?1 ORDER BY cycle_number",
+        )
+        .unwrap()
+        .query_map([&effort.id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(processes.len(), 10);
+    assert_eq!(
+        processes
+            .iter()
+            .map(|process| process.0)
+            .collect::<Vec<_>>(),
+        (1..=10).collect::<Vec<_>>()
+    );
+    assert!(processes.iter().all(|process| process.3 == "failed"));
+    let identities = processes
+        .iter()
+        .map(|process| (process.1, process.2))
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(identities.len(), 10);
+    assert_eq!(
+        store
+            .events_after(0, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == "cycle_limit")
+            .count(),
+        1
+    );
+    let held = integrator.run_once().unwrap().unwrap();
+    assert_eq!(held.id, item.id);
+    let cycle_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM integration_cycles WHERE effort_id=?1",
+            [&effort.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(cycle_count, 10);
 }
 
 #[test]
@@ -859,6 +893,7 @@ fn target_moved_merge_conflict_blocks_with_conflict_metadata() {
             current_head_sha: source_head,
             pr_url: None,
             producer_metadata: serde_json::json!({"worker":"W004"}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
         })
         .unwrap();
 
@@ -872,6 +907,7 @@ fn target_moved_merge_conflict_blocks_with_conflict_metadata() {
             base_remote: "origin".into(),
             workspace_root: fixture.temp.path().join("workspaces"),
             rift_database: Some(fixture.rift_database.clone()),
+            system_config: fixture.system_config(),
         })
         .unwrap();
 
@@ -913,6 +949,7 @@ fn target_movement_keeps_the_attempt_validation_policy() {
             current_head_sha: source_head,
             pr_url: None,
             producer_metadata: serde_json::json!({"worker":"W005"}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
         })
         .unwrap();
 
@@ -926,6 +963,7 @@ fn target_movement_keeps_the_attempt_validation_policy() {
             base_remote: "origin".into(),
             workspace_root: fixture.temp.path().join("workspaces"),
             rift_database: Some(fixture.rift_database.clone()),
+            system_config: fixture.system_config(),
         })
         .unwrap();
 
@@ -957,6 +995,7 @@ fn direct_landing_fetch_failure_persists_integrating_block() {
             current_head_sha: source_head,
             pr_url: None,
             producer_metadata: serde_json::json!({"worker":"W006"}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
         })
         .unwrap();
 
@@ -970,6 +1009,7 @@ fn direct_landing_fetch_failure_persists_integrating_block() {
             base_remote: "origin".into(),
             workspace_root: fixture.temp.path().join("workspaces"),
             rift_database: Some(fixture.rift_database.clone()),
+            system_config: fixture.system_config(),
         })
         .unwrap();
 
@@ -978,6 +1018,80 @@ fn direct_landing_fetch_failure_persists_integrating_block() {
     assert_eq!(item.status, QueueStatus::Blocked);
     assert_eq!(item.blocked_phase, Some(BlockedPhase::Integrating));
     assert_eq!(item.blocked_reason, Some(BlockedReason::Infra));
+}
+
+#[test]
+fn unsupported_provider_url_blocks_the_authoritative_effort() {
+    let fixture = GitFixture::new(true);
+    let source_head =
+        fixture.create_source_branch("agent/unsupported-provider", "feature.txt", "feature\n");
+    git(
+        &fixture.repo,
+        ["push", "-u", "origin", "agent/unsupported-provider"],
+    )
+    .unwrap();
+    let db = fixture.temp.path().join("queues.db");
+    let queue = SqliteQueue::open(&db).unwrap();
+    let repo_key = "fixture::main";
+    let item = queue
+        .enqueue(EnqueueRequest {
+            repo_key: repo_key.into(),
+            repo_path: fixture.repo.to_string_lossy().to_string(),
+            source_branch: "agent/unsupported-provider".into(),
+            target_branch: "main".into(),
+            current_head_sha: source_head,
+            pr_url: Some("https://code.example.test/change/8".into()),
+            producer_metadata: serde_json::json!({"worker":"W007"}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
+        })
+        .unwrap();
+    let integrator = fixture
+        .integrator(IntegratorOptions {
+            repo_key: repo_key.into(),
+            repo_path: fixture.repo.clone(),
+            queue_db: db.clone(),
+            owner_id: "test-integrator".into(),
+            lease_ttl_seconds: 30,
+            base_remote: "origin".into(),
+            workspace_root: fixture.temp.path().join("workspaces"),
+            rift_database: Some(fixture.rift_database.clone()),
+            system_config: fixture.system_config(),
+        })
+        .unwrap();
+
+    let blocked = integrator.run_once().unwrap().unwrap();
+
+    assert_eq!(blocked.id, item.id);
+    assert_eq!(blocked.status, QueueStatus::Blocked);
+    assert_eq!(blocked.blocked_phase, Some(BlockedPhase::Integrating));
+    assert_eq!(blocked.blocked_reason, Some(BlockedReason::Infra));
+    let effort = iq::control_store::ControlStore::open(&db)
+        .unwrap()
+        .effort_for_item(&item.id)
+        .unwrap()
+        .unwrap();
+    let iq::control_domain::IntegrationEffortState::InfrastructureBlocked(blocked) = effort.state
+    else {
+        panic!("unsupported provider URL did not block the effort")
+    };
+    let iq::control_domain::IntegrationBlocker::Infrastructure(blocker) = blocked.blocker else {
+        panic!("unsupported provider URL used the wrong blocker")
+    };
+    let iq::control_domain::ResumeState::Validating(resume) = blocked.resume else {
+        panic!("unsupported provider URL lost its landing-gate resume state")
+    };
+    assert_eq!(
+        blocker.component,
+        iq::control_domain::InfrastructureComponent::Configuration
+    );
+    assert_eq!(blocker.operation, "select_provider_adapter");
+    assert!(matches!(
+        blocker.cause,
+        iq::control_domain::InfrastructureCause::Unavailable { ref detail }
+            if detail.contains("https://code.example.test/change/8")
+                && detail.contains(&resume.candidate_sha)
+    ));
+    assert_eq!(resume.stage, iq::control_domain::ValidationStage::Gates);
 }
 
 #[test]
@@ -998,6 +1112,7 @@ fn pr_provider_landing_blocks_when_provider_does_not_land_queued_head() {
             current_head_sha: source_head.clone(),
             pr_url: Some("https://github.com/org/repo/pull/8".into()),
             producer_metadata: serde_json::json!({"worker":"W004"}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
         })
         .unwrap();
     let fake_gh = fixture.temp.path().join("fake-gh-noop");
@@ -1034,12 +1149,13 @@ exit 2
         .integrator(IntegratorOptions {
             repo_key: repo_key.into(),
             repo_path: fixture.repo.clone(),
-            queue_db: db,
+            queue_db: db.clone(),
             owner_id: "test-integrator".into(),
             lease_ttl_seconds: 30,
             base_remote: "origin".into(),
             workspace_root: fixture.temp.path().join("workspaces"),
             rift_database: Some(fixture.rift_database.clone()),
+            system_config: fixture.system_config(),
         })
         .unwrap();
 
@@ -1049,6 +1165,16 @@ exit 2
     assert_eq!(item.blocked_phase, Some(BlockedPhase::Integrating));
     assert_eq!(item.blocked_reason, Some(BlockedReason::Provider));
     assert_eq!(item.landed_commit_sha, None);
+    let store = iq::control_store::ControlStore::open(&db).unwrap();
+    let effort = store.effort_for_item(&item.id).unwrap().unwrap();
+    let iq::control_domain::IntegrationEffortState::ProviderBlocked(blocked) = &effort.state else {
+        panic!("provider result did not transition the effort: {effort:?}")
+    };
+    let iq::control_domain::IntegrationBlocker::ProviderSignoff(provider) = &blocked.blocker else {
+        panic!("provider-blocked effort has the wrong blocker")
+    };
+    assert_eq!(provider.repository, "https://github.com/org/repo/pull/8");
+    assert_eq!(provider.candidate_sha, attempt_candidate(&queue, &item));
     assert!(git(
         &fixture.repo,
         [
@@ -1059,7 +1185,25 @@ exit 2
         ],
     )
     .is_err());
+    let retried = integrator.run_once().unwrap().unwrap();
+    assert_eq!(retried.status, QueueStatus::Blocked);
+    assert_eq!(retried.blocked_reason, Some(BlockedReason::Provider));
+    let connection = rusqlite::Connection::open(db).unwrap();
+    let cycle_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM integration_cycles", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(cycle_count, 1);
     std::env::remove_var("IQ_GITHUB_CLI");
+}
+
+fn attempt_candidate(queue: &SqliteQueue, item: &iq::sqlite::QueueItem) -> String {
+    queue
+        .get_attempt(item.current_attempt_id.as_deref().unwrap())
+        .unwrap()
+        .validated_commit_sha
+        .unwrap()
 }
 
 struct GitFixture {
@@ -1067,12 +1211,16 @@ struct GitFixture {
     remote: std::path::PathBuf,
     repo: std::path::PathBuf,
     rift_database: std::path::PathBuf,
+    runner: std::path::PathBuf,
     validation_command: Mutex<Option<String>>,
 }
 
 impl GitFixture {
     fn new(_include_validation: bool) -> Self {
-        let temp = tempdir().unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix(".iq-integrator-test-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
         let remote = temp.path().join("remote.git");
         git(temp.path(), ["init", "--bare", remote.to_str().unwrap()]).unwrap();
         let repo = temp.path().join("repo");
@@ -1105,12 +1253,123 @@ impl GitFixture {
             "rift init failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        let runner = temp.path().join("fake-opencode");
+        fs::write(
+            &runner,
+            r##"#!/usr/bin/python3
+import hashlib
+import json
+import os
+import subprocess
+
+prompt = os.sys.argv[-1]
+with open("/iq-protocol/input.json", "r", encoding="utf-8") as source:
+    request = json.load(source)
+result_path = "/iq-protocol/result.json"
+answers = [
+    entry["text"]
+    for entry in request["validation_evidence"]
+    if entry["kind"].startswith("guidance_answer:")
+]
+if request["conflicts"] and not answers:
+    result = {
+        "outcome": "guidance_required",
+        "version": 1,
+        "identity": request["identity"],
+        "question": "Resolve the semantic conflict",
+        "affected_contracts": ["preserve target and source behavior"],
+        "affected_paths": [request["conflicts"][0]["path"]],
+        "alternatives": {"kind": "free_text"},
+        "evidence": "automatic fixture agent does not choose one conflict side",
+    }
+else:
+    if request["conflicts"]:
+        for conflict in request["conflicts"]:
+            path = b"/".join(bytes.fromhex(part["hex"]) for part in conflict["path"])
+            target = subprocess.run(
+                ["git", "show", b":2:" + path], capture_output=True
+            ).stdout
+            source = subprocess.run(
+                ["git", "show", b":3:" + path], capture_output=True
+            ).stdout
+            combined = target
+            if source and source not in combined:
+                combined += source
+            with open(path, "wb") as output:
+                output.write(combined)
+            subprocess.check_call(["git", "add", "--", path])
+    tree = subprocess.check_output(["git", "write-tree"], text=True).strip()
+    names = subprocess.check_output(
+        ["git", "diff", "--cached", "--name-only", "-z"]
+    ).split(b"\0")
+    paths = [
+        [{"hex": component.hex()} for component in name.split(b"/")]
+        for name in names
+        if name
+    ]
+    result = {
+        "outcome": "resolved",
+        "version": 1,
+        "identity": request["identity"],
+        "staged_tree_sha256": hashlib.sha256(tree.encode()).hexdigest(),
+        "changed_paths": paths,
+        "checks": [],
+    }
+    if os.path.exists("force-invalid-agent"):
+        result["identity"]["cycle_id"] = "invalid-cycle"
+temporary = result_path + ".tmp"
+with open(temporary, "w", encoding="utf-8") as output:
+    json.dump(result, output, separators=(",", ":"))
+os.replace(temporary, result_path)
+"##,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&runner).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&runner, permissions).unwrap();
+        }
+        std::env::set_var("IQ_TEST_MODEL_KEY", "fixture-model-key");
         Self {
             temp,
             remote,
             repo,
             rift_database,
+            runner,
             validation_command: Mutex::new(None),
+        }
+    }
+
+    fn system_config(&self) -> iq::agent_config::SystemConfig {
+        iq::agent_config::SystemConfig {
+            integration_agent: iq::agent_config::IntegrationAgentConfig {
+                runner: iq::control_domain::RunnerKind::Opencode,
+                executable: self.runner.clone(),
+                agent: "iq-integration".into(),
+                model: "test/model".into(),
+                cycle_timeout_seconds: 30,
+                max_log_bytes: 1024 * 1024,
+                max_result_bytes: 1024 * 1024,
+                max_processes: 16,
+                memory_bytes: 256 * 1024 * 1024,
+                cpu_seconds: 30,
+                writable_bytes: 16 * 1024 * 1024,
+                open_files: 128,
+                credential_env: "IQ_TEST_MODEL_KEY".into(),
+            },
+            control_plane: iq::agent_config::ControlPlaneConfig {
+                unix_socket: self.temp.path().join("control.sock"),
+                max_request_bytes: 4096,
+                max_free_text_bytes: 1024,
+                max_response_bytes: 4096,
+                max_concurrent_clients: 2,
+                max_client_queue_bytes: 4096,
+                max_stream_backlog_events: 100,
+                client_idle_seconds: 5,
+            },
+            notifications: Default::default(),
         }
     }
 

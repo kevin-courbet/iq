@@ -13,6 +13,7 @@ use std::process::{Command, Output};
 use std::time::Duration;
 use uuid::Uuid;
 
+use crate::control_domain::StateRepositorySnapshot;
 use crate::integrator::{
     git_output, RepositoryOperationLease, ResidueDiscardRequest, RiftWorkspaceManager,
 };
@@ -65,6 +66,8 @@ pub enum SignoffPolicy {
 struct RawConfig {
     version: u32,
     integration: RawIntegration,
+    #[serde(default)]
+    state_repository: StateRepositorySnapshot,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,6 +75,20 @@ struct RawConfig {
 struct RawIntegration {
     validation: RawValidation,
     signoff: SignoffPolicy,
+    #[serde(default)]
+    agent: Option<ProjectAgentConfig>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectAgentConfig {
+    pub model: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectControlPolicy {
+    pub model: Option<String>,
+    pub state_repository: StateRepositorySnapshot,
 }
 
 #[derive(Debug, Deserialize)]
@@ -595,11 +612,15 @@ impl RepositoryManager {
             anyhow::bail!("immutable local submission ref was not published exactly");
         }
         guard.ensure()?;
+        let state_repository =
+            load_project_control_only(&repository.integration_path)?.state_repository;
+        crate::state_repository::repository(&state_repository)?.verify()?;
         self.queue.finalize_local_submission(
             &repository.key,
             &self.owner_id,
             &submission.id,
             &Value::Object(Default::default()),
+            &state_repository,
         )
     }
 
@@ -1455,13 +1476,25 @@ pub(crate) fn reconcile_registered_checkout(
 }
 
 pub fn load_local_policy(repo: &Path) -> Result<(PolicySnapshot, String, String)> {
+    let (policy, json, digest, _) = load_project_control_policy(repo)?;
+    Ok((policy, json, digest))
+}
+
+pub fn load_project_control_only(repo: &Path) -> Result<ProjectControlPolicy> {
+    let (_, _, _, control) = load_project_control_policy(repo)?;
+    Ok(control)
+}
+
+pub fn load_project_control_policy(
+    repo: &Path,
+) -> Result<(PolicySnapshot, String, String, ProjectControlPolicy)> {
     reject_tracked_policy(repo)?;
     let config_directory = repo.join(".iq");
     let config_path = config_directory.join("config.json");
     let directory_metadata = match fs::symlink_metadata(&config_directory) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return canonical_policy_snapshot(ValidationPolicy::None)
+            return default_project_control_policy()
         }
         Err(error) => {
             return Err(error).with_context(|| format!("inspect {}", config_directory.display()))
@@ -1496,7 +1529,7 @@ pub fn load_local_policy(repo: &Path) -> Result<(PolicySnapshot, String, String)
         let error = std::io::Error::last_os_error();
         verify_policy_directory(&config_directory, &directory, &directory_metadata)?;
         if error.kind() == std::io::ErrorKind::NotFound {
-            return canonical_policy_snapshot(ValidationPolicy::None);
+            return default_project_control_policy();
         }
         return Err(error).context("open local IQ policy config.json");
     }
@@ -1522,19 +1555,48 @@ pub fn load_local_policy(repo: &Path) -> Result<(PolicySnapshot, String, String)
             config_path.display()
         )
     })?;
-    if raw.version != 1 {
+    if raw.version != 2 {
         anyhow::bail!(
-            "unsupported .iq/config.json version {}; expected 1",
+            "unsupported .iq/config.json version {}; expected 2",
             raw.version
         );
     }
     let validation_command =
         exact_nonblank(raw.integration.validation.command, "validation command")?;
     let signoff = validate_signoff(raw.integration.signoff)?;
-    canonical_policy_snapshot(ValidationPolicy::Command {
+    let (policy, json, digest) = canonical_policy_snapshot(ValidationPolicy::Command {
         command: validation_command,
         signoff,
-    })
+    })?;
+    let model = raw
+        .integration
+        .agent
+        .map(|agent| exact_nonblank(agent.model, "integration agent model"))
+        .transpose()?;
+    let state_repository = raw.state_repository.validate()?;
+    Ok((
+        policy,
+        json,
+        digest,
+        ProjectControlPolicy {
+            model,
+            state_repository,
+        },
+    ))
+}
+
+fn default_project_control_policy() -> Result<(PolicySnapshot, String, String, ProjectControlPolicy)>
+{
+    let (policy, json, digest) = canonical_policy_snapshot(ValidationPolicy::None)?;
+    Ok((
+        policy,
+        json,
+        digest,
+        ProjectControlPolicy {
+            model: None,
+            state_repository: StateRepositorySnapshot::Local,
+        },
+    ))
 }
 
 fn verify_policy_directory(

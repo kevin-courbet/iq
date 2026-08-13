@@ -1,5 +1,12 @@
-pub mod communication;
+pub mod agent_config;
+pub mod agent_protocol;
+pub mod agent_runner;
 pub mod composition;
+pub mod control_api;
+pub mod control_domain;
+pub mod control_store;
+pub mod notifications;
+pub mod state_repository;
 
 pub mod core {
     use serde::{Deserialize, Serialize};
@@ -213,8 +220,7 @@ pub mod sqlite {
     use uuid::Uuid;
 
     use crate::core::{
-        BlockedPhase, BlockedReason, BlockedState, LandingPolicy, QueueSource, QueueStatus,
-        StateMachine,
+        BlockedPhase, BlockedReason, LandingPolicy, QueueSource, QueueStatus, StateMachine,
     };
 
     #[derive(Clone, Debug)]
@@ -226,6 +232,7 @@ pub mod sqlite {
         pub current_head_sha: String,
         pub pr_url: Option<String>,
         pub producer_metadata: Value,
+        pub state_repository: crate::control_domain::StateRepositorySnapshot,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -572,31 +579,6 @@ pub mod sqlite {
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-    pub struct CommunicationBinding {
-        pub id: String,
-        pub repo_key: String,
-        pub item_id: String,
-        pub transport_id: String,
-        pub transport_kind: String,
-        pub endpoint_fingerprint: String,
-        pub marker: String,
-        pub external_ref: Option<Value>,
-        pub external_url: Option<String>,
-        pub status: String,
-        pub last_error: Option<String>,
-    }
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum CommunicationResponseDisposition {
-        Applied,
-        Duplicate,
-        Stale,
-        Invalid,
-        Unauthorized,
-    }
-
-    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
     pub struct QueueEvent {
         pub id: String,
         pub item_id: String,
@@ -675,11 +657,13 @@ pub mod sqlite {
         },
     }
 
+    #[allow(dead_code)]
     struct CanonicalPathUpdate {
         stored: String,
         canonical: String,
     }
 
+    #[allow(dead_code)]
     struct V2RepositoryPathUpdates {
         queue: Vec<CanonicalPathUpdate>,
         workspace_roots: Vec<CanonicalPathUpdate>,
@@ -880,25 +864,13 @@ pub mod sqlite {
                     )
                     .optional()?;
                 match version.as_deref() {
-                    Some("2") => Self::migrate_released_v2(&mut conn)?,
-                    Some("3") => {
-                        Self::migrate_standalone_v3(&mut conn, &path)?;
-                        Self::migrate_standalone_v7(&mut conn)?;
-                    }
-                    Some("4") => {
-                        Self::migrate_standalone_v4(&mut conn)?;
-                        Self::migrate_standalone_v7(&mut conn)?;
-                    }
-                    Some("5") => {
-                        Self::migrate_standalone_v5(&mut conn)?;
-                        Self::migrate_standalone_v7(&mut conn)?;
-                    }
-                    Some("6") => {
-                        Self::migrate_standalone_v6(&mut conn)?;
-                        Self::migrate_standalone_v7(&mut conn)?;
-                    }
-                    Some("7") => Self::migrate_standalone_v7(&mut conn)?,
-                    Some("8") => Self::validate_standalone_v8(&conn)?,
+                    Some("2" | "3" | "4" | "5" | "6" | "7") => anyhow::bail!(
+                        "IQ schema must first be upgraded to version 8 by the prior release"
+                    ),
+                    Some("8") => anyhow::bail!(
+                        "IQ schema version 8 requires explicit migration with a verified system configuration path"
+                    ),
+                    Some("9") => {},
                     Some(version) => anyhow::bail!("unsupported IQ schema version {version}"),
                     None => anyhow::bail!("existing IQ database has no standalone schema version"),
                 }
@@ -918,7 +890,7 @@ pub mod sqlite {
                 .optional()?;
             if workspace_schema_version
                 .as_deref()
-                .is_some_and(|version| version != "8")
+                .is_some_and(|version| version != "9")
             {
                 anyhow::bail!(
                     "unsupported workspace schema version {}",
@@ -930,13 +902,10 @@ pub mod sqlite {
             tx.execute_batch(REGISTERED_CHECKOUT_TRIGGERS)?;
             tx.execute_batch(LANDING_STATE_TRIGGERS)?;
             tx.execute_batch(REGISTERED_REMOTE_TRIGGERS)?;
-            tx.execute(
-                "INSERT INTO queue_metadata (key,value) VALUES ('workspace_schema_version','8') ON CONFLICT(key) DO UPDATE SET value='8'",
-                [],
-            )?;
+            crate::control_store::install_fresh_v9(&tx)?;
             tx.execute_batch(WORKSPACE_STATE_TRIGGERS)?;
             tx.commit()?;
-            Self::validate_standalone_v8(&conn)?;
+            crate::control_store::ControlStore::open(&path)?;
             let metadata = fs::symlink_metadata(&path)
                 .with_context(|| format!("inspect queue db {}", path.display()))?;
             if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -957,6 +926,45 @@ pub mod sqlite {
             })
         }
 
+        pub fn migrate_v8(path: &Path, system_config_path: &Path) -> Result<Self> {
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir()?.join(path)
+            };
+            let parent = path.parent().context("queue database path has no parent")?;
+            let canonical = parent.canonicalize()?.join(
+                path.file_name()
+                    .context("queue database path has no file name")?,
+            );
+            let metadata = fs::symlink_metadata(&canonical)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                anyhow::bail!("queue database must be a regular non-symlink file");
+            }
+            let mut connection = Connection::open_with_flags(
+                &canonical,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?;
+            connection.busy_timeout(Self::MIGRATION_BUSY_TIMEOUT)?;
+            connection.pragma_update(None, "foreign_keys", "ON")?;
+            let version: String = connection.query_row(
+                "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
+                [],
+                |row| row.get(0),
+            )?;
+            if version != "8" {
+                anyhow::bail!("explicit schema migration requires version 8, found {version}");
+            }
+            crate::control_store::migrate_v8_to_v9(
+                &mut connection,
+                &canonical,
+                system_config_path,
+            )?;
+            drop(connection);
+            Self::open(&canonical)
+        }
+
+        #[allow(dead_code)]
         fn validate_standalone_v7(conn: &Connection) -> Result<()> {
             let foreign_key_errors: i64 =
                 conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
@@ -1049,6 +1057,7 @@ pub mod sqlite {
             Ok(())
         }
 
+        #[allow(dead_code)]
         fn migrate_standalone_v7(conn: &mut Connection) -> Result<()> {
             conn.pragma_update(None, "foreign_keys", "OFF")?;
             conn.pragma_update(None, "legacy_alter_table", "ON")?;
@@ -1095,6 +1104,7 @@ UPDATE queue_metadata SET value='8' WHERE key='workspace_schema_version';"#,
             migration
         }
 
+        #[allow(dead_code)]
         fn validate_standalone_v8(conn: &Connection) -> Result<()> {
             Self::validate_standalone_v7(conn).map_err(|error| {
                 anyhow::anyhow!("IQ schema version 8 structural validation failed: {error:#}")
@@ -1141,6 +1151,7 @@ UPDATE queue_metadata SET value='8' WHERE key='workspace_schema_version';"#,
             Ok(())
         }
 
+        #[allow(dead_code)]
         fn migrate_released_v2(conn: &mut Connection) -> Result<()> {
             let invalid_rows: i64 = conn.query_row(
                 "SELECT
@@ -1250,6 +1261,7 @@ UPDATE queue_metadata SET value='8' WHERE key='workspace_schema_version';"#,
             Ok(())
         }
 
+        #[allow(dead_code)]
         fn validated_v2_repository_paths(conn: &Connection) -> Result<V2RepositoryPathUpdates> {
             let mut queue_statement = conn.prepare(
                 "SELECT DISTINCT CAST(repo_path AS BLOB),target_branch,repo_key FROM queue_items",
@@ -1325,6 +1337,7 @@ UPDATE queue_metadata SET value='8' WHERE key='workspace_schema_version';"#,
             })
         }
 
+        #[allow(dead_code)]
         fn canonical_git_root(stored: &str, label: &str) -> Result<String> {
             if stored.is_empty() {
                 anyhow::bail!("{label} path must not be empty");
@@ -1368,6 +1381,7 @@ UPDATE queue_metadata SET value='8' WHERE key='workspace_schema_version';"#,
                 .context("canonical repository path is not valid UTF-8")
         }
 
+        #[allow(dead_code)]
         fn migrate_standalone_v3(conn: &mut Connection, database_path: &Path) -> Result<()> {
             conn.pragma_update(None, "foreign_keys", "OFF")?;
             conn.pragma_update(None, "legacy_alter_table", "ON")?;
@@ -1488,6 +1502,7 @@ SET seed_refresh_json=json_object('state','ready','target_sha',policy_target_sha
             Ok(())
         }
 
+        #[allow(dead_code)]
         fn migrate_standalone_v4(conn: &mut Connection) -> Result<()> {
             conn.pragma_update(None, "foreign_keys", "OFF")?;
             conn.pragma_update(None, "legacy_alter_table", "ON")?;
@@ -1544,6 +1559,7 @@ UPDATE queue_metadata SET value='7' WHERE key='workspace_schema_version';"#,
             Ok(())
         }
 
+        #[allow(dead_code)]
         fn migrate_standalone_v5(conn: &mut Connection) -> Result<()> {
             conn.pragma_update(None, "foreign_keys", "OFF")?;
             conn.pragma_update(None, "legacy_alter_table", "ON")?;
@@ -1587,6 +1603,7 @@ UPDATE queue_metadata SET value='7' WHERE key='workspace_schema_version';"#,
             migration
         }
 
+        #[allow(dead_code)]
         fn migrate_standalone_v6(conn: &mut Connection) -> Result<()> {
             conn.pragma_update(None, "foreign_keys", "OFF")?;
             conn.pragma_update(None, "legacy_alter_table", "ON")?;
@@ -1615,6 +1632,7 @@ UPDATE queue_metadata SET value='7' WHERE key='workspace_schema_version';"#,
             migration
         }
 
+        #[allow(dead_code)]
         fn migrate_queue_landing_state(conn: &Connection) -> Result<()> {
             conn.execute_batch(
                 r#"
@@ -1641,6 +1659,7 @@ DROP TABLE queue_items_v6;"#,
             Ok(())
         }
 
+        #[allow(dead_code)]
         fn migrate_registered_remote_identities(conn: &Connection) -> Result<()> {
             conn.execute_batch(COMPOSITION_SCHEMA)?;
             let mut statement = conn.prepare(
@@ -1679,6 +1698,7 @@ DROP TABLE queue_items_v6;"#,
             Ok(())
         }
 
+        #[allow(dead_code)]
         fn reject_active_migration_leases(conn: &Connection, version: &str) -> Result<()> {
             let active_leases: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM repo_leases WHERE expires_at>?1",
@@ -1693,6 +1713,7 @@ DROP TABLE queue_items_v6;"#,
             Ok(())
         }
 
+        #[allow(dead_code)]
         fn reject_nonterminal_migration_items(conn: &Connection, version: &str) -> Result<()> {
             let nonterminal_items: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM queue_items WHERE status NOT IN ('integrated','cancelled')",
@@ -1864,6 +1885,7 @@ DROP TABLE queue_items_v6;"#,
         }
 
         pub fn enqueue(&self, request: EnqueueRequest) -> Result<QueueItem> {
+            let state_repository = request.state_repository.clone().validate()?;
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let now = now();
@@ -1880,6 +1902,16 @@ DROP TABLE queue_items_v6;"#,
                     anyhow::bail!(
                         "active queue item {id} already tracks {current_head_sha}; update blocked agent work through requeue instead of enqueue"
                     );
+                }
+                let stored: String = tx.query_row(
+                    "SELECT snapshot_json FROM item_state_repository_bindings WHERE item_id=?1",
+                    params![id],
+                    |row| row.get(0),
+                )?;
+                if serde_json::from_str::<crate::control_domain::StateRepositorySnapshot>(&stored)?
+                    != state_repository
+                {
+                    anyhow::bail!("active queue item has a different state-repository binding");
                 }
                 id
             } else {
@@ -1901,6 +1933,7 @@ DROP TABLE queue_items_v6;"#,
                     ],
                 )?;
                 Self::record_event_tx(&tx, &id, "item_enqueued", "item enqueued")?;
+                insert_state_repository_binding(&tx, &id, &state_repository, &now)?;
                 id
             };
             tx.commit()?;
@@ -2085,6 +2118,14 @@ DROP TABLE queue_items_v6;"#,
                 "queue item",
                 item_id,
             )?;
+            let effort_owned: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM integration_efforts WHERE item_id=?1)",
+                params![item_id],
+                |row| row.get(0),
+            )?;
+            if effort_owned {
+                anyhow::bail!("queue lifecycle is read-only after integration effort creation");
+            }
             Self::require_mutation_authority(&tx, &item.repo_key, authority)?;
             StateMachine
                 .transition(item.status, target)
@@ -2280,6 +2321,14 @@ DROP TABLE queue_items_v6;"#,
                 "queue item",
                 item_id,
             )?;
+            let effort_owned: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM integration_efforts WHERE item_id=?1)",
+                params![item_id],
+                |row| row.get(0),
+            )?;
+            if effort_owned {
+                anyhow::bail!("queue lifecycle is read-only after integration effort creation");
+            }
             Self::require_mutation_authority(&tx, &item.repo_key, authority)?;
             if item.status != expected_status {
                 anyhow::bail!(
@@ -2290,11 +2339,7 @@ DROP TABLE queue_items_v6;"#,
             let timestamp = now();
             let prompt_id = if reason == BlockedReason::NeedsUserInput {
                 let prompt_id = Uuid::new_v4().to_string();
-                let options = if phase == BlockedPhase::Merging {
-                    vec!["use source", "use target"]
-                } else {
-                    Vec::new()
-                };
+                let options: Vec<&str> = Vec::new();
                 let options_json = serde_json::to_string(&options)?;
                 tx.execute(
                     "INSERT INTO prompts (id,item_id,attempt_id,blocked_phase,status,question,options_json,allow_freeform,created_by,created_at) VALUES (?1,?2,?3,?4,'open',?5,?6,?7,'integrator',?8)",
@@ -2318,137 +2363,6 @@ DROP TABLE queue_items_v6;"#,
             Ok(prompt_id.unwrap_or_default())
         }
 
-        pub fn answer_prompt(
-            &self,
-            prompt_id: &str,
-            answer: &str,
-            answered_by: &str,
-        ) -> Result<QueueItem> {
-            let mut conn = self.connect()?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let prompt = required_row(
-                tx.query_row(
-                    "SELECT id,item_id,attempt_id,blocked_phase,status,question,answer,options_json FROM prompts WHERE id=?1",
-                    params![prompt_id],
-                    map_prompt,
-                ),
-                "prompt",
-                prompt_id,
-            )?;
-            if prompt.status != "open" {
-                anyhow::bail!("prompt {prompt_id} is not open")
-            }
-            let answer = answer.trim();
-            let answered_by = answered_by.trim();
-            if answer.is_empty() || answered_by.is_empty() {
-                anyhow::bail!("prompt answer and answered_by must not be blank");
-            }
-            if !prompt.options.is_empty()
-                && !prompt
-                    .options
-                    .iter()
-                    .any(|option| option.eq_ignore_ascii_case(answer))
-            {
-                anyhow::bail!(
-                    "unsupported answer for prompt {prompt_id}; choose {}",
-                    prompt.options.join(", ")
-                );
-            }
-            let item = required_row(
-                tx.query_row(
-                    "SELECT * FROM queue_items WHERE id=?1",
-                    params![prompt.item_id],
-                    map_item,
-                ),
-                "queue item",
-                &prompt.item_id,
-            )?;
-            if item.status != QueueStatus::Blocked
-                || item.blocked_reason != Some(BlockedReason::NeedsUserInput)
-            {
-                anyhow::bail!("item {} is not blocked for user input", item.id)
-            }
-            if item.prompt_id().as_deref() != Some(prompt_id) {
-                anyhow::bail!("prompt {prompt_id} is not current for item {}", item.id)
-            }
-            let resume = StateMachine
-                .resume_target(&BlockedState {
-                    phase: prompt.blocked_phase,
-                    reason: BlockedReason::NeedsUserInput,
-                    prompt_id: Some(prompt_id.to_string()),
-                })
-                .map_err(anyhow::Error::msg)?;
-            let timestamp = now();
-            tx.execute(
-                "UPDATE prompts SET status='answered',answer=?1,answered_by=?2,answered_at=?3 WHERE id=?4",
-                params![answer, answered_by, timestamp, prompt_id],
-            )?;
-            tx.execute(
-                "UPDATE queue_items SET status=?1,blocked_phase=NULL,blocked_reason=NULL,blocked_message=NULL,prompt_id=NULL,updated_at=?2 WHERE id=?3",
-                params![resume.to_string(), timestamp, item.id],
-            )?;
-            Self::record_event_tx(&tx, &item.id, "user_answered", answer)?;
-            tx.commit()?;
-            self.get_item(&item.id)
-        }
-
-        pub(crate) fn accept_current_merge_resolution(
-            &self,
-            item_id: &str,
-            answered_by: &str,
-        ) -> Result<QueueItem> {
-            let answered_by = answered_by.trim();
-            if answered_by.is_empty() {
-                anyhow::bail!("merge recovery actor must not be blank");
-            }
-            let mut conn = self.connect()?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let item = required_row(
-                tx.query_row(
-                    "SELECT * FROM queue_items WHERE id=?1",
-                    params![item_id],
-                    map_item,
-                ),
-                "queue item",
-                item_id,
-            )?;
-            if item.status != QueueStatus::Blocked
-                || item.blocked_phase != Some(BlockedPhase::Merging)
-                || item.blocked_reason != Some(BlockedReason::NeedsUserInput)
-            {
-                anyhow::bail!("item {item_id} is not blocked for merge resolution");
-            }
-            let prompt_id = item
-                .prompt_id()
-                .context("blocked merge item has no current prompt")?;
-            let prompt = tx.query_row(
-                "SELECT id,item_id,attempt_id,blocked_phase,status,question,answer,options_json FROM prompts WHERE id=?1",
-                params![prompt_id],
-                map_prompt,
-            )?;
-            if prompt.status != "open"
-                || prompt.item_id != item.id
-                || prompt.blocked_phase != BlockedPhase::Merging
-            {
-                anyhow::bail!(
-                    "merge recovery prompt {} is not current and open",
-                    prompt.id
-                );
-            }
-            let timestamp = now();
-            tx.execute(
-                "UPDATE prompts SET status='answered',answer='accept-current',answered_by=?1,answered_at=?2 WHERE id=?3",
-                params![answered_by, timestamp, prompt.id],
-            )?;
-            tx.execute(
-                "UPDATE queue_items SET status='merging',blocked_phase=NULL,blocked_reason=NULL,blocked_message=NULL,prompt_id=NULL,updated_at=?1 WHERE id=?2",
-                params![timestamp, item.id],
-            )?;
-            Self::record_event_tx(&tx, &item.id, "user_answered", "accept-current")?;
-            tx.commit()?;
-            self.get_item(&item.id)
-        }
-
         pub fn requeue_agent_fix(&self, item_id: &str, new_head: &str) -> Result<QueueItem> {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2461,6 +2375,14 @@ DROP TABLE queue_items_v6;"#,
                 "queue item",
                 item_id,
             )?;
+            let effort_owned: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM integration_efforts WHERE item_id=?1)",
+                params![item_id],
+                |row| row.get(0),
+            )?;
+            if effort_owned {
+                anyhow::bail!("queue lifecycle is read-only after integration effort creation");
+            }
             if item.status != QueueStatus::Blocked
                 || item.blocked_reason != Some(BlockedReason::NeedsAgentFix)
             {
@@ -2480,54 +2402,6 @@ DROP TABLE queue_items_v6;"#,
                 params![new_head, now(), item_id],
             )?;
             Self::record_event_tx(&tx, item_id, "agent_requeued", "agent fix marked ready")?;
-            tx.commit()?;
-            self.get_item(item_id)
-        }
-
-        pub fn retry_blocked(&self, item_id: &str) -> Result<QueueItem> {
-            let mut conn = self.connect()?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let item = required_row(
-                tx.query_row(
-                    "SELECT * FROM queue_items WHERE id=?1",
-                    params![item_id],
-                    map_item,
-                ),
-                "queue item",
-                item_id,
-            )?;
-            if item.status != QueueStatus::Blocked {
-                anyhow::bail!("item {item_id} is not blocked")
-            }
-            let phase = item
-                .blocked_phase
-                .ok_or_else(|| anyhow::anyhow!("blocked item {item_id} has no blocked phase"))?;
-            let reason = item
-                .blocked_reason
-                .ok_or_else(|| anyhow::anyhow!("blocked item {item_id} has no blocked reason"))?;
-            match reason {
-                BlockedReason::NeedsUserInput => {
-                    anyhow::bail!("item {item_id} requires an answered prompt before retry")
-                }
-                BlockedReason::NeedsAgentFix => {
-                    anyhow::bail!("item {item_id} requires agent requeue before retry")
-                }
-                BlockedReason::Infra
-                | BlockedReason::Dependency
-                | BlockedReason::Credentials
-                | BlockedReason::Provider => {}
-            }
-            let resume: QueueStatus = phase.into();
-            tx.execute(
-                "UPDATE queue_items SET status=?1,blocked_phase=NULL,blocked_reason=NULL,blocked_message=NULL,prompt_id=NULL,updated_at=?2 WHERE id=?3",
-                params![resume.to_string(), now(), item_id],
-            )?;
-            Self::record_event_tx(
-                &tx,
-                item_id,
-                "item_retried",
-                &format!("retrying {phase} after {reason} block"),
-            )?;
             tx.commit()?;
             self.get_item(item_id)
         }
@@ -2787,7 +2661,7 @@ DROP TABLE queue_items_v6;"#,
             .context("read queue database identity")
         }
 
-        pub(crate) fn path(&self) -> &Path {
+        pub fn path(&self) -> &Path {
             &self.path
         }
 
@@ -2880,239 +2754,6 @@ DROP TABLE queue_items_v6;"#,
 
         pub fn prompts_for_item(&self, item_id: &str) -> Result<Vec<Prompt>> {
             self.reader().prompts_for_item(item_id)
-        }
-
-        pub fn communication_bindings(&self, repo_key: &str) -> Result<Vec<CommunicationBinding>> {
-            let conn = self.connect_read_only()?;
-            let mut stmt = conn.prepare(
-                "SELECT * FROM communication_bindings WHERE repo_key=?1 ORDER BY created_at ASC",
-            )?;
-            let bindings = stmt
-                .query_map(params![repo_key], map_communication_binding)?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            Ok(bindings)
-        }
-
-        pub fn communication_binding(
-            &self,
-            item_id: &str,
-            transport_id: &str,
-        ) -> Result<Option<CommunicationBinding>> {
-            let conn = self.connect_read_only()?;
-            conn.query_row(
-                "SELECT * FROM communication_bindings WHERE item_id=?1 AND transport_id=?2",
-                params![item_id, transport_id],
-                map_communication_binding,
-            )
-            .optional()
-            .context("read communication binding")
-        }
-
-        pub fn reserve_communication_binding(
-            &self,
-            repo_key: &str,
-            item_id: &str,
-            transport_id: &str,
-            transport_kind: &str,
-            endpoint_fingerprint: &str,
-        ) -> Result<CommunicationBinding> {
-            let mut conn = self.connect()?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let existing = tx
-                .query_row(
-                    "SELECT * FROM communication_bindings WHERE item_id=?1 AND transport_id=?2",
-                    params![item_id, transport_id],
-                    map_communication_binding,
-                )
-                .optional()?;
-            let id = if let Some(binding) = existing {
-                if binding.repo_key != repo_key
-                    || binding.transport_kind != transport_kind
-                    || binding.endpoint_fingerprint != endpoint_fingerprint
-                {
-                    anyhow::bail!(
-                        "communication transport {transport_id} changed identity while item {item_id} has a live binding"
-                    );
-                }
-                binding.id
-            } else {
-                let id = Uuid::new_v4().to_string();
-                let marker = format!("iq:binding:{id}");
-                let timestamp = now();
-                tx.execute(
-                    "INSERT INTO communication_bindings (id,repo_key,item_id,transport_id,transport_kind,endpoint_fingerprint,marker,status,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,'pending_create',?8,?8)",
-                    params![id, repo_key, item_id, transport_id, transport_kind, endpoint_fingerprint, marker, timestamp],
-                )?;
-                id
-            };
-            tx.commit()?;
-            self.communication_binding(item_id, transport_id)?
-                .with_context(|| {
-                    format!("communication binding disappeared after reservation: {id}")
-                })
-        }
-
-        pub fn activate_communication_binding(
-            &self,
-            binding_id: &str,
-            external_ref: &Value,
-            external_url: &str,
-        ) -> Result<()> {
-            let conn = self.connect()?;
-            let changed = conn.execute(
-                "UPDATE communication_bindings SET external_ref_json=?1,external_url=?2,status='active',last_error=NULL,updated_at=?3 WHERE id=?4",
-                params![external_ref.to_string(), external_url, now(), binding_id],
-            )?;
-            if changed != 1 {
-                anyhow::bail!("communication binding not found: {binding_id}");
-            }
-            Ok(())
-        }
-
-        pub fn set_communication_binding_status(
-            &self,
-            binding_id: &str,
-            status: &str,
-        ) -> Result<()> {
-            let conn = self.connect()?;
-            let changed = conn.execute(
-                "UPDATE communication_bindings SET status=?1,last_error=NULL,updated_at=?2 WHERE id=?3",
-                params![status, now(), binding_id],
-            )?;
-            if changed != 1 {
-                anyhow::bail!("communication binding not found: {binding_id}");
-            }
-            Ok(())
-        }
-
-        pub fn record_communication_error(&self, binding_id: &str, error: &str) -> Result<()> {
-            let conn = self.connect()?;
-            let changed = conn.execute(
-                "UPDATE communication_bindings SET last_error=?1,updated_at=?2 WHERE id=?3",
-                params![error, now(), binding_id],
-            )?;
-            if changed != 1 {
-                anyhow::bail!("communication binding not found: {binding_id}");
-            }
-            Ok(())
-        }
-
-        pub fn clear_communication_error(&self, binding_id: &str) -> Result<()> {
-            let conn = self.connect()?;
-            let changed = conn.execute(
-                "UPDATE communication_bindings SET last_error=NULL,updated_at=?1 WHERE id=?2",
-                params![now(), binding_id],
-            )?;
-            if changed != 1 {
-                anyhow::bail!("communication binding not found: {binding_id}");
-            }
-            Ok(())
-        }
-
-        pub fn apply_communication_response(
-            &self,
-            binding_id: &str,
-            external_response_id: &str,
-            prompt_id: &str,
-            answer: &str,
-            actor: &str,
-            authorized: bool,
-        ) -> Result<CommunicationResponseDisposition> {
-            let external_response_id = external_response_id.trim();
-            if external_response_id.is_empty() {
-                anyhow::bail!("communication response requires a stable external identity");
-            }
-            let mut conn = self.connect()?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let seen: Option<String> = tx
-                .query_row(
-                    "SELECT disposition FROM communication_response_receipts WHERE binding_id=?1 AND external_response_id=?2",
-                    params![binding_id, external_response_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if seen.is_some() {
-                tx.commit()?;
-                return Ok(CommunicationResponseDisposition::Duplicate);
-            }
-
-            let binding_item_id: String = required_row(
-                tx.query_row(
-                    "SELECT item_id FROM communication_bindings WHERE id=?1",
-                    params![binding_id],
-                    |row| row.get(0),
-                ),
-                "communication binding",
-                binding_id,
-            )?;
-
-            let answer = answer.trim();
-            let actor = actor.trim();
-            let prompt = tx
-                .query_row(
-                    "SELECT id,item_id,attempt_id,blocked_phase,status,question,answer,options_json FROM prompts WHERE id=?1",
-                    params![prompt_id],
-                    map_prompt,
-                )
-                .optional()?;
-            let disposition = if !authorized || actor.is_empty() {
-                CommunicationResponseDisposition::Unauthorized
-            } else if answer.is_empty() {
-                CommunicationResponseDisposition::Invalid
-            } else if let Some(prompt) = prompt {
-                let item = tx
-                    .query_row(
-                        "SELECT * FROM queue_items WHERE id=?1",
-                        params![prompt.item_id],
-                        map_item,
-                    )
-                    .optional()?;
-                let answer_supported = !prompt.options.is_empty()
-                    && prompt
-                        .options
-                        .iter()
-                        .any(|option| option.eq_ignore_ascii_case(answer));
-                if prompt.item_id != binding_item_id
-                    || prompt.status != "open"
-                    || item.as_ref().is_none_or(|item| {
-                        item.status != QueueStatus::Blocked
-                            || item.blocked_reason != Some(BlockedReason::NeedsUserInput)
-                            || item.prompt_id().as_deref() != Some(prompt_id)
-                    })
-                {
-                    CommunicationResponseDisposition::Stale
-                } else if !answer_supported {
-                    CommunicationResponseDisposition::Invalid
-                } else {
-                    let item = item.expect("checked above");
-                    let resume = StateMachine
-                        .resume_target(&BlockedState {
-                            phase: prompt.blocked_phase,
-                            reason: BlockedReason::NeedsUserInput,
-                            prompt_id: Some(prompt_id.to_string()),
-                        })
-                        .map_err(anyhow::Error::msg)?;
-                    let timestamp = now();
-                    tx.execute(
-                        "UPDATE prompts SET status='answered',answer=?1,answered_by=?2,answered_at=?3 WHERE id=?4",
-                        params![answer, actor, timestamp, prompt_id],
-                    )?;
-                    tx.execute(
-                        "UPDATE queue_items SET status=?1,blocked_phase=NULL,blocked_reason=NULL,blocked_message=NULL,prompt_id=NULL,updated_at=?2 WHERE id=?3",
-                        params![resume.to_string(), timestamp, item.id],
-                    )?;
-                    Self::record_event_tx(&tx, &item.id, "user_answered", answer)?;
-                    CommunicationResponseDisposition::Applied
-                }
-            } else {
-                CommunicationResponseDisposition::Stale
-            };
-            tx.execute(
-                "INSERT INTO communication_response_receipts (binding_id,external_response_id,prompt_id,answer,actor,disposition,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                params![binding_id, external_response_id, prompt_id, answer, actor, communication_disposition_text(disposition), now()],
-            )?;
-            tx.commit()?;
-            Ok(disposition)
         }
 
         pub fn get_attempt(&self, attempt_id: &str) -> Result<Attempt> {
@@ -3306,284 +2947,6 @@ DROP TABLE queue_items_v6;"#,
             if changed != 1 {
                 anyhow::bail!("integration attempt disappeared during signoff");
             }
-            Ok(())
-        }
-
-        pub(crate) fn begin_moved_base_reconciliation(
-            &self,
-            attempt_id: &str,
-            target_sha: &str,
-            source_sha: &str,
-        ) -> Result<()> {
-            let conn = self.connect()?;
-            let moved = serde_json::to_string(&MovedBaseState::Pending {
-                target_sha: target_sha.to_string(),
-                source_sha: source_sha.to_string(),
-            })?;
-            let changed = conn.execute(
-                "UPDATE integration_attempts SET target_base_sha=?1,merge_commit_sha=NULL,validated_commit_sha=NULL,validation_command=NULL,validation_exit_code=NULL,validation_log_path=NULL,signoff_evidence_json=NULL,moved_base_json=?2 WHERE id=?3",
-                params![target_sha,moved,attempt_id],
-            )?;
-            if changed != 1 {
-                anyhow::bail!("integration attempt disappeared during moved-base intent");
-            }
-            Ok(())
-        }
-
-        pub(crate) fn complete_moved_base_reconciliation(
-            &self,
-            attempt_id: &str,
-            candidate_sha: &str,
-        ) -> Result<()> {
-            let mut conn = self.connect()?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let raw: String = required_row(
-                tx.query_row(
-                    "SELECT moved_base_json FROM integration_attempts WHERE id=?1",
-                    params![attempt_id],
-                    |row| row.get(0),
-                ),
-                "integration attempt",
-                attempt_id,
-            )?;
-            let pending: MovedBaseState =
-                serde_json::from_str(&raw).context("parse pending moved-base reconciliation")?;
-            let MovedBaseState::Pending {
-                target_sha,
-                source_sha,
-            } = pending
-            else {
-                anyhow::bail!("integration attempt has no pending moved-base reconciliation");
-            };
-            let applied = serde_json::to_string(&MovedBaseState::Applied {
-                target_sha,
-                source_sha,
-                candidate_sha: candidate_sha.to_string(),
-            })?;
-            tx.execute(
-                "UPDATE integration_attempts SET merge_commit_sha=?1,moved_base_json=?2 WHERE id=?3",
-                params![candidate_sha, applied, attempt_id],
-            )?;
-            tx.commit()?;
-            Ok(())
-        }
-
-        pub fn mark_integrated(
-            &self,
-            item_id: &str,
-            attempt_id: &str,
-            landed_commit_sha: &str,
-            remote_target_sha: &str,
-            repo_key: &str,
-            owner_id: &str,
-        ) -> Result<QueueItem> {
-            let mut conn = self.connect()?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let item: (String, Option<String>, String, String) = required_row(
-                tx.query_row(
-                    "SELECT status,current_attempt_id,landing_state_json,repo_key FROM queue_items WHERE id=?1",
-                    params![item_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                ),
-                "queue item",
-                item_id,
-            )?;
-            Self::require_mutation_authority(
-                &tx,
-                &item.3,
-                MutationAuthority::RepositoryLease { repo_key, owner_id },
-            )?;
-            let landing: LandingState = serde_json::from_str(&item.2)
-                .context("parse landing state while marking integrated")?;
-            let LandingState::Uncertain { candidate_sha, .. } = landing else {
-                anyhow::bail!("item {item_id} has no uncertain landing to mark");
-            };
-            if item.0 != QueueStatus::Integrating.to_string()
-                || item.1.as_deref() != Some(attempt_id)
-            {
-                anyhow::bail!(
-                    "item {item_id} is no longer integrating attempt {attempt_id}; refusing to mark landed"
-                );
-            }
-            tx.execute(
-                "UPDATE integration_attempts SET landed_commit_sha=?1,result='integrated',finished_at=?2 WHERE id=?3",
-                params![landed_commit_sha, now(), attempt_id],
-            )?;
-            let landed = serde_json::to_string(&LandingState::Landed {
-                candidate_sha,
-                commit_sha: landed_commit_sha.to_string(),
-            })?;
-            tx.execute(
-                "UPDATE queue_items SET status='integrated',landed_commit_sha=?1,landing_state_json=?2,updated_at=?3 WHERE id=?4",
-                params![landed_commit_sha, landed, now(), item_id],
-            )?;
-            let submission_id: Option<String> = tx.query_row(
-                "SELECT submission_id FROM queue_items WHERE id=?1 AND source_kind='local_submission'",
-                params![item_id],
-                |row| row.get(0),
-            ).optional()?;
-            if let Some(submission_id) = submission_id {
-                let changed = tx.execute(
-                    "UPDATE local_submissions SET state='integrated' WHERE id=?1 AND state='queued'",
-                    params![submission_id],
-                )?;
-                if changed != 1 {
-                    anyhow::bail!("integrated local submission is not queued");
-                }
-                let workspace_id: String = tx.query_row(
-                    "SELECT workspace_id FROM local_submissions WHERE id=?1",
-                    params![submission_id],
-                    |row| row.get(0),
-                )?;
-                let cleanup = serde_json::to_string(&CleanupState::Pending)?;
-                let changed = tx.execute(
-                    "UPDATE development_workspaces SET status='cleanup_pending',cleanup_json=?1,updated_at=?2 WHERE id=?3 AND status IN ('submitted','cleanup_pending','cleanup_failed')",
-                    params![cleanup,now(),workspace_id],
-                )?;
-                if changed != 1 {
-                    anyhow::bail!("local submission workspace cannot enter durable cleanup debt");
-                }
-            }
-            let registered: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM registered_repositories WHERE repo_key=(SELECT repo_key FROM queue_items WHERE id=?1))",
-                params![item_id],
-                |row| row.get(0),
-            )?;
-            if registered {
-                let seed_cleanup = serde_json::to_string(&SeedRefreshState::Pending {
-                    target_sha: remote_target_sha.to_string(),
-                })?;
-                let changed = tx.execute(
-                    "UPDATE registered_repositories SET seed_refresh_json=?1,updated_at=?2 WHERE repo_key=(SELECT repo_key FROM queue_items WHERE id=?3)",
-                    params![seed_cleanup,now(),item_id],
-                )?;
-                if changed != 1 {
-                    anyhow::bail!("registered repository cannot enter durable seed refresh debt");
-                }
-            }
-            Self::record_event_tx(
-                &tx,
-                item_id,
-                "integrated",
-                &format!("landed {landed_commit_sha}"),
-            )?;
-            tx.commit()?;
-            self.get_item(item_id)
-        }
-
-        pub fn begin_landing(
-            &self,
-            item_id: &str,
-            attempt_id: &str,
-            candidate_sha: &str,
-            expected_target_sha: &str,
-            repo_key: &str,
-            owner_id: &str,
-        ) -> Result<()> {
-            let mut conn = self.connect()?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let item: (String, Option<String>, String, String) = required_row(
-                tx.query_row(
-                    "SELECT status,current_attempt_id,landing_state_json,repo_key FROM queue_items WHERE id=?1",
-                    params![item_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                ),
-                "queue item",
-                item_id,
-            )?;
-            Self::require_mutation_authority(
-                &tx,
-                &item.3,
-                MutationAuthority::RepositoryLease { repo_key, owner_id },
-            )?;
-            if item.0 != QueueStatus::Integrating.to_string()
-                || item.1.as_deref() != Some(attempt_id)
-            {
-                anyhow::bail!(
-                    "item {item_id} is no longer integrating attempt {attempt_id}; refusing target mutation"
-                );
-            }
-            let current: LandingState = serde_json::from_str(&item.2)
-                .context("parse landing state while authorizing target mutation")?;
-            let uncertain = LandingState::Uncertain {
-                candidate_sha: candidate_sha.to_string(),
-                expected_target_sha: expected_target_sha.to_string(),
-            };
-            if current == LandingState::Ready {
-                tx.execute(
-                    "UPDATE queue_items SET landing_state_json=?1,updated_at=?2 WHERE id=?3",
-                    params![serde_json::to_string(&uncertain)?, now(), item_id],
-                )?;
-                Self::record_event_tx(
-                    &tx,
-                    item_id,
-                    "landing_uncertain",
-                    "target mutation started; cancellation is closed until the outcome is known",
-                )?;
-            } else if current != uncertain {
-                anyhow::bail!("item has a different durable landing outcome");
-            }
-            tx.commit()?;
-            Ok(())
-        }
-
-        pub fn record_definite_landing_rejection(
-            &self,
-            item_id: &str,
-            attempt_id: &str,
-            candidate_sha: &str,
-            expected_target_sha: &str,
-            repo_key: &str,
-            owner_id: &str,
-        ) -> Result<()> {
-            let mut conn = self.connect()?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let (status, current_attempt_id, raw, item_repo_key): (
-                String,
-                Option<String>,
-                String,
-                String,
-            ) = required_row(
-                tx.query_row(
-                    "SELECT status,current_attempt_id,landing_state_json,repo_key FROM queue_items WHERE id=?1",
-                    params![item_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                ),
-                "queue item",
-                item_id,
-            )?;
-            Self::require_mutation_authority(
-                &tx,
-                &item_repo_key,
-                MutationAuthority::RepositoryLease { repo_key, owner_id },
-            )?;
-            let expected = LandingState::Uncertain {
-                candidate_sha: candidate_sha.to_string(),
-                expected_target_sha: expected_target_sha.to_string(),
-            };
-            let current: LandingState =
-                serde_json::from_str(&raw).context("parse rejected landing state")?;
-            if status != QueueStatus::Integrating.to_string()
-                || current_attempt_id.as_deref() != Some(attempt_id)
-                || current != expected
-            {
-                anyhow::bail!("definite rejection does not match the active landing attempt");
-            }
-            tx.execute(
-                r#"UPDATE queue_items SET landing_state_json='{"state":"ready"}',updated_at=?1 WHERE id=?2"#,
-                params![now(), item_id],
-            )?;
-            tx.execute(
-                "UPDATE integration_attempts SET validated_commit_sha=NULL,validation_command=NULL,validation_exit_code=NULL,validation_log_path=NULL,signoff_evidence_json=NULL WHERE id=?1",
-                params![attempt_id],
-            )?;
-            Self::record_event_tx(
-                &tx,
-                item_id,
-                "landing_rejected",
-                "compare-and-set rejected before target mutation; candidate evidence invalidated",
-            )?;
-            tx.commit()?;
             Ok(())
         }
 
@@ -4110,7 +3473,9 @@ DROP TABLE queue_items_v6;"#,
             owner_id: &str,
             submission_id: &str,
             producer_metadata: &Value,
+            state_repository: &crate::control_domain::StateRepositorySnapshot,
         ) -> Result<(LocalSubmission, QueueItem)> {
+            let state_repository = state_repository.clone().validate()?;
             let mut queue_item_id = None;
             self.composition_transaction(repo_key, owner_id, |tx| {
                 let submission = required_row(
@@ -4185,7 +3550,7 @@ DROP TABLE queue_items_v6;"#,
                         ),
                     };
                     let changed = tx.execute(
-                        r#"UPDATE queue_items SET source_branch=?1,source_ref=?1,submission_id=?2,current_head_sha=?3,repo_path=?4,target_branch=?5,status=?6,current_attempt_id=?7,integration_workspace_path=?8,integration_workspace_rift_id=?9,integration_workspace_source_rift_id=?10,replacement_json=?11,landing_state_json='{"state":"ready"}',conflict_json=NULL,target_sha=NULL,source_sha=NULL,landed_commit_sha=NULL,validation_evidence_json='{}',updated_at=?12 WHERE id=?13 AND repo_key=?14 AND status='blocked'"#,
+                        r#"UPDATE queue_items SET source_branch=?1,source_ref=?1,submission_id=?2,current_head_sha=?3,repo_path=?4,target_branch=?5,status=?6,current_attempt_id=?7,integration_workspace_path=?8,integration_workspace_rift_id=?9,integration_workspace_source_rift_id=?10,replacement_json=?11,conflict_json=NULL,target_sha=NULL,source_sha=NULL,validation_evidence_json='{}',updated_at=?12 WHERE id=?13 AND repo_key=?14 AND status='blocked'"#,
                         params![submission.private_ref,submission.id,submission.commit_sha,path_text(&repository.integration_path)?,repository.target_branch,status,current_attempt,workspace_path,workspace_rift,workspace_source,replacement_json,timestamp,item_id,repo_key],
                     )?;
                     if changed != 1 { anyhow::bail!("local replacement state changed concurrently"); }
@@ -4214,6 +3579,12 @@ DROP TABLE queue_items_v6;"#,
                     )?;
                     if changed != 1 { anyhow::bail!("development workspace is not active"); }
                     Self::record_event_tx(tx,&submission.queue_item_id,"item_enqueued","immutable local submission enqueued")?;
+                    insert_state_repository_binding(
+                        tx,
+                        &submission.queue_item_id,
+                        &state_repository,
+                        &timestamp,
+                    )?;
                 }
                 let changed = tx.execute(
                     "UPDATE local_submissions SET state='queued' WHERE id=?1 AND state='creating'",
@@ -4963,15 +4334,6 @@ DROP TABLE queue_items_v6;"#,
         }
     }
 
-    impl QueueItem {
-        fn prompt_id(&self) -> Option<String> {
-            self.validation_evidence
-                .get("prompt_id")
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
-        }
-    }
-
     fn map_prompt(row: &Row<'_>) -> rusqlite::Result<Prompt> {
         let phase: String = row.get(3)?;
         let status: String = row.get(4)?;
@@ -5009,34 +4371,6 @@ DROP TABLE queue_items_v6;"#,
                 .transpose()?
                 .unwrap_or_default(),
         })
-    }
-
-    fn map_communication_binding(row: &Row<'_>) -> rusqlite::Result<CommunicationBinding> {
-        Ok(CommunicationBinding {
-            id: row.get("id")?,
-            repo_key: row.get("repo_key")?,
-            item_id: row.get("item_id")?,
-            transport_id: row.get("transport_id")?,
-            transport_kind: row.get("transport_kind")?,
-            endpoint_fingerprint: row.get("endpoint_fingerprint")?,
-            marker: row.get("marker")?,
-            external_ref: parse_json_option(row, "external_ref_json")?,
-            external_url: row.get("external_url")?,
-            status: row.get("status")?,
-            last_error: row.get("last_error")?,
-        })
-    }
-
-    fn communication_disposition_text(
-        disposition: CommunicationResponseDisposition,
-    ) -> &'static str {
-        match disposition {
-            CommunicationResponseDisposition::Applied => "applied",
-            CommunicationResponseDisposition::Duplicate => "duplicate",
-            CommunicationResponseDisposition::Stale => "stale",
-            CommunicationResponseDisposition::Invalid => "invalid",
-            CommunicationResponseDisposition::Unauthorized => "unauthorized",
-        }
     }
 
     fn map_item(row: &Row<'_>) -> rusqlite::Result<QueueItem> {
@@ -5159,6 +4493,49 @@ DROP TABLE queue_items_v6;"#,
         )
     }
 
+    fn insert_state_repository_binding(
+        transaction: &rusqlite::Transaction<'_>,
+        item_id: &str,
+        snapshot: &crate::control_domain::StateRepositorySnapshot,
+        timestamp: &str,
+    ) -> Result<()> {
+        use crate::control_domain::{IssueVisibility, StateRepositorySnapshot};
+        let (provider, repository, visibility, reservation_state) = match snapshot {
+            StateRepositorySnapshot::Local => (None, None, None, "none"),
+            StateRepositorySnapshot::GithubIssue(issue) => (
+                Some("github"),
+                Some(issue.repository.as_str()),
+                Some(match issue.visibility {
+                    IssueVisibility::Minimal => "minimal",
+                    IssueVisibility::Full => "full",
+                }),
+                if issue.visibility == IssueVisibility::Full {
+                    "pending"
+                } else {
+                    "none"
+                },
+            ),
+            StateRepositorySnapshot::GitlabIssue(issue) => (
+                Some("gitlab"),
+                Some(issue.repository.as_str()),
+                Some(match issue.visibility {
+                    IssueVisibility::Minimal => "minimal",
+                    IssueVisibility::Full => "full",
+                }),
+                if issue.visibility == IssueVisibility::Full {
+                    "pending"
+                } else {
+                    "none"
+                },
+            ),
+        };
+        transaction.execute(
+            "INSERT INTO item_state_repository_bindings(item_id,snapshot_json,provider,repository,visibility,reservation_state,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![item_id,serde_json::to_string(snapshot)?,provider,repository,visibility,reservation_state,timestamp],
+        )?;
+        Ok(())
+    }
+
     fn now() -> String {
         Utc::now().to_rfc3339()
     }
@@ -5258,6 +4635,7 @@ CREATE TABLE IF NOT EXISTS integration_attempts (
   result TEXT,
   UNIQUE(item_id, attempt_number)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS integration_attempt_item_identity ON integration_attempts(id,item_id);
 
 CREATE TABLE IF NOT EXISTS queue_events (
   id TEXT PRIMARY KEY,
@@ -5310,6 +4688,10 @@ CREATE TABLE IF NOT EXISTS communication_response_receipts (
   created_at TEXT NOT NULL,
   PRIMARY KEY(binding_id, external_response_id)
 );
+
+-- Schema v9 has no communication transport authority.
+DROP TABLE IF EXISTS communication_response_receipts;
+DROP TABLE IF EXISTS communication_bindings;
 
 CREATE TABLE IF NOT EXISTS repo_leases (
   repo_key TEXT PRIMARY KEY,
@@ -5589,6 +4971,7 @@ pub mod integrator {
         pub base_remote: String,
         pub workspace_root: PathBuf,
         pub rift_database: Option<PathBuf>,
+        pub system_config: crate::agent_config::SystemConfig,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -5622,6 +5005,7 @@ pub mod integrator {
         registered: bool,
         lease_owner_id: String,
         workspaces: RiftWorkspaceManager,
+        control_store: crate::control_store::ControlStore,
     }
 
     pub(crate) struct RiftWorkspaceManager {
@@ -6581,42 +5965,6 @@ pub mod integrator {
         } else {
             Err(error).context("inspect cleanup residue entry")
         }
-    }
-
-    fn checked_workspace_descendant(workspace: &Path, relative: &Path) -> Result<PathBuf> {
-        let components = relative.components().collect::<Vec<_>>();
-        if components.is_empty()
-            || !components
-                .iter()
-                .all(|component| matches!(component, std::path::Component::Normal(_)))
-        {
-            anyhow::bail!(
-                "workspace path is not checkout-relative: {}",
-                relative.display()
-            );
-        }
-        let mut path = workspace.to_path_buf();
-        for (index, component) in components.iter().enumerate() {
-            path.push(component.as_os_str());
-            match fs::symlink_metadata(&path) {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
-                    anyhow::bail!("workspace path traverses symlink: {}", path.display())
-                }
-                Ok(metadata) if index + 1 < components.len() && !metadata.is_dir() => {
-                    anyhow::bail!(
-                        "workspace path parent is not a directory: {}",
-                        path.display()
-                    )
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("inspect workspace path {}", path.display()))
-                }
-            }
-        }
-        Ok(path)
     }
 
     fn acquire_exclusive_lock(path: &Path, label: &str) -> Result<fs::File> {
@@ -8274,6 +7622,7 @@ pub mod integrator {
 
     pub(crate) struct RepositoryOperationLease {
         queue: SqliteQueue,
+        _database_lease: crate::control_store::DatabaseProcessLease,
         repo_key: String,
         owner_id: String,
         ttl_seconds: i64,
@@ -8329,6 +7678,7 @@ pub mod integrator {
                 }
                 Err(error) => return Err(error),
             };
+            let database_lease = crate::control_store::DatabaseProcessLease::acquire(queue.path())?;
             if !queue.acquire_repo_operation_lease(
                 repo_key,
                 owner_id,
@@ -8346,6 +7696,7 @@ pub mod integrator {
             );
             Ok(Some(Self {
                 queue,
+                _database_lease: database_lease,
                 repo_key: repo_key.to_string(),
                 owner_id: owner_id.to_string(),
                 ttl_seconds,
@@ -8554,6 +7905,7 @@ pub mod integrator {
             )?;
             options.workspace_root = workspaces.root.clone();
             let policy = validate_host_policy(policy)?;
+            let control_store = crate::control_store::ControlStore::open(queue.path())?;
             let lease_owner_id = format!("{}:{}", options.owner_id, Uuid::new_v4());
             queue.register_workspace_root(
                 &options.repo_key,
@@ -8569,7 +7921,50 @@ pub mod integrator {
                 registered,
                 lease_owner_id,
                 workspaces,
+                control_store,
             })
+        }
+
+        fn ensure_effort_after_composition(
+            &self,
+            item: &QueueItem,
+            attempt: &Attempt,
+        ) -> Result<crate::control_store::IntegrationEffort> {
+            let workspace = item
+                .workspace
+                .identity()
+                .context("composed item has no retained Rift identity")?;
+            let target_sha = item
+                .target_sha
+                .as_deref()
+                .context("composed item has no target SHA")?;
+            let source_sha = item
+                .source_sha
+                .as_deref()
+                .context("composed item has no source SHA")?;
+            let control = crate::composition::load_project_control_only(&self.options.repo_path)?;
+            let runner = self
+                .options
+                .system_config
+                .runner_snapshot(control.model.as_deref())?;
+            let source_variant = match item.source {
+                crate::core::QueueSource::RemoteBranch { .. } => "remote_branch",
+                crate::core::QueueSource::LocalSubmission { .. } => "local_submission",
+            };
+            let landing_variant = item.landing_policy.to_string();
+            let state_repository = self.control_store.item_state_repository_binding(&item.id)?;
+            self.control_store
+                .create_effort(crate::control_store::NewEffort {
+                    item_id: &item.id,
+                    attempt_id: &attempt.id,
+                    target_sha,
+                    source_sha,
+                    source_variant,
+                    landing_variant: &landing_variant,
+                    workspace,
+                    runner: &runner,
+                    state_repository: &state_repository,
+                })
         }
 
         fn verify_registered_remote_identity_for(
@@ -8633,7 +8028,9 @@ pub mod integrator {
             if let Some(blocked) = self.enforce_item_boundary(&active)? {
                 return Ok(Some(blocked));
             }
-            if active.status == QueueStatus::Blocked {
+            if active.status == QueueStatus::Blocked
+                && self.control_store.effort_for_item(&active.id)?.is_none()
+            {
                 return Ok(Some(active));
             }
             if active.status != QueueStatus::Ready {
@@ -8664,12 +8061,15 @@ pub mod integrator {
                 return Ok(None);
             };
             let item = self.with_lease_heartbeat("merging", || self.merge_item(item, &attempt))?;
-            if matches!(item.status, QueueStatus::Blocked | QueueStatus::Cancelled) {
+            if item.status != QueueStatus::Merged {
                 return Ok(Some(item));
             }
             let item =
                 self.with_lease_heartbeat("validating", || self.validate_item(item, &attempt))?;
-            if matches!(item.status, QueueStatus::Blocked | QueueStatus::Cancelled) {
+            if !matches!(
+                item.status,
+                QueueStatus::Validated | QueueStatus::Integrating
+            ) {
                 return Ok(Some(item));
             }
             let item =
@@ -8735,30 +8135,146 @@ pub mod integrator {
                 .as_deref()
                 .context("item has no active integration attempt")?;
             let attempt = self.queue.get_attempt(attempt_id)?;
+            if let Some(effort) = self.control_store.effort_for_item(item_id)? {
+                match &effort.state {
+                    crate::control_domain::IntegrationEffortState::AgentReady(_) => {
+                        return self.run_agent_cycle(item, &attempt)
+                    }
+                    crate::control_domain::IntegrationEffortState::AgentLaunching(launch) => {
+                        if crate::agent_runner::systemd_unit_main_pid(
+                            &effort.runner.sandbox.systemctl,
+                            &launch.unit_name,
+                        )?
+                        .is_some()
+                        {
+                            crate::agent_runner::stop_systemd_unit(
+                                &effort.runner.sandbox.systemctl,
+                                &launch.unit_name,
+                            )?;
+                        }
+                        self.control_store
+                            .reset_prepared_launch(&effort.id, &launch.cycle_id)?;
+                        return self.run_agent_cycle(item, &attempt);
+                    }
+                    crate::control_domain::IntegrationEffortState::CandidateBuilding(building) => {
+                        return self.reconcile_candidate_build(item, &attempt, &effort, building)
+                    }
+                    crate::control_domain::IntegrationEffortState::GuidanceRequired(_)
+                    | crate::control_domain::IntegrationEffortState::InfrastructureBlocked(_)
+                    | crate::control_domain::IntegrationEffortState::CycleLimitBlocked(_) => {
+                        return Ok(item)
+                    }
+                    crate::control_domain::IntegrationEffortState::ProviderBlocked(_) => {
+                        self.control_store
+                            .resume_provider_reconciliation(&effort.id)?;
+                        let item = self.queue.get_item(item_id)?;
+                        return self.with_lease_heartbeat("provider reconciliation", || {
+                            self.integrate_item(item, &attempt)
+                        });
+                    }
+                    crate::control_domain::IntegrationEffortState::CandidateReady(_)
+                    | crate::control_domain::IntegrationEffortState::Validating(_)
+                    | crate::control_domain::IntegrationEffortState::Landing(_)
+                    | crate::control_domain::IntegrationEffortState::LandingUncertain(_)
+                    | crate::control_domain::IntegrationEffortState::Integrated(_)
+                    | crate::control_domain::IntegrationEffortState::Cancelled(_) => {}
+                    crate::control_domain::IntegrationEffortState::AgentRunning(running) => {
+                        crate::agent_runner::terminate_exact_process(
+                            running.pid,
+                            running.process_start_ticks,
+                            running.process_group_id,
+                        )?;
+                        let workspace = self.load_owned_workspace(&item)?;
+                        match crate::agent_runner::read_restart_result(
+                            &workspace,
+                            &running.cycle_id,
+                            effort.runner.bounds.max_result_bytes,
+                        ) {
+                            Ok(Some(restart)) => {
+                                let input = restart.input;
+                                if input.identity.effort_id != effort.id
+                                    || input.identity.item_id != item.id
+                                    || input.identity.attempt_id != attempt.id
+                                    || input.identity.cycle_id != running.cycle_id
+                                    || input.identity.target_sha != effort.target_sha
+                                    || input.identity.source_sha != effort.source_sha
+                                    || input.identity.candidate_sha.is_some()
+                                    || restart.input_sha256 != running.input_sha256
+                                {
+                                    anyhow::bail!(
+                                        "restart protocol input differs from effort authority"
+                                    );
+                                }
+                                if running.result != restart.result_state {
+                                    self.control_store.record_result_state(
+                                        &effort.id,
+                                        &running.cycle_id,
+                                        &restart.result_state,
+                                    )?;
+                                }
+                                return self.classify_agent_result(
+                                    &item,
+                                    &attempt,
+                                    &effort,
+                                    &input.identity,
+                                    restart.result,
+                                    &restart.export_directory,
+                                );
+                            }
+                            Ok(None) => {
+                                crate::agent_runner::quarantine_restart_artifacts(
+                                    &workspace,
+                                    &running.cycle_id,
+                                )?;
+                                self.control_store.consume_cycle_failure(
+                                    &effort.id,
+                                    &running.cycle_id,
+                                    crate::control_domain::CycleFailure::Interrupted,
+                                )?;
+                            }
+                            Err(error) => {
+                                crate::agent_runner::quarantine_restart_artifacts(
+                                    &workspace,
+                                    &running.cycle_id,
+                                )?;
+                                self.control_store.consume_cycle_failure(
+                                    &effort.id,
+                                    &running.cycle_id,
+                                    crate::control_domain::CycleFailure::InvalidResult {
+                                        reason: format!("restart result rejected: {error:#}"),
+                                    },
+                                )?;
+                            }
+                        }
+                        let refreshed = self.queue.get_item(item_id)?;
+                        let refreshed_effort = self
+                            .control_store
+                            .effort_for_item(item_id)?
+                            .context("effort disappeared after restart classification")?;
+                        if matches!(
+                            refreshed_effort.state,
+                            crate::control_domain::IntegrationEffortState::AgentReady(_)
+                        ) {
+                            return self.run_agent_cycle(refreshed, &attempt);
+                        }
+                        return Ok(refreshed);
+                    }
+                }
+            }
             match item.status {
                 QueueStatus::Merging => {
-                    let has_conflict_prompt = self
-                        .queue
-                        .prompts_for_item(&item.id)?
-                        .into_iter()
-                        .any(|prompt| {
-                            prompt.attempt_id.as_deref() == Some(attempt.id.as_str())
-                                && prompt.blocked_phase == BlockedPhase::Merging
-                        });
-                    let item = self.with_lease_heartbeat("merging", || {
-                        if has_conflict_prompt {
-                            self.resume_merge(item, &attempt)
-                        } else {
-                            self.merge_item(item, &attempt)
-                        }
-                    })?;
+                    let item =
+                        self.with_lease_heartbeat("merging", || self.merge_item(item, &attempt))?;
                     if matches!(item.status, QueueStatus::Blocked | QueueStatus::Cancelled) {
                         return Ok(item);
                     }
                     let item = self.with_lease_heartbeat("validating", || {
                         self.validate_item(item, &attempt)
                     })?;
-                    if matches!(item.status, QueueStatus::Blocked | QueueStatus::Cancelled) {
+                    if !matches!(
+                        item.status,
+                        QueueStatus::Validated | QueueStatus::Integrating
+                    ) {
                         return Ok(item);
                     }
                     self.with_lease_heartbeat("integrating", || self.integrate_item(item, &attempt))
@@ -8767,7 +8283,10 @@ pub mod integrator {
                     let item = self.with_lease_heartbeat("validating", || {
                         self.validate_item(item, &attempt)
                     })?;
-                    if matches!(item.status, QueueStatus::Blocked | QueueStatus::Cancelled) {
+                    if !matches!(
+                        item.status,
+                        QueueStatus::Validated | QueueStatus::Integrating
+                    ) {
                         return Ok(item);
                     }
                     self.with_lease_heartbeat("integrating", || self.integrate_item(item, &attempt))
@@ -8776,7 +8295,10 @@ pub mod integrator {
                     let item = self.with_lease_heartbeat("validating", || {
                         self.validate_item(item, &attempt)
                     })?;
-                    if matches!(item.status, QueueStatus::Blocked | QueueStatus::Cancelled) {
+                    if !matches!(
+                        item.status,
+                        QueueStatus::Validated | QueueStatus::Integrating
+                    ) {
                         return Ok(item);
                     }
                     self.with_lease_heartbeat("integrating", || self.integrate_item(item, &attempt))
@@ -9069,15 +8591,31 @@ pub mod integrator {
             attempt_id: &str,
             candidate_sha: &str,
             expected_target_sha: &str,
+            command_id: &str,
         ) -> Result<Option<QueueItem>> {
             self.ensure_repo_lease()?;
-            match self.queue.begin_landing(
-                item_id,
-                attempt_id,
-                candidate_sha,
+            let effort = self
+                .control_store
+                .effort_for_item(item_id)?
+                .context("landing item has no integration effort")?;
+            if effort.attempt_id != attempt_id {
+                anyhow::bail!("landing attempt differs from effort authority");
+            }
+            let signoff = self
+                .queue
+                .get_attempt(attempt_id)?
+                .signoff_evidence_json
+                .map(|_| crate::control_domain::SignoffDisposition::Evidence {
+                    evidence_id: format!("attempt:{attempt_id}"),
+                    candidate_sha: candidate_sha.to_string(),
+                })
+                .unwrap_or(crate::control_domain::SignoffDisposition::NotRequired);
+            match self.control_store.begin_landing(
+                &effort.id,
                 expected_target_sha,
-                &self.options.repo_key,
                 &self.lease_owner_id,
+                command_id,
+                signoff,
             ) {
                 Ok(()) => Ok(None),
                 Err(error) => {
@@ -9116,14 +8654,16 @@ pub mod integrator {
             remote_target_sha: &str,
         ) -> Result<QueueItem> {
             self.ensure_repo_lease()?;
-            let item = self.queue.mark_integrated(
-                item_id,
-                attempt_id,
-                landed_commit_sha,
-                remote_target_sha,
-                &self.options.repo_key,
-                &self.lease_owner_id,
-            )?;
+            let effort = self
+                .control_store
+                .effort_for_item(item_id)?
+                .context("integrated item has no integration effort")?;
+            if effort.attempt_id != attempt_id {
+                anyhow::bail!("integrated attempt differs from effort authority");
+            }
+            self.control_store
+                .mark_integrated(&effort.id, landed_commit_sha, remote_target_sha)?;
+            let item = self.queue.get_item(item_id)?;
             self.cleanup_terminal_item(&item)?;
             self.queue.get_item(item_id)
         }
@@ -9221,7 +8761,7 @@ pub mod integrator {
                     ) {
                         Ok(()) => self.source_remote_sha(&item)?,
                         Err(error) => {
-                            self.block_item_owned(
+                            return self.block_and_get(
                                 &item.id,
                                 BlockedPhase::Merging,
                                 BlockedReason::Infra,
@@ -9229,8 +8769,7 @@ pub mod integrator {
                                     "failed to fetch source branch {}: {error}",
                                     item.source_branch
                                 ),
-                            )?;
-                            return self.queue.get_item(&item.id);
+                            );
                         }
                     }
                 }
@@ -9266,13 +8805,12 @@ pub mod integrator {
                         item.source_branch, source_sha, item.current_head_sha
                     ),
                 )?;
-                self.block_item_owned(
+                return self.block_and_get(
                     &item.id,
                     BlockedPhase::Merging,
                     BlockedReason::NeedsAgentFix,
                     "source branch head does not match queued source head",
-                )?;
-                return self.queue.get_item(&item.id);
+                );
             }
 
             let workspace = self.workspaces.expected_path(&item.id)?;
@@ -9450,274 +8988,615 @@ pub mod integrator {
                     &base_sha,
                     &source_sha,
                 )?;
-                self.block_item_owned(
-                    &item.id,
-                    BlockedPhase::Merging,
-                    BlockedReason::NeedsUserInput,
-                    "merge conflict requires user resolution",
-                )?;
-                return self.queue.get_item(&item.id);
-            }
-
-            let merge_in_progress =
-                git_status(&workspace, ["rev-parse", "--verify", "MERGE_HEAD"])?
-                    .status
-                    .success();
-            let diff = git_status(&workspace, ["diff", "--cached", "--quiet"])?;
-            if local_squash && diff.status.success() {
-                return self.block_and_get(
-                    &item.id,
-                    BlockedPhase::Merging,
-                    BlockedReason::NeedsAgentFix,
-                    "local submission is empty relative to the exact target base",
-                );
-            }
-            if merge_in_progress || !diff.status.success() {
-                self.run_supervised_item_command(
-                    &item.id,
-                    &attempt.id,
-                    QueueStatus::Merging,
-                    "git",
-                    [
-                        "commit",
-                        "-m",
-                        &if local_squash {
-                            format!("Squash integrate queue item {}", item.id)
-                        } else {
-                            format!("Integrate queue item {}", item.id)
+                let composed = self.queue.get_item(&item.id)?;
+                let effort = self.ensure_effort_after_composition(&composed, attempt)?;
+                if let Err(error) = crate::composition::reject_tracked_policy(&workspace) {
+                    self.control_store.block_infrastructure(
+                        &effort.id,
+                        crate::control_domain::InfrastructureBlocker {
+                            component:
+                                crate::control_domain::InfrastructureComponent::Configuration,
+                            operation: "admit_cycle".into(),
+                            cause: crate::control_domain::InfrastructureCause::Unavailable {
+                                detail: format!("{error:#}"),
+                            },
                         },
-                    ],
-                    Some(&workspace),
-                    StdDuration::from_secs(60),
-                    "merge commit",
-                )?;
+                    )?;
+                    return self.queue.get_item(&item.id);
+                }
+                let composed_attempt = self.queue.get_attempt(&attempt.id)?;
+                return self.run_agent_cycle(composed, &composed_attempt);
             }
-            let merge_sha = git_output(&workspace, ["rev-parse", "HEAD"])?;
-            if local_squash {
-                verify_one_parent_candidate(&workspace, &merge_sha, &base_sha)?;
-            }
-            self.ensure_repo_lease()?;
-            if matches!(
-                self.queue.get_attempt(&attempt.id)?.moved_base,
-                crate::sqlite::MovedBaseState::Pending { .. }
-            ) {
-                self.queue
-                    .complete_moved_base_reconciliation(&attempt.id, &merge_sha)?;
-            } else {
-                self.queue.update_attempt_merge(&attempt.id, &merge_sha)?;
-            }
-            self.transition_item_owned(&item.id, QueueStatus::Merged)
-        }
 
-        fn resume_merge(&self, item: QueueItem, attempt: &Attempt) -> Result<QueueItem> {
-            let prompt = self
-                .queue
-                .prompts_for_item(&item.id)?
-                .into_iter()
-                .rfind(|prompt| prompt.attempt_id.as_deref() == Some(attempt.id.as_str()))
-                .with_context(|| {
-                    format!(
-                        "item {} cannot resume merge without a prompt for attempt {}",
-                        item.id, attempt.id
-                    )
-                })?;
-            if prompt.status != "answered" {
-                anyhow::bail!(
-                    "item {} cannot resume merge because current prompt {} is {}",
-                    item.id,
-                    prompt.id,
-                    prompt.status
-                );
-            }
-            if prompt.blocked_phase != BlockedPhase::Merging {
-                anyhow::bail!(
-                    "item {} cannot resume merge from {} prompt {}",
-                    item.id,
-                    prompt.blocked_phase,
-                    prompt.id
-                );
-            }
-            let prompt_id = prompt.id.clone();
-            let answer = prompt.answer.with_context(|| {
-                format!(
-                    "item {} cannot resume merge because answered prompt {} has no answer",
-                    item.id, prompt_id
-                )
-            })?;
-
-            self.resume_merge_with_answer(item, attempt, &answer)
-        }
-
-        fn resume_merge_with_answer(
-            &self,
-            item: QueueItem,
-            attempt: &Attempt,
-            answer: &str,
-        ) -> Result<QueueItem> {
-            let workspace = self.load_owned_workspace(&item)?;
-            if !entry_exists(&workspace)? {
-                self.block_item_owned(
-                    &item.id,
-                    BlockedPhase::Merging,
-                    BlockedReason::Infra,
-                    "integration workspace is missing during merge resume",
-                )?;
-                return self.queue.get_item(&item.id);
-            }
-            self.apply_merge_answer(&workspace, &item, attempt, answer)?;
-            let unresolved = conflict_files(&workspace)?;
-            if !unresolved.is_empty() {
-                self.ensure_repo_lease()?;
-                self.queue.set_conflict_metadata(
-                    &item.id,
-                    &json!({
-                        "files": unresolved,
-                        "summary": "merge still has unresolved conflict files",
-                        "workspace_path": workspace,
-                    }),
-                    item.target_sha.as_deref().unwrap_or_default(),
-                    item.source_sha.as_deref().unwrap_or_default(),
-                )?;
-                self.block_item_owned(
-                    &item.id,
-                    BlockedPhase::Merging,
-                    BlockedReason::NeedsUserInput,
-                    "merge conflict remains unresolved",
-                )?;
-                return self.queue.get_item(&item.id);
-            }
-            let staged = git_status(&workspace, ["diff", "--cached", "--quiet"])?;
-            let merge_in_progress =
-                git_status(&workspace, ["rev-parse", "--verify", "MERGE_HEAD"])?
-                    .status
-                    .success();
-            let local_squash = matches!(
-                item.source,
-                crate::core::QueueSource::LocalSubmission { .. }
-            ) && item.landing_policy == crate::core::LandingPolicy::Squash;
-            if local_squash && staged.status.success() {
-                return self.block_and_get(
-                    &item.id,
-                    BlockedPhase::Merging,
-                    BlockedReason::NeedsAgentFix,
-                    "local submission is empty after conflict resolution",
-                );
-            }
-            if merge_in_progress || !staged.status.success() {
-                self.run_supervised_item_command(
-                    &item.id,
-                    &attempt.id,
-                    QueueStatus::Merging,
-                    "git",
-                    ["commit", "-m", &format!("Resolve queue item {}", item.id)],
-                    Some(&workspace),
-                    StdDuration::from_secs(60),
-                    "merge resolution commit",
-                )?;
-            }
-            let merge_sha = git_output(&workspace, ["rev-parse", "HEAD"])?;
-            if local_squash {
-                verify_one_parent_candidate(
-                    &workspace,
-                    &merge_sha,
-                    attempt
-                        .target_base_sha
-                        .as_deref()
-                        .context("squash attempt has no exact target base")?,
-                )?;
-            }
-            self.ensure_repo_lease()?;
-            if matches!(
-                self.queue.get_attempt(&attempt.id)?.moved_base,
-                crate::sqlite::MovedBaseState::Pending { .. }
-            ) {
-                self.queue
-                    .complete_moved_base_reconciliation(&attempt.id, &merge_sha)?;
-            } else {
-                self.queue.update_attempt_merge(&attempt.id, &merge_sha)?;
-            }
-            self.queue.clear_conflict_metadata(&item.id)?;
-            self.queue.record_event(
+            self.queue.set_conflict_metadata(
                 &item.id,
-                "merge_resumed",
-                "merge resumed from answered prompt",
+                &json!({"files": [], "target_sha": base_sha, "source_sha": source_sha}),
+                &base_sha,
+                &source_sha,
             )?;
-            self.transition_item_owned(&item.id, QueueStatus::Merged)
+            let composed = self.queue.get_item(&item.id)?;
+            let effort = self.ensure_effort_after_composition(&composed, attempt)?;
+            if let Err(error) = crate::composition::reject_tracked_policy(&workspace) {
+                self.control_store.block_infrastructure(
+                    &effort.id,
+                    crate::control_domain::InfrastructureBlocker {
+                        component: crate::control_domain::InfrastructureComponent::Configuration,
+                        operation: "admit_cycle".into(),
+                        cause: crate::control_domain::InfrastructureCause::Unavailable {
+                            detail: format!("{error:#}"),
+                        },
+                    },
+                )?;
+                return self.queue.get_item(&item.id);
+            }
+            let composed_attempt = self.queue.get_attempt(&attempt.id)?;
+            self.run_agent_cycle(composed, &composed_attempt)
         }
 
-        fn apply_merge_answer(
+        fn run_agent_cycle(&self, item: QueueItem, attempt: &Attempt) -> Result<QueueItem> {
+            use crate::agent_protocol::{
+                AgentInput, ConflictEntry, LandingVariant, ProtocolLimits, RepositoryIdentity,
+                RiftIdentity, SourceVariant,
+            };
+            use crate::control_domain::{
+                AgentRunning, AtomicResultState, EncodedPath, ExactEffortIdentity,
+                InfrastructureBlocker, InfrastructureCause, InfrastructureComponent,
+            };
+            use std::os::unix::ffi::OsStrExt;
+
+            let effort = self
+                .control_store
+                .effort_for_item(&item.id)?
+                .context("composed item has no integration effort")?;
+            let crate::control_domain::IntegrationEffortState::AgentReady(ready) = &effort.state
+            else {
+                anyhow::bail!("integration effort is not ready for an agent cycle");
+            };
+            let workspace = self.load_owned_workspace(&item)?;
+            let cycle_id = Uuid::new_v4().to_string();
+            let identity = ExactEffortIdentity {
+                effort_id: effort.id.clone(),
+                item_id: item.id.clone(),
+                attempt_id: attempt.id.clone(),
+                cycle_id: cycle_id.clone(),
+                target_sha: effort.target_sha.clone(),
+                source_sha: effort.source_sha.clone(),
+                candidate_sha: None,
+            };
+            let conflict_paths = conflict_files(&workspace)?;
+            let conflicts = conflict_paths
+                .iter()
+                .map(|path| {
+                    Ok(ConflictEntry {
+                        path: EncodedPath::from_bytes(path.as_bytes())?,
+                        base_blob: conflict_blob(&workspace, 1, path)?,
+                        target_blob: conflict_blob(&workspace, 2, path)?,
+                        source_blob: conflict_blob(&workspace, 3, path)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let (prior_outcomes, validation_evidence) =
+                self.control_store.agent_evidence(&effort.id, 100)?;
+            let input = AgentInput {
+                version: crate::control_domain::PROTOCOL_VERSION,
+                identity: identity.clone(),
+                repository: RepositoryIdentity {
+                    repo_key: item.repo_key.clone(),
+                    target_branch: item.target_branch.clone(),
+                },
+                source: match &item.source {
+                    crate::core::QueueSource::RemoteBranch { branch } => {
+                        SourceVariant::RemoteBranch {
+                            branch: branch.clone(),
+                            sha: effort.source_sha.clone(),
+                        }
+                    }
+                    crate::core::QueueSource::LocalSubmission {
+                        submission_id,
+                        commit_sha,
+                    } => SourceVariant::LocalSubmission {
+                        submission_id: submission_id.clone(),
+                        sha: commit_sha.clone(),
+                    },
+                },
+                landing: match item.landing_policy {
+                    crate::core::LandingPolicy::Direct => LandingVariant::Direct,
+                    crate::core::LandingPolicy::Provider => LandingVariant::Provider {
+                        url: item.pr_url.clone().context("provider item has no URL")?,
+                    },
+                    crate::core::LandingPolicy::Squash => LandingVariant::Squash,
+                },
+                base_sha: attempt
+                    .target_base_sha
+                    .clone()
+                    .context("attempt has no exact base SHA")?,
+                rift: RiftIdentity {
+                    rift_id: effort.workspace.rift_id.clone(),
+                    source_rift_id: effort.workspace.source_rift_id.clone(),
+                    relative_path: EncodedPath::from_bytes(
+                        workspace
+                            .file_name()
+                            .context("retained Rift has no name")?
+                            .as_bytes(),
+                    )?,
+                },
+                conflicts,
+                prior_outcomes,
+                validation_evidence,
+                instructions: instruction_identities(&workspace)?,
+                limits: ProtocolLimits {
+                    max_result_bytes: effort.runner.bounds.max_result_bytes,
+                    max_text_bytes: 16 * 1024,
+                    max_paths: 10_000,
+                    max_evidence_entries: 100,
+                },
+            };
+            let input_bytes = serde_json::to_vec(&input)?;
+            let runner = crate::agent_runner::OpenCodeRunner::new(
+                self.options.system_config.integration_agent.clone(),
+                effort.runner.clone(),
+            )?;
+            if let Err(error) = runner.verify_capability(self.queue.path()) {
+                self.control_store.block_infrastructure(
+                    &effort.id,
+                    InfrastructureBlocker {
+                        component: InfrastructureComponent::Sandbox,
+                        operation: "admit_cycle".into(),
+                        cause: InfrastructureCause::Unavailable {
+                            detail: format!("{error:#}"),
+                        },
+                    },
+                )?;
+                return self.queue.get_item(&item.id);
+            }
+            let protected = vec![self.options.repo_path.clone()];
+            let launch_operation_id = Uuid::new_v4().to_string();
+            let outcome = runner.run(
+                &workspace,
+                &input,
+                &protected,
+                crate::agent_runner::RunnerLifecycle {
+                    on_prepared: |unit_name: &str, protocol: &Path| {
+                        self.control_store.prepare_cycle_launch(
+                            &effort.id,
+                            &crate::control_domain::AgentLaunching {
+                                launch_operation_id: launch_operation_id.clone(),
+                                unit_name: unit_name.to_string(),
+                                cycle_id: cycle_id.clone(),
+                                cycle_number: ready.next_cycle,
+                                authority_lease_id: self.lease_owner_id.clone(),
+                                input_sha256: format!("{:x}", Sha256::digest(&input_bytes)),
+                                protocol_directory: protocol.to_path_buf(),
+                                prepared_at: chrono::Utc::now().to_rfc3339(),
+                            },
+                        )
+                    },
+                    on_started: |pid: u32,
+                                 start: u64,
+                                 group: i32,
+                                 sandbox: &str,
+                                 protocol: &Path| {
+                        self.control_store.record_cycle_started(
+                            &effort.id,
+                            &AgentRunning {
+                                launch_operation_id: launch_operation_id.clone(),
+                                unit_name: format!("iq-agent-{cycle_id}"),
+                                cycle_id: cycle_id.clone(),
+                                cycle_number: ready.next_cycle,
+                                pid,
+                                process_start_ticks: start,
+                                process_group_id: group,
+                                authority_lease_id: self.lease_owner_id.clone(),
+                                sandbox_id: sandbox.to_string(),
+                                input_sha256: format!("{:x}", Sha256::digest(&input_bytes)),
+                                result: AtomicResultState::Absent,
+                                started_at: chrono::Utc::now().to_rfc3339(),
+                            },
+                        )?;
+                        let _ = protocol;
+                        Ok(())
+                    },
+                    on_writing: |state: &crate::control_domain::AtomicResultState| {
+                        self.control_store
+                            .record_result_state(&effort.id, &cycle_id, state)
+                    },
+                    authority_active: || {
+                        Ok(matches!(
+                            self.execution_authority(&item.id)?,
+                            ExecutionAuthority::Active
+                        ))
+                    },
+                },
+            )?;
+            match outcome {
+                crate::agent_runner::RunnerOutcome::Complete {
+                    result,
+                    result_state,
+                    log,
+                    export_directory,
+                    ..
+                } => {
+                    self.control_store
+                        .record_cycle_log(&effort.id, &cycle_id, &log)?;
+                    self.control_store
+                        .record_result_state(&effort.id, &cycle_id, &result_state)?;
+                    self.classify_agent_result(
+                        &item,
+                        attempt,
+                        &effort,
+                        &identity,
+                        result,
+                        &export_directory,
+                    )
+                }
+                crate::agent_runner::RunnerOutcome::MissingResult { log, exit_status } => {
+                    self.control_store
+                        .record_cycle_log(&effort.id, &cycle_id, &log)?;
+                    let result = self.consume_agent_failure(
+                        &effort,
+                        &cycle_id,
+                        crate::control_domain::CycleFailure::RunnerCrash {
+                            exit_code: exit_status.code(),
+                        },
+                    );
+                    remove_cycle_protocol(&workspace, &cycle_id)?;
+                    result
+                }
+                crate::agent_runner::RunnerOutcome::TimedOut { log } => {
+                    self.control_store
+                        .record_cycle_log(&effort.id, &cycle_id, &log)?;
+                    let result = self.consume_agent_failure(
+                        &effort,
+                        &cycle_id,
+                        crate::control_domain::CycleFailure::Timeout,
+                    );
+                    remove_cycle_protocol(&workspace, &cycle_id)?;
+                    result
+                }
+                crate::agent_runner::RunnerOutcome::AuthorityLost { log } => {
+                    let current = self.queue.get_item(&item.id)?;
+                    if current.status == QueueStatus::Cancelled {
+                        remove_cycle_protocol(&workspace, &cycle_id)?;
+                        Ok(current)
+                    } else {
+                        self.control_store
+                            .record_cycle_log(&effort.id, &cycle_id, &log)?;
+                        anyhow::bail!("runner lost repository or queue authority")
+                    }
+                }
+                crate::agent_runner::RunnerOutcome::InvalidResult {
+                    log,
+                    reason,
+                    export_directory,
+                } => {
+                    self.control_store
+                        .record_cycle_log(&effort.id, &cycle_id, &log)?;
+                    crate::agent_runner::remove_sandbox_export(&export_directory)?;
+                    remove_cycle_protocol(&workspace, &cycle_id)?;
+                    self.consume_agent_failure(
+                        &effort,
+                        &cycle_id,
+                        crate::control_domain::CycleFailure::InvalidResult { reason },
+                    )
+                }
+            }
+        }
+
+        fn classify_agent_result(
             &self,
-            workspace: &Path,
             item: &QueueItem,
             attempt: &Attempt,
-            answer: &str,
-        ) -> Result<()> {
-            let normalized = answer.trim().to_ascii_lowercase();
-            let conflicts = conflict_files(workspace)?;
-            if normalized == "accept-current" || normalized == "resolved" || normalized == "done" {
-                return Ok(());
+            effort: &crate::control_store::IntegrationEffort,
+            identity: &crate::control_domain::ExactEffortIdentity,
+            result: Box<crate::agent_protocol::AgentResult>,
+            export_directory: &Path,
+        ) -> Result<QueueItem> {
+            match *result {
+                crate::agent_protocol::AgentResult::Resolved(resolved) => {
+                    let workspace = self.load_owned_workspace(item)?;
+                    if let Err(error) = crate::agent_runner::import_staged_result(
+                        export_directory,
+                        &workspace,
+                        &resolved.staged_tree_sha256,
+                        &resolved.changed_paths,
+                    ) {
+                        remove_cycle_protocol(&workspace, &identity.cycle_id)?;
+                        return self.consume_agent_failure(
+                            effort,
+                            &identity.cycle_id,
+                            crate::control_domain::CycleFailure::InvalidResult {
+                                reason: format!("staged result rejected: {error:#}"),
+                            },
+                        );
+                    }
+                    remove_cycle_protocol(&workspace, &identity.cycle_id)?;
+                    if !conflict_files(&workspace)?.is_empty() {
+                        return self.consume_agent_failure(
+                            effort,
+                            &identity.cycle_id,
+                            crate::control_domain::CycleFailure::InvalidResult {
+                                reason: "resolved result left unresolved index entries".into(),
+                            },
+                        );
+                    }
+                    self.build_candidate(
+                        item,
+                        attempt,
+                        effort,
+                        &identity.cycle_id,
+                        &resolved.staged_tree_sha256,
+                    )
+                }
+                crate::agent_protocol::AgentResult::GuidanceRequired(guidance) => {
+                    self.control_store.require_guidance(
+                        &effort.id,
+                        crate::control_domain::SemanticGuidanceBlocker {
+                            request_id: Uuid::new_v4().to_string(),
+                            question: guidance.question,
+                            affected_contracts: guidance.affected_contracts,
+                            affected_paths: guidance.affected_paths,
+                            alternatives: guidance.alternatives,
+                            evidence: guidance.evidence,
+                            identity: identity.clone(),
+                        },
+                    )?;
+                    remove_cycle_protocol(&self.load_owned_workspace(item)?, &identity.cycle_id)?;
+                    self.queue.get_item(&item.id)
+                }
+                crate::agent_protocol::AgentResult::MechanicalFailure(failure) => {
+                    let result = self.consume_agent_failure(
+                        effort,
+                        &identity.cycle_id,
+                        crate::control_domain::CycleFailure::Mechanical {
+                            operation: failure.operation,
+                            reason: failure.reason,
+                            evidence: failure.evidence,
+                        },
+                    );
+                    remove_cycle_protocol(&self.load_owned_workspace(item)?, &identity.cycle_id)?;
+                    result
+                }
             }
-            if conflicts.is_empty() {
-                return Ok(());
+        }
+
+        fn consume_agent_failure(
+            &self,
+            effort: &crate::control_store::IntegrationEffort,
+            cycle_id: &str,
+            failure: crate::control_domain::CycleFailure,
+        ) -> Result<QueueItem> {
+            self.control_store
+                .consume_cycle_failure(&effort.id, cycle_id, failure)?;
+            let refreshed = self
+                .control_store
+                .effort_for_item(&effort.item_id)?
+                .context("effort disappeared")?;
+            if matches!(
+                refreshed.state,
+                crate::control_domain::IntegrationEffortState::AgentReady(_)
+            ) {
+                let item = self.queue.get_item(&effort.item_id)?;
+                let attempt = self.queue.get_attempt(&effort.attempt_id)?;
+                self.run_agent_cycle(item, &attempt)
+            } else {
+                self.queue.get_item(&effort.item_id)
             }
-            let (checkout_arg, stage) = match normalized.as_str() {
-                "use source" | "source" | "theirs" | "accept-theirs" => ("--theirs", 3),
-                "use target" | "target" | "ours" | "accept-ours" => ("--ours", 2),
-                _ => anyhow::bail!(
-                    "unsupported merge answer for item {}: {answer}; use accept-current, use source, or use target",
+        }
+
+        fn build_candidate(
+            &self,
+            item: &QueueItem,
+            attempt: &Attempt,
+            effort: &crate::control_store::IntegrationEffort,
+            cycle_id: &str,
+            staged_tree_sha256: &str,
+        ) -> Result<QueueItem> {
+            let workspace = self.load_owned_workspace(item)?;
+            if workspace_has_unstaged_changes(&workspace)? {
+                anyhow::bail!("candidate builder requires an entirely staged worktree");
+            }
+            if !conflict_files(&workspace)?.is_empty() {
+                anyhow::bail!("candidate builder rejects unresolved index entries");
+            }
+            crate::composition::reject_tracked_policy(&workspace)?;
+            let base = attempt
+                .target_base_sha
+                .as_deref()
+                .context("candidate has no target base")?;
+            let tree = git_output(&workspace, ["write-tree"])?;
+            let parents = match item.landing_policy {
+                crate::core::LandingPolicy::Squash => vec![base.to_string()],
+                crate::core::LandingPolicy::Direct | crate::core::LandingPolicy::Provider => {
+                    vec![base.to_string(), effort.source_sha.clone()]
+                }
+            };
+            if item.landing_policy == crate::core::LandingPolicy::Squash {
+                let target_tree =
+                    git_output(&workspace, ["rev-parse", &format!("{base}^{{tree}}")])?;
+                if tree.trim() == target_tree.trim() {
+                    anyhow::bail!("local squash staged tree is empty relative to the exact target");
+                }
+            }
+            let operation_id = Uuid::new_v4().to_string();
+            let operation_ref = format!("refs/iq/candidate-operations/{operation_id}");
+            let timestamp = chrono::Utc::now().timestamp().to_string();
+            let message = match item.landing_policy {
+                crate::core::LandingPolicy::Squash => format!(
+                    "Squash integrate queue item {}\n\nIQ-Builder-Operation: {operation_id}",
+                    item.id
+                ),
+                _ => format!(
+                    "Integrate queue item {}\n\nIQ-Builder-Operation: {operation_id}",
                     item.id
                 ),
             };
-            for file in &conflicts {
-                let selected_stage = format!(":{stage}:{file}");
-                if git_status(workspace, ["cat-file", "-e", selected_stage.as_str()])?
-                    .status
-                    .success()
-                {
-                    self.run_supervised_item_command(
-                        &item.id,
-                        &attempt.id,
-                        QueueStatus::Merging,
-                        "git",
-                        ["checkout", checkout_arg, "--", file.as_str()],
-                        Some(workspace),
-                        StdDuration::from_secs(20),
-                        "merge answer checkout",
-                    )?;
-                    self.run_supervised_item_command(
-                        &item.id,
-                        &attempt.id,
-                        QueueStatus::Merging,
-                        "git",
-                        ["add", "--", file.as_str()],
-                        Some(workspace),
-                        StdDuration::from_secs(20),
-                        "merge answer stage",
-                    )?;
-                } else {
-                    let relative = Path::new(file);
-                    checked_workspace_descendant(workspace, relative)?;
-                    self.run_supervised_item_command(
-                        &item.id,
-                        &attempt.id,
-                        QueueStatus::Merging,
-                        "git",
-                        ["rm", "--force", "--ignore-unmatch", "--", file.as_str()],
-                        Some(workspace),
-                        StdDuration::from_secs(20),
-                        "merge answer delete",
-                    )?;
-                }
+            let intent = crate::control_store::CandidateIntent {
+                operation_id: operation_id.clone(),
+                cycle_id: cycle_id.to_string(),
+                staged_tree_sha256: staged_tree_sha256.to_string(),
+                tree_sha: tree.trim().to_string(),
+                parents: parents.clone(),
+                author_name: "IQ Integration Builder".into(),
+                author_email: "iq@localhost".into(),
+                author_timestamp: timestamp.clone(),
+                committer_name: "IQ Integration Builder".into(),
+                committer_email: "iq@localhost".into(),
+                committer_timestamp: timestamp,
+                message: message.clone(),
+                operation_ref: operation_ref.clone(),
+            };
+            self.control_store
+                .accept_resolved_cycle(&effort.id, &intent)?;
+            let mut args = vec!["commit-tree".to_string(), tree.trim().to_string()];
+            for parent in &parents {
+                args.push("-p".into());
+                args.push(parent.clone());
             }
-            let unresolved = conflict_files(workspace)?;
-            if !unresolved.is_empty() {
+            args.push("-m".into());
+            args.push(message);
+            let output = Command::new("git")
+                .args(&args)
+                .env("GIT_AUTHOR_NAME", "IQ Integration Builder")
+                .env("GIT_AUTHOR_EMAIL", "iq@localhost")
+                .env(
+                    "GIT_AUTHOR_DATE",
+                    format!("{} +0000", intent.author_timestamp),
+                )
+                .env("GIT_COMMITTER_NAME", "IQ Integration Builder")
+                .env("GIT_COMMITTER_EMAIL", "iq@localhost")
+                .env(
+                    "GIT_COMMITTER_DATE",
+                    format!("{} +0000", intent.committer_timestamp),
+                )
+                .current_dir(&workspace)
+                .output()?;
+            if !output.status.success() {
                 anyhow::bail!(
-                    "merge answer for item {} left unresolved paths: {}",
-                    item.id,
-                    unresolved.join(", ")
+                    "candidate builder commit-tree failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
                 );
             }
-            Ok(())
+            let candidate = String::from_utf8(output.stdout)?.trim().to_string();
+            git(
+                &workspace,
+                [
+                    "update-ref",
+                    operation_ref.as_str(),
+                    candidate.as_str(),
+                    "0000000000000000000000000000000000000000",
+                ],
+            )?;
+            git(&workspace, ["reset", "--hard", candidate.as_str()])?;
+            if item.landing_policy == crate::core::LandingPolicy::Squash {
+                verify_one_parent_candidate(&workspace, &candidate, base)?;
+            }
+            self.control_store.record_candidate(
+                &effort.id,
+                &crate::control_store::CandidateObservation::read(
+                    &workspace,
+                    &candidate,
+                    &operation_ref,
+                )?,
+            )?;
+            self.queue.get_item(&item.id)
+        }
+
+        fn reconcile_candidate_build(
+            &self,
+            item: QueueItem,
+            _attempt: &Attempt,
+            effort: &crate::control_store::IntegrationEffort,
+            building: &crate::control_domain::CandidateBuilding,
+        ) -> Result<QueueItem> {
+            let workspace = self.load_owned_workspace(&item)?;
+            let output = git_status(
+                &workspace,
+                ["rev-parse", "--verify", building.operation_ref.as_str()],
+            )?;
+            let candidate = if output.status.success() {
+                String::from_utf8(output.stdout)?.trim().to_string()
+            } else {
+                let mut args = vec!["commit-tree".to_string(), building.tree_sha.clone()];
+                for parent in &building.parent_shas {
+                    args.push("-p".into());
+                    args.push(parent.clone());
+                }
+                args.push("-m".into());
+                args.push(building.message.clone());
+                let output = Command::new("git")
+                    .args(args)
+                    .env("GIT_AUTHOR_NAME", &building.author_name)
+                    .env("GIT_AUTHOR_EMAIL", &building.author_email)
+                    .env(
+                        "GIT_AUTHOR_DATE",
+                        format!("{} +0000", building.author_timestamp),
+                    )
+                    .env("GIT_COMMITTER_NAME", &building.committer_name)
+                    .env("GIT_COMMITTER_EMAIL", &building.committer_email)
+                    .env(
+                        "GIT_COMMITTER_DATE",
+                        format!("{} +0000", building.committer_timestamp),
+                    )
+                    .current_dir(&workspace)
+                    .output()?;
+                if !output.status.success() {
+                    anyhow::bail!(
+                        "candidate reconciliation commit-tree failed: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                }
+                let candidate = String::from_utf8(output.stdout)?.trim().to_string();
+                git(
+                    &workspace,
+                    [
+                        "update-ref",
+                        building.operation_ref.as_str(),
+                        candidate.as_str(),
+                        "0000000000000000000000000000000000000000",
+                    ],
+                )?;
+                candidate
+            };
+            let tree = git_output(&workspace, ["show", "-s", "--format=%T", &candidate])?;
+            let digest = format!("{:x}", Sha256::digest(tree.trim().as_bytes()));
+            let parents = git_output(&workspace, ["show", "-s", "--format=%P", &candidate])?
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let metadata = git_output(
+                &workspace,
+                [
+                    "show",
+                    "-s",
+                    "--format=%an%x00%ae%x00%at%x00%cn%x00%ce%x00%ct%x00%B",
+                    &candidate,
+                ],
+            )?;
+            let fields = metadata.splitn(7, '\0').collect::<Vec<_>>();
+            if tree.trim() != building.tree_sha
+                || digest != building.staged_tree_sha256
+                || parents != building.parent_shas
+                || fields.len() != 7
+                || fields[0] != building.author_name
+                || fields[1] != building.author_email
+                || fields[2] != building.author_timestamp
+                || fields[3] != building.committer_name
+                || fields[4] != building.committer_email
+                || fields[5] != building.committer_timestamp
+                || fields[6].trim_end() != building.message
+            {
+                anyhow::bail!("candidate operation ref differs from durable builder intent");
+            }
+            git(&workspace, ["reset", "--hard", candidate.as_str()])?;
+            self.control_store.record_candidate(
+                &effort.id,
+                &crate::control_store::CandidateObservation::read(
+                    &workspace,
+                    &candidate,
+                    &building.operation_ref,
+                )?,
+            )?;
+            self.queue.get_item(&item.id)
         }
 
         fn policy_for_attempt(
@@ -9889,13 +9768,30 @@ pub mod integrator {
 
         fn validate_item(&self, item: QueueItem, attempt: &Attempt) -> Result<QueueItem> {
             let workspace = self.load_owned_workspace(&item)?;
-            let item = if item.status == QueueStatus::Merged {
-                self.transition_item_owned(&item.id, QueueStatus::Validating)?
-            } else if item.status != QueueStatus::Validating {
-                anyhow::bail!("item {} in status {} cannot validate", item.id, item.status);
-            } else {
-                item
-            };
+            let effort = self
+                .control_store
+                .effort_for_item(&item.id)?
+                .context("candidate has no integration effort")?;
+            if matches!(
+                effort.state,
+                crate::control_domain::IntegrationEffortState::CandidateReady(_)
+            ) {
+                self.control_store.start_validation(
+                    &effort.id,
+                    attempt.policy_digest.as_deref().unwrap_or("host_policy"),
+                )?;
+            } else if !matches!(
+                effort.state,
+                crate::control_domain::IntegrationEffortState::Validating(
+                    crate::control_domain::Validating {
+                        stage: crate::control_domain::ValidationStage::Running,
+                        ..
+                    }
+                )
+            ) {
+                anyhow::bail!("integration effort is not ready to validate");
+            }
+            let item = self.queue.get_item(&item.id)?;
             if item.status == QueueStatus::Cancelled {
                 return Ok(item);
             }
@@ -9947,7 +9843,9 @@ pub mod integrator {
                     &self.options.repo_key,
                     &self.lease_owner_id,
                 )?;
-                return self.transition_item_owned(&item.id, QueueStatus::Validated);
+                self.control_store
+                    .complete_validation(&effort.id, &candidate_sha)?;
+                return self.queue.get_item(&item.id);
             };
             let log_dir = self.evidence_dir(&item, attempt)?;
             let log_path = log_dir.path.join("validation.log");
@@ -10067,7 +9965,9 @@ pub mod integrator {
                 &log_path.to_string_lossy(),
                 Some(&validated_sha),
             )?;
-            self.transition_item_owned(&item.id, QueueStatus::Validated)
+            self.control_store
+                .complete_validation(&effort.id, &validated_sha)?;
+            self.queue.get_item(&item.id)
         }
 
         fn integrate_item(&self, item: QueueItem, attempt: &Attempt) -> Result<QueueItem> {
@@ -10087,17 +9987,23 @@ pub mod integrator {
                     );
                 }
             }
-            let item = if item.status == QueueStatus::Validated {
-                self.transition_item_owned(&item.id, QueueStatus::Integrating)?
-            } else if item.status != QueueStatus::Integrating {
-                anyhow::bail!(
-                    "item {} in status {} cannot integrate",
-                    item.id,
-                    item.status
-                );
-            } else {
-                item
-            };
+            let effort = self
+                .control_store
+                .effort_for_item(&item.id)?
+                .context("candidate has no integration effort")?;
+            if !matches!(
+                effort.state,
+                crate::control_domain::IntegrationEffortState::Validating(
+                    crate::control_domain::Validating {
+                        stage: crate::control_domain::ValidationStage::Gates,
+                        ..
+                    }
+                ) | crate::control_domain::IntegrationEffortState::Landing(_)
+                    | crate::control_domain::IntegrationEffortState::LandingUncertain(_)
+            ) {
+                anyhow::bail!("integration effort is not ready for landing gates");
+            }
+            let item = self.queue.get_item(&item.id)?;
             if item.status == QueueStatus::Cancelled {
                 return Ok(item);
             }
@@ -10154,6 +10060,7 @@ pub mod integrator {
                 return self.reconcile_fenced_exact_landing(
                     &item,
                     attempt,
+                    &workspace,
                     &remote_ref,
                     &remote_sha,
                 );
@@ -10289,9 +10196,13 @@ pub mod integrator {
                 );
             }
             self.ensure_registered_remote_identity()?;
-            if let Some(cancelled) =
-                self.begin_landing_owned(&item.id, &attempt.id, candidate_sha, expected_target_sha)?
-            {
+            if let Some(cancelled) = self.begin_landing_owned(
+                &item.id,
+                &attempt.id,
+                candidate_sha,
+                expected_target_sha,
+                &format!("git-push:{}", item.id),
+            )? {
                 return Ok(cancelled);
             }
             let target_ref = format!("refs/heads/{}", item.target_branch);
@@ -10325,7 +10236,6 @@ pub mod integrator {
                     item,
                     attempt,
                     workspace,
-                    candidate_sha,
                     expected_target_sha,
                 );
             }
@@ -10401,18 +10311,9 @@ pub mod integrator {
             item: &QueueItem,
             attempt: &Attempt,
             workspace: &Path,
-            candidate_sha: &str,
             expected_target_sha: &str,
         ) -> Result<QueueItem> {
             self.ensure_repo_lease()?;
-            self.queue.record_definite_landing_rejection(
-                &item.id,
-                &attempt.id,
-                candidate_sha,
-                expected_target_sha,
-                &self.options.repo_key,
-                &self.lease_owner_id,
-            )?;
             if let Some(cancelled) = self.cancelled_item(&item.id)? {
                 return Ok(cancelled);
             }
@@ -10464,6 +10365,7 @@ pub mod integrator {
             &self,
             item: &QueueItem,
             attempt: &Attempt,
+            workspace: &Path,
             remote_ref: &str,
             remote_sha: &str,
         ) -> Result<QueueItem> {
@@ -10499,6 +10401,17 @@ pub mod integrator {
                     fenced_candidate,
                     remote_sha,
                 );
+            }
+            if remote_sha != expected_target_sha {
+                return self
+                    .merge_moved_base(
+                        item,
+                        attempt,
+                        workspace,
+                        remote_sha,
+                        "reconciled rejected compare-and-set landing",
+                    )?
+                    .context("target recomposition did not return an authoritative item state");
             }
             self.block_and_get(
                 &item.id,
@@ -10922,45 +10835,10 @@ pub mod integrator {
             moved_base_sha: &str,
             summary_prefix: &str,
         ) -> Result<Option<QueueItem>> {
-            let current_attempt = self.queue.get_attempt(&attempt.id)?;
-            let source_sha = match &current_attempt.moved_base {
-                crate::sqlite::MovedBaseState::Pending {
-                    target_sha,
-                    source_sha,
-                } if target_sha == moved_base_sha => source_sha.clone(),
-                crate::sqlite::MovedBaseState::Applied {
-                    target_sha,
-                    candidate_sha,
-                    ..
-                } if target_sha == moved_base_sha
-                    && git_output(workspace, ["rev-parse", "HEAD"])? == *candidate_sha
-                    && workspace_dirty(workspace)?.is_none() =>
-                {
-                    return Ok(None)
-                }
-                _ => {
-                    let source_sha = match git_output(workspace, ["rev-parse", "HEAD"]) {
-                        Ok(sha) => sha,
-                        Err(error) => {
-                            return Ok(Some(self.block_and_get(
-                                &item.id,
-                                BlockedPhase::Integrating,
-                                BlockedReason::Infra,
-                                &format!(
-                                    "cannot resolve candidate before moved-base reconciliation: {error}"
-                                ),
-                            )?));
-                        }
-                    };
-                    self.ensure_repo_lease()?;
-                    self.queue.begin_moved_base_reconciliation(
-                        &attempt.id,
-                        moved_base_sha,
-                        &source_sha,
-                    )?;
-                    source_sha
-                }
-            };
+            let effort = self
+                .control_store
+                .effort_for_item(&item.id)?
+                .context("target movement item has no integration effort")?;
             self.run_supervised_landing_command(
                 &item.id,
                 &attempt.id,
@@ -11001,7 +10879,12 @@ pub mod integrator {
                     &attempt.id,
                     QueueStatus::Integrating,
                     "git",
-                    ["merge", "--no-edit", source_sha.as_str()],
+                    [
+                        "merge",
+                        "--no-ff",
+                        "--no-commit",
+                        effort.source_sha.as_str(),
+                    ],
                     Some(workspace),
                     StdDuration::from_secs(60),
                     "moved-base merge",
@@ -11023,39 +10906,6 @@ pub mod integrator {
                         )?))
                     }
                 };
-            if merge.status.success() && conflict_files.is_empty() {
-                if local_squash {
-                    if git_status(workspace, ["diff", "--cached", "--quiet"])?
-                        .status
-                        .success()
-                    {
-                        return Ok(Some(self.block_and_get(
-                            &item.id,
-                            BlockedPhase::Merging,
-                            BlockedReason::NeedsAgentFix,
-                            "local submission is empty after target movement",
-                        )?));
-                    }
-                    self.run_supervised_landing_command(
-                        &item.id,
-                        &attempt.id,
-                        "git",
-                        [
-                            "commit",
-                            "-m",
-                            &format!("Squash integrate queue item {}", item.id),
-                        ],
-                        Some(workspace),
-                    )?;
-                    let candidate = git_output(workspace, ["rev-parse", "HEAD"])?;
-                    verify_one_parent_candidate(workspace, &candidate, moved_base_sha)?;
-                }
-                let candidate = git_output(workspace, ["rev-parse", "HEAD"])?;
-                self.ensure_repo_lease()?;
-                self.queue
-                    .complete_moved_base_reconciliation(&attempt.id, &candidate)?;
-                return Ok(None);
-            }
             let conflict_json = json!({
                 "files": conflict_files,
                 "summary": format!(
@@ -11063,21 +10913,38 @@ pub mod integrator {
                     String::from_utf8_lossy(&merge.stderr).trim()
                 ),
                 "target_sha": moved_base_sha,
-                "source_sha": source_sha,
+                "source_sha": effort.source_sha,
                 "workspace_path": workspace,
             });
-            self.queue.set_conflict_metadata(
-                &item.id,
-                &conflict_json,
+            if local_squash
+                && merge.status.success()
+                && git_status(workspace, ["diff", "--cached", "--quiet"])?
+                    .status
+                    .success()
+            {
+                return Ok(Some(self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Merging,
+                    BlockedReason::NeedsAgentFix,
+                    "local submission is empty after target movement",
+                )?));
+            }
+            self.control_store.recompose_after_target_move(
+                &effort.id,
                 moved_base_sha,
-                &source_sha,
+                &conflict_json,
             )?;
-            Ok(Some(self.block_and_get(
-                &item.id,
-                BlockedPhase::Merging,
-                BlockedReason::NeedsUserInput,
-                "target branch moved and merge requires user resolution",
-            )?))
+            let recomposed = self.queue.get_item(&item.id)?;
+            let recomposed_attempt = self.queue.get_attempt(&attempt.id)?;
+            let candidate = self.run_agent_cycle(recomposed, &recomposed_attempt)?;
+            if candidate.status != QueueStatus::Merged {
+                return Ok(Some(candidate));
+            }
+            let validated = self.validate_item(candidate, &recomposed_attempt)?;
+            if validated.status != QueueStatus::Integrating {
+                return Ok(Some(validated));
+            }
+            Ok(Some(self.integrate_item(validated, &recomposed_attempt)?))
         }
 
         fn apply_local_submission_patch(
@@ -11307,6 +11174,44 @@ pub mod integrator {
             if item.status == QueueStatus::Cancelled {
                 return Ok(item);
             }
+            if let Some(effort) = self.control_store.effort_for_item(item_id)? {
+                match reason {
+                    BlockedReason::NeedsAgentFix => {
+                        self.control_store.reject_candidate(&effort.id, message)?;
+                    }
+                    BlockedReason::Infra
+                    | BlockedReason::Dependency
+                    | BlockedReason::Credentials => {
+                        self.control_store.block_infrastructure(
+                            &effort.id,
+                            crate::control_domain::InfrastructureBlocker {
+                                component: if phase == BlockedPhase::Validating {
+                                    crate::control_domain::InfrastructureComponent::Validation
+                                } else {
+                                    crate::control_domain::InfrastructureComponent::Filesystem
+                                },
+                                operation: phase.to_string(),
+                                cause: crate::control_domain::InfrastructureCause::Unavailable {
+                                    detail: message.to_string(),
+                                },
+                            },
+                        )?;
+                    }
+                    BlockedReason::Provider => {
+                        self.block_provider_effort(
+                            &item,
+                            &effort,
+                            phase,
+                            crate::control_domain::ProviderGateStatus::Pending,
+                            message,
+                        )?;
+                    }
+                    BlockedReason::NeedsUserInput => anyhow::bail!(
+                        "post-composition semantic guidance must come from a running agent cycle"
+                    ),
+                }
+                return self.queue.get_item(item_id);
+            }
             let result = if item.status == QueueStatus::Integrating
                 && matches!(phase, BlockedPhase::Merging | BlockedPhase::Validating)
             {
@@ -11332,15 +11237,93 @@ pub mod integrator {
             self.queue.get_item(item_id)
         }
 
+        fn block_provider_and_get(
+            &self,
+            item: &QueueItem,
+            phase: BlockedPhase,
+            status: crate::control_domain::ProviderGateStatus,
+            message: &str,
+        ) -> Result<QueueItem> {
+            let effort = self
+                .control_store
+                .effort_for_item(&item.id)?
+                .context("provider outcome has no integration effort")?;
+            self.block_provider_effort(item, &effort, phase, status, message)?;
+            self.queue.get_item(&item.id)
+        }
+
+        fn block_provider_effort(
+            &self,
+            item: &QueueItem,
+            effort: &crate::control_store::IntegrationEffort,
+            phase: BlockedPhase,
+            status: crate::control_domain::ProviderGateStatus,
+            message: &str,
+        ) -> Result<()> {
+            let candidate_sha = match &effort.state {
+                crate::control_domain::IntegrationEffortState::Validating(value) => {
+                    value.candidate_sha.clone()
+                }
+                crate::control_domain::IntegrationEffortState::Landing(value) => {
+                    value.candidate_sha.clone()
+                }
+                crate::control_domain::IntegrationEffortState::LandingUncertain(value) => {
+                    value.candidate_sha.clone()
+                }
+                _ => anyhow::bail!("provider blocker requires candidate or landing authority"),
+            };
+            self.control_store.block_provider(
+                &effort.id,
+                crate::control_domain::ProviderSignoffBlocker {
+                    gate: crate::control_domain::ProviderGateKind::Provider,
+                    repository: item
+                        .pr_url
+                        .clone()
+                        .context("provider item has no exact provider URL")?,
+                    context: phase.to_string(),
+                    candidate_sha,
+                    status,
+                    evidence: message.to_string(),
+                },
+            )
+        }
+
         fn integrate_provider_item(
             &self,
             mut item: QueueItem,
             attempt: &Attempt,
             pr_url: &str,
         ) -> Result<QueueItem> {
-            let provider = crate::providers::provider_for_url(pr_url)?;
+            let provider = match crate::providers::provider_for_url(pr_url) {
+                Ok(provider) => provider,
+                Err(error) => {
+                    let effort = self
+                        .control_store
+                        .effort_for_item(&item.id)?
+                        .context("provider item has no integration effort")?;
+                    let candidate_sha = effort
+                        .state
+                        .candidate_sha()
+                        .context("provider URL failure has no exact candidate authority")?;
+                    self.control_store.block_infrastructure(
+                        &effort.id,
+                        crate::control_domain::InfrastructureBlocker {
+                            component:
+                                crate::control_domain::InfrastructureComponent::Configuration,
+                            operation: "select_provider_adapter".into(),
+                            cause: crate::control_domain::InfrastructureCause::Unavailable {
+                                detail: format!(
+                                    "PR/MR URL {pr_url:?} is invalid or unsupported for exact candidate {candidate_sha}: {error:#}"
+                                ),
+                            },
+                        },
+                    )?;
+                    return self.queue.get_item(&item.id);
+                }
+            };
             let registered = self.queue.repository_if_exists(&item.repo_key)?.is_some();
             if item.landing.is_uncertain() && registered {
+                let workspace = self.load_owned_workspace(&item)?;
                 if let Err(error) = self.fetch_target_supervised(&item, attempt) {
                     return self.block_and_get(
                         &item.id,
@@ -11359,6 +11342,7 @@ pub mod integrator {
                 return self.reconcile_fenced_exact_landing(
                     &item,
                     attempt,
+                    &workspace,
                     &remote_ref,
                     &remote_sha,
                 );
@@ -11388,13 +11372,12 @@ pub mod integrator {
                 Ok(Some(updated)) => item = updated,
                 Ok(None) => {}
                 Err(error) => {
-                    self.block_item_owned(
+                    return self.block_and_get(
                         &item.id,
                         BlockedPhase::Integrating,
-                        BlockedReason::Provider,
+                        BlockedReason::Infra,
                         &format!("failed to push PR/MR conflict resolution: {error}"),
-                    )?;
-                    return self.queue.get_item(&item.id);
+                    );
                 }
             }
             if let Err(error) = self.fetch_target_supervised(&item, attempt) {
@@ -11408,23 +11391,21 @@ pub mod integrator {
             let snapshot = match provider.snapshot(pr_url) {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
-                    self.block_item_owned(
+                    return self.block_and_get(
                         &item.id,
                         BlockedPhase::Integrating,
-                        BlockedReason::Provider,
+                        BlockedReason::Infra,
                         &format!("provider snapshot failed: {error}"),
-                    )?;
-                    return self.queue.get_item(&item.id);
+                    );
                 }
             };
             if snapshot.head_sha != item.current_head_sha {
-                self.block_item_owned(
+                return self.block_and_get(
                     &item.id,
                     BlockedPhase::Integrating,
                     BlockedReason::NeedsAgentFix,
                     "PR/MR head does not match queued source head",
-                )?;
-                return self.queue.get_item(&item.id);
+                );
             }
             let remote_ref = format!(
                 "refs/remotes/{}/{}",
@@ -11442,22 +11423,20 @@ pub mod integrator {
             match snapshot.gate {
                 crate::providers::ProviderGate::Pass => {}
                 crate::providers::ProviderGate::Pending(message) => {
-                    self.block_item_owned(
+                    return self.block_and_get(
                         &item.id,
                         BlockedPhase::Integrating,
                         BlockedReason::Provider,
                         &message,
-                    )?;
-                    return self.queue.get_item(&item.id);
+                    );
                 }
                 crate::providers::ProviderGate::Fail(message) => {
-                    self.block_item_owned(
-                        &item.id,
+                    return self.block_provider_and_get(
+                        &item,
                         BlockedPhase::Integrating,
-                        BlockedReason::NeedsAgentFix,
+                        crate::control_domain::ProviderGateStatus::Failed,
                         &message,
-                    )?;
-                    return self.queue.get_item(&item.id);
+                    );
                 }
             }
 
@@ -11536,7 +11515,7 @@ pub mod integrator {
                         return self.block_and_get(
                             &item.id,
                             BlockedPhase::Integrating,
-                            BlockedReason::Provider,
+                            BlockedReason::Infra,
                             &format!("final provider snapshot failed: {error}"),
                         );
                     }
@@ -11568,10 +11547,10 @@ pub mod integrator {
                         );
                     }
                     crate::providers::ProviderGate::Fail(message) => {
-                        return self.block_and_get(
-                            &item.id,
+                        return self.block_provider_and_get(
+                            &item,
                             BlockedPhase::Integrating,
-                            BlockedReason::NeedsAgentFix,
+                            crate::control_domain::ProviderGateStatus::Failed,
                             &message,
                         );
                     }
@@ -11622,7 +11601,7 @@ pub mod integrator {
                     return self.block_and_get(
                         &item.id,
                         BlockedPhase::Integrating,
-                        BlockedReason::Provider,
+                        BlockedReason::Infra,
                         &format!("provider snapshot after signoff failed: {error}"),
                     );
                 }
@@ -11693,10 +11672,10 @@ pub mod integrator {
                     );
                 }
                 crate::providers::ProviderGate::Fail(message) => {
-                    return self.block_and_get(
-                        &item.id,
+                    return self.block_provider_and_get(
+                        &item,
                         BlockedPhase::Integrating,
-                        BlockedReason::NeedsAgentFix,
+                        crate::control_domain::ProviderGateStatus::Failed,
                         &message,
                     );
                 }
@@ -11707,6 +11686,7 @@ pub mod integrator {
                 &attempt.id,
                 &candidate_sha,
                 &signed_snapshot.base_sha,
+                &format!("provider-merge:{}", item.id),
             )? {
                 return Ok(cancelled);
             }
@@ -11883,37 +11863,6 @@ pub mod integrator {
 
         pub fn workspace_status(&self) -> Result<Vec<WorkspaceStatus>> {
             workspace_status(&self.queue.reader(), &self.options.repo_key)
-        }
-
-        pub fn accept_current_workspace(&self, item_id: &str) -> Result<QueueItem> {
-            self.ensure_registered_remote_identity()?;
-            let _operation = RepositoryOperationLease::acquire(
-                self.queue.clone(),
-                &self.options.repo_path,
-                &self.options.repo_key,
-                &self.lease_owner_id,
-                self.options.lease_ttl_seconds,
-            )?;
-            let item = self.queue.get_item(item_id)?;
-            let workspace = self.load_owned_workspace(&item)?;
-            let unresolved = conflict_files(&workspace)?;
-            if !unresolved.is_empty() {
-                anyhow::bail!(
-                    "cannot accept merge workspace with unresolved paths: {}",
-                    unresolved.join(", ")
-                );
-            }
-            let attempt_id = item
-                .current_attempt_id
-                .as_deref()
-                .context("item has no current attempt")?;
-            let attempt = self.queue.get_attempt(attempt_id)?;
-            let item = self
-                .queue
-                .accept_current_merge_resolution(item_id, &self.options.owner_id)?;
-            self.with_lease_heartbeat("merging", || {
-                self.resume_merge_with_answer(item, &attempt, "accept-current")
-            })
         }
 
         pub fn reset_workspaces(&self) -> Result<Vec<PathBuf>> {
@@ -12214,10 +12163,10 @@ pub mod integrator {
                     item.status
                 ),
             };
-            self.block_item_owned(
+            self.block_and_get(
                 &item.id,
                 phase,
-                BlockedReason::NeedsAgentFix,
+                BlockedReason::Infra,
                 &format!(
                     "queued repository/target {}::{} does not match host policy {}::{}; cancel and enqueue on the correct queue",
                     queued_repo.display(),
@@ -12225,8 +12174,8 @@ pub mod integrator {
                     self.options.repo_path.display(),
                     expected_target
                 ),
-            )?;
-            self.queue.get_item(&item.id).map(Some)
+            )
+            .map(Some)
         }
 
         fn evidence_dir(&self, item: &QueueItem, attempt: &Attempt) -> Result<EvidenceDirectory> {
@@ -12849,12 +12798,23 @@ exit "$status""#,
     fn workspace_dirty(workspace: &Path) -> Result<Option<String>> {
         let status = git_observe_output(
             workspace,
-            ["status", "--porcelain=v1", "--untracked-files=all"],
+            ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
         )?;
-        if status.is_empty() {
+        let dirty = status
+            .split('\0')
+            .filter(|record| !record.is_empty())
+            .filter(|record| {
+                let Some(path) = record.strip_prefix("?? ") else {
+                    return true;
+                };
+                path != ".iq-agent-protocol" && !path.starts_with(".iq-agent-protocol/")
+            })
+            .take(20)
+            .collect::<Vec<_>>();
+        if dirty.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(status.lines().take(20).collect::<Vec<_>>().join("; ")))
+            Ok(Some(dirty.join("; ")))
         }
     }
 
@@ -12934,6 +12894,59 @@ exit "$status""#,
                 .collect(),
         )
     }
+
+    fn conflict_blob(workspace: &Path, stage: u8, path: &str) -> Result<Option<String>> {
+        let object = format!(":{stage}:{path}");
+        let output = git_status(workspace, ["rev-parse", "--verify", object.as_str()])?;
+        if output.status.success() {
+            Ok(Some(String::from_utf8(output.stdout)?.trim().to_string()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn instruction_identities(
+        workspace: &Path,
+    ) -> Result<Vec<crate::agent_protocol::InstructionIdentity>> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut identities = Vec::new();
+        for name in ["AGENTS.md", "DOMAIN_LANGUAGE.md"] {
+            let path = workspace.join(name);
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    let bytes = fs::read(&path)?;
+                    identities.push(crate::agent_protocol::InstructionIdentity {
+                        path: crate::control_domain::EncodedPath::from_bytes(
+                            OsStr::new(name).as_bytes(),
+                        )?,
+                        sha256: format!("{:x}", Sha256::digest(bytes)),
+                    });
+                }
+                Ok(_) => anyhow::bail!("repository instruction path is not a regular file: {name}"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("inspect repository instruction file"),
+            }
+        }
+        Ok(identities)
+    }
+
+    fn workspace_has_unstaged_changes(workspace: &Path) -> Result<bool> {
+        if !git_status(workspace, ["diff", "--quiet"])?.status.success() {
+            return Ok(true);
+        }
+        let untracked = git_output(
+            workspace,
+            ["ls-files", "--others", "--exclude-standard", "-z"],
+        )?;
+        Ok(untracked
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .any(|path| !path.starts_with(".iq-agent-protocol/")))
+    }
+
+    fn remove_cycle_protocol(workspace: &Path, cycle_id: &str) -> Result<()> {
+        crate::agent_protocol::remove_protocol_cycle(workspace, cycle_id)
+    }
 }
 
 pub mod providers {
@@ -12981,9 +12994,31 @@ pub mod providers {
     }
 
     pub fn provider_for_url(url: &str) -> Result<Box<dyn ProviderAdapter>> {
-        if url.contains("/pull/") || url.contains("github.com") {
+        let (scheme, location) = url.split_once("://").context("PR/MR URL has no scheme")?;
+        if !matches!(scheme, "http" | "https") {
+            anyhow::bail!("unsupported PR/MR URL scheme: {scheme}");
+        }
+        let (host, path) = location
+            .split_once('/')
+            .context("PR/MR URL has no repository path")?;
+        let path = path
+            .split(['?', '#'])
+            .next()
+            .context("PR/MR URL has no path")?;
+        let segments = path.split('/').collect::<Vec<_>>();
+        let github_pull = host.eq_ignore_ascii_case("github.com")
+            && matches!(segments.as_slice(), [owner, repository, "pull", number] if !owner.is_empty() && !repository.is_empty() && number.parse::<u64>().is_ok());
+        let gitlab_merge_request = host.to_ascii_lowercase().contains("gitlab")
+            && segments.len() >= 5
+            && segments[segments.len() - 3] == "-"
+            && segments[segments.len() - 2] == "merge_requests"
+            && segments[segments.len() - 1].parse::<u64>().is_ok()
+            && segments[..segments.len() - 3]
+                .iter()
+                .all(|segment| !segment.is_empty());
+        if github_pull {
             Ok(Box::new(GitHubProvider))
-        } else if url.contains("/merge_requests/") || url.contains("gitlab") {
+        } else if gitlab_merge_request {
             Ok(Box::new(GitLabProvider))
         } else {
             anyhow::bail!("unsupported PR/MR provider URL: {url}")
@@ -13274,9 +13309,9 @@ pub mod issue_backends {
             target: &IssueSyncTarget,
             projection: &IssueProjection,
         ) -> Result<IssueSyncResult>;
-        fn ingest_prompt_answers(&self, target: &IssueSyncTarget) -> Result<Vec<PromptAnswer>>;
         fn close(&self, target: &IssueSyncTarget) -> Result<()>;
         fn verify_destination(&self, repo: &str) -> Result<()>;
+        fn answer_comments(&self, target: &IssueSyncTarget) -> Result<Vec<IssueAnswerComment>>;
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -13291,12 +13326,11 @@ pub mod issue_backends {
         pub url: String,
     }
 
-    #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
-    pub struct PromptAnswer {
-        pub external_response_id: Option<String>,
-        pub prompt_id: String,
-        pub answer: String,
-        pub answered_by: Option<String>,
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct IssueAnswerComment {
+        pub id: String,
+        pub actor: Option<String>,
+        pub body: String,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -13460,29 +13494,6 @@ pub mod issue_backends {
             })
         }
 
-        fn ingest_prompt_answers(&self, target: &IssueSyncTarget) -> Result<Vec<PromptAnswer>> {
-            let issue = target
-                .issue
-                .as_deref()
-                .context("GitHub issue number required")?;
-            let program = std::env::var("IQ_GITHUB_CLI").unwrap_or_else(|_| "gh".into());
-            let value = command_json(
-                &program,
-                [
-                    "issue",
-                    "view",
-                    issue,
-                    "--repo",
-                    &target.repo,
-                    "--json",
-                    "comments",
-                ],
-            )?;
-            let view: CommentView =
-                serde_json::from_value(value).context("parse gh issue comments")?;
-            Ok(extract_prompt_answers(view.comments))
-        }
-
         fn close(&self, target: &IssueSyncTarget) -> Result<()> {
             let issue = target
                 .issue
@@ -13506,6 +13517,16 @@ pub mod issue_backends {
         fn verify_destination(&self, repo: &str) -> Result<()> {
             let program = std::env::var("IQ_GITHUB_CLI").unwrap_or_else(|_| "gh".into());
             command_ok(&program, ["repo", "view", repo, "--json", "nameWithOwner"])
+        }
+
+        fn answer_comments(&self, target: &IssueSyncTarget) -> Result<Vec<IssueAnswerComment>> {
+            let issue = target
+                .issue
+                .as_deref()
+                .context("GitHub issue number required")?;
+            let program = std::env::var("IQ_GITHUB_CLI").unwrap_or_else(|_| "gh".into());
+            let view = github_issue_view(&program, target, issue)?;
+            issue_answer_comments(view.comments, "GitHub")
         }
     }
 
@@ -13569,17 +13590,6 @@ pub mod issue_backends {
             })
         }
 
-        fn ingest_prompt_answers(&self, target: &IssueSyncTarget) -> Result<Vec<PromptAnswer>> {
-            let issue = target
-                .issue
-                .as_deref()
-                .context("GitLab issue number required")?;
-            let program = std::env::var("IQ_GITLAB_CLI").unwrap_or_else(|_| "glab".into());
-            Ok(extract_prompt_answers(gitlab_issue_notes(
-                &program, target, issue,
-            )?))
-        }
-
         fn close(&self, target: &IssueSyncTarget) -> Result<()> {
             let issue = target
                 .issue
@@ -13592,6 +13602,15 @@ pub mod issue_backends {
         fn verify_destination(&self, repo: &str) -> Result<()> {
             let program = std::env::var("IQ_GITLAB_CLI").unwrap_or_else(|_| "glab".into());
             command_ok(&program, ["repo", "view", repo, "--output", "json"])
+        }
+
+        fn answer_comments(&self, target: &IssueSyncTarget) -> Result<Vec<IssueAnswerComment>> {
+            let issue = target
+                .issue
+                .as_deref()
+                .context("GitLab issue number required")?;
+            let program = std::env::var("IQ_GITLAB_CLI").unwrap_or_else(|_| "glab".into());
+            issue_answer_comments(gitlab_issue_notes(&program, target, issue)?, "GitLab")
         }
     }
 
@@ -13995,64 +14014,45 @@ pub mod issue_backends {
     }
 
     #[derive(Debug, Deserialize)]
-    struct CommentView {
-        #[serde(default)]
-        comments: Vec<IssueComment>,
-    }
-
-    #[derive(Debug, Deserialize)]
     struct IssueComment {
         #[serde(default)]
         id: Option<serde_json::Value>,
         #[serde(default, alias = "body")]
         body: String,
         #[serde(default)]
-        author: Option<CommentAuthor>,
+        author: Option<IssueCommentAuthor>,
     }
 
     #[derive(Debug, Deserialize)]
-    struct CommentAuthor {
+    struct IssueCommentAuthor {
         #[serde(default, alias = "username")]
         login: Option<String>,
     }
 
-    fn extract_prompt_answers(comments: Vec<IssueComment>) -> Vec<PromptAnswer> {
+    fn issue_answer_comments(
+        comments: Vec<IssueComment>,
+        provider: &str,
+    ) -> Result<Vec<IssueAnswerComment>> {
         comments
             .into_iter()
-            .filter_map(|comment| {
-                let (prompt_id, answer) = parse_prompt_answer(&comment.body)?;
-                Some(PromptAnswer {
-                    external_response_id: comment.id.as_ref().and_then(json_identity),
-                    prompt_id,
-                    answer,
-                    answered_by: comment.author.and_then(|author| author.login),
+            .filter(|comment| !comment.body.contains("<!-- iq:"))
+            .map(|comment| {
+                let id = match comment.id.context("provider answer comment has no ID")? {
+                    serde_json::Value::String(value) if !value.is_empty() => value,
+                    serde_json::Value::Number(value) => value.to_string(),
+                    _ => anyhow::bail!("provider answer comment has an invalid ID"),
+                };
+                let actor = comment
+                    .author
+                    .and_then(|author| author.login)
+                    .filter(|actor| !actor.is_empty());
+                Ok(IssueAnswerComment {
+                    id: format!("{provider}:{id}"),
+                    actor,
+                    body: comment.body,
                 })
             })
             .collect()
-    }
-
-    fn json_identity(value: &serde_json::Value) -> Option<String> {
-        match value {
-            serde_json::Value::String(value) if !value.trim().is_empty() => Some(value.clone()),
-            serde_json::Value::Number(value) => Some(value.to_string()),
-            _ => None,
-        }
-    }
-
-    fn parse_prompt_answer(body: &str) -> Option<(String, String)> {
-        for line in body.lines() {
-            let trimmed = line.trim().trim_matches('`').trim();
-            let Some(rest) = trimmed.strip_prefix("iq answer ") else {
-                continue;
-            };
-            let mut parts = rest.splitn(2, char::is_whitespace);
-            let prompt_id = parts.next()?.trim().to_string();
-            let answer = parts.next().unwrap_or("").trim().to_string();
-            if !prompt_id.is_empty() && !answer.is_empty() {
-                return Some((prompt_id, answer));
-            }
-        }
-        None
     }
 
     fn parse_issue_number(output: &str) -> Option<String> {
