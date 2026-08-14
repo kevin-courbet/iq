@@ -8,11 +8,15 @@ use iq::integrator::{
 };
 use iq::sqlite::{EnqueueRequest, SqliteQueue};
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
+use wait_timeout::ChildExt;
 
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -981,7 +985,7 @@ fn guidance_answer_starts_new_agent_process_and_lands_exact_validated_candidate(
     std::fs::set_permissions(control_temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     control_config.unix_socket = control_temp.path().join("control.sock");
     let socket = control_config.unix_socket.clone();
-    let server = iq::control_api::ControlApiServer::bind(
+    let (_lifetime, server) = iq::control_api::ControlApiServer::bind(
         control_config.clone(),
         iq::control_store::ControlStore::open(&db).unwrap(),
     )
@@ -1907,6 +1911,289 @@ fn iq_cleanup_cli_removes_one_workspace_without_repository_arguments() {
 }
 
 #[test]
+fn daemon_once_opens_valid_v10_database_and_completes_cycle() {
+    let fixture = GitFixture::new(false);
+    let db = fixture.temp.path().join("queues.db");
+    drop(SqliteQueue::open(&db).unwrap());
+    let (daemon_config, system_config, _control_directory) = write_daemon_runtime_config(&fixture);
+
+    let output = run_daemon_once(&fixture, &db, &daemon_config, &system_config);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!([null])
+    );
+}
+
+#[test]
+fn validated_integrator_queue_rejects_different_configured_database_before_mutation() {
+    let fixture = GitFixture::new(false);
+    let database_a = fixture.temp.path().join("queue-a.db");
+    let database_b = fixture.temp.path().join("queue-b.db");
+    let queue_a = SqliteQueue::open(&database_a).unwrap();
+    drop(SqliteQueue::open(&database_b).unwrap());
+    let before_a = fs::read(&database_a).unwrap();
+    let before_b = fs::read(&database_b).unwrap();
+    let workspace_root = fixture.temp.path().join("validated-queue-workspaces");
+    let options = IntegratorOptions {
+        repo_key: format!("{}::main", fixture.repo.display()),
+        repo_path: fixture.repo.clone(),
+        queue_db: database_b.clone(),
+        owner_id: "validated-queue-test".into(),
+        lease_ttl_seconds: 30,
+        base_remote: "origin".into(),
+        workspace_root: workspace_root.clone(),
+        rift_database: Some(fixture.rift_database.clone()),
+        system_config: fixture.system_config(),
+    };
+
+    let mismatch = Integrator::new_with_policy_and_validated_queue(
+        options.clone(),
+        IntegrationPolicy::NoValidation,
+        queue_a.clone(),
+    );
+
+    let error = match mismatch {
+        Ok(_) => panic!("integrator accepted a different configured queue database"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(error.contains("validated queue authority path"), "{error}");
+    assert!(error.contains("does not match configured integrator queue database"));
+    assert_eq!(fs::read(&database_a).unwrap(), before_a);
+    assert_eq!(fs::read(&database_b).unwrap(), before_b);
+    assert!(!workspace_root.exists());
+
+    let matching = Integrator::new_with_policy_and_validated_queue(
+        IntegratorOptions {
+            queue_db: database_a,
+            ..options
+        },
+        IntegrationPolicy::NoValidation,
+        queue_a,
+    );
+    if let Err(error) = matching {
+        panic!("matching validated queue was rejected: {error:#}");
+    }
+}
+
+#[test]
+fn daemon_once_rejects_independent_database_process_lease_holder() {
+    let fixture = GitFixture::new(false);
+    let db = fixture.temp.path().join("queues.db");
+    drop(SqliteQueue::open(&db).unwrap());
+    let (daemon_config, system_config, _control_directory) = write_daemon_runtime_config(&fixture);
+    let mut holder = spawn_database_process_lease_holder(&db, fixture.temp.path());
+
+    let blocked = run_daemon_once(&fixture, &db, &daemon_config, &system_config);
+
+    assert!(!blocked.status.success());
+    let stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert!(stderr.contains("acquire exclusive IQ database process lease"));
+    assert!(stderr.contains("Resource temporarily unavailable"));
+    drop(holder.stdin.take());
+    assert!(holder.wait().unwrap().success());
+
+    let released = run_daemon_once(&fixture, &db, &daemon_config, &system_config);
+    assert!(
+        released.status.success(),
+        "{}",
+        String::from_utf8_lossy(&released.stderr)
+    );
+}
+
+#[test]
+fn daemon_api_failure_stops_daemon_before_lifetime_fences_release() {
+    let fixture = GitFixture::new(false);
+    let db = fixture.temp.path().join("queues.db");
+    drop(SqliteQueue::open(&db).unwrap());
+    let (daemon_config, system_config, control_directory) = write_daemon_runtime_config(&fixture);
+    let mut system = iq::agent_config::SystemConfig::load(&system_config).unwrap();
+    system.control_plane.max_concurrent_clients = 1;
+    fs::write(&system_config, serde_yaml::to_string(&system).unwrap()).unwrap();
+    let ready = fixture.temp.path().join("daemon-ready");
+    let failure = fixture.temp.path().join("api-failure");
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_iq"))
+        .env("IQ_RIFT_DATABASE", &fixture.rift_database)
+        .env("IQ_TEST_CONTROL_API_FAILURE_TRIGGER", &failure)
+        .args([
+            "--queue-db",
+            db.to_str().unwrap(),
+            "daemon",
+            "--config",
+            daemon_config.to_str().unwrap(),
+            "--system-config",
+            system_config.to_str().unwrap(),
+            "--ready-file",
+            ready.to_str().unwrap(),
+            "--interval-seconds",
+            "60",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() {
+        assert!(
+            daemon.try_wait().unwrap().is_none(),
+            "daemon exited before readiness"
+        );
+        assert!(Instant::now() < deadline, "daemon readiness timed out");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut silent = UnixStream::connect(control_directory.path().join("control.sock")).unwrap();
+    let saturation_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Ok(response) = iq::control_api::request(
+            &control_directory.path().join("control.sock"),
+            &iq::control_api::ApiRequest::Inbox { limit: 1 },
+            4096,
+        ) {
+            if response.result["error"] == "too_many_clients" {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < saturation_deadline,
+            "daemon API did not register the silent client"
+        );
+    }
+
+    let blocked = run_daemon_once(&fixture, &db, &daemon_config, &system_config);
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr)
+        .contains("acquire exclusive IQ database process lease"));
+
+    fs::write(&failure, b"fail\n").unwrap();
+    let status = daemon
+        .wait_timeout(Duration::from_secs(5))
+        .unwrap()
+        .expect("daemon did not stop after API failure");
+    let mut stderr = String::new();
+    daemon
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(!status.success());
+    assert!(stderr.contains("IQ control API stopped unexpectedly"));
+    assert!(stderr.contains("simulated IQ control API failure"));
+    silent
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut byte = [0_u8; 1];
+    assert!(!matches!(
+        silent.read(&mut byte),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            )
+    ));
+
+    let released = run_daemon_once(&fixture, &db, &daemon_config, &system_config);
+    assert!(
+        released.status.success(),
+        "{}",
+        String::from_utf8_lossy(&released.stderr)
+    );
+}
+
+#[test]
+fn database_process_lease_holder_process() {
+    let Some(database) = std::env::var_os("IQ_TEST_DATABASE_LEASE_HOLDER") else {
+        return;
+    };
+    let ready = std::env::var_os("IQ_TEST_DATABASE_LEASE_READY").unwrap();
+    let _lease = iq::control_store::DatabaseProcessLease::acquire(Path::new(&database)).unwrap();
+    fs::write(ready, b"ready\n").unwrap();
+    std::io::stdin().read_to_end(&mut Vec::new()).unwrap();
+}
+
+fn write_daemon_runtime_config(
+    fixture: &GitFixture,
+) -> (std::path::PathBuf, std::path::PathBuf, tempfile::TempDir) {
+    let daemon_config = fixture.temp.path().join("daemon.yaml");
+    let system_config = fixture.temp.path().join("system.yaml");
+    let control_directory = tempfile::Builder::new()
+        .prefix("iq-control-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    fs::set_permissions(control_directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        &daemon_config,
+        serde_json::to_vec(&serde_json::json!({
+            "repos": [{
+                "repo_path": fixture.repo,
+                "target": "main",
+                "remote": "origin",
+                "workspace_root": fixture.temp.path().join("daemon-workspaces"),
+                "validation": {"mode": "none"}
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut system = fixture.system_config();
+    system.control_plane.unix_socket = control_directory.path().join("control.sock");
+    fs::write(&system_config, serde_yaml::to_string(&system).unwrap()).unwrap();
+    (daemon_config, system_config, control_directory)
+}
+
+fn run_daemon_once(
+    fixture: &GitFixture,
+    database: &Path,
+    daemon_config: &Path,
+    system_config: &Path,
+) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_iq"))
+        .env("IQ_RIFT_DATABASE", &fixture.rift_database)
+        .args([
+            "--queue-db",
+            database.to_str().unwrap(),
+            "daemon",
+            "--once",
+            "--config",
+            daemon_config.to_str().unwrap(),
+            "--system-config",
+            system_config.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap()
+}
+
+fn spawn_database_process_lease_holder(database: &Path, root: &Path) -> Child {
+    let ready = root.join("database-lease-ready");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "database_process_lease_holder_process",
+            "--nocapture",
+        ])
+        .env("IQ_TEST_DATABASE_LEASE_HOLDER", database)
+        .env("IQ_TEST_DATABASE_LEASE_READY", &ready)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "database lease holder exited before readiness"
+        );
+        assert!(Instant::now() < deadline, "database lease holder timed out");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child
+}
+
+#[test]
 fn creation_intent_terminal_preservation_keeps_authoritative_target_and_alert_payload() {
     let fixture = GitFixture::new(false);
     std::env::set_var("IQ_RIFT_DATABASE", &fixture.rift_database);
@@ -2155,7 +2442,7 @@ fn automatic_creation_intent_retry_before_due_keeps_observation_and_processes_la
 }
 
 #[test]
-fn automatic_retry_rejects_mismatched_debt_authority_before_backoff() {
+fn validated_open_rejects_mismatched_cleanup_debt_authority() {
     let (fixture, queue, repository, first, retained) = cancelled_retained_integrator_fixture();
     let db = fixture.temp.path().join("queues.db");
     fs::write(retained.join("dirty.txt"), "preserve\n").unwrap();
@@ -2170,18 +2457,13 @@ fn automatic_retry_rejects_mismatched_debt_authority_before_backoff() {
         rift_database: Some(fixture.rift_database.clone()),
         system_config: fixture.system_config(),
     };
-    let integrator = fixture.integrator(options.clone()).unwrap();
+    let integrator = fixture.integrator(options).unwrap();
     let preserved = integrator.reset_workspaces().unwrap();
     assert!(preserved.outcomes.iter().any(|outcome| matches!(
         outcome,
         iq::integrator::TerminalCleanupOutcome::Preserved { .. }
     )));
     let later = enqueue_fixture_item(&fixture, &queue, &repository, "agent/authority-later");
-    let store = ControlStore::open(&db).unwrap();
-    let before = store
-        .terminal_workspace_cleanup_debt(&first.id)
-        .unwrap()
-        .unwrap();
     let connection = rusqlite::Connection::open(&db).unwrap();
     connection
         .execute_batch("DROP TRIGGER terminal_cleanup_debt_update_guard;")
@@ -2193,22 +2475,29 @@ fn automatic_retry_rejects_mismatched_debt_authority_before_backoff() {
         )
         .unwrap();
     iq::control_store::reinstall_v10_triggers_for_test(&connection).unwrap();
-    let error = integrator.run_once().unwrap_err();
+    drop(connection);
+    let error = match SqliteQueue::open(&db) {
+        Ok(_) => panic!("mismatched cleanup debt passed validated open"),
+        Err(error) => error,
+    };
     let error = format!("{error:#}");
     assert!(
-        error.contains("terminal workspace cleanup debt identity differs from queue authority"),
+        error.contains("schema v10 cleanup debt target set differs from queue authority"),
         "{error}"
     );
     assert!(retained.exists());
-    assert_eq!(
-        queue.get_item(&later.id).unwrap().status,
-        QueueStatus::Ready
-    );
-    let after = store
-        .terminal_workspace_cleanup_debt(&first.id)
+    let later_status: String = rusqlite::Connection::open(&db)
         .unwrap()
+        .query_row(
+            "SELECT status FROM queue_items WHERE id=?1",
+            [&later.id],
+            |row| row.get(0),
+        )
         .unwrap();
-    assert_eq!(after.state, before.state);
+    assert_eq!(
+        later_status, "ready",
+        "validated-open rejection changed the later queue item"
+    );
 }
 
 #[test]
@@ -2223,17 +2512,16 @@ fn repeated_operator_retry_reopen_keeps_one_alert_and_caps_backoff() {
     )
     .unwrap();
     fs::set_permissions(&notify, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    let notification = iq::notifications::NotificationDispatcher::new(
-        &db,
-        iq::agent_config::NotificationConfig {
+    let notification = queue
+        .notification_dispatcher(iq::agent_config::NotificationConfig {
             backends: vec![iq::agent_config::NotificationBackendConfig::Wslg {
                 executable: notify.clone(),
             }],
             max_attempts: 3,
             max_event_age_seconds: 3600,
             projection_debt_alert_seconds: 60,
-        },
-    );
+        })
+        .unwrap();
     notification.configure().unwrap();
     fs::write(retained.join("dirty.txt"), "preserve\n").unwrap();
     let make_integrator = || {

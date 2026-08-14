@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::agent_config::{NotificationBackendConfig, NotificationConfig};
@@ -55,16 +54,16 @@ pub struct NotificationPayload {
 }
 
 pub struct NotificationDispatcher {
-    database: PathBuf,
+    authority: crate::control_store::ValidatedDatabaseAuthority,
     config: NotificationConfig,
 }
 
 impl NotificationDispatcher {
-    pub fn new(database: &Path, config: NotificationConfig) -> Self {
-        Self {
-            database: database.to_path_buf(),
-            config,
-        }
+    pub(crate) fn from_validated_authority(
+        authority: crate::control_store::ValidatedDatabaseAuthority,
+        config: NotificationConfig,
+    ) -> Self {
+        Self { authority, config }
     }
 
     pub fn health(&self) -> Vec<BackendHealth> {
@@ -191,11 +190,11 @@ impl NotificationDispatcher {
     }
 
     fn connect(&self) -> Result<Connection> {
-        let connection = Connection::open_with_flags(
-            &self.database,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )?;
+        let connection = self
+            .authority
+            .open_connection(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
+        self.authority.verify_configured_connection(&connection)?;
         Ok(connection)
     }
 }

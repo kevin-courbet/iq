@@ -756,6 +756,25 @@ fn runtime_open_handoff_blocks_extra_schema_wal_commit() {
 }
 
 #[test]
+fn validated_control_store_rejects_replaced_database_before_connection_access() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("queues.db");
+    let queue = SqliteQueue::open(&db).unwrap();
+    let store = queue.validated_control_store().unwrap();
+    drop(queue);
+    fs::rename(&db, temp.path().join("validated.db")).unwrap();
+    let replacement = b"replacement is not an IQ database\n";
+    fs::write(&db, replacement).unwrap();
+
+    let error = format!("{:#}", store.inbox(1).unwrap_err());
+
+    assert!(error.contains("queue database identity changed while IQ was running"));
+    assert_eq!(fs::read(&db).unwrap(), replacement);
+    assert!(!db.with_extension("db-wal").exists());
+    assert!(!db.with_extension("db-shm").exists());
+}
+
+#[test]
 fn private_validation_snapshots_are_removed_after_success_and_failure() {
     let _guard = env_lock().lock().unwrap();
     let temp = tempdir().unwrap();

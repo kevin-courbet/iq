@@ -445,10 +445,7 @@ fn main() -> Result<()> {
             let queue = SqliteQueue::open(&db_path)?;
             let manager = RepositoryManager::new(queue.clone());
             let (submission, item) = manager.submit(&workspace, replace.as_deref())?;
-            iq::state_repository::reserve_full_issue(
-                &iq::control_store::ControlStore::open(queue.path())?,
-                &item.id,
-            )?;
+            iq::state_repository::reserve_full_issue(&queue.validated_control_store()?, &item.id)?;
             print_json(&(submission, item))?;
         }
         Command::Cleanup(CleanupArgs {
@@ -540,10 +537,7 @@ fn main() -> Result<()> {
                 producer_metadata: json!({ "producer": producer }),
                 state_repository,
             })?;
-            iq::state_repository::reserve_full_issue(
-                &iq::control_store::ControlStore::open(queue.path())?,
-                &item.id,
-            )?;
+            iq::state_repository::reserve_full_issue(&queue.validated_control_store()?, &item.id)?;
             print_json(&item)?;
         }
         Command::List => {
@@ -620,7 +614,7 @@ fn main() -> Result<()> {
         }
         Command::Cancel { item } => {
             let queue = SqliteQueue::open(&db_path)?;
-            let store = iq::control_store::ControlStore::open(queue.path())?;
+            let store = queue.validated_control_store()?;
             if let Some(effort) = store.effort_for_item(&item)? {
                 let cancelled = store.cancel(&effort.id, "local_cli", "operator_cancelled")?;
                 store.reconcile_cancelled_runner_terminations(false)?;
@@ -642,8 +636,8 @@ fn main() -> Result<()> {
             system_config,
         } => {
             let system = iq::agent_config::SystemConfig::load(&system_config)?;
-            let dispatcher =
-                iq::notifications::NotificationDispatcher::new(&db_path, system.notifications);
+            let queue = SqliteQueue::open(&db_path)?;
+            let dispatcher = queue.notification_dispatcher(system.notifications)?;
             match command {
                 NotifyCommand::Dispatch => {
                     print_json(&json!({"processed":dispatcher.dispatch_once()?}))?
@@ -786,13 +780,11 @@ fn run_doctor(
     let system_config = iq::agent_config::SystemConfig::load(system_config_path)?;
     let runner_snapshot = system_config.runner_snapshot(None)?;
     iq::agent_config::verify_executable(&runner_snapshot.executable)?;
-    let notification_health = iq::notifications::NotificationDispatcher::new(
-        queue_db,
-        system_config.notifications.clone(),
-    )
-    .health();
     let config = read_daemon_config(config_path)?;
     let queue = SqliteQueue::open(queue_db)?;
+    let notification_health = queue
+        .notification_dispatcher(system_config.notifications.clone())?
+        .health();
     let repository_manager = RepositoryManager::new(queue.clone());
     let gh = std::env::var("IQ_GITHUB_CLI").unwrap_or_else(|_| "gh".into());
     let mut results = Vec::new();
@@ -972,10 +964,7 @@ fn run_remote_exec(
                 producer_metadata: json!({ "producer": producer }),
                 state_repository,
             })?;
-            iq::state_repository::reserve_full_issue(
-                &iq::control_store::ControlStore::open(queue.path())?,
-                &item.id,
-            )?;
+            iq::state_repository::reserve_full_issue(&queue.validated_control_store()?, &item.id)?;
             print_json(&item)?;
         }
         RemoteCommand::List => {
@@ -2643,6 +2632,70 @@ fn require_exact_nonblank<'a>(value: &'a str, field: &str) -> Result<&'a str> {
     Ok(value)
 }
 
+struct DaemonApiTask {
+    shutdown: Option<std::sync::mpsc::Sender<()>>,
+    result: std::sync::mpsc::Receiver<Result<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DaemonApiTask {
+    fn start(api: iq::control_api::ControlApiServer) -> Self {
+        let (shutdown_sender, shutdown_receiver) = std::sync::mpsc::channel();
+        let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
+        let thread = std::thread::spawn(move || {
+            let _ = result_sender.send(api.serve(shutdown_receiver));
+        });
+        Self {
+            shutdown: Some(shutdown_sender),
+            result: result_receiver,
+            thread: Some(thread),
+        }
+    }
+
+    fn check(&mut self) -> Result<()> {
+        match self.result.try_recv() {
+            Ok(result) => self.finish_unexpected(result),
+            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(()),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                anyhow::bail!("IQ control API task disconnected unexpectedly")
+            }
+        }
+    }
+
+    fn wait(&mut self, duration: std::time::Duration) -> Result<()> {
+        match self.result.recv_timeout(duration) {
+            Ok(result) => self.finish_unexpected(result),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(()),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("IQ control API task disconnected unexpectedly")
+            }
+        }
+    }
+
+    fn finish_unexpected(&mut self, result: Result<()>) -> Result<()> {
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("IQ control API thread panicked"))?;
+        }
+        match result {
+            Ok(()) => anyhow::bail!("IQ control API stopped unexpectedly"),
+            Err(error) => Err(error).context("IQ control API stopped unexpectedly"),
+        }
+    }
+}
+
+impl Drop for DaemonApiTask {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 fn run_daemon_config(
     db_path: PathBuf,
     config_path: &std::path::Path,
@@ -2655,27 +2708,16 @@ fn run_daemon_config(
     let system_config = iq::agent_config::SystemConfig::load(system_config_path)?;
     let config = read_daemon_config(config_path)?;
     let queue = SqliteQueue::open(&db_path)?;
-    let control_store = iq::control_store::ControlStore::open(&db_path)?;
+    let control_store = queue.validated_control_store()?;
     control_store.reconcile_cancelled_runner_terminations(true)?;
-    let notifications = iq::notifications::NotificationDispatcher::new(
-        &db_path,
-        system_config.notifications.clone(),
-    );
+    let notifications = queue.notification_dispatcher(system_config.notifications.clone())?;
     notifications.configure()?;
-    let api = iq::control_api::ControlApiServer::bind(
+    let (_daemon_lifetime, api) = iq::control_api::ControlApiServer::bind(
         system_config.control_plane.clone(),
-        control_store,
+        control_store.clone(),
     )?;
     notifications.mark_started_unknown_after_restart()?;
-    let startup_store = iq::control_store::ControlStore::open(&db_path)?;
-    iq::state_repository::process_issue_reservation_outbox(&startup_store, 1000)?;
-    if !once {
-        std::thread::spawn(move || {
-            if let Err(error) = api.serve() {
-                eprintln!("IQ control API stopped: {error:#}");
-            }
-        });
-    }
+    iq::state_repository::process_issue_reservation_outbox(&control_store, 1000)?;
     let mut runners = Vec::new();
     for validated in config.repos {
         let ValidatedDaemonRepo {
@@ -2714,17 +2756,30 @@ fn run_daemon_config(
             },
             ValidationConfig::None => IntegrationPolicy::NoValidation,
         };
-        let integrator = Integrator::new_with_policy(options, policy)?;
+        let integrator =
+            Integrator::new_with_policy_and_validated_queue(options, policy, queue.clone())?;
         runners.push((repo_key, integrator));
     }
+    let mut api_task = if once {
+        drop(api);
+        None
+    } else {
+        Some(DaemonApiTask::start(api))
+    };
     if let Some(path) = ready_file.as_deref() {
         write_ready_file(path)?;
     }
     loop {
+        if let Some(task) = api_task.as_mut() {
+            task.check()?;
+        }
         let mut results = Vec::new();
         for (repo_key, integrator) in &runners {
+            if let Some(task) = api_task.as_mut() {
+                task.check()?;
+            }
             let cycle = || -> Result<Option<QueueItem>> {
-                let store = iq::control_store::ControlStore::open(&db_path)?;
+                let store = control_store.clone();
                 iq::state_repository::process_issue_reservation_outbox(&store, 1000)?;
                 for effort in store.inbox(1000)? {
                     if let Err(error) =
@@ -2763,6 +2818,9 @@ fn run_daemon_config(
                     results.push(None);
                 }
             }
+            if let Some(task) = api_task.as_mut() {
+                task.check()?;
+            }
         }
         if once {
             print_json(&results)?;
@@ -2773,7 +2831,10 @@ fn run_daemon_config(
         if once {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_secs(interval_seconds));
+        api_task
+            .as_mut()
+            .context("daemon API task is missing")?
+            .wait(std::time::Duration::from_secs(interval_seconds))?;
     }
     Ok(())
 }

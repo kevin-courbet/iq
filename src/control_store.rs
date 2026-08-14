@@ -12,6 +12,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -36,6 +37,10 @@ static RUNTIME_OPEN_HANDOFF_TEST_HOOK: std::sync::Mutex<MigrationBackupTestHook>
 
 #[cfg(debug_assertions)]
 static DATABASE_SNAPSHOT_TEST_HOOK: std::sync::Mutex<MigrationBackupTestHook> =
+    std::sync::Mutex::new(None);
+
+#[cfg(debug_assertions)]
+static RECOMPOSITION_PROJECTION_FAILURE_TEST_HOOK: std::sync::Mutex<Option<PathBuf>> =
     std::sync::Mutex::new(None);
 
 #[doc(hidden)]
@@ -71,6 +76,13 @@ pub fn set_runtime_open_handoff_test_hook(database_path: &Path, hook: Option<fn(
 pub fn set_database_snapshot_test_hook(database_path: &Path, hook: Option<fn(&Path)>) {
     *DATABASE_SNAPSHOT_TEST_HOOK.lock().unwrap() =
         hook.map(|hook| (database_path.to_path_buf(), hook));
+}
+
+#[doc(hidden)]
+#[cfg(debug_assertions)]
+pub fn set_recomposition_projection_failure_test_hook(database_path: &Path, enabled: bool) {
+    *RECOMPOSITION_PROJECTION_FAILURE_TEST_HOOK.lock().unwrap() =
+        enabled.then(|| database_path.to_path_buf());
 }
 
 use crate::agent_config::SystemConfig;
@@ -318,14 +330,6 @@ impl SnapshotSource {
     }
 }
 
-pub(crate) fn validate_database_snapshot<T>(
-    database_path: &Path,
-    validate: impl FnOnce(&Connection) -> Result<T>,
-) -> Result<T> {
-    let lease = DatabaseProcessLease::acquire_existing_exclusive(database_path)?;
-    validate_database_snapshot_under_lease(database_path, &lease, validate)
-}
-
 pub(crate) fn validate_database_snapshot_under_lease<T>(
     database_path: &Path,
     lease: &DatabaseProcessLease,
@@ -488,6 +492,104 @@ impl PrimaryDatabaseIdentity {
             anyhow::bail!("primary IQ database lost its authoritative inode identity");
         }
         Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ValidatedDatabaseAuthority {
+    identity: Arc<ValidatedDatabaseIdentity>,
+}
+
+struct ValidatedDatabaseIdentity {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    database_id: String,
+    workspace_schema_version: String,
+    sqlite_schema_version: i64,
+}
+
+impl ValidatedDatabaseAuthority {
+    pub(crate) fn from_validated_connection(
+        path: PathBuf,
+        device: u64,
+        inode: u64,
+        database_id: String,
+        connection: &Connection,
+    ) -> Result<Self> {
+        let workspace_schema_version: String = connection.query_row(
+            "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        let sqlite_schema_version: i64 =
+            connection.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
+        let authority = Self {
+            identity: Arc::new(ValidatedDatabaseIdentity {
+                path,
+                device,
+                inode,
+                database_id,
+                workspace_schema_version,
+                sqlite_schema_version,
+            }),
+        };
+        authority.verify_path()?;
+        authority.verify_connection(connection)?;
+        Ok(authority)
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.identity.path
+    }
+
+    pub(crate) fn verify_path(&self) -> Result<()> {
+        let metadata = fs::symlink_metadata(&self.identity.path)
+            .with_context(|| format!("inspect queue db {}", self.identity.path.display()))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.dev() != self.identity.device
+            || metadata.ino() != self.identity.inode
+        {
+            anyhow::bail!(
+                "queue database identity changed while IQ was running: {}",
+                self.identity.path.display()
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn verify_connection(&self, connection: &Connection) -> Result<()> {
+        let (database_id, workspace_schema_version): (Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT (SELECT value FROM queue_metadata WHERE key='database_id'),(SELECT value FROM queue_metadata WHERE key='workspace_schema_version')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+        let sqlite_schema_version: i64 =
+            connection.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
+        if database_id.as_deref() != Some(self.identity.database_id.as_str())
+            || workspace_schema_version.as_deref()
+                != Some(self.identity.workspace_schema_version.as_str())
+            || sqlite_schema_version != self.identity.sqlite_schema_version
+        {
+            anyhow::bail!("queue database identity or schema changed after validated open");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn open_connection(&self, flags: OpenFlags) -> Result<Connection> {
+        self.verify_path()?;
+        let connection = Connection::open_with_flags(self.path(), flags)
+            .with_context(|| format!("open validated IQ database {}", self.path().display()))?;
+        self.verify_path()?;
+        self.verify_connection(&connection)?;
+        Ok(connection)
+    }
+
+    pub(crate) fn verify_configured_connection(&self, connection: &Connection) -> Result<()> {
+        self.verify_path()?;
+        self.verify_connection(connection)
     }
 }
 
@@ -757,26 +859,22 @@ struct RunnerTerminationDebt {
 
 #[derive(Clone)]
 pub struct ControlStore {
-    path: PathBuf,
+    authority: ValidatedDatabaseAuthority,
 }
 
 impl ControlStore {
     pub fn open(path: &Path) -> Result<Self> {
-        let path = path.canonicalize()?;
-        let store = Self { path };
-        store.validate_schema()?;
-        drop(DatabaseProcessLease::acquire(&store.path)?);
-        Ok(store)
+        let reader = crate::sqlite::SqliteQueueReader::open(path)?;
+        reader.validated_control_store()
     }
 
-    pub(crate) fn open_validated(path: &Path) -> Result<Self> {
-        Ok(Self {
-            path: path.canonicalize()?,
-        })
+    pub(crate) fn open_validated(authority: ValidatedDatabaseAuthority) -> Result<Self> {
+        authority.verify_path()?;
+        Ok(Self { authority })
     }
 
     pub(crate) fn path(&self) -> &Path {
-        &self.path
+        self.authority.path()
     }
 
     pub fn effort_for_item(&self, item_id: &str) -> Result<Option<IntegrationEffort>> {
@@ -2197,6 +2295,7 @@ impl ControlStore {
             next_cycle: next_cycle_number(&transaction, effort_id)?,
         });
         update_state(&transaction, &effort, &state)?;
+        fail_recomposition_projection_for_test(self.path())?;
         let projected = transaction.execute(
             "UPDATE queue_items SET target_sha=?1,source_sha=?2,conflict_json=?3,updated_at=?4 WHERE id=?5 AND current_attempt_id=?6",
             params![target_sha,effort.source_sha,conflict.to_string(),now(),effort.item_id,effort.attempt_id],
@@ -2640,19 +2739,16 @@ impl ControlStore {
         required_effort(&connection, effort_id)
     }
 
-    fn validate_schema(&self) -> Result<()> {
-        validate_database_snapshot(&self.path, validate_v10)
-    }
-
     fn connect(&self, write: bool) -> Result<Connection> {
         let flags = if write {
             OpenFlags::SQLITE_OPEN_READ_WRITE
         } else {
             OpenFlags::SQLITE_OPEN_READ_ONLY
         } | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-        let connection = Connection::open_with_flags(&self.path, flags)?;
+        let connection = self.authority.open_connection(flags)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.busy_timeout(Duration::from_secs(5))?;
+        self.authority.verify_configured_connection(&connection)?;
         Ok(connection)
     }
 
@@ -2664,6 +2760,18 @@ impl ControlStore {
         drop(connection);
         Self::open(path)
     }
+}
+
+fn fail_recomposition_projection_for_test(_database_path: &Path) -> Result<()> {
+    #[cfg(debug_assertions)]
+    {
+        let mut hook = RECOMPOSITION_PROJECTION_FAILURE_TEST_HOOK.lock().unwrap();
+        if hook.as_deref() == Some(_database_path) {
+            hook.take();
+            anyhow::bail!("injected recomposition failure");
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn install_v9_schema_objects(connection: &Connection) -> Result<()> {

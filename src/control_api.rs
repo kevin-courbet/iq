@@ -1,15 +1,17 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+use std::net::Shutdown;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -46,12 +48,137 @@ pub struct ControlApiServer {
     listener: UnixListener,
     config: ControlPlaneConfig,
     store: Arc<ControlStore>,
-    lease: DaemonLease,
-    database_lease: crate::control_store::DatabaseProcessLease,
+}
+
+pub struct DaemonLifetime {
+    _daemon_lease: DaemonLease,
+    _database_lease: crate::control_store::DatabaseProcessLease,
+}
+
+#[derive(Clone)]
+struct ApiShutdown {
+    state: Arc<Mutex<ApiShutdownState>>,
+}
+
+struct ApiShutdownState {
+    requested: bool,
+    next_stream_id: u64,
+    streams: BTreeMap<u64, UnixStream>,
+}
+
+struct StreamRegistration {
+    shutdown: ApiShutdown,
+    stream_id: Option<u64>,
+}
+
+impl ApiShutdown {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ApiShutdownState {
+                requested: false,
+                next_stream_id: 0,
+                streams: BTreeMap::new(),
+            })),
+        }
+    }
+
+    fn register(&self, stream: &UnixStream) -> Result<StreamRegistration> {
+        let registered = stream.try_clone()?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("control API shutdown lock poisoned"))?;
+        if state.requested {
+            drop(state);
+            stream.shutdown(Shutdown::Both)?;
+            drop(registered);
+            return Ok(StreamRegistration {
+                shutdown: self.clone(),
+                stream_id: None,
+            });
+        }
+        let stream_id = state.next_stream_id;
+        state.next_stream_id = state
+            .next_stream_id
+            .checked_add(1)
+            .context("control API stream identity exhausted")?;
+        state.streams.insert(stream_id, registered);
+        Ok(StreamRegistration {
+            shutdown: self.clone(),
+            stream_id: Some(stream_id),
+        })
+    }
+
+    fn request(&self) -> Result<()> {
+        let streams = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("control API shutdown lock poisoned"))?;
+            state.requested = true;
+            std::mem::take(&mut state.streams)
+        };
+        let mut first_error = None;
+        for (_, stream) in streams {
+            if let Err(error) = stream.shutdown(Shutdown::Both) {
+                record_first_error(&mut first_error, error.into());
+            }
+        }
+        finish_errors(first_error)
+    }
+
+    fn is_requested(&self) -> Result<bool> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("control API shutdown lock poisoned"))?
+            .requested)
+    }
+
+    fn unregister(&self, stream_id: u64) {
+        if let Ok(mut state) = self.state.lock() {
+            state.streams.remove(&stream_id);
+        }
+    }
+}
+
+impl Drop for StreamRegistration {
+    fn drop(&mut self) {
+        if let Some(stream_id) = self.stream_id.take() {
+            self.shutdown.unregister(stream_id);
+        }
+    }
+}
+
+struct ConnectionWorker {
+    handle: thread::JoinHandle<Result<()>>,
+}
+
+struct ApiTaskTree {
+    shutdown: ApiShutdown,
+    workers: Vec<ConnectionWorker>,
+}
+
+impl ApiTaskTree {
+    fn new() -> Self {
+        Self {
+            shutdown: ApiShutdown::new(),
+            workers: Vec::new(),
+        }
+    }
+}
+
+impl Drop for ApiTaskTree {
+    fn drop(&mut self) {
+        let _ = self.shutdown.request();
+        for worker in self.workers.drain(..) {
+            let _ = worker.handle.join();
+        }
+    }
 }
 
 impl ControlApiServer {
-    pub fn bind(config: ControlPlaneConfig, store: ControlStore) -> Result<Self> {
+    pub fn bind(config: ControlPlaneConfig, store: ControlStore) -> Result<(DaemonLifetime, Self)> {
         verify_socket_path(&config.unix_socket)?;
         let parent = config
             .unix_socket
@@ -75,28 +202,82 @@ impl ControlApiServer {
         let listener = UnixListener::bind(&config.unix_socket)?;
         fs::set_permissions(&config.unix_socket, fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(false)?;
-        Ok(Self {
-            listener,
-            config,
-            store: Arc::new(store),
-            lease,
-            database_lease,
-        })
+        Ok((
+            DaemonLifetime {
+                _daemon_lease: lease,
+                _database_lease: database_lease,
+            },
+            Self {
+                listener,
+                config,
+                store: Arc::new(store),
+            },
+        ))
     }
 
-    pub fn serve(self) -> Result<()> {
-        let _lease = self.lease;
-        let _database_lease = self.database_lease;
+    pub fn serve(self, shutdown: mpsc::Receiver<()>) -> Result<()> {
+        self.serve_inner(shutdown, false)
+    }
+
+    #[doc(hidden)]
+    #[cfg(debug_assertions)]
+    pub fn serve_failure_for_test(self) -> Result<()> {
+        let (_shutdown, receiver) = mpsc::channel();
+        self.serve_inner(receiver, true)
+    }
+
+    fn serve_inner(self, shutdown: mpsc::Receiver<()>, fail_for_test: bool) -> Result<()> {
+        self.listener.set_nonblocking(true)?;
         let permits = Arc::new(std::sync::Mutex::new(0_u32));
-        for stream in self.listener.incoming() {
-            let stream = stream?;
-            let mut active = permits
-                .lock()
-                .map_err(|_| anyhow::anyhow!("API permit lock poisoned"))?;
+        let mut task_tree = ApiTaskTree::new();
+        let mut first_error = None;
+        loop {
+            collect_finished_workers(&mut task_tree.workers, &mut first_error);
+            if first_error.is_some() {
+                break;
+            }
+            if let Err(error) = fail_control_api_serve_for_test(fail_for_test) {
+                record_first_error(&mut first_error, error);
+                break;
+            }
+            let stream = match self.listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    match shutdown.recv_timeout(Duration::from_millis(50)) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    }
+                }
+                Err(error) => {
+                    record_first_error(&mut first_error, error.into());
+                    break;
+                }
+            };
+            let registration = match task_tree.shutdown.register(&stream) {
+                Ok(registration) => registration,
+                Err(error) => {
+                    record_first_error(&mut first_error, error);
+                    break;
+                }
+            };
+            if let Err(error) = fail_control_api_serve_for_test(fail_for_test) {
+                record_first_error(&mut first_error, error);
+                break;
+            }
+            let mut active = match permits.lock() {
+                Ok(active) => active,
+                Err(_) => {
+                    record_first_error(
+                        &mut first_error,
+                        anyhow::anyhow!("API permit lock poisoned"),
+                    );
+                    break;
+                }
+            };
             if *active >= self.config.max_concurrent_clients {
                 drop(active);
                 let mut stream = stream;
-                write_response(
+                if let Err(error) = write_response(
                     &mut stream,
                     &ApiResponse {
                         version: 1,
@@ -104,7 +285,11 @@ impl ControlApiServer {
                         result: json!({"error":"too_many_clients"}),
                     },
                     self.config.max_response_bytes,
-                )?;
+                ) {
+                    record_first_error(&mut first_error, error);
+                    break;
+                }
+                drop(registration);
                 continue;
             }
             *active += 1;
@@ -112,20 +297,107 @@ impl ControlApiServer {
             let store = self.store.clone();
             let config = self.config.clone();
             let permits = permits.clone();
-            thread::spawn(move || {
-                let _ = handle_connection(stream, &config, &store);
-                if let Ok(mut active) = permits.lock() {
-                    *active = active.saturating_sub(1);
-                }
+            let worker_shutdown = task_tree.shutdown.clone();
+            task_tree.workers.push(ConnectionWorker {
+                handle: thread::spawn(move || {
+                    let result =
+                        handle_connection(stream, &config, &store, &worker_shutdown, registration);
+                    let result = match worker_shutdown.is_requested() {
+                        Ok(true) => Ok(()),
+                        Ok(false) => result,
+                        Err(error) => result.and(Err(error)),
+                    };
+                    let permit_result = permits
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("API permit lock poisoned"))
+                        .map(|mut active| *active = active.saturating_sub(1));
+                    result.and(permit_result)
+                }),
             });
         }
-        Ok(())
+        if let Err(error) = task_tree.shutdown.request() {
+            record_first_error(&mut first_error, error);
+        }
+        join_all_workers(&mut task_tree.workers, &mut first_error);
+        finish_errors(first_error)
     }
 
     pub fn serve_one(self) -> Result<()> {
         let (stream, _) = self.listener.accept()?;
-        handle_connection(stream, &self.config, &self.store)
+        let shutdown = ApiShutdown::new();
+        let registration = shutdown.register(&stream)?;
+        handle_connection(stream, &self.config, &self.store, &shutdown, registration)
     }
+}
+
+fn collect_finished_workers(
+    workers: &mut Vec<ConnectionWorker>,
+    first_error: &mut Option<anyhow::Error>,
+) {
+    let mut index = 0;
+    while index < workers.len() {
+        if workers[index].handle.is_finished() {
+            let worker = workers.remove(index);
+            record_join_result(
+                first_error,
+                worker.handle.join(),
+                "IQ control API worker panicked",
+            );
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn join_all_workers(workers: &mut Vec<ConnectionWorker>, first_error: &mut Option<anyhow::Error>) {
+    for worker in workers.drain(..) {
+        record_join_result(
+            first_error,
+            worker.handle.join(),
+            "IQ control API worker panicked",
+        );
+    }
+}
+
+fn record_join_result(
+    first_error: &mut Option<anyhow::Error>,
+    result: std::thread::Result<Result<()>>,
+    panic_message: &str,
+) {
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => record_first_error(first_error, error),
+        Err(_) => record_first_error(first_error, anyhow::anyhow!(panic_message.to_string())),
+    }
+}
+
+fn record_first_error(first_error: &mut Option<anyhow::Error>, error: anyhow::Error) {
+    if first_error.is_none() {
+        *first_error = Some(error);
+    }
+}
+
+fn finish_errors(first_error: Option<anyhow::Error>) -> Result<()> {
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn fail_control_api_serve_for_test(_fail: bool) -> Result<()> {
+    #[cfg(debug_assertions)]
+    if _fail {
+        anyhow::bail!("simulated IQ control API failure");
+    }
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("IQ_TEST_CONTROL_API_FAILURE_TRIGGER") {
+        match fs::symlink_metadata(path) {
+            Ok(_) => anyhow::bail!("simulated IQ control API failure"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("inspect control API failure trigger"),
+        }
+    }
+    Ok(())
 }
 
 pub fn request(
@@ -190,7 +462,12 @@ fn handle_connection(
     mut stream: UnixStream,
     config: &ControlPlaneConfig,
     store: &ControlStore,
+    shutdown: &ApiShutdown,
+    _registration: StreamRegistration,
 ) -> Result<()> {
+    if shutdown.is_requested()? {
+        return Ok(());
+    }
     let peer = peer_uid(&stream)?;
     let daemon_uid = unsafe { libc::geteuid() };
     if peer != daemon_uid {
@@ -205,7 +482,7 @@ fn handle_connection(
         anyhow::bail!("unsupported control API version");
     }
     if let ApiRequest::Watch { cursor, limit } = envelope.request {
-        return stream_events(&mut stream, config, store, cursor, limit);
+        return stream_events(&mut stream, config, store, shutdown, cursor, limit);
     }
     let result = match envelope.request {
         ApiRequest::Inbox { limit } => serde_json::to_value(store.inbox(limit)?)?,
@@ -251,6 +528,7 @@ fn stream_events(
     stream: &mut UnixStream,
     config: &ControlPlaneConfig,
     store: &ControlStore,
+    shutdown: &ApiShutdown,
     cursor: u64,
     limit: u32,
 ) -> Result<()> {
@@ -281,14 +559,19 @@ fn stream_events(
     }
     let message_bound =
         usize::try_from((config.max_client_queue_bytes / config.max_response_bytes.max(1)).max(1))?;
-    let (sender, receiver) = mpsc::sync_channel::<Result<ApiResponse>>(message_bound);
+    let (sender, receiver) = mpsc::sync_channel::<ApiResponse>(message_bound);
     let backpressure = Arc::new(AtomicBool::new(false));
     let producer_backpressure = backpressure.clone();
     let producer_store = store.clone();
+    let producer_shutdown = shutdown.clone();
     let producer_max = config.max_client_queue_bytes.min(config.max_response_bytes);
-    thread::spawn(move || {
+    let (producer_stop, producer_stop_receiver) = mpsc::channel();
+    let producer = thread::spawn(move || -> Result<()> {
         let mut selected_cursor = cursor;
         loop {
+            if producer_shutdown.is_requested()? {
+                return Ok(());
+            }
             let result = (|| -> Result<Option<ApiResponse>> {
                 let events = producer_store.events_after(selected_cursor, limit)?;
                 if events.is_empty() {
@@ -310,61 +593,72 @@ fn stream_events(
                 Ok(Some(response))
             })();
             match result {
-                Ok(Some(response)) => match sender.try_send(Ok(response)) {
+                Ok(Some(response)) => match sender.try_send(response) {
                     Ok(()) => {}
                     Err(mpsc::TrySendError::Full(_)) => {
                         producer_backpressure.store(true, Ordering::Release);
-                        break;
+                        return Ok(());
                     }
-                    Err(mpsc::TrySendError::Disconnected(_)) => break,
+                    Err(mpsc::TrySendError::Disconnected(_)) => return Ok(()),
                 },
-                Ok(None) if producer_backpressure.load(Ordering::Acquire) => break,
-                Ok(None) => thread::sleep(Duration::from_millis(100)),
-                Err(error) => {
-                    let _ = sender.try_send(Err(error));
-                    break;
-                }
+                Ok(None) if producer_backpressure.load(Ordering::Acquire) => return Ok(()),
+                Ok(None) => match producer_stop_receiver.recv_timeout(Duration::from_millis(100)) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                },
+                Err(error) => return Err(error),
             }
         }
     });
     let idle = Duration::from_secs(config.client_idle_seconds);
     let mut sent_cursor = cursor;
     let mut last_activity = Instant::now();
-    loop {
-        if backpressure.load(Ordering::Acquire) {
-            return write_response(
-                stream,
-                &ApiResponse {
-                    version: 1,
-                    ok: true,
-                    result: json!({"kind":"disconnect","reason":"backpressure","cursor":sent_cursor}),
-                },
-                config.max_response_bytes.min(config.max_client_queue_bytes),
-            );
-        }
-        match receiver.recv_timeout(Duration::from_millis(100)) {
-            Ok(Ok(response)) => {
-                write_response(stream, &response, config.max_response_bytes)?;
-                sent_cursor = response.result["cursor"].as_u64().unwrap_or(sent_cursor);
-                last_activity = Instant::now();
+    let stream_result = (|| -> Result<()> {
+        loop {
+            if shutdown.is_requested()? {
+                return Ok(());
             }
-            Ok(Err(error)) => return Err(error),
-            Err(mpsc::RecvTimeoutError::Disconnected) if backpressure.load(Ordering::Acquire) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-            Err(mpsc::RecvTimeoutError::Timeout) if last_activity.elapsed() >= idle => {
+            if backpressure.load(Ordering::Acquire) {
                 return write_response(
                     stream,
                     &ApiResponse {
                         version: 1,
                         ok: true,
-                        result: json!({"kind":"disconnect","reason":"idle","cursor":sent_cursor}),
+                        result: json!({"kind":"disconnect","reason":"backpressure","cursor":sent_cursor}),
                     },
                     config.max_response_bytes.min(config.max_client_queue_bytes),
                 );
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            match receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(response) => {
+                    write_response(stream, &response, config.max_response_bytes)?;
+                    sent_cursor = response.result["cursor"].as_u64().unwrap_or(sent_cursor);
+                    last_activity = Instant::now();
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected)
+                    if backpressure.load(Ordering::Acquire) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                Err(mpsc::RecvTimeoutError::Timeout) if last_activity.elapsed() >= idle => {
+                    return write_response(
+                        stream,
+                        &ApiResponse {
+                            version: 1,
+                            ok: true,
+                            result: json!({"kind":"disconnect","reason":"idle","cursor":sent_cursor}),
+                        },
+                        config.max_response_bytes.min(config.max_client_queue_bytes),
+                    );
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
         }
-    }
+    })();
+    let _ = producer_stop.send(());
+    drop(receiver);
+    let producer_result = producer
+        .join()
+        .map_err(|_| anyhow::anyhow!("IQ control API event producer panicked"))?;
+    stream_result.and(producer_result)
 }
 
 fn read_frame(stream: &mut UnixStream, max: u64) -> Result<Vec<u8>> {
@@ -490,4 +784,22 @@ fn remove_stale_socket(path: &Path, _lease: &DaemonLease) -> Result<()> {
     }
     fs::remove_file(path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_registration_after_shutdown_closes_immediately() {
+        let shutdown = ApiShutdown::new();
+        shutdown.request().unwrap();
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+
+        let _registration = shutdown.register(&stream).unwrap();
+
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut byte = [0_u8; 1];
+        assert_eq!(peer.read(&mut byte).unwrap(), 0);
+    }
 }

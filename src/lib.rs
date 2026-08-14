@@ -687,16 +687,28 @@ pub mod sqlite {
 
     #[derive(Clone)]
     pub struct SqliteQueue {
-        path: PathBuf,
-        database_dev: u64,
-        database_ino: u64,
+        authority: crate::control_store::ValidatedDatabaseAuthority,
     }
 
     #[derive(Clone)]
     pub struct SqliteQueueReader {
-        path: PathBuf,
-        database_dev: u64,
-        database_ino: u64,
+        authority: crate::control_store::ValidatedDatabaseAuthority,
+    }
+
+    pub(crate) fn resolve_queue_database_path_without_creating(path: &Path) -> Result<PathBuf> {
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        let parent = path.parent().context("queue database path has no parent")?;
+        let file_name = path
+            .file_name()
+            .context("queue database path has no file name")?;
+        Ok(parent
+            .canonicalize()
+            .with_context(|| format!("resolve queue db parent {}", parent.display()))?
+            .join(file_name))
     }
 
     fn require_current_schema_version(version: Option<&str>) -> Result<()> {
@@ -857,14 +869,7 @@ pub mod sqlite {
                         .with_context(|| format!("inspect queue db {}", path.display()))
                 }
             };
-            let parent = path.parent().context("queue database path has no parent")?;
-            let file_name = path
-                .file_name()
-                .context("queue database path has no file name")?;
-            let path = parent
-                .canonicalize()
-                .with_context(|| format!("resolve queue db parent {}", parent.display()))?
-                .join(file_name);
+            let path = resolve_queue_database_path_without_creating(&path)?;
             let lease = if preexisting_identity.is_some() {
                 crate::control_store::DatabaseProcessLease::acquire_existing_exclusive(&path)?
             } else {
@@ -988,14 +993,18 @@ pub mod sqlite {
                     path.display()
                 );
             }
+            let authority =
+                crate::control_store::ValidatedDatabaseAuthority::from_validated_connection(
+                    path,
+                    final_metadata.dev(),
+                    final_metadata.ino(),
+                    authoritative_database_id,
+                    &conn,
+                )?;
             drop(conn);
             drop(source);
             drop(lease);
-            Ok(Self {
-                path,
-                database_dev: final_metadata.dev(),
-                database_ino: final_metadata.ino(),
-            })
+            Ok(Self { authority })
         }
 
         pub fn migrate_v8(path: &Path, system_config_path: &Path) -> Result<Self> {
@@ -2006,15 +2015,12 @@ DROP TABLE queue_items_v6;"#,
         }
 
         fn connect(&self) -> Result<Connection> {
-            self.verify_database_file()?;
-            let conn = Connection::open_with_flags(
-                &self.path,
+            let conn = self.authority.open_connection(
                 OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-            )
-            .with_context(|| format!("open queue db {}", self.path.display()))?;
-            self.verify_database_file()?;
+            )?;
             conn.pragma_update(None, "foreign_keys", "ON")?;
             conn.busy_timeout(Self::WRITE_BUSY_TIMEOUT)?;
+            self.authority.verify_configured_connection(&conn)?;
             Ok(conn)
         }
 
@@ -2024,26 +2030,8 @@ DROP TABLE queue_items_v6;"#,
 
         pub(crate) fn reader(&self) -> SqliteQueueReader {
             SqliteQueueReader {
-                path: self.path.clone(),
-                database_dev: self.database_dev,
-                database_ino: self.database_ino,
+                authority: self.authority.clone(),
             }
-        }
-
-        fn verify_database_file(&self) -> Result<()> {
-            let metadata = fs::symlink_metadata(&self.path)
-                .with_context(|| format!("inspect queue db {}", self.path.display()))?;
-            if metadata.file_type().is_symlink()
-                || !metadata.is_file()
-                || metadata.dev() != self.database_dev
-                || metadata.ino() != self.database_ino
-            {
-                anyhow::bail!(
-                    "queue database identity changed while IQ was running: {}",
-                    self.path.display()
-                );
-            }
-            Ok(())
         }
 
         pub fn enqueue(&self, request: EnqueueRequest) -> Result<QueueItem> {
@@ -2888,7 +2876,24 @@ DROP TABLE queue_items_v6;"#,
         }
 
         pub fn path(&self) -> &Path {
-            &self.path
+            self.authority.path()
+        }
+
+        pub fn validated_control_store(&self) -> Result<crate::control_store::ControlStore> {
+            crate::control_store::ControlStore::open_validated(self.authority.clone())
+        }
+
+        pub fn notification_dispatcher(
+            &self,
+            config: crate::agent_config::NotificationConfig,
+        ) -> Result<crate::notifications::NotificationDispatcher> {
+            self.authority.verify_path()?;
+            Ok(
+                crate::notifications::NotificationDispatcher::from_validated_authority(
+                    self.authority.clone(),
+                    config,
+                ),
+            )
         }
 
         pub fn record_workspace_gc_debt(&self, registry_identity: &str) -> Result<()> {
@@ -4094,11 +4099,6 @@ DROP TABLE queue_items_v6;"#,
                     path.display()
                 );
             }
-            let reader = Self {
-                path: path.clone(),
-                database_dev: metadata.dev(),
-                database_ino: metadata.ino(),
-            };
             let validated_database_id =
                 crate::control_store::validate_database_snapshot_under_lease(
                     &path,
@@ -4126,9 +4126,13 @@ DROP TABLE queue_items_v6;"#,
             crate::control_store::run_runtime_open_handoff_test_hook(&path);
             lease.verify_authority(&path)?;
             source.verify_authoritative(&path)?;
-            let conn = reader
-                .connect(Self::BUSY_TIMEOUT)
-                .with_context(|| format!("open existing queue db {}", path.display()))?;
+            let conn = Connection::open_with_flags(
+                &path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )
+            .with_context(|| format!("open existing queue db {}", path.display()))?;
+            conn.busy_timeout(Self::BUSY_TIMEOUT)?;
+            conn.pragma_update(None, "query_only", "ON")?;
             source.verify_authoritative(&path)?;
             let authoritative_database_id =
                 crate::control_store::validate_existing_v10_identity(&conn)?;
@@ -4137,39 +4141,38 @@ DROP TABLE queue_items_v6;"#,
             }
             lease.verify_authority(&path)?;
             source.verify_authoritative(&path)?;
+            let final_metadata = fs::symlink_metadata(&path)?;
+            if final_metadata.file_type().is_symlink()
+                || !final_metadata.is_file()
+                || (final_metadata.dev(), final_metadata.ino()) != (metadata.dev(), metadata.ino())
+            {
+                anyhow::bail!(
+                    "queue database identity changed while opening: {}",
+                    path.display()
+                );
+            }
+            let authority =
+                crate::control_store::ValidatedDatabaseAuthority::from_validated_connection(
+                    path,
+                    final_metadata.dev(),
+                    final_metadata.ino(),
+                    authoritative_database_id,
+                    &conn,
+                )?;
             drop(conn);
             drop(source);
             drop(lease);
-            Ok(reader)
+            Ok(Self { authority })
         }
 
         fn connect(&self, timeout: std::time::Duration) -> Result<Connection> {
-            self.verify_database_file()?;
-            let conn = Connection::open_with_flags(
-                &self.path,
+            let conn = self.authority.open_connection(
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-            )
-            .with_context(|| format!("open queue db for reading {}", self.path.display()))?;
-            self.verify_database_file()?;
+            )?;
             conn.busy_timeout(timeout)?;
             conn.pragma_update(None, "query_only", "ON")?;
+            self.authority.verify_configured_connection(&conn)?;
             Ok(conn)
-        }
-
-        fn verify_database_file(&self) -> Result<()> {
-            let metadata = fs::symlink_metadata(&self.path)
-                .with_context(|| format!("inspect queue db {}", self.path.display()))?;
-            if metadata.file_type().is_symlink()
-                || !metadata.is_file()
-                || metadata.dev() != self.database_dev
-                || metadata.ino() != self.database_ino
-            {
-                anyhow::bail!(
-                    "queue database identity changed while IQ was running: {}",
-                    self.path.display()
-                );
-            }
-            Ok(())
         }
 
         pub fn list_items(&self) -> Result<Vec<QueueItem>> {
@@ -4192,7 +4195,11 @@ DROP TABLE queue_items_v6;"#,
         }
 
         pub fn path(&self) -> &Path {
-            &self.path
+            self.authority.path()
+        }
+
+        pub fn validated_control_store(&self) -> Result<crate::control_store::ControlStore> {
+            crate::control_store::ControlStore::open_validated(self.authority.clone())
         }
 
         pub fn verify_workspace_root_path(
@@ -8225,7 +8232,7 @@ pub mod integrator {
         repo_key: &str,
         repair_deleted_cycles: bool,
     ) -> Result<()> {
-        let store = crate::control_store::ControlStore::open_validated(queue.path())?;
+        let store = queue.validated_control_store()?;
         let cycles = store.terminal_cycle_artifacts(repo_key)?;
         let mut roots = HashSet::new();
         for cycle in cycles {
@@ -8614,12 +8621,37 @@ pub mod integrator {
             Self::new_with_policy_and_owner(options, policy, None, None)
         }
 
+        pub fn new_with_policy_and_validated_queue(
+            options: IntegratorOptions,
+            policy: IntegrationPolicy,
+            queue: SqliteQueue,
+        ) -> Result<Self> {
+            Self::new_with_policy_and_owner(options, policy, None, Some(queue))
+        }
+
         fn new_with_policy_and_owner(
             mut options: IntegratorOptions,
             policy: IntegrationPolicy,
             lease_owner_id: Option<String>,
             validated_queue: Option<SqliteQueue>,
         ) -> Result<Self> {
+            if let Some(queue) = validated_queue.as_ref() {
+                let configured_queue =
+                    crate::sqlite::resolve_queue_database_path_without_creating(&options.queue_db)
+                        .with_context(|| {
+                            format!(
+                                "resolve configured integrator queue database {}",
+                                options.queue_db.display()
+                            )
+                        })?;
+                if configured_queue != queue.path() {
+                    anyhow::bail!(
+                        "validated queue authority path {} does not match configured integrator queue database {}",
+                        queue.path().display(),
+                        configured_queue.display()
+                    );
+                }
+            }
             options.repo_path = options.repo_path.canonicalize().with_context(|| {
                 format!(
                     "resolve configured repository {}",
@@ -8641,13 +8673,7 @@ pub mod integrator {
                 options.workspace_root = std::env::current_dir()?.join(&options.workspace_root);
             }
             let queue = match validated_queue {
-                Some(queue) => {
-                    let requested = options.queue_db.canonicalize()?;
-                    if requested != queue.path() {
-                        anyhow::bail!("validated queue path differs from integrator queue path");
-                    }
-                    queue
-                }
+                Some(queue) => queue,
                 None => SqliteQueue::open(&options.queue_db)?,
             };
             options.queue_db = queue.path().to_path_buf();
@@ -8678,7 +8704,7 @@ pub mod integrator {
             )?;
             options.workspace_root = workspaces.root.clone();
             let policy = validate_host_policy(policy)?;
-            let control_store = crate::control_store::ControlStore::open_validated(queue.path())?;
+            let control_store = queue.validated_control_store()?;
             let lease_owner_id = lease_owner_id
                 .unwrap_or_else(|| format!("{}:{}", options.owner_id, Uuid::new_v4()));
             queue.register_workspace_root(

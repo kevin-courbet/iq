@@ -2,7 +2,7 @@ use iq::agent_protocol::{
     parse_result, AgentInput, AgentResult, LandingVariant, ProtocolLimits, RepositoryIdentity,
     RiftIdentity, SourceVariant,
 };
-use iq::control_api::{request, ApiRequest, ControlApiServer};
+use iq::control_api::{request, ApiEnvelope, ApiRequest, ControlApiServer};
 use iq::control_domain::{
     AgentRunning, AtomicResultState, EncodedPath, ExactEffortIdentity, ExecutableIdentity,
     InfrastructureCause, InfrastructureComponent, IntegrationEffortState, IssueRepositorySnapshot,
@@ -10,13 +10,17 @@ use iq::control_domain::{
     RunnerKind, RunnerSnapshot, SandboxIdentity, StateRepositorySnapshot,
 };
 use iq::control_store::ControlStore;
+use iq::sqlite::SqliteQueue;
 use sha2::Digest;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
+use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 fn env_lock() -> &'static Mutex<()> {
@@ -308,7 +312,7 @@ fn unix_socket_api_enforces_private_modes_and_serves_durable_inbox() {
         max_stream_backlog_events: 100,
         client_idle_seconds: 5,
     };
-    let server = ControlApiServer::bind(config, store).unwrap();
+    let (_lifetime, server) = ControlApiServer::bind(config, store).unwrap();
     assert_eq!(
         std::fs::metadata(socket.parent().unwrap())
             .unwrap()
@@ -326,6 +330,135 @@ fn unix_socket_api_enforces_private_modes_and_serves_durable_inbox() {
     assert!(response.ok);
     assert_eq!(response.result, serde_json::json!([]));
     thread.join().unwrap();
+}
+
+#[test]
+fn daemon_lifetime_fences_outlive_api_server_failure() {
+    let temp = tempdir().unwrap();
+    let database = temp.path().join("queue.db");
+    let store = ControlStore::open_test_database(&database).unwrap();
+    let socket = temp.path().join("control/control.sock");
+    let config = iq::agent_config::ControlPlaneConfig {
+        unix_socket: socket,
+        max_request_bytes: 4096,
+        max_free_text_bytes: 1024,
+        max_response_bytes: 4096,
+        max_concurrent_clients: 2,
+        max_client_queue_bytes: 4096,
+        max_stream_backlog_events: 100,
+        client_idle_seconds: 5,
+    };
+    let (lifetime, server) = ControlApiServer::bind(config.clone(), store.clone()).unwrap();
+
+    let error = format!("{:#}", server.serve_failure_for_test().unwrap_err());
+
+    assert!(error.contains("simulated IQ control API failure"));
+    let second_daemon = match ControlApiServer::bind(config.clone(), store.clone()) {
+        Ok(_) => panic!("second daemon acquired live lifetime fences"),
+        Err(error) => error,
+    };
+    assert!(format!("{second_daemon:#}").contains("acquire exclusive IQ daemon lease"));
+    let second_database = match SqliteQueue::open(&database) {
+        Ok(_) => panic!("second database authority opened under daemon lifetime fence"),
+        Err(error) => error,
+    };
+    assert!(format!("{second_database:#}").contains("acquire exclusive IQ database process lease"));
+
+    drop(lifetime);
+    let (next_lifetime, next_server) = ControlApiServer::bind(config, store).unwrap();
+    drop(next_server);
+    drop(next_lifetime);
+    drop(SqliteQueue::open(&database).unwrap());
+}
+
+#[test]
+fn api_shutdown_closes_silent_and_watch_clients_and_joins_producer() {
+    let temp = tempdir().unwrap();
+    let database = temp.path().join("queue.db");
+    let store = ControlStore::open_test_database(&database).unwrap();
+    let socket = temp.path().join("control/control.sock");
+    let config = test_control_api_config(socket.clone(), 60, 2);
+    let (_lifetime, server) = ControlApiServer::bind(config, store).unwrap();
+    let (stop_sender, stop_receiver) = mpsc::channel();
+    let (done_sender, done_receiver) = mpsc::sync_channel(1);
+    let thread = std::thread::spawn(move || {
+        let _ = done_sender.send(server.serve(stop_receiver));
+    });
+    let mut silent = UnixStream::connect(&socket).unwrap();
+    let mut watch_client = UnixStream::connect(&socket).unwrap();
+    write_watch_request(&mut watch_client);
+    wait_for_control_api_saturation(&socket);
+
+    let started = Instant::now();
+    stop_sender.send(()).unwrap();
+    let result = done_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("control API shutdown did not finish promptly");
+    assert!(result.is_ok(), "{result:?}");
+    thread.join().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_stream_closed(&mut silent);
+    assert_stream_closed(&mut watch_client);
+}
+
+#[test]
+fn api_worker_failure_shuts_down_and_joins_silent_worker() {
+    let temp = tempdir().unwrap();
+    let database = temp.path().join("queue.db");
+    let store = ControlStore::open_test_database(&database).unwrap();
+    let socket = temp.path().join("control/control.sock");
+    let config = test_control_api_config(socket.clone(), 60, 2);
+    let (_lifetime, server) = ControlApiServer::bind(config, store).unwrap();
+    let (_stop_sender, stop_receiver) = mpsc::channel();
+    let (done_sender, done_receiver) = mpsc::sync_channel(1);
+    let thread = std::thread::spawn(move || {
+        let _ = done_sender.send(server.serve(stop_receiver));
+    });
+    let mut silent = UnixStream::connect(&socket).unwrap();
+    let mut malformed = UnixStream::connect(&socket).unwrap();
+    use std::io::Write;
+    malformed.write_all(&10_u32.to_be_bytes()).unwrap();
+    malformed.write_all(b"x").unwrap();
+    malformed.flush().unwrap();
+    wait_for_control_api_saturation(&socket);
+
+    malformed.shutdown(std::net::Shutdown::Write).unwrap();
+    let result = done_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("worker failure did not stop the control API");
+    assert!(result.is_err());
+    thread.join().unwrap();
+    assert_stream_closed(&mut silent);
+}
+
+#[test]
+fn api_watch_producer_failure_shuts_down_and_joins_silent_worker() {
+    let temp = tempdir().unwrap();
+    let database = temp.path().join("queue.db");
+    let store = ControlStore::open_test_database(&database).unwrap();
+    let socket = temp.path().join("control/control.sock");
+    let config = test_control_api_config(socket.clone(), 60, 2);
+    let (_lifetime, server) = ControlApiServer::bind(config, store).unwrap();
+    let (_stop_sender, stop_receiver) = mpsc::channel();
+    let (done_sender, done_receiver) = mpsc::sync_channel(1);
+    let thread = std::thread::spawn(move || {
+        let _ = done_sender.send(server.serve(stop_receiver));
+    });
+    let mut silent = UnixStream::connect(&socket).unwrap();
+    let mut watch_client = UnixStream::connect(&socket).unwrap();
+    write_watch_request(&mut watch_client);
+    wait_for_control_api_saturation(&socket);
+    std::fs::rename(&database, temp.path().join("validated.db")).unwrap();
+    std::fs::write(&database, b"replacement\n").unwrap();
+
+    let result = done_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("producer failure did not stop the control API");
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(error.contains("queue database identity changed while IQ was running"));
+    thread.join().unwrap();
+    assert_stream_closed(&mut silent);
+    assert_stream_closed(&mut watch_client);
 }
 
 #[test]
@@ -350,7 +483,7 @@ fn unix_socket_event_stream_resumes_from_last_durable_cursor() {
         max_stream_backlog_events: 100,
         client_idle_seconds: 1,
     };
-    let server = ControlApiServer::bind(config.clone(), fixture.store.clone()).unwrap();
+    let (lifetime, server) = ControlApiServer::bind(config.clone(), fixture.store.clone()).unwrap();
     let thread = std::thread::spawn(move || server.serve_one().unwrap());
     let mut event_ids = Vec::new();
     let cursor = iq::control_api::watch(&socket, 0, 100, 64 * 1024, |response| {
@@ -368,6 +501,7 @@ fn unix_socket_event_stream_resumes_from_last_durable_cursor() {
     .unwrap();
     thread.join().unwrap();
     assert!(!event_ids.is_empty());
+    drop(lifetime);
 
     fixture
         .store
@@ -377,7 +511,7 @@ fn unix_socket_event_stream_resumes_from_last_durable_cursor() {
             serde_json::json!({"reason":"second"}),
         )
         .unwrap();
-    let server = ControlApiServer::bind(config, fixture.store.clone()).unwrap();
+    let (_lifetime, server) = ControlApiServer::bind(config, fixture.store.clone()).unwrap();
     let thread = std::thread::spawn(move || server.serve_one().unwrap());
     let mut resumed = Vec::new();
     let resumed_cursor = iq::control_api::watch(&socket, cursor, 100, 64 * 1024, |response| {
@@ -421,7 +555,7 @@ fn unix_socket_event_stream_reports_backpressure_without_advancing_cursor() {
         max_stream_backlog_events: 100,
         client_idle_seconds: 1,
     };
-    let server = ControlApiServer::bind(config, fixture.store.clone()).unwrap();
+    let (_lifetime, server) = ControlApiServer::bind(config, fixture.store.clone()).unwrap();
     let thread = std::thread::spawn(move || server.serve_one().unwrap());
     let mut responses = Vec::new();
     let cursor = iq::control_api::watch(&socket, 0, 100, 4096, |response| {
@@ -479,7 +613,7 @@ fn unix_socket_event_stream_reports_expired_cursor() {
         max_stream_backlog_events: 100,
         client_idle_seconds: 1,
     };
-    let server = ControlApiServer::bind(config, fixture.store.clone()).unwrap();
+    let (_lifetime, server) = ControlApiServer::bind(config, fixture.store.clone()).unwrap();
     let thread = std::thread::spawn(move || server.serve_one().unwrap());
     let response = request(
         &socket,
@@ -800,7 +934,7 @@ fn api_retry_resumes_provider_gate_without_consuming_an_agent_cycle() {
         max_stream_backlog_events: 100,
         client_idle_seconds: 5,
     };
-    let server = ControlApiServer::bind(config, fixture.store.clone()).unwrap();
+    let (_lifetime, server) = ControlApiServer::bind(config, fixture.store.clone()).unwrap();
     let thread = std::thread::spawn(move || server.serve_one().unwrap());
     let response = request(
         &socket,
@@ -890,11 +1024,7 @@ fn failed_landing_recomposition_preserves_one_recoverable_uncertain_state() {
         )
         .unwrap();
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
-    connection
-        .execute_batch(
-            "CREATE TRIGGER fail_recomposition_projection BEFORE UPDATE OF conflict_json ON queue_items BEGIN SELECT RAISE(ABORT,'injected recomposition failure'); END;",
-        )
-        .unwrap();
+    iq::control_store::set_recomposition_projection_failure_test_hook(&fixture.database, true);
 
     assert!(fixture
         .store
@@ -930,9 +1060,6 @@ fn failed_landing_recomposition_preserves_one_recoverable_uncertain_state() {
     assert_eq!(target_sha.as_deref(), None);
     assert_eq!(validated_sha.as_deref(), Some(candidate_sha.as_str()));
 
-    connection
-        .execute_batch("DROP TRIGGER fail_recomposition_projection")
-        .unwrap();
     fixture
         .store
         .recompose_after_target_move(
@@ -1603,15 +1730,15 @@ fn notification_fake_receives_one_bounded_deduplicated_delivery() {
     )
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let dispatcher = iq::notifications::NotificationDispatcher::new(
-        &fixture.database,
-        iq::agent_config::NotificationConfig {
+    let dispatcher = SqliteQueue::open(&fixture.database)
+        .unwrap()
+        .notification_dispatcher(iq::agent_config::NotificationConfig {
             backends: vec![iq::agent_config::NotificationBackendConfig::Wslg { executable: fake }],
             max_attempts: 2,
             max_event_age_seconds: 60,
             projection_debt_alert_seconds: 60,
-        },
-    );
+        })
+        .unwrap();
     dispatcher.configure().unwrap();
     fixture
         .store
@@ -1635,6 +1762,29 @@ fn notification_fake_receives_one_bounded_deduplicated_delivery() {
 }
 
 #[test]
+fn notification_dispatcher_rejects_replaced_database_before_access() {
+    let temp = tempdir().unwrap();
+    let database = temp.path().join("queue.db");
+    let queue = SqliteQueue::open(&database).unwrap();
+    let dispatcher = queue
+        .notification_dispatcher(iq::agent_config::NotificationConfig::default())
+        .unwrap();
+    drop(queue);
+    std::fs::rename(&database, temp.path().join("validated.db")).unwrap();
+    let replacement = b"replacement is not an IQ database\n";
+    std::fs::write(&database, replacement).unwrap();
+
+    let configure = format!("{:#}", dispatcher.configure().unwrap_err());
+    let dispatch = format!("{:#}", dispatcher.dispatch_once().unwrap_err());
+
+    assert!(configure.contains("queue database identity changed while IQ was running"));
+    assert!(dispatch.contains("queue database identity changed while IQ was running"));
+    assert_eq!(std::fs::read(&database).unwrap(), replacement);
+    assert!(!database.with_extension("db-wal").exists());
+    assert!(!database.with_extension("db-shm").exists());
+}
+
+#[test]
 fn restarted_notification_becomes_unknown_and_runs_only_as_attributed_redelivery() {
     let fixture = effort_fixture();
     let fake = fixture.temp.path().join("notify-send");
@@ -1645,15 +1795,15 @@ fn restarted_notification_becomes_unknown_and_runs_only_as_attributed_redelivery
     )
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let dispatcher = iq::notifications::NotificationDispatcher::new(
-        &fixture.database,
-        iq::agent_config::NotificationConfig {
+    let dispatcher = SqliteQueue::open(&fixture.database)
+        .unwrap()
+        .notification_dispatcher(iq::agent_config::NotificationConfig {
             backends: vec![iq::agent_config::NotificationBackendConfig::Wslg { executable: fake }],
             max_attempts: 2,
             max_event_age_seconds: 60,
             projection_debt_alert_seconds: 60,
-        },
-    );
+        })
+        .unwrap();
     dispatcher.configure().unwrap();
     fixture
         .store
@@ -1882,17 +2032,17 @@ fn windows_notification_uses_fixed_arguments_and_payload_environment() {
     )
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let dispatcher = iq::notifications::NotificationDispatcher::new(
-        &fixture.database,
-        iq::agent_config::NotificationConfig {
+    let dispatcher = SqliteQueue::open(&fixture.database)
+        .unwrap()
+        .notification_dispatcher(iq::agent_config::NotificationConfig {
             backends: vec![iq::agent_config::NotificationBackendConfig::Windows {
                 executable: fake,
             }],
             max_attempts: 2,
             max_event_age_seconds: 60,
             projection_debt_alert_seconds: 60,
-        },
-    );
+        })
+        .unwrap();
     dispatcher.configure().unwrap();
     record_notification_alert(&fixture);
     assert_eq!(dispatcher.dispatch_once().unwrap(), 1);
@@ -2116,6 +2266,73 @@ mv "$result.tmp" "$result"
     );
 }
 
+fn test_control_api_config(
+    unix_socket: std::path::PathBuf,
+    client_idle_seconds: u64,
+    max_concurrent_clients: u32,
+) -> iq::agent_config::ControlPlaneConfig {
+    iq::agent_config::ControlPlaneConfig {
+        unix_socket,
+        max_request_bytes: 4096,
+        max_free_text_bytes: 1024,
+        max_response_bytes: 4096,
+        max_concurrent_clients,
+        max_client_queue_bytes: 4096,
+        max_stream_backlog_events: 100,
+        client_idle_seconds,
+    }
+}
+
+fn write_watch_request(stream: &mut UnixStream) {
+    use std::io::Write;
+    let bytes = serde_json::to_vec(&ApiEnvelope {
+        version: 1,
+        request: ApiRequest::Watch {
+            cursor: 0,
+            limit: 100,
+        },
+    })
+    .unwrap();
+    stream
+        .write_all(&(bytes.len() as u32).to_be_bytes())
+        .unwrap();
+    stream.write_all(&bytes).unwrap();
+    stream.flush().unwrap();
+}
+
+fn wait_for_control_api_saturation(socket: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Ok(response) = request(socket, &ApiRequest::Inbox { limit: 1 }, 4096) {
+            if response.result["error"] == "too_many_clients" {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "control API did not register all expected clients"
+        );
+    }
+}
+
+fn assert_stream_closed(stream: &mut UnixStream) {
+    use std::io::Read;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut byte = [0_u8; 1];
+    match stream.read(&mut byte) {
+        Ok(0) => {}
+        Ok(read) => panic!("control API client remained open and returned {read} byte(s)"),
+        Err(error)
+            if !matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) => {}
+        Err(error) => panic!("control API client remained open: {error}"),
+    }
+}
+
 fn system_config(root: &Path) -> String {
     format!(
         "integration_agent:\n  runner: opencode\n  executable: /bin/true\n  agent: iq-integration\n  model: test/model\n  cycle_timeout_seconds: 10\n  max_log_bytes: 4096\n  max_result_bytes: 4096\n  max_processes: 4\n  memory_bytes: 67108864\n  cpu_seconds: 10\n  writable_bytes: 1048576\n  open_files: 64\n  credential_env: TEST_MODEL_KEY\ncontrol_plane:\n  unix_socket: {}/control.sock\n  max_request_bytes: 4096\n  max_free_text_bytes: 1024\n  max_response_bytes: 4096\n  max_concurrent_clients: 2\n  max_client_queue_bytes: 4096\n  max_stream_backlog_events: 100\n  client_idle_seconds: 5\nnotifications:\n  backends: []\n  max_attempts: 2\n  max_event_age_seconds: 60\n  projection_debt_alert_seconds: 60\n",
@@ -2129,15 +2346,15 @@ fn notification_dispatcher(
     max_attempts: u8,
     max_event_age_seconds: u64,
 ) -> iq::notifications::NotificationDispatcher {
-    iq::notifications::NotificationDispatcher::new(
-        &fixture.database,
-        iq::agent_config::NotificationConfig {
+    SqliteQueue::open(&fixture.database)
+        .unwrap()
+        .notification_dispatcher(iq::agent_config::NotificationConfig {
             backends: vec![iq::agent_config::NotificationBackendConfig::Wslg { executable }],
             max_attempts,
             max_event_age_seconds,
             projection_debt_alert_seconds: 60,
-        },
-    )
+        })
+        .unwrap()
 }
 
 fn record_notification_alert(fixture: &EffortFixture) {
