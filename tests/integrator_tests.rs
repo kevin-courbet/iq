@@ -84,6 +84,7 @@ fn provision_fixture_repository(
         .init(
             &fixture.repo,
             RepositoryInitOptions {
+                storage_root: fixture.temp.path().to_path_buf(),
                 target_branch: "main".into(),
                 remote: "origin".into(),
             },
@@ -146,6 +147,7 @@ fn direct_landing_integrates_only_after_remote_target_contains_landed_commit() {
         .init(
             &fixture.repo,
             RepositoryInitOptions {
+                storage_root: fixture.temp.path().to_path_buf(),
                 target_branch: "main".into(),
                 remote: "origin".into(),
             },
@@ -213,6 +215,7 @@ fn no_validation_accepts_exact_candidate_and_reports_skipped_policy() {
         .init(
             &fixture.repo,
             RepositoryInitOptions {
+                storage_root: fixture.temp.path().to_path_buf(),
                 target_branch: "main".into(),
                 remote: "origin".into(),
             },
@@ -414,6 +417,7 @@ fn registered_attempt_snapshots_local_policy_once() {
         .init(
             &fixture.repo,
             RepositoryInitOptions {
+                storage_root: fixture.temp.path().to_path_buf(),
                 target_branch: "main".into(),
                 remote: "origin".into(),
             },
@@ -1252,6 +1256,7 @@ fn target_moved_merge_conflict_blocks_with_conflict_metadata() {
         .init(
             &fixture.repo,
             RepositoryInitOptions {
+                storage_root: fixture.temp.path().to_path_buf(),
                 target_branch: "main".into(),
                 remote: "origin".into(),
             },
@@ -1318,6 +1323,7 @@ fn target_movement_keeps_the_attempt_validation_policy() {
         .init(
             &fixture.repo,
             RepositoryInitOptions {
+                storage_root: fixture.temp.path().to_path_buf(),
                 target_branch: "main".into(),
                 remote: "origin".into(),
             },
@@ -1569,6 +1575,7 @@ fn registered_terminal_fixture() -> (GitFixture, SqliteQueue, iq::sqlite::Regist
         .init(
             &fixture.repo,
             RepositoryInitOptions {
+                storage_root: fixture.temp.path().to_path_buf(),
                 target_branch: "main".into(),
                 remote: "origin".into(),
             },

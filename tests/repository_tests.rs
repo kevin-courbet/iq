@@ -90,6 +90,8 @@ impl CliFixture {
             "init",
             "--path",
             self.bootstrap.to_str().unwrap(),
+            "--storage-root",
+            self.root.to_str().unwrap(),
             "--target",
             target,
         ])
@@ -141,6 +143,8 @@ fn interrupt_init(fixture: &CliFixture, boundary: &str) -> Output {
             "init",
             "--path",
             fixture.bootstrap.to_str().unwrap(),
+            "--storage-root",
+            fixture.root.to_str().unwrap(),
             "--target",
             "main",
         ])
@@ -160,6 +164,8 @@ fn interrupt_init_after_effect(fixture: &CliFixture, boundary: &str) -> Output {
             "init",
             "--path",
             fixture.bootstrap.to_str().unwrap(),
+            "--storage-root",
+            fixture.root.to_str().unwrap(),
             "--target",
             "main",
         ])
@@ -492,6 +498,8 @@ fn policy_restart_resyncs_existing_identical_file_and_parent_before_success() {
                 "init",
                 "--path",
                 fixture.bootstrap.to_str().unwrap(),
+                "--storage-root",
+                fixture.root.to_str().unwrap(),
                 "--target",
                 "main",
             ])
@@ -717,6 +725,8 @@ fn second_bootstrap_resumes_fetched_remote_owner_without_remote_access() {
             "init",
             "--path",
             second_bootstrap.to_str().unwrap(),
+            "--storage-root",
+            fixture.root.to_str().unwrap(),
             "--target",
             "main",
         ])
@@ -740,6 +750,67 @@ fn second_bootstrap_resumes_fetched_remote_owner_without_remote_access() {
 
 #[test]
 #[cfg(debug_assertions)]
+fn remote_owner_rejects_a_different_storage_root_without_binding_the_request() {
+    let fixture = CliFixture::new("main");
+    let second_bootstrap = fixture.root.join("second-bootstrap");
+    git(
+        &fixture.root,
+        &[
+            "clone",
+            fixture.remote.to_str().unwrap(),
+            second_bootstrap.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        interrupt_init(&fixture, "reservation").status.code(),
+        Some(86)
+    );
+    let different_storage = fixture.root.join("different-storage");
+    std::fs::create_dir(&different_storage).unwrap();
+    let register_second = |storage: &Path| {
+        fixture.iq(&[
+            "repo",
+            "init",
+            "--path",
+            second_bootstrap.to_str().unwrap(),
+            "--storage-root",
+            storage.to_str().unwrap(),
+            "--target",
+            "main",
+        ])
+    };
+
+    let request_count = || {
+        Connection::open(&fixture.database)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM repository_bootstrap_requests",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    let rejected_active = register_second(&different_storage);
+    assert!(!rejected_active.status.success());
+    assert!(String::from_utf8_lossy(&rejected_active.stderr)
+        .contains("already bound to owned storage root"));
+    assert_eq!(request_count(), 1);
+
+    successful_json(fixture.init("main"));
+    let rejected_ready = register_second(&different_storage);
+    assert!(!rejected_ready.status.success());
+    assert!(String::from_utf8_lossy(&rejected_ready.stderr)
+        .contains("already bound to owned storage root"));
+    assert_eq!(request_count(), 1);
+
+    let registered = successful_json(register_second(&fixture.root));
+    assert!(Path::new(registered["owned_root_path"].as_str().unwrap())
+        .starts_with(fixture.root.join("repositories")));
+    assert_eq!(request_count(), 2);
+}
+
+#[test]
+#[cfg(debug_assertions)]
 fn bootstrap_request_identity_survives_relative_dotdot_and_deleted_symlink_spellings() {
     for symlink_spelling in [false, true] {
         let fixture = CliFixture::new("main");
@@ -758,7 +829,16 @@ fn bootstrap_request_identity_survives_relative_dotdot_and_deleted_symlink_spell
                 .env("IQ_RIFT_DATABASE", &fixture.rift_database)
                 .arg("--queue-db")
                 .arg(&fixture.database)
-                .args(["repo", "init", "--path", spelling, "--target", "main"]);
+                .args([
+                    "repo",
+                    "init",
+                    "--path",
+                    spelling,
+                    "--storage-root",
+                    fixture.root.to_str().unwrap(),
+                    "--target",
+                    "main",
+                ]);
             if stop {
                 command.env("IQ_TEST_PROVISION_STOP_AFTER", "reservation");
             }
@@ -949,6 +1029,8 @@ fn provisioning_restarts_after_every_external_effect_boundary() {
                 "init",
                 "--path",
                 fixture.bootstrap.to_str().unwrap(),
+                "--storage-root",
+                fixture.root.to_str().unwrap(),
                 "--target",
                 "main",
             ])
@@ -1424,6 +1506,8 @@ fn main_and_master_register_but_one_remote_cannot_own_both_targets() {
             "init",
             "--path",
             fixture.bootstrap.to_str().unwrap(),
+            "--storage-root",
+            fixture.root.to_str().unwrap(),
             "--target",
             "main",
         ]);
@@ -1439,6 +1523,8 @@ fn main_and_master_register_but_one_remote_cannot_own_both_targets() {
             "init",
             "--path",
             fixture.bootstrap.to_str().unwrap(),
+            "--storage-root",
+            fixture.root.to_str().unwrap(),
             "--target",
             "master",
         ]);
@@ -1561,6 +1647,8 @@ fn concurrent_same_target_registration_at_reservation_barrier_returns_one_reposi
                 "init",
                 "--path",
                 path.to_str().unwrap(),
+                "--storage-root",
+                fixture.root.to_str().unwrap(),
                 "--target",
                 "main",
             ]);
@@ -1641,6 +1729,8 @@ fn concurrent_same_target_registration_at_reservation_barrier_returns_one_reposi
             "init",
             "--path",
             third_bootstrap.to_str().unwrap(),
+            "--storage-root",
+            fixture.root.to_str().unwrap(),
             "--target",
             "master",
         ])
@@ -1655,6 +1745,192 @@ fn concurrent_same_target_registration_at_reservation_barrier_returns_one_reposi
             .unwrap(),
         0
     );
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn concurrent_registration_uses_one_winning_storage_root_and_one_fence() {
+    let fixture = CliFixture::new("main");
+    let barrier = fixture.root.join("different-storage-reservation-barrier");
+    std::fs::create_dir(&barrier).unwrap();
+    let second_bootstrap = fixture.root.join("second-bootstrap");
+    git(
+        &fixture.root,
+        &[
+            "clone",
+            fixture.remote.to_str().unwrap(),
+            second_bootstrap.to_str().unwrap(),
+        ],
+    );
+    let second_storage = fixture.root.join("second-storage");
+    std::fs::create_dir(&second_storage).unwrap();
+    let spawn = |path: &Path, storage: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_iq"))
+            .env("IQ_RIFT_DATABASE", &fixture.rift_database)
+            .env("IQ_TEST_RESERVATION_BARRIER", &barrier)
+            .env("IQ_TEST_RESERVATION_BARRIER_PARTIES", "2")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .arg("--queue-db")
+            .arg(&fixture.database)
+            .args([
+                "repo",
+                "init",
+                "--path",
+                path.to_str().unwrap(),
+                "--storage-root",
+                storage.to_str().unwrap(),
+                "--target",
+                "main",
+            ])
+            .spawn()
+            .unwrap()
+    };
+    let first = spawn(&fixture.bootstrap, &fixture.root);
+    let second = spawn(&second_bootstrap, &second_storage);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::fs::read_dir(&barrier).unwrap().count() != 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "reservation barrier timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let first = first.wait_with_output().unwrap();
+    let second = second.wait_with_output().unwrap();
+    assert_ne!(first.status.success(), second.status.success());
+
+    let (winner, loser, loser_bootstrap) = if first.status.success() {
+        (&first, &second, &second_bootstrap)
+    } else {
+        (&second, &first, &fixture.bootstrap)
+    };
+    let winner: Value = serde_json::from_slice(&winner.stdout).unwrap();
+    let winner_root = PathBuf::from(winner["owned_root_path"].as_str().unwrap());
+    let winner_storage = winner_root
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&loser.stderr).contains("already bound to owned storage root"));
+    assert_eq!(
+        Connection::open(&fixture.database)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM repository_bootstrap_requests",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+
+    let retried = successful_json(fixture.iq(&[
+        "repo",
+        "init",
+        "--path",
+        loser_bootstrap.to_str().unwrap(),
+        "--storage-root",
+        winner_storage.to_str().unwrap(),
+        "--target",
+        "main",
+    ]));
+    assert_eq!(retried["key"], winner["key"]);
+    assert_eq!(retried["owned_root_path"], winner["owned_root_path"]);
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn concurrent_registration_uses_one_winning_rift_registry() {
+    let fixture = CliFixture::new("main");
+    let barrier = fixture.root.join("different-registry-reservation-barrier");
+    std::fs::create_dir(&barrier).unwrap();
+    let second_bootstrap = fixture.root.join("second-bootstrap");
+    git(
+        &fixture.root,
+        &[
+            "clone",
+            fixture.remote.to_str().unwrap(),
+            second_bootstrap.to_str().unwrap(),
+        ],
+    );
+    let second_registry = fixture.root.join("second-rift.sqlite");
+    let spawn = |path: &Path, registry: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_iq"))
+            .env("IQ_RIFT_DATABASE", registry)
+            .env("IQ_TEST_RESERVATION_BARRIER", &barrier)
+            .env("IQ_TEST_RESERVATION_BARRIER_PARTIES", "2")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .arg("--queue-db")
+            .arg(&fixture.database)
+            .args([
+                "repo",
+                "init",
+                "--path",
+                path.to_str().unwrap(),
+                "--storage-root",
+                fixture.root.to_str().unwrap(),
+                "--target",
+                "main",
+            ])
+            .spawn()
+            .unwrap()
+    };
+    let first = spawn(&fixture.bootstrap, &fixture.rift_database);
+    let second = spawn(&second_bootstrap, &second_registry);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::fs::read_dir(&barrier).unwrap().count() != 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "reservation barrier timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let first = first.wait_with_output().unwrap();
+    let second = second.wait_with_output().unwrap();
+    assert_ne!(first.status.success(), second.status.success());
+
+    let (winner, loser, loser_bootstrap, winner_registry) = if first.status.success() {
+        (&first, &second, &second_bootstrap, &fixture.rift_database)
+    } else {
+        (&second, &first, &fixture.bootstrap, &second_registry)
+    };
+    let winner: Value = serde_json::from_slice(&winner.stdout).unwrap();
+    assert!(String::from_utf8_lossy(&loser.stderr).contains("and Rift registry"));
+    assert_eq!(
+        Connection::open(&fixture.database)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM repository_bootstrap_requests",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+
+    let retried = Command::new(env!("CARGO_BIN_EXE_iq"))
+        .env("IQ_RIFT_DATABASE", winner_registry)
+        .arg("--queue-db")
+        .arg(&fixture.database)
+        .args([
+            "repo",
+            "init",
+            "--path",
+            loser_bootstrap.to_str().unwrap(),
+            "--storage-root",
+            fixture.root.to_str().unwrap(),
+            "--target",
+            "main",
+        ])
+        .output()
+        .unwrap();
+    let retried = successful_json(retried);
+    assert_eq!(retried["key"], winner["key"]);
+    assert_eq!(retried["owned_root_path"], winner["owned_root_path"]);
 }
 
 #[test]
@@ -1690,6 +1966,8 @@ fn registrations_for_two_remotes_get_distinct_repository_uuids() {
         "init",
         "--path",
         second_bootstrap.to_str().unwrap(),
+        "--storage-root",
+        fixture.root.to_str().unwrap(),
         "--target",
         "main",
     ]));
@@ -1705,6 +1983,60 @@ fn registrations_for_two_remotes_get_distinct_repository_uuids() {
             .unwrap(),
         2
     );
+}
+
+#[test]
+fn explicit_storage_root_is_independent_of_queue_database_location() {
+    let fixture = CliFixture::new("main");
+    let storage_root = fixture.root.join("rift-storage");
+    std::fs::create_dir(&storage_root).unwrap();
+
+    let repository = successful_json(fixture.iq(&[
+        "repo",
+        "init",
+        "--path",
+        fixture.bootstrap.to_str().unwrap(),
+        "--storage-root",
+        storage_root.to_str().unwrap(),
+        "--target",
+        "main",
+    ]));
+
+    let owned_root = PathBuf::from(repository["owned_root_path"].as_str().unwrap());
+    assert!(owned_root.starts_with(storage_root.join("repositories")));
+    assert!(!owned_root.starts_with(fixture.database.parent().unwrap().join("repositories")));
+}
+
+#[test]
+fn noncanonical_rift_registry_path_has_one_durable_identity() {
+    let fixture = CliFixture::new("main");
+    let registry_directory = fixture.root.join("registry-directory");
+    std::fs::create_dir(&registry_directory).unwrap();
+    let registry = registry_directory.join("../alternate-rift.sqlite");
+    let register = || {
+        Command::new(env!("CARGO_BIN_EXE_iq"))
+            .env("IQ_RIFT_DATABASE", &registry)
+            .arg("--queue-db")
+            .arg(&fixture.database)
+            .args([
+                "repo",
+                "init",
+                "--path",
+                fixture.bootstrap.to_str().unwrap(),
+                "--storage-root",
+                fixture.root.to_str().unwrap(),
+                "--target",
+                "main",
+            ])
+            .output()
+            .unwrap()
+    };
+
+    let first = successful_json(register());
+    let retried = successful_json(register());
+
+    assert_eq!(retried["key"], first["key"]);
+    assert_eq!(retried["owned_root_path"], first["owned_root_path"]);
 }
 
 #[test]
@@ -1835,6 +2167,8 @@ fn linked_bootstrap_request_resumes_active_intent_without_reopening_checkout() {
             "init",
             "--path",
             second_bootstrap.to_str().unwrap(),
+            "--storage-root",
+            fixture.root.to_str().unwrap(),
             "--target",
             "main",
         ])
@@ -1856,6 +2190,8 @@ fn linked_bootstrap_request_resumes_active_intent_without_reopening_checkout() {
             "init",
             "--path",
             second_bootstrap.to_str().unwrap(),
+            "--storage-root",
+            fixture.root.to_str().unwrap(),
             "--target",
             "main",
         ])

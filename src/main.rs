@@ -190,6 +190,8 @@ enum RepoCommand {
     Init {
         #[arg(long, default_value = ".")]
         path: PathBuf,
+        #[arg(long)]
+        storage_root: PathBuf,
         #[arg(long, default_value = "main")]
         target: String,
         #[arg(long, default_value = "origin")]
@@ -344,6 +346,7 @@ fn main() -> Result<()> {
         Command::Repo { command } => match command {
             RepoCommand::Init {
                 path,
+                storage_root,
                 target,
                 remote,
             } => {
@@ -352,6 +355,7 @@ fn main() -> Result<()> {
                 print_json(&manager.init(
                     &path,
                     RepositoryInitOptions {
+                        storage_root,
                         target_branch: target,
                         remote,
                     },

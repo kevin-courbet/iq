@@ -169,6 +169,7 @@ pub struct ProvisionOptions {
 #[derive(Clone, Debug)]
 struct ProvisionPlan {
     repo_key: RepoKey,
+    storage_root: PathBuf,
     path: PathBuf,
     staging_path: PathBuf,
     target: String,
@@ -183,12 +184,24 @@ pub(crate) fn provision(
     connection: &mut Connection,
     options: &ProvisionOptions,
 ) -> Result<OwnedRepositoryRoot> {
+    let mut options = options.clone();
+    options.storage_root = absolute_path(&options.storage_root)?;
+    let requested_rift_database = planned_rift_database(options.rift_database.as_deref())?;
+    options.rift_database = Some(requested_rift_database.clone());
     validate_target_branch(&options.target)?;
-    let bootstrap_identity = absolute_path(&options.bootstrap_path)?;
-    let request_repo_key = prepare_bootstrap_request(connection, options, &bootstrap_identity)?;
-    let persisted = load_intent_by_bootstrap(connection, &bootstrap_identity)?;
     require_absolute_directory(&options.storage_root, "owned repository storage root")?;
+    let bootstrap_identity = absolute_path(&options.bootstrap_path)?;
+    let request_repo_key = prepare_bootstrap_request(connection, &options, &bootstrap_identity)?;
+    let persisted = load_intent_by_bootstrap(connection, &bootstrap_identity)?;
     let (plan, newly_reserved) = if let Some((plan, _)) = persisted {
+        require_requested_locations(
+            connection,
+            &bootstrap_identity,
+            &options.storage_root,
+            &plan.storage_root,
+            &requested_rift_database,
+            &plan.rift_database,
+        )?;
         if plan.target != options.target {
             anyhow::bail!(
                 "remote is already reserved with immutable target {}",
@@ -198,6 +211,14 @@ pub(crate) fn provision(
         (plan, false)
     } else if let Some(repo_key) = request_repo_key {
         if let Some(existing) = find_registered_by_key(connection, &repo_key)? {
+            require_requested_locations(
+                connection,
+                &bootstrap_identity,
+                &options.storage_root,
+                &repository_storage_root(existing.path(), existing.repo_key())?,
+                &requested_rift_database,
+                &existing.rift().registry_identity,
+            )?;
             if existing.target != options.target {
                 anyhow::bail!(
                     "remote is already registered with immutable target {}",
@@ -208,6 +229,14 @@ pub(crate) fn provision(
         }
         let (plan, _) = load_intent_by_repo_key(connection, &repo_key)?.context(
             "bootstrap request is linked to neither active provisioning intent nor ready repository",
+        )?;
+        require_requested_locations(
+            connection,
+            &bootstrap_identity,
+            &options.storage_root,
+            &plan.storage_root,
+            &requested_rift_database,
+            &plan.rift_database,
         )?;
         if plan.target != options.target {
             anyhow::bail!(
@@ -220,6 +249,14 @@ pub(crate) fn provision(
         let bootstrap_path = canonical_git_root(&options.bootstrap_path)?;
         let remote = remote_identity(&bootstrap_path, &options.remote_name)?;
         if let Some(existing) = find_registered(connection, &remote)? {
+            require_requested_locations(
+                connection,
+                &bootstrap_identity,
+                &options.storage_root,
+                &repository_storage_root(existing.path(), existing.repo_key())?,
+                &requested_rift_database,
+                &existing.rift().registry_identity,
+            )?;
             if existing.target != options.target {
                 anyhow::bail!(
                     "remote is already registered with immutable target {}",
@@ -233,8 +270,16 @@ pub(crate) fn provision(
             if target != options.target {
                 anyhow::bail!("remote is already reserved with immutable target {target}");
             }
-            link_bootstrap_request(connection, &bootstrap_identity, repo_key.as_str())?;
             if let Some(existing) = find_registered_by_key(connection, &repo_key)? {
+                require_requested_locations(
+                    connection,
+                    &bootstrap_identity,
+                    &options.storage_root,
+                    &repository_storage_root(existing.path(), existing.repo_key())?,
+                    &requested_rift_database,
+                    &existing.rift().registry_identity,
+                )?;
+                link_bootstrap_request(connection, &bootstrap_identity, repo_key.as_str())?;
                 return Ok(existing);
             }
             let (plan, _) = load_intent_by_repo_key(connection, &repo_key)?.context(
@@ -243,13 +288,22 @@ pub(crate) fn provision(
             if plan.remote != remote {
                 anyhow::bail!("remote owner identity differs from durable provisioning intent");
             }
+            require_requested_locations(
+                connection,
+                &bootstrap_identity,
+                &options.storage_root,
+                &plan.storage_root,
+                &requested_rift_database,
+                &plan.rift_database,
+            )?;
+            link_bootstrap_request(connection, &bootstrap_identity, repo_key.as_str())?;
             (plan, false)
         } else {
             let source_sha = remote_target_sha(&remote.fetch_url, &options.target)?;
             let policy = read_bootstrap_policy(&bootstrap_path)?;
             let (plan, _, newly_reserved) = reserve_plan(
                 connection,
-                options,
+                &options,
                 bootstrap_identity,
                 remote,
                 source_sha,
@@ -262,7 +316,7 @@ pub(crate) fn provision(
         stop_after("reservation");
     }
 
-    let _fence = ProvisioningFence::acquire(&options.storage_root, &plan.repo_key)?;
+    let _fence = ProvisioningFence::acquire(&plan.storage_root, &plan.repo_key)?;
     if let Some(existing) = find_registered_by_key(connection, &plan.repo_key)? {
         return Ok(existing);
     }
@@ -464,23 +518,24 @@ fn load_intent_by_bootstrap(
             )| {
                 validate_target_branch(&target)?;
                 crate::control_domain::require_sha(&source_sha, "provisioning source SHA")?;
-                Ok((
-                    ProvisionPlan {
-                        repo_key: RepoKey::from_stored(repo_key)?,
-                        path: path_from_bytes(path),
-                        staging_path: path_from_bytes(staging_path),
-                        target,
-                        remote: RemoteIdentity {
-                            fetch_url,
-                            push_url,
-                        },
-                        rift_database: path_from_bytes(rift_database),
-                        source_sha,
-                        policy,
-                        created_at,
+                let repo_key = RepoKey::from_stored(repo_key)?;
+                let path = path_from_bytes(path);
+                let plan = ProvisionPlan {
+                    storage_root: repository_storage_root(&path, &repo_key)?,
+                    repo_key,
+                    path,
+                    staging_path: path_from_bytes(staging_path),
+                    target,
+                    remote: RemoteIdentity {
+                        fetch_url,
+                        push_url,
                     },
-                    serde_json::from_str(&lifecycle)?,
-                ))
+                    rift_database: path_from_bytes(rift_database),
+                    source_sha,
+                    policy,
+                    created_at,
+                };
+                Ok((plan, serde_json::from_str(&lifecycle)?))
             },
         )
         .transpose()
@@ -512,10 +567,11 @@ fn load_intent_by_repo_key(
         .optional()?
         .map(|stored| {
             crate::control_domain::require_sha(&stored.6, "provisioning source SHA")?;
-            Ok((
-                ProvisionPlan {
+            let path = path_from_bytes(stored.0);
+            let plan = ProvisionPlan {
+                    storage_root: repository_storage_root(&path, repo_key)?,
                     repo_key: repo_key.clone(),
-                    path: path_from_bytes(stored.0),
+                    path,
                     staging_path: path_from_bytes(stored.1),
                     rift_database: path_from_bytes(stored.2),
                     target: stored.3,
@@ -526,9 +582,8 @@ fn load_intent_by_repo_key(
                     source_sha: stored.6,
                     policy: stored.7,
                     created_at: stored.9,
-                },
-                serde_json::from_str(&stored.8)?,
-            ))
+            };
+            Ok((plan, serde_json::from_str(&stored.8)?))
         })
         .transpose()
 }
@@ -539,6 +594,47 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
     } else {
         Ok(std::env::current_dir()?.join(path))
     }
+}
+
+fn repository_storage_root(path: &Path, repo_key: &RepoKey) -> Result<PathBuf> {
+    let repository_directory = path
+        .parent()
+        .context("owned repository root has no repository directory")?;
+    let repositories_directory = repository_directory
+        .parent()
+        .context("owned repository root has no repositories directory")?;
+    if path.file_name() != Some(OsStr::new("root"))
+        || repository_directory.file_name() != Some(OsStr::new(repo_key.as_str()))
+        || repositories_directory.file_name() != Some(OsStr::new("repositories"))
+    {
+        anyhow::bail!("owned repository root does not match its repository identity");
+    }
+    repositories_directory
+        .parent()
+        .map(Path::to_path_buf)
+        .context("owned repository root has no storage root")
+}
+
+fn require_requested_locations(
+    connection: &Connection,
+    request_path: &Path,
+    requested_storage: &Path,
+    durable_storage: &Path,
+    requested_registry: &Path,
+    durable_registry: &Path,
+) -> Result<()> {
+    if requested_storage == durable_storage && requested_registry == durable_registry {
+        return Ok(());
+    }
+    connection.execute(
+        "DELETE FROM repository_bootstrap_requests WHERE request_path=?1 AND repo_key IS NULL",
+        [request_path.as_os_str().as_bytes()],
+    )?;
+    anyhow::bail!(
+        "remote repository is already bound to owned storage root {} and Rift registry {}",
+        durable_storage.display(),
+        durable_registry.display()
+    )
 }
 
 fn prepare_bootstrap_request(
@@ -606,7 +702,23 @@ fn planned_rift_database(explicit: Option<&Path>) -> Result<PathBuf> {
                 })
                 .join("rift/rift.sqlite")
         });
-    absolute_path(&configured)
+    let path = absolute_path(&configured)?;
+    match fs::symlink_metadata(&path) {
+        Ok(_) => path
+            .canonicalize()
+            .with_context(|| format!("resolve Rift registry {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path.parent().context("Rift registry path has no parent")?;
+            let name = path.file_name().context("Rift registry path has no name")?;
+            Ok(parent
+                .canonicalize()
+                .with_context(|| format!("resolve Rift registry parent {}", parent.display()))?
+                .join(name))
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("inspect Rift registry {}", path.display()))
+        }
+    }
 }
 
 fn reserve_plan(
@@ -661,6 +773,7 @@ fn reserve_plan(
         )
         .optional()?;
     let (
+        storage_root,
         path,
         staging_path,
         rift_database,
@@ -671,10 +784,26 @@ fn reserve_plan(
         lifecycle,
         created_at,
     ) = if let Some(stored) = stored {
+        let path = path_from_bytes(stored.0);
+        let storage_root = repository_storage_root(&path, &repo_key)?;
+        let durable_rift_database = path_from_bytes(stored.2);
+        if storage_root != options.storage_root || durable_rift_database != rift_database {
+            transaction.execute(
+                "DELETE FROM repository_bootstrap_requests WHERE request_path=?1 AND repo_key IS NULL",
+                [bootstrap_request.as_os_str().as_bytes()],
+            )?;
+            transaction.commit()?;
+            anyhow::bail!(
+                "remote repository is already bound to owned storage root {} and Rift registry {}",
+                storage_root.display(),
+                durable_rift_database.display()
+            );
+        }
         (
-            path_from_bytes(stored.0),
+            storage_root,
+            path,
             path_from_bytes(stored.1),
-            path_from_bytes(stored.2),
+            durable_rift_database,
             stored.3,
             RemoteIdentity {
                 fetch_url: stored.4,
@@ -704,6 +833,7 @@ fn reserve_plan(
             params![repo_key.as_str(),bootstrap_request.as_os_str().as_bytes(),path.as_os_str().as_bytes(),staging_path.as_os_str().as_bytes(),rift_database.as_os_str().as_bytes(),options.target,remote.fetch_url,remote.push_url,source_sha,policy,serde_json::to_string(&lifecycle)?,created_at],
         )?;
         (
+            options.storage_root.clone(),
             path,
             staging_path,
             rift_database,
@@ -726,6 +856,7 @@ fn reserve_plan(
     Ok((
         ProvisionPlan {
             repo_key,
+            storage_root,
             path,
             staging_path,
             target,
@@ -1654,6 +1785,7 @@ fn verify_owned_root(
     database: Option<&Path>,
 ) -> Result<()> {
     let plan = ProvisionPlan {
+        storage_root: repository_storage_root(&repository.path, &repository.repo_key)?,
         repo_key: repository.repo_key.clone(),
         path: repository.path.clone(),
         staging_path: repository.path.with_file_name(".root.tmp"),

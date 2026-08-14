@@ -33,6 +33,7 @@ fn stop_composition_target_after(_boundary: &str) {}
 
 #[derive(Clone, Debug)]
 pub struct RepositoryInitOptions {
+    pub storage_root: PathBuf,
     pub target_branch: String,
     pub remote: String,
 }
@@ -306,16 +307,10 @@ impl RepositoryManager {
         options: RepositoryInitOptions,
     ) -> Result<RegisteredRepository> {
         crate::repository::validate_target_branch(&options.target_branch)?;
-        let storage_root = self
-            .queue
-            .path()
-            .parent()
-            .context("queue database has no state parent")?
-            .to_path_buf();
         let provisioned =
             self.queue
                 .provision_repository(&crate::repository::ProvisionOptions {
-                    storage_root,
+                    storage_root: options.storage_root,
                     bootstrap_path: bootstrap_path.to_path_buf(),
                     target: options.target_branch,
                     remote_name: options.remote,

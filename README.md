@@ -51,7 +51,7 @@ IQ copies optional untracked policy from the bootstrap checkout into the owned r
 Registered repositories reject daemon validation commands and daemon signoff because owned-root policy is authoritative. `iq doctor` reports `owned_root` or `none` as the validation authority.
 
 ```sh
-iq repo init --path /path/to/repo --target main --remote origin
+iq repo init --path /path/to/repo --storage-root /path/to/reflink-storage --target main --remote origin
 iq repo list
 iq dev-workspace create --repo-key <repository-uuid> --name feature
 iq submit --workspace <workspace-id>
