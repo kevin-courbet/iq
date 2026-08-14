@@ -1083,8 +1083,7 @@ pub mod sqlite {
                 anyhow::bail!("queue database must be a regular file: {}", path.display());
             }
             let expected_identity = (metadata.dev(), metadata.ino());
-            let lease =
-                crate::control_store::DatabaseProcessLease::acquire_existing_exclusive(&path)?;
+            let lease = crate::control_store::DatabaseProcessLease::acquire_existing(&path)?;
             let source = crate::control_store::PrimaryDatabaseIdentity::open(&path)?;
             let validated_database_id =
                 crate::control_store::validate_database_snapshot_under_lease(
@@ -1118,6 +1117,7 @@ pub mod sqlite {
                         crate::sqlite::validate_existing_schema_identity(validation)
                     },
                 )?;
+            let lease = lease.stabilize(&path)?;
             sync_database_file_and_parent(&path)?;
             stop_fresh_database_after("open_resynced");
             crate::control_store::run_runtime_open_handoff_test_hook(&path);
@@ -3473,8 +3473,7 @@ pub mod sqlite {
                     path.display()
                 );
             }
-            let lease =
-                crate::control_store::DatabaseProcessLease::acquire_existing_exclusive(&path)?;
+            let lease = crate::control_store::DatabaseProcessLease::acquire_existing(&path)?;
             let source = crate::control_store::PrimaryDatabaseIdentity::open(&path)?;
             let current_metadata = fs::symlink_metadata(&path)?;
             if (metadata.dev(), metadata.ino()) != (current_metadata.dev(), current_metadata.ino())
@@ -3508,6 +3507,7 @@ pub mod sqlite {
                         validate_existing_schema_identity(conn)
                     },
                 )?;
+            let lease = lease.stabilize(&path)?;
             crate::control_store::run_runtime_open_handoff_test_hook(&path);
             lease.verify_authority(&path)?;
             source.verify_authoritative(&path)?;

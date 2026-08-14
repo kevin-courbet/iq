@@ -20,6 +20,8 @@ Landing outcome is a durable variant. `ready` means no target mutation is unreso
 
 Repository operation authority is scoped and RAII-owned. Integrator and composition validate one canonical checkout and target binding in code and SQLite, use the same repository process lock before the non-stealing SQLite lease, then use short Rift-root and registry lock scopes. All external mutations run in supervised process groups whose authority pipe terminates the group after owner loss.
 
+Validated runtime processes hold shared database identity leases, so the daemon and CLI can open the same current database. An exclusive database lease is reserved for maintenance or replacement and blocks runtime opens. The daemon singleton lease remains exclusive. Repository process locks and durable repository leases serialize mutations for one repository without excluding operations on other repositories.
+
 Queue source and landing policy are exact variants enforced by SQLite. Local submissions use durable creation intents and immutable replacement. Cancellation returns local development work to reusable state and retains explicit terminal integration cleanup debt. Remote sources alone can requeue.
 
 IQ owns its default state namespace. The state root is absolute and non-empty. Incompatible existing state is rejected without mutation.

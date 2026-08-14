@@ -27,6 +27,39 @@ fn env_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+struct DatabaseSnapshotPause {
+    ready: mpsc::SyncSender<()>,
+    release: mpsc::Receiver<()>,
+}
+
+fn database_snapshot_pause() -> &'static Mutex<Option<DatabaseSnapshotPause>> {
+    static PAUSE: OnceLock<Mutex<Option<DatabaseSnapshotPause>>> = OnceLock::new();
+    PAUSE.get_or_init(|| Mutex::new(None))
+}
+
+fn pause_database_snapshot(_temporary: &Path) {
+    let Some(pause) = database_snapshot_pause().lock().unwrap().take() else {
+        return;
+    };
+    pause.ready.send(()).unwrap();
+    pause.release.recv().unwrap();
+}
+
+fn database_maintenance_blocked() -> &'static Mutex<Option<mpsc::SyncSender<()>>> {
+    static BLOCKED: OnceLock<Mutex<Option<mpsc::SyncSender<()>>>> = OnceLock::new();
+    BLOCKED.get_or_init(|| Mutex::new(None))
+}
+
+fn signal_database_maintenance_blocked(_database: &Path) {
+    database_maintenance_blocked()
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap()
+        .send(())
+        .unwrap();
+}
+
 fn sha(byte: char) -> String {
     std::iter::repeat_n(byte, 40).collect()
 }
@@ -386,17 +419,93 @@ fn daemon_lifetime_fences_outlive_api_server_failure() {
         Err(error) => error,
     };
     assert!(format!("{second_daemon:#}").contains("acquire exclusive IQ daemon lease"));
-    let second_database = match SqliteQueue::open(&database) {
-        Ok(_) => panic!("second database authority opened under daemon lifetime fence"),
-        Err(error) => error,
-    };
-    assert!(format!("{second_database:#}").contains("acquire exclusive IQ database process lease"));
+    let second_database = SqliteQueue::open(&database)
+        .expect("validated queue open must coexist with the daemon database lease");
+    drop(second_database);
 
     drop(lifetime);
     let (next_lifetime, next_server) = ControlApiServer::bind(config, store).unwrap();
     drop(next_server);
     drop(next_lifetime);
     drop(SqliteQueue::open(&database).unwrap());
+}
+
+#[test]
+fn exclusive_database_maintenance_lease_blocks_validated_queue_open() {
+    let temp = tempdir().unwrap();
+    let database = temp.path().join("queue.db");
+    drop(SqliteQueue::open(&database).unwrap());
+    let maintenance = iq::control_store::DatabaseProcessLease::acquire_exclusive(&database)
+        .expect("acquire database maintenance lease");
+
+    let blocked = match SqliteQueue::open(&database) {
+        Ok(_) => panic!("validated queue open ignored exclusive database maintenance lease"),
+        Err(error) => error,
+    };
+
+    assert!(format!("{blocked:#}").contains("acquire shared IQ database process lease"));
+    drop(maintenance);
+    drop(SqliteQueue::open(&database).unwrap());
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn first_control_lock_handoff_fences_exclusive_maintenance() {
+    let _guard = env_lock().lock().unwrap();
+    let temp = tempdir().unwrap();
+    let database = temp.path().join("queue.db");
+    drop(SqliteQueue::open(&database).unwrap());
+    let control_lock = temp.path().join("queue.db.control.lock");
+    std::fs::remove_file(&control_lock).unwrap();
+    let (snapshot_ready, snapshot_ready_receiver) = mpsc::sync_channel(1);
+    let (snapshot_release, snapshot_release_receiver) = mpsc::sync_channel(1);
+    *database_snapshot_pause().lock().unwrap() = Some(DatabaseSnapshotPause {
+        ready: snapshot_ready,
+        release: snapshot_release_receiver,
+    });
+    iq::control_store::set_database_snapshot_test_hook(&database, Some(pause_database_snapshot));
+    let runtime_database = database.clone();
+    let runtime = std::thread::spawn(move || SqliteQueue::open(&runtime_database));
+    snapshot_ready_receiver
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    assert!(!control_lock.exists());
+
+    let (maintenance_ready, maintenance_ready_receiver) = mpsc::sync_channel(1);
+    let (maintenance_release, maintenance_release_receiver) = mpsc::sync_channel(1);
+    let (maintenance_blocked, maintenance_blocked_receiver) = mpsc::sync_channel(1);
+    *database_maintenance_blocked().lock().unwrap() = Some(maintenance_blocked);
+    iq::control_store::set_database_lease_blocked_test_hook(
+        &database,
+        Some(signal_database_maintenance_blocked),
+    );
+    let maintenance_database = database.clone();
+    let maintenance = std::thread::spawn(move || {
+        let lease =
+            iq::control_store::DatabaseProcessLease::acquire_exclusive(&maintenance_database)
+                .unwrap();
+        maintenance_ready.send(()).unwrap();
+        maintenance_release_receiver.recv().unwrap();
+        drop(lease);
+    });
+    maintenance_blocked_receiver
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    assert!(matches!(
+        maintenance_ready_receiver.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+
+    snapshot_release.send(()).unwrap();
+    drop(runtime.join().unwrap().unwrap());
+    iq::control_store::set_database_snapshot_test_hook(&database, None);
+    iq::control_store::set_database_lease_blocked_test_hook(&database, None);
+    maintenance_ready_receiver
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    assert!(control_lock.is_file());
+    maintenance_release.send(()).unwrap();
+    maintenance.join().unwrap();
 }
 
 #[test]

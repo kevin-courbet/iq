@@ -29,6 +29,10 @@ static DATABASE_SNAPSHOT_TEST_HOOK: std::sync::Mutex<DatabaseTestHook> =
     std::sync::Mutex::new(None);
 
 #[cfg(debug_assertions)]
+static DATABASE_LEASE_BLOCKED_TEST_HOOK: std::sync::Mutex<DatabaseTestHook> =
+    std::sync::Mutex::new(None);
+
+#[cfg(debug_assertions)]
 static RECOMPOSITION_PROJECTION_FAILURE_TEST_HOOK: std::sync::Mutex<Option<PathBuf>> =
     std::sync::Mutex::new(None);
 
@@ -43,6 +47,13 @@ pub fn set_runtime_open_handoff_test_hook(database_path: &Path, hook: Option<fn(
 #[cfg(debug_assertions)]
 pub fn set_database_snapshot_test_hook(database_path: &Path, hook: Option<fn(&Path)>) {
     *DATABASE_SNAPSHOT_TEST_HOOK.lock().unwrap() =
+        hook.map(|hook| (database_path.to_path_buf(), hook));
+}
+
+#[doc(hidden)]
+#[cfg(debug_assertions)]
+pub fn set_database_lease_blocked_test_hook(database_path: &Path, hook: Option<fn(&Path)>) {
+    *DATABASE_LEASE_BLOCKED_TEST_HOOK.lock().unwrap() =
         hook.map(|hook| (database_path.to_path_buf(), hook));
 }
 
@@ -78,55 +89,80 @@ impl DatabaseProcessLease {
     }
 
     fn acquire_with_mode(database_path: &Path, mode: libc::c_int) -> Result<Self> {
+        let database = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOATIME)
+            .open(database_path)?;
+        let database_lease =
+            Self::acquire_file(database_path, database_path.to_path_buf(), database, mode)?;
         let path = database_lock_path(database_path)?;
-        let file = OpenOptions::new()
-            .create(true)
+        let file = match OpenOptions::new()
+            .create_new(true)
             .read(true)
             .write(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOATIME)
-            .open(&path)?;
-        Self::acquire_file(database_path, path, file, mode)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                open_database_lock(&path)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let lease = Self::acquire_file(database_path, path, file, mode)?;
+        drop(database_lease);
+        Ok(lease)
     }
 
-    pub(crate) fn acquire_existing_exclusive(database_path: &Path) -> Result<Self> {
+    pub(crate) fn acquire_existing(database_path: &Path) -> Result<Self> {
+        let database = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOATIME)
+            .open(database_path)?;
+        let database_lease = Self::acquire_file(
+            database_path,
+            database_path.to_path_buf(),
+            database,
+            libc::LOCK_SH,
+        )?;
         let lock_path = database_lock_path(database_path)?;
         match fs::symlink_metadata(&lock_path) {
             Ok(_) => {
-                let file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOATIME)
-                    .open(&lock_path)?;
-                Self::acquire_file(database_path, lock_path, file, libc::LOCK_EX)
+                let file = open_database_lock(&lock_path)?;
+                let lease = Self::acquire_file(database_path, lock_path, file, libc::LOCK_SH)?;
+                drop(database_lease);
+                Ok(lease)
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let file = OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOATIME)
-                    .open(database_path)?;
-                let lease = Self::acquire_file(
-                    database_path,
-                    database_path.to_path_buf(),
-                    file,
-                    libc::LOCK_EX,
-                )?;
-                match fs::symlink_metadata(&lock_path) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(lease),
-                    Ok(_) => {
-                        drop(lease);
-                        let file = OpenOptions::new()
-                            .read(true)
-                            .write(true)
-                            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOATIME)
-                            .open(&lock_path)?;
-                        Self::acquire_file(database_path, lock_path, file, libc::LOCK_EX)
-                    }
-                    Err(error) => Err(error.into()),
-                }
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(database_lease),
             Err(error) => Err(error.into()),
         }
+    }
+
+    pub(crate) fn stabilize(self, database_path: &Path) -> Result<Self> {
+        if self.authority_path != database_path {
+            return Ok(self);
+        }
+        self.verify_authority(database_path)?;
+        let lock_path = database_lock_path(database_path)?;
+        let file = match OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOATIME)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                open_database_lock(&lock_path)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let lease = Self::acquire_file(database_path, lock_path, file, libc::LOCK_SH)?;
+        drop(self);
+        Ok(lease)
     }
 
     fn acquire_file(
@@ -160,8 +196,15 @@ impl DatabaseProcessLease {
             if error.raw_os_error() != Some(libc::EWOULDBLOCK)
                 || std::time::Instant::now() >= deadline
             {
-                return Err(error).context("acquire exclusive IQ database process lease");
+                let kind = if mode & libc::LOCK_EX != 0 {
+                    "exclusive"
+                } else {
+                    "shared"
+                };
+                return Err(error)
+                    .with_context(|| format!("acquire {kind} IQ database process lease"));
             }
+            run_database_lease_blocked_test_hook(database_path);
             std::thread::sleep(Duration::from_millis(10));
         }
         Ok(Self {
@@ -196,6 +239,15 @@ impl DatabaseProcessLease {
         }
         Ok(())
     }
+}
+
+fn open_database_lock(path: &Path) -> Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOATIME)
+        .open(path)
+        .map_err(Into::into)
 }
 
 fn database_lock_path(database_path: &Path) -> Result<PathBuf> {
@@ -3419,6 +3471,20 @@ fn run_database_snapshot_test_hook(_database_path: &Path, _snapshot_path: &Path)
         {
             let (_, run) = hook.take().unwrap();
             run(_snapshot_path);
+        }
+    }
+}
+
+fn run_database_lease_blocked_test_hook(_database_path: &Path) {
+    #[cfg(debug_assertions)]
+    {
+        let mut hook = DATABASE_LEASE_BLOCKED_TEST_HOOK.lock().unwrap();
+        if hook
+            .as_ref()
+            .is_some_and(|(target, _)| target == _database_path)
+        {
+            let (_, run) = hook.take().unwrap();
+            run(_database_path);
         }
     }
 }

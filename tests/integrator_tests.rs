@@ -2033,7 +2033,7 @@ fn daemon_once_rejects_missing_generation_marker_without_any_durable_effect() {
 }
 
 #[test]
-fn daemon_once_rejects_independent_database_process_lease_holder() {
+fn daemon_once_allows_independent_shared_database_process_lease_holder() {
     let fixture = GitFixture::new(false);
     let db = fixture.temp.path().join("queues.db");
     drop(SqliteQueue::open(&db).unwrap());
@@ -2041,12 +2041,13 @@ fn daemon_once_rejects_independent_database_process_lease_holder() {
         write_daemon_runtime_config(&fixture, &db);
     let mut holder = spawn_database_process_lease_holder(&db, fixture.temp.path());
 
-    let blocked = run_daemon_once(&fixture, &db, &daemon_config, &system_config);
+    let concurrent = run_daemon_once(&fixture, &db, &daemon_config, &system_config);
 
-    assert!(!blocked.status.success());
-    let stderr = String::from_utf8_lossy(&blocked.stderr);
-    assert!(stderr.contains("acquire exclusive IQ database process lease"));
-    assert!(stderr.contains("Resource temporarily unavailable"));
+    assert!(
+        concurrent.status.success(),
+        "{}",
+        String::from_utf8_lossy(&concurrent.stderr)
+    );
     drop(holder.stdin.take());
     assert!(holder.wait().unwrap().success());
 
@@ -2056,6 +2057,121 @@ fn daemon_once_rejects_independent_database_process_lease_holder() {
         "{}",
         String::from_utf8_lossy(&released.stderr)
     );
+}
+
+#[test]
+fn live_daemon_allows_cli_development_workspace_lifecycle() {
+    let fixture = GitFixture::new(false);
+    let database = fixture.temp.path().join("queues.db");
+    let (daemon_config, system_config, _control_directory) =
+        write_daemon_runtime_config(&fixture, &database);
+    let daemon: serde_json::Value =
+        serde_json::from_slice(&fs::read(&daemon_config).unwrap()).unwrap();
+    let repo_key = daemon["repos"][0]["repo_key"].as_str().unwrap();
+    let ready = fixture.temp.path().join("daemon-ready");
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_iq"))
+        .env("IQ_RIFT_DATABASE", &fixture.rift_database)
+        .env("IQ_TEST_MODEL_KEY", "fixture-model-key")
+        .args([
+            "--queue-db",
+            database.to_str().unwrap(),
+            "daemon",
+            "--config",
+            daemon_config.to_str().unwrap(),
+            "--system-config",
+            system_config.to_str().unwrap(),
+            "--ready-file",
+            ready.to_str().unwrap(),
+            "--interval-seconds",
+            "60",
+        ])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready.exists() {
+        if let Some(status) = daemon.try_wait().unwrap() {
+            let mut stderr = String::new();
+            daemon
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            panic!("daemon exited before readiness with {status}: {stderr}");
+        }
+        assert!(Instant::now() < deadline, "daemon readiness timed out");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let created = Command::new(env!("CARGO_BIN_EXE_iq"))
+        .env("IQ_RIFT_DATABASE", &fixture.rift_database)
+        .args([
+            "--queue-db",
+            database.to_str().unwrap(),
+            "dev-workspace",
+            "create",
+            "--repo-key",
+            repo_key,
+            "--name",
+            "daemon-cli-live",
+        ])
+        .output()
+        .unwrap();
+    let created_json: serde_json::Value = if created.status.success() {
+        serde_json::from_slice(&created.stdout).unwrap()
+    } else {
+        serde_json::Value::Null
+    };
+    let workspace_id = created_json["id"].as_str().unwrap_or_default();
+    let workspace_path = created_json["path"].as_str().unwrap_or_default();
+    let observed = Command::new(env!("CARGO_BIN_EXE_iq"))
+        .env("IQ_RIFT_DATABASE", &fixture.rift_database)
+        .args([
+            "--queue-db",
+            database.to_str().unwrap(),
+            "dev-workspace",
+            "status",
+            workspace_id,
+        ])
+        .output()
+        .unwrap();
+    let removed = Command::new(env!("CARGO_BIN_EXE_iq"))
+        .env("IQ_RIFT_DATABASE", &fixture.rift_database)
+        .args([
+            "--queue-db",
+            database.to_str().unwrap(),
+            "dev-workspace",
+            "remove",
+            workspace_id,
+        ])
+        .output()
+        .unwrap();
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    assert!(
+        observed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&observed.stderr)
+    );
+    let observed: serde_json::Value = serde_json::from_slice(&observed.stdout).unwrap();
+    assert_eq!(observed["workspace"]["status"], "active");
+    assert_eq!(observed["exists"], true);
+    assert_eq!(observed["clean"], true);
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    let removed: serde_json::Value = serde_json::from_slice(&removed.stdout).unwrap();
+    assert_eq!(removed["status"], "removed");
+    assert!(!Path::new(workspace_path).exists());
 }
 
 #[test]
@@ -2126,8 +2242,7 @@ fn daemon_api_failure_stops_daemon_before_lifetime_fences_release() {
 
     let blocked = run_daemon_once(&fixture, &db, &daemon_config, &system_config);
     assert!(!blocked.status.success());
-    assert!(String::from_utf8_lossy(&blocked.stderr)
-        .contains("acquire exclusive IQ database process lease"));
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("acquire exclusive IQ daemon lease"));
 
     fs::write(&failure, b"fail\n").unwrap();
     let status = daemon
