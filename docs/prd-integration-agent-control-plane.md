@@ -92,16 +92,17 @@ Example project policy:
 
 ### Integration-Effort Aggregate
 
-- [ ] One queue item owns at most one effort. The effort references the current `integration_attempts` row and retained queue-item Rift. It does not replace queue item, attempt, workspace, or landing authority.
-- [ ] Queue status is derived from effort state during this refactor. Old queue phase and blocker columns are removed or replaced in schema v9; no second writable state machine remains.
+- [ ] One queue item owns at most one effort. An active effort references the current `integration_attempts` row and retained queue-item Rift. A `replacement_pending` effort references the superseded attempt until composition binds the same effort to the replacement attempt. It does not replace queue item, workspace, or landing authority.
+- [ ] Queue status is derived from effort state; no second writable state machine remains.
 - [ ] Cleanup is not an effort state. Terminal queue cleanup and retained-Rift cleanup stay in the existing cleanup-debt lifecycle.
-- [ ] Each effort has immutable item ID and effort ID; current attempt ID; exact target and source SHA; source and landing variants; retained Rift identity; runner snapshot; repository snapshot; failed consumed-cycle count; current state payload; created and updated times.
+- [ ] Each effort has immutable item ID and effort ID; active or superseded attempt ID according to state; exact target and source SHA; source and landing variants; retained Rift identity; runner snapshot; repository snapshot; failed consumed-cycle count; current state payload; created and updated times.
 - [ ] SQL foreign keys, unique indexes, `CHECK` constraints, and triggers require each state's payload, prohibit payloads owned by other states, and reject invalid combinations. At most one running cycle, open guidance request, current candidate, repository artifact, and terminal result can exist per effort.
 
 The aggregate state matrix is authoritative:
 
 | State | Required payload and invariant | Legal next states |
 | --- | --- | --- |
+| `replacement_pending` | Superseded attempt identity and replacement time; old Rift cleanup is complete; failed consumed-cycle count is reset | `agent_ready` after composition binds the replacement attempt and exact source |
 | `agent_ready` | Current attempt, exact target/source, retained Rift, runner snapshot, and next cycle number; no live runner or current candidate | `agent_running`, `infrastructure_blocked`, `cancelled` |
 | `agent_running` | One started cycle with process/start identity, input digest, atomic result-file state, start time, and authority lease | `candidate_building`, `agent_ready`, `guidance_required`, `infrastructure_blocked`, `cycle_limit_blocked`, `cancelled` |
 | `candidate_building` | Durable builder operation ID, accepted cycle, staged-tree digest, exact parents, commit metadata, and no candidate evidence | `candidate_ready`, `agent_ready`, `infrastructure_blocked`, `cancelled` |
@@ -109,7 +110,7 @@ The aggregate state matrix is authoritative:
 | `validating` | Validation policy snapshot and exact candidate SHA; any evidence under construction names that SHA | `landing`, `agent_ready`, `guidance_required`, `infrastructure_blocked`, `provider_blocked`, `cancelled` |
 | `guidance_required` | Typed semantic `IntegrationBlocker`, one open request, exact attempt/cycle/target/source/candidate identities as applicable | `agent_ready`, `cancelled` |
 | `infrastructure_blocked` | Typed infrastructure `IntegrationBlocker`; no live runner | `agent_ready`, `candidate_ready`, `validating`, `landing`, `cancelled` according to recorded resume state |
-| `cycle_limit_blocked` | Typed cycle-limit blocker, failed consumed-cycle count exactly 10, durable alert event | `agent_ready` only after authorized explicit retry resets the count, or `cancelled` |
+| `cycle_limit_blocked` | Typed cycle-limit blocker, failed consumed-cycle count exactly 10, durable alert event | `replacement_pending` for an immutable local replacement, `agent_ready` only after authorized explicit retry resets the count, or `cancelled` |
 | `provider_blocked` | Typed provider/signoff blocker, exact candidate and external gate identity; no automatic agent retry | `landing`, `agent_ready` only with evidence of candidate defect, or `cancelled` |
 | `landing` | Validated candidate, exact signoff disposition `not_required` or matching evidence, expected target SHA, and landing lease identity | `landing_uncertain`, `integrated`, `agent_ready` after target movement, `provider_blocked`, `infrastructure_blocked`, `cancelled` |
 | `landing_uncertain` | Candidate SHA, expected target SHA, command identity, and reconciliation evidence | `integrated`, `landing`, `provider_blocked`, `infrastructure_blocked` after reconciliation proves the landing outcome |
@@ -223,7 +224,7 @@ ADR 0006 defines IQ as solo local tooling. The runner boundary provides basic pr
 
 ### Acceptance Oracle
 
-- [ ] The live item `5382bb36-54ce-4323-a01b-8b73aa45fd8d` remains the operational acceptance case and survives schema v9 migration.
+- [ ] A reproducible fixture remains the operational acceptance case for the complete lifecycle.
 - [ ] Before implementation changes the live item, a fixture generator captures its exact target SHA, source SHA, source base SHA, source/landing variants, eight conflict paths, and target/source blobs. The fixture contains no credentials or unrelated working state.
 - [ ] The reproducible fixture asserts the exact target/source/base identities and the exact eight conflict paths. A mismatch fails fixture setup instead of updating expected data.
 - [ ] Expected behavior assertions define preservation: target assertions present before composition still pass; source sectoring and scoped-access assertions still pass; README, package metadata, OpenAPI, and WF-10/20/30/40/50 exports contain their specified combined behavior; no conflict marker or obsolete duplicate path remains.
@@ -264,36 +265,21 @@ flowchart LR
 
 ### Current Seams And Target Modules
 
-- `src/lib.rs::sqlite`: schema v9, migration, effort/cycle/blocker/decision/event/delivery records, transactions, constraints, and queue compatibility removal.
+- `src/lib.rs::sqlite`: current schema, effort/cycle/blocker/decision/event/delivery records, transactions, and constraints.
 - `src/lib.rs::integrator`: mechanical composition, aggregate orchestration, the one candidate builder, validation, provider/signoff handling, landing, restart reconciliation, and cleanup handoff.
 - `src/composition.rs`: strict project model override and one state-repository policy; enqueue-time binding resolution and snapshot support.
 - `src/communication.rs`: replace `DecisionTransport` and transport vectors with `StateRepository`, visibility projection, provider ingestion, and shared responder authorization calls.
 - New focused modules can own runner protocol/sandbox/process supervision, Unix-socket API/event stream, and notifications. They depend on domain types and SQLite transactions, not on CLI wire types.
 - `src/main.rs`: system config, daemon wiring, doctor output, and API-backed `inbox`, `show`, `answer`, and `watch` commands. Remove direct old answer ingestion commands.
 
-### Schema V9 Migration
-
-- [ ] Migration starts only with the exclusive schema migration lock and no active repository-operation or daemon lease.
-- [ ] Before the transaction, IQ creates a byte-for-byte SQLite backup with the SQLite backup API to a new mode-`0600` regular file in the same protected state directory. It `fsync`s file and directory, runs `PRAGMA integrity_check` on the backup, verifies schema version 8 and database identity, records size and SHA-256, and refuses overwrite.
-- [ ] One `BEGIN IMMEDIATE` transaction creates v9 tables/constraints, converts data, validates conversion counts and foreign keys, sets schema version 9, and commits. Runtime code supports only v9 after migration; no v8 compatibility read or write path remains.
-- [ ] On migration error, IQ rolls back and proves the original database is still schema v8 with `integrity_check=ok`; it does not start the daemon. Acceptance restores a copy of the verified backup, proves its SHA-256 and schema v8, migrates it again, and compares all authoritative identities.
-- [ ] Every active merge-conflict prompt becomes one `agent_ready` effort. Conversion preserves exact item ID, attempt ID, target SHA, source SHA, conflict JSON, retained Rift path/Rift ID/source-Rift ID, source and landing variants, policy snapshot, and timestamps.
-- [ ] Migration receives one verified system configuration path and resolves the registered project's current local policy before the transaction. It snapshots the exact approved OpenCode runner/agent/default-or-project model and the project's single state-repository binding on each converted effort. Migration does not invent configuration.
-- [ ] If required system configuration is absent or invalid, migration aborts before database mutation. If the project has no state-repository setting, the explicit version-2 default `local` is snapshotted. External repository identity must verify before migration can snapshot it.
-- [ ] Each converted old prompt becomes `superseded` with reason `schema_v9_agent_first`; it cannot be answered. No guidance request is created from it.
-- [ ] The live item `5382bb36-54ce-4323-a01b-8b73aa45fd8d` must match this conversion. Migration aborts if it exists in an active merge-conflict state and any required identity is absent, or if the converted values differ byte-for-byte.
-- [ ] Other active items map from their current queue/attempt/landing authority to exactly one aggregate state. Migration aborts on a combination that has no exact mapping; it does not infer or repair ambiguous authority.
-- [ ] SQL acceptance checks `foreign_key_check`, `integrity_check`, aggregate state/payload constraints, old-prompt supersession, one effort per active item, no old transport vector authority, and exact live-item identity preservation.
-
 ## Implementation Phases
 
-### Phase 1: Schema V9 And Domain State
+### Phase 1: Schema And Domain State
 
 - Add exact aggregate, blocker, cycle, repository, decision, event, and delivery types in the SQLite/domain seam.
 - Implement constraints and transactions for every state-matrix edge.
-- Implement verified backup, v8-to-v9 migration, exact live-item conversion, and rollback acceptance.
-- Remove old queue/blocker and prompt authority after conversion.
-- **Verify:** run migration against a copied schema-v8 live database and synthetic rows for every old state; run `PRAGMA integrity_check`, `PRAGMA foreign_key_check`, exact live-item identity queries, every legal transition, every rejected illegal transition, and crash injection before backup sync, during table copy, before version update, and before commit.
+- Reject incompatible existing databases without mutation.
+- **Verify:** run `PRAGMA integrity_check`, `PRAGMA foreign_key_check`, every legal transition, every rejected illegal transition, and clean-start schema identity checks.
 
 ### Phase 2: Mechanical Composition And Candidate Builder
 
@@ -345,7 +331,7 @@ flowchart LR
 ### Phase 9: End-To-End Acceptance
 
 - Run the reproducible fixture, local repository case, explicit GitLab full-visibility case, cycle-limit case, sandbox suite, notification command tests, and all crash-injection suites.
-- Migrate and process live item `5382bb36-54ce-4323-a01b-8b73aa45fd8d` through semantic integration, candidate creation, validation, signoff/provider gates, leased landing, projection, and cleanup debt.
+- Process the reproducible fixture through semantic integration, candidate creation, validation, signoff/provider gates, leased landing, projection, and cleanup debt.
 - **Verify:** `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --locked`, exact fixture assertions, exact live-item identity/evidence queries, exact landed SHA checks, issue closure, no external issue for local mode, clean retained-Rift cleanup, and manual WSLg/Windows visible toasts.
 
 ## Edge Cases And Error Handling

@@ -1,9 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{
-    backup::Backup, params, types::ValueRef, Connection, OpenFlags, OptionalExtension,
-    TransactionBehavior,
-};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -16,53 +13,24 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
-#[cfg(debug_assertions)]
-type MigrationBackupTestHook = Option<(PathBuf, fn(&Path))>;
+#[derive(Debug, thiserror::Error)]
+#[error("IQ database snapshot source changed during validation")]
+struct DatabaseSnapshotChanged;
 
 #[cfg(debug_assertions)]
-static MIGRATION_BACKUP_TEST_HOOK: std::sync::Mutex<MigrationBackupTestHook> =
+type DatabaseTestHook = Option<(PathBuf, fn(&Path))>;
+
+#[cfg(debug_assertions)]
+static RUNTIME_OPEN_HANDOFF_TEST_HOOK: std::sync::Mutex<DatabaseTestHook> =
     std::sync::Mutex::new(None);
 
 #[cfg(debug_assertions)]
-static MIGRATION_PRIMARY_TEST_HOOK: std::sync::Mutex<MigrationBackupTestHook> =
-    std::sync::Mutex::new(None);
-
-#[cfg(debug_assertions)]
-static MIGRATION_BACKUP_PRECOMMIT_TEST_HOOK: std::sync::Mutex<MigrationBackupTestHook> =
-    std::sync::Mutex::new(None);
-
-#[cfg(debug_assertions)]
-static RUNTIME_OPEN_HANDOFF_TEST_HOOK: std::sync::Mutex<MigrationBackupTestHook> =
-    std::sync::Mutex::new(None);
-
-#[cfg(debug_assertions)]
-static DATABASE_SNAPSHOT_TEST_HOOK: std::sync::Mutex<MigrationBackupTestHook> =
+static DATABASE_SNAPSHOT_TEST_HOOK: std::sync::Mutex<DatabaseTestHook> =
     std::sync::Mutex::new(None);
 
 #[cfg(debug_assertions)]
 static RECOMPOSITION_PROJECTION_FAILURE_TEST_HOOK: std::sync::Mutex<Option<PathBuf>> =
     std::sync::Mutex::new(None);
-
-#[doc(hidden)]
-#[cfg(debug_assertions)]
-pub fn set_migration_backup_test_hook(database_path: &Path, hook: Option<fn(&Path)>) {
-    *MIGRATION_BACKUP_TEST_HOOK.lock().unwrap() =
-        hook.map(|hook| (database_path.to_path_buf(), hook));
-}
-
-#[doc(hidden)]
-#[cfg(debug_assertions)]
-pub fn set_migration_primary_test_hook(database_path: &Path, hook: Option<fn(&Path)>) {
-    *MIGRATION_PRIMARY_TEST_HOOK.lock().unwrap() =
-        hook.map(|hook| (database_path.to_path_buf(), hook));
-}
-
-#[doc(hidden)]
-#[cfg(debug_assertions)]
-pub fn set_migration_backup_precommit_test_hook(database_path: &Path, hook: Option<fn(&Path)>) {
-    *MIGRATION_BACKUP_PRECOMMIT_TEST_HOOK.lock().unwrap() =
-        hook.map(|hook| (database_path.to_path_buf(), hook));
-}
 
 #[doc(hidden)]
 #[cfg(debug_assertions)]
@@ -85,14 +53,11 @@ pub fn set_recomposition_projection_failure_test_hook(database_path: &Path, enab
         enabled.then(|| database_path.to_path_buf());
 }
 
-use crate::agent_config::SystemConfig;
 use crate::control_domain::{
     AgentLaunching, AgentReady, IntegrationBlocker, IntegrationEffortState, ResumeState,
     RunnerSnapshot, StateRepositorySnapshot, AUTOMATIC_CYCLE_LIMIT,
 };
 use crate::sqlite::WorkspaceIdentity;
-
-pub const SCHEMA_VERSION: &str = "10";
 
 pub struct DatabaseProcessLease {
     file: File,
@@ -186,9 +151,18 @@ impl DatabaseProcessLease {
         {
             anyhow::bail!("IQ database process fence lost its authoritative inode identity");
         }
-        if unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("acquire exclusive IQ database process lease");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) } == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EWOULDBLOCK)
+                || std::time::Instant::now() >= deadline
+            {
+                return Err(error).context("acquire exclusive IQ database process lease");
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
         Ok(Self {
             file,
@@ -290,11 +264,11 @@ impl SnapshotSource {
         output.sync_all()?;
         let copied_sha256 = format!("{:x}", digest.finalize());
         let (destination_sha256, destination_size) = digest_open_file(&output)?;
-        if destination_size != metadata.len()
-            || destination_sha256 != copied_sha256
-            || output.metadata()?.permissions().mode() & 0o777 != 0o600
-        {
+        if output.metadata()?.permissions().mode() & 0o777 != 0o600 {
             anyhow::bail!("IQ database snapshot copy is not exact and private");
+        }
+        if destination_size != metadata.len() || destination_sha256 != copied_sha256 {
+            return Err(DatabaseSnapshotChanged.into());
         }
         Ok(Self {
             path: path.to_path_buf(),
@@ -324,7 +298,7 @@ impl SnapshotSource {
             || metadata.ctime_nsec() != self.changed_nanoseconds
             || digest_open_file(&self.file)?.0 != self.sha256
         {
-            anyhow::bail!("IQ database snapshot source changed during validation");
+            return Err(DatabaseSnapshotChanged.into());
         }
         Ok(())
     }
@@ -333,26 +307,25 @@ impl SnapshotSource {
 pub(crate) fn validate_database_snapshot_under_lease<T>(
     database_path: &Path,
     lease: &DatabaseProcessLease,
-    validate: impl FnOnce(&Connection) -> Result<T>,
+    mut validate: impl FnMut(&Connection) -> Result<T>,
 ) -> Result<T> {
-    validate_database_snapshot_with_source_under_lease(
-        database_path,
-        lease,
-        SnapshotInput::AuthoritativeDatabase,
-        validate,
-    )
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match validate_database_snapshot_under_lease_inner(database_path, lease, &mut validate) {
+            Err(error)
+                if error.downcast_ref::<DatabaseSnapshotChanged>().is_some()
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
 }
 
-#[derive(Clone, Copy)]
-enum SnapshotInput<'a> {
-    AuthoritativeDatabase,
-    SidecarFreeOpenFile(&'a File),
-}
-
-fn validate_database_snapshot_with_source_under_lease<T>(
+fn validate_database_snapshot_under_lease_inner<T>(
     database_path: &Path,
     lease: &DatabaseProcessLease,
-    input: SnapshotInput<'_>,
     validate: impl FnOnce(&Connection) -> Result<T>,
 ) -> Result<T> {
     lease.verify_authority(database_path)?;
@@ -370,28 +343,18 @@ fn validate_database_snapshot_with_source_under_lease<T>(
             .file_name()
             .context("database path has no file name")?;
         let snapshot_path = temporary.path().join(database_name);
-        let mut sources = vec![match input {
-            SnapshotInput::AuthoritativeDatabase => {
-                SnapshotSource::copy(database_path, &snapshot_path)?
-            }
-            SnapshotInput::SidecarFreeOpenFile(file) => {
-                verify_no_database_sidecars(database_path, "schema backup")?;
-                SnapshotSource::copy_open_file(database_path, &snapshot_path, file)?
-            }
-        }];
-        if matches!(input, SnapshotInput::AuthoritativeDatabase) {
-            for suffix in ["-wal", "-shm"] {
-                let mut sidecar_name = database_name.to_os_string();
-                sidecar_name.push(suffix);
-                let source_path = database_path.with_file_name(&sidecar_name);
-                match fs::symlink_metadata(&source_path) {
-                    Ok(_) => sources.push(SnapshotSource::copy(
-                        &source_path,
-                        &temporary.path().join(sidecar_name),
-                    )?),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                }
+        let mut sources = vec![SnapshotSource::copy(database_path, &snapshot_path)?];
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar_name = database_name.to_os_string();
+            sidecar_name.push(suffix);
+            let source_path = database_path.with_file_name(&sidecar_name);
+            match fs::symlink_metadata(&source_path) {
+                Ok(_) => sources.push(SnapshotSource::copy(
+                    &source_path,
+                    &temporary.path().join(sidecar_name),
+                )?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
         }
         lease.verify_authority(database_path)?;
@@ -416,11 +379,8 @@ fn validate_database_snapshot_with_source_under_lease<T>(
             if !sources.iter().any(|source| source.path == source_path)
                 && fs::symlink_metadata(&source_path).is_ok()
             {
-                anyhow::bail!("IQ database sidecar appeared during snapshot validation");
+                return Err(DatabaseSnapshotChanged.into());
             }
-        }
-        if matches!(input, SnapshotInput::SidecarFreeOpenFile(_)) {
-            verify_no_database_sidecars(database_path, "schema backup")?;
         }
         lease.verify_authority(database_path)?;
         validated
@@ -438,21 +398,13 @@ fn validate_database_snapshot_with_source_under_lease<T>(
     }
 }
 
-fn verify_no_database_sidecars(database_path: &Path, label: &str) -> Result<()> {
-    let database_name = database_path
-        .file_name()
-        .context("database path has no file name")?;
-    for suffix in ["-wal", "-shm"] {
-        let mut sidecar_name = database_name.to_os_string();
-        sidecar_name.push(suffix);
-        let sidecar_path = database_path.with_file_name(sidecar_name);
-        match fs::symlink_metadata(&sidecar_path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(_) => anyhow::bail!("{label} has a forbidden {suffix} sidecar"),
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(())
+fn digest_open_file(file: &File) -> Result<(String, u64)> {
+    let mut file = file.try_clone()?;
+    use std::io::{Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0))?;
+    let mut digest = Sha256::new();
+    let size = std::io::copy(&mut file, &mut digest)?;
+    Ok((format!("{:x}", digest.finalize()), size))
 }
 
 pub struct PrimaryDatabaseIdentity {
@@ -544,8 +496,19 @@ impl ValidatedDatabaseAuthority {
     }
 
     pub(crate) fn verify_path(&self) -> Result<()> {
-        let metadata = fs::symlink_metadata(&self.identity.path)
-            .with_context(|| format!("inspect queue db {}", self.identity.path.display()))?;
+        let metadata = match fs::symlink_metadata(&self.identity.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                anyhow::bail!(
+                    "queue database identity changed while IQ was running: {}",
+                    self.identity.path.display()
+                )
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect queue db {}", self.identity.path.display()))
+            }
+        };
         if metadata.file_type().is_symlink()
             || !metadata.is_file()
             || metadata.dev() != self.identity.device
@@ -580,8 +543,15 @@ impl ValidatedDatabaseAuthority {
 
     pub(crate) fn open_connection(&self, flags: OpenFlags) -> Result<Connection> {
         self.verify_path()?;
-        let connection = Connection::open_with_flags(self.path(), flags)
-            .with_context(|| format!("open validated IQ database {}", self.path().display()))?;
+        let connection = match Connection::open_with_flags(self.path(), flags) {
+            Ok(connection) => connection,
+            Err(error) => {
+                self.verify_path()?;
+                return Err(error).with_context(|| {
+                    format!("open validated IQ database {}", self.path().display())
+                });
+            }
+        };
         self.verify_path()?;
         self.verify_connection(&connection)?;
         Ok(connection)
@@ -1146,6 +1116,42 @@ impl ControlStore {
             )
             .optional()?
         {
+            if let IntegrationEffortState::ReplacementPending(pending) = &existing.state {
+                if existing.attempt_id == new.attempt_id {
+                    anyhow::bail!("replacement effort still references its superseded attempt");
+                }
+                let superseded: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM integration_attempts WHERE id=?1 AND item_id=?2 AND result='superseded' AND finished_at IS NOT NULL)",
+                    params![pending.old_attempt_id,new.item_id],
+                    |row| row.get(0),
+                )?;
+                if !superseded || existing.attempt_id != pending.old_attempt_id {
+                    anyhow::bail!("replacement effort does not reference a superseded attempt");
+                }
+                let next_cycle: u8 = transaction.query_row(
+                    "SELECT COALESCE(MAX(cycle_number),0)+1 FROM integration_cycles WHERE effort_id=?1",
+                    params![existing.id],
+                    |row| row.get(0),
+                )?;
+                let state = IntegrationEffortState::AgentReady(AgentReady { next_cycle });
+                let changed = transaction.execute(
+                    "UPDATE integration_efforts SET attempt_id=?1,target_sha=?2,source_sha=?3,source_variant=?4,landing_variant=?5,workspace_json=?6,runner_snapshot_json=?7,state_repository_json=?8,failed_cycles=0,state='agent_ready',state_json=?9,blocker_kind=NULL,updated_at=?10 WHERE id=?11 AND item_id=?12 AND state='replacement_pending' AND attempt_id=?13",
+                    params![new.attempt_id,new.target_sha,new.source_sha,new.source_variant,new.landing_variant,serde_json::to_string(new.workspace)?,serde_json::to_string(new.runner)?,serde_json::to_string(new.state_repository)?,serde_json::to_string(&state)?,now(),existing.id,new.item_id,pending.old_attempt_id],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("replacement effort identity changed before composition");
+                }
+                let effort = required_effort(&transaction, &existing.id)?;
+                append_event(
+                    &transaction,
+                    &effort,
+                    "agent_ready",
+                    serde_json::json!({"cycle":next_cycle,"replacement_attempt_id":new.attempt_id}),
+                    false,
+                )?;
+                transaction.commit()?;
+                return self.effort_by_id(&existing.id);
+            }
             if existing.attempt_id != new.attempt_id
                 || existing.target_sha != new.target_sha
                 || existing.source_sha != new.source_sha
@@ -1183,6 +1189,42 @@ impl ControlStore {
         )?;
         transaction.commit()?;
         self.effort_by_id(&id)
+    }
+
+    pub(crate) fn mark_effort_replacement_pending(
+        connection: &Connection,
+        item_id: &str,
+        old_attempt_id: &str,
+    ) -> Result<bool> {
+        let Some(effort) = connection
+            .query_row(
+                "SELECT id,item_id,attempt_id,target_sha,source_sha,source_variant,landing_variant,workspace_json,runner_snapshot_json,state_repository_json,failed_cycles,state_json,created_at,updated_at FROM integration_efforts WHERE item_id=?1",
+                params![item_id],
+                map_effort,
+            )
+            .optional()?
+        else {
+            return Ok(false);
+        };
+        if effort.attempt_id != old_attempt_id
+            || !matches!(effort.state, IntegrationEffortState::CycleLimitBlocked(_))
+        {
+            anyhow::bail!("replacement cleanup requires the blocked effort for the old attempt");
+        }
+        let state =
+            IntegrationEffortState::ReplacementPending(crate::control_domain::ReplacementPending {
+                old_attempt_id: old_attempt_id.to_string(),
+                replaced_at: now(),
+            });
+        update_state_and_count(connection, &effort, &state, 0)?;
+        append_event(
+            connection,
+            &effort,
+            "replacement_pending",
+            serde_json::to_value(&state)?,
+            false,
+        )?;
+        Ok(true)
     }
 
     pub fn prepare_cycle_launch(&self, effort_id: &str, launch: &AgentLaunching) -> Result<()> {
@@ -1907,9 +1949,33 @@ impl ControlStore {
             "INSERT INTO candidate_evidence(effort_id,cycle_id,candidate_sha,builder_operation_id,created_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(effort_id) DO UPDATE SET cycle_id=excluded.cycle_id,candidate_sha=excluded.candidate_sha,builder_operation_id=excluded.builder_operation_id,created_at=excluded.created_at",
             params![effort_id,building.cycle_id,observation.candidate_sha,observation.operation_id,now()],
         )?;
+        let moved_base_json: String = transaction.query_row(
+            "SELECT moved_base_json FROM integration_attempts WHERE id=?1 AND item_id=?2",
+            params![effort.attempt_id, effort.item_id],
+            |row| row.get(0),
+        )?;
+        let moved_base: crate::sqlite::MovedBaseState = serde_json::from_str(&moved_base_json)
+            .context("integration attempt has invalid moved-base state")?;
+        let moved_base = match moved_base {
+            crate::sqlite::MovedBaseState::None => crate::sqlite::MovedBaseState::None,
+            crate::sqlite::MovedBaseState::Pending {
+                target_sha,
+                source_sha,
+            }
+            | crate::sqlite::MovedBaseState::Applied {
+                target_sha,
+                source_sha,
+                ..
+            } => crate::sqlite::MovedBaseState::Applied {
+                target_sha,
+                source_sha,
+                candidate_sha: observation.candidate_sha.clone(),
+            },
+        };
+        invalidate_validation_invocations(&transaction, &effort.attempt_id)?;
         let projected = transaction.execute(
-            "UPDATE integration_attempts SET merge_commit_sha=?1,validated_commit_sha=NULL,validation_command=NULL,validation_exit_code=NULL,validation_log_path=NULL,signoff_evidence_json=NULL WHERE id=?2 AND item_id=?3",
-            params![observation.candidate_sha,effort.attempt_id,effort.item_id],
+            "UPDATE integration_attempts SET merge_commit_sha=?1,validated_commit_sha=NULL,validation_command=NULL,validation_exit_code=NULL,validation_log_path=NULL,signoff_evidence_json=NULL,moved_base_json=?2 WHERE id=?3 AND item_id=?4",
+            params![observation.candidate_sha,serde_json::to_string(&moved_base)?,effort.attempt_id,effort.item_id],
         )?;
         if projected != 1 {
             anyhow::bail!("candidate attempt projection lost exact effort authority");
@@ -1949,7 +2015,10 @@ impl ControlStore {
     }
 
     pub fn start_validation(&self, effort_id: &str, policy_digest: &str) -> Result<()> {
-        crate::control_domain::require_exact_text(policy_digest, "validation policy digest")?;
+        if policy_digest.len() != 64 || !policy_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            anyhow::bail!("validation policy digest must be an exact SHA-256 digest");
+        }
         let mut connection = self.connect(true)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let effort = required_effort(&transaction, effort_id)?;
@@ -1985,6 +2054,17 @@ impl ControlStore {
             || validating.candidate_sha != candidate_sha
         {
             anyhow::bail!("validation completion differs from current candidate authority");
+        }
+        let attempt_validated_sha: Option<String> = transaction
+            .query_row(
+                "SELECT validated_commit_sha FROM integration_attempts WHERE id=?1 AND item_id=?2",
+                params![effort.attempt_id, effort.item_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if attempt_validated_sha.as_deref() != Some(candidate_sha) {
+            anyhow::bail!("validation completion differs from exact attempt evidence");
         }
         let state = IntegrationEffortState::Validating(crate::control_domain::Validating {
             candidate_sha: candidate_sha.to_string(),
@@ -2045,6 +2125,22 @@ impl ControlStore {
         let IntegrationEffortState::Validating(validating) = &effort.state else {
             anyhow::bail!("landing requires validating effort");
         };
+        let policy_digest = match &signoff {
+            crate::control_domain::SignoffDisposition::NoValidation { policy_digest }
+            | crate::control_domain::SignoffDisposition::ValidationWithoutSignoff {
+                policy_digest,
+            }
+            | crate::control_domain::SignoffDisposition::Evidence { policy_digest, .. } => {
+                policy_digest
+            }
+        };
+        if policy_digest.len() != 64 || !policy_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            anyhow::bail!("landing policy digest must be an exact SHA-256 digest");
+        }
+        if policy_digest != &validating.policy_digest {
+            anyhow::bail!("landing evidence policy digest differs from validation authority");
+        }
         if let crate::control_domain::SignoffDisposition::Evidence { candidate_sha, .. } = &signoff
         {
             if candidate_sha != &validating.candidate_sha {
@@ -2175,7 +2271,7 @@ impl ControlStore {
             }
         }
         transaction.execute(
-            "UPDATE registered_repositories SET seed_refresh_json=json_object('state','pending','target_sha',?1),updated_at=?2 WHERE repo_key=(SELECT repo_key FROM queue_items WHERE id=?3)",
+            "UPDATE registered_repositories SET checkout_json=json_object('state','pending','target_sha',?1),updated_at=?2 WHERE repo_key=(SELECT repo_key FROM queue_items WHERE id=?3)",
             params![remote_target_sha,now(),effort.item_id],
         )?;
         append_event_with_id(
@@ -2283,9 +2379,13 @@ impl ControlStore {
             "DELETE FROM candidate_evidence WHERE effort_id=?1",
             params![effort_id],
         )?;
+        invalidate_validation_invocations(&transaction, &effort.attempt_id)?;
         transaction.execute(
-            "UPDATE integration_attempts SET target_base_sha=?1,merge_commit_sha=NULL,validated_commit_sha=NULL,validation_command=NULL,validation_exit_code=NULL,validation_log_path=NULL,signoff_evidence_json=NULL,moved_base_json=json_object('state','none') WHERE id=?2",
-            params![target_sha,effort.attempt_id],
+            "UPDATE integration_attempts SET target_base_sha=?1,merge_commit_sha=NULL,validated_commit_sha=NULL,validation_command=NULL,validation_exit_code=NULL,validation_log_path=NULL,signoff_evidence_json=NULL,moved_base_json=?2 WHERE id=?3",
+            params![target_sha,serde_json::to_string(&crate::sqlite::MovedBaseState::Pending {
+                target_sha: target_sha.to_string(),
+                source_sha: effort.source_sha.clone(),
+            })?,effort.attempt_id],
         )?;
         transaction.execute(
             "UPDATE integration_efforts SET target_sha=?1 WHERE id=?2",
@@ -2312,6 +2412,47 @@ impl ControlStore {
         )?;
         transaction.commit()?;
         self.effort_by_id(effort_id)
+    }
+
+    pub fn begin_target_move(&self, effort_id: &str, target_sha: &str) -> Result<()> {
+        crate::control_domain::require_sha(target_sha, "replacement target SHA")?;
+        let mut connection = self.connect(true)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let effort = required_effort(&transaction, effort_id)?;
+        if !matches!(
+            effort.state,
+            IntegrationEffortState::CandidateReady(_)
+                | IntegrationEffortState::Validating(_)
+                | IntegrationEffortState::Landing(_)
+                | IntegrationEffortState::LandingUncertain(_)
+        ) {
+            anyhow::bail!("target movement requires candidate or landing authority");
+        }
+        let moved_base = crate::sqlite::MovedBaseState::Pending {
+            target_sha: target_sha.to_string(),
+            source_sha: effort.source_sha.clone(),
+        };
+        invalidate_validation_invocations(&transaction, &effort.attempt_id)?;
+        let changed = transaction.execute(
+            "UPDATE integration_attempts SET target_base_sha=?1,merge_commit_sha=NULL,validated_commit_sha=NULL,validation_command=NULL,validation_exit_code=NULL,validation_log_path=NULL,signoff_evidence_json=NULL,moved_base_json=?2 WHERE id=?3 AND item_id=?4",
+            params![target_sha,serde_json::to_string(&moved_base)?,effort.attempt_id,effort.item_id],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("target movement lost exact attempt authority");
+        }
+        transaction.execute(
+            "DELETE FROM candidate_evidence WHERE effort_id=?1",
+            params![effort_id],
+        )?;
+        append_event(
+            &transaction,
+            &effort,
+            "target_move_pending",
+            serde_json::json!({"old_target_sha":effort.target_sha,"target_sha":target_sha}),
+            false,
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn reject_candidate(&self, effort_id: &str, evidence: &str) -> Result<IntegrationEffort> {
@@ -2388,6 +2529,7 @@ impl ControlStore {
             "DELETE FROM candidate_evidence WHERE effort_id=?1",
             params![effort_id],
         )?;
+        invalidate_validation_invocations(&transaction, &effort.attempt_id)?;
         transaction.execute(
             "UPDATE integration_attempts SET merge_commit_sha=NULL,validated_commit_sha=NULL,validation_command=NULL,validation_exit_code=NULL,validation_log_path=NULL,signoff_evidence_json=NULL WHERE id=?1",
             params![effort.attempt_id],
@@ -2756,10 +2898,31 @@ impl ControlStore {
     pub fn open_test_database(path: &Path) -> Result<Self> {
         let connection = Connection::open(path)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        crate::sqlite::initialize_test_schema(&connection, "10")?;
+        crate::sqlite::initialize_test_schema(&connection)?;
+        let database_id = crate::sqlite::validate_existing_schema_identity(&connection)?;
+        let path = path.canonicalize()?;
+        let metadata = fs::symlink_metadata(&path)?;
+        let authority = ValidatedDatabaseAuthority::from_validated_connection(
+            path,
+            metadata.dev(),
+            metadata.ino(),
+            database_id,
+            &connection,
+        )?;
         drop(connection);
-        Self::open(path)
+        Self::open_validated(authority)
     }
+}
+
+fn invalidate_validation_invocations(
+    transaction: &rusqlite::Transaction<'_>,
+    attempt_id: &str,
+) -> Result<()> {
+    transaction.execute(
+        "UPDATE validation_invocations SET invalidated_at=?1 WHERE attempt_id=?2 AND invalidated_at IS NULL",
+        params![now(), attempt_id],
+    )?;
+    Ok(())
 }
 
 fn fail_recomposition_projection_for_test(_database_path: &Path) -> Result<()> {
@@ -2774,87 +2937,15 @@ fn fail_recomposition_projection_for_test(_database_path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn install_v9_schema_objects(connection: &Connection) -> Result<()> {
-    connection.execute_batch(V9_SCHEMA)?;
+pub(crate) fn install_control_schema(connection: &Connection) -> Result<()> {
+    connection.execute_batch(CONTROL_SCHEMA)?;
+    connection.execute_batch(CLEANUP_SCHEMA)?;
+    connection.execute_batch(CLEANUP_TRIGGERS)?;
     Ok(())
-}
-
-pub(crate) fn install_v10_schema_objects(connection: &Connection) -> Result<()> {
-    connection.execute_batch(V10_SCHEMA)?;
-    connection.execute_batch(V10_TRIGGERS)?;
-    Ok(())
-}
-
-pub fn install_fresh_v10(connection: &Connection) -> Result<()> {
-    install_v9_schema_objects(connection)?;
-    install_v10_schema_objects(connection)
-}
-
-#[allow(dead_code)]
-pub fn install_fresh_v9(connection: &Connection) -> Result<()> {
-    install_fresh_v10(connection)
-}
-
-pub(crate) fn migrate_v9_to_v10_under_lease(
-    connection: &mut Connection,
-    database_path: &Path,
-    _lease: &DatabaseProcessLease,
-    source: &PrimaryDatabaseIdentity,
-) -> Result<()> {
-    let migration = (|| -> Result<()> {
-        source.verify_authoritative(database_path)?;
-        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        reject_migration_authority(&tx)?;
-        let (source_database_id, expected) = validate_v9(&tx)?;
-        let backup_source = open_backup_source(database_path)?;
-        let backup = create_verified_backup(&backup_source, database_path, "9")?;
-        drop(backup_source);
-        run_migration_backup_test_hook(database_path, &backup.path);
-        run_migration_primary_test_hook(database_path);
-        source.verify_authoritative(database_path)?;
-        validate_backup(&backup, "9", _lease, Some(&expected))?;
-        install_v10_schema_objects(&tx)?;
-        let timestamp = now();
-        for (item_id, target) in &expected {
-            let (target_kind, workspace_json) = target.storage()?;
-            tx.execute(
-                "INSERT INTO terminal_workspace_cleanup_debt(item_id,workspace_json,target_kind,state,reason,observation_count,next_retry_at,alert_event_id,created_at,updated_at) VALUES(?1,?2,?3,'pending',NULL,0,?4,NULL,?4,?4)",
-                params![item_id, workspace_json, target_kind, timestamp],
-            )?;
-        }
-        require_database_id(&tx, "9", &source_database_id)?;
-        validate_v10_contents(&tx, &expected)?;
-        let changed = tx.execute(
-            "UPDATE queue_metadata SET value='10' WHERE key='workspace_schema_version' AND value='9'",
-            [],
-        )?;
-        if changed != 1 {
-            anyhow::bail!("schema v10 metadata update did not change exactly one row");
-        }
-        require_database_id(&tx, "10", &source_database_id)?;
-        validate_v10(&tx)?;
-        run_migration_backup_precommit_test_hook(database_path, &backup.path);
-        source.verify_authoritative(database_path)?;
-        let _backup_guard = verify_backup_ready_for_commit(&backup)?;
-        tx.commit()?;
-        source.verify_authoritative(database_path)?;
-        Ok(())
-    })();
-    match migration {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            if validate_v9(connection).is_err() {
-                anyhow::bail!(
-                    "schema v10 migration failed and rollback did not preserve valid schema v9: {error:#}"
-                );
-            }
-            Err(error).context("schema v10 migration rolled back to valid schema v9")
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum MigrationWorkspace {
+enum StoredWorkspace {
     NotCreated,
     CreationIntent { path: String },
     Retained { identity: WorkspaceIdentity },
@@ -2864,25 +2955,6 @@ enum MigrationWorkspace {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ExpectedDebt {
     target: TerminalWorkspaceTarget,
-}
-
-impl ExpectedDebt {
-    fn storage(&self) -> Result<(&'static str, String)> {
-        match &self.target {
-            TerminalWorkspaceTarget::CreationIntent { path } => Ok((
-                "creation_intent",
-                serde_json::to_string(&CreationIntentJson { path })?,
-            )),
-            TerminalWorkspaceTarget::Retained { identity } => {
-                Ok(("retained", serde_json::to_string(identity)?))
-            }
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct CreationIntentJson<'a> {
-    path: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -2933,20 +3005,6 @@ impl StoredQueueStatus {
     }
 }
 
-fn validate_v9(connection: &Connection) -> Result<(String, BTreeMap<String, ExpectedDebt>)> {
-    crate::sqlite::validate_schema_objects(connection, "9")?;
-    let database_id = validate_database_identity(connection, "9")?;
-    let debt_objects: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('terminal_workspace_cleanup_debt','terminal_workspace_cleanup_debt_due')",
-        [],
-        |row| row.get(0),
-    )?;
-    if debt_objects != 0 {
-        anyhow::bail!("IQ schema version 9 contains schema v10 cleanup debt objects");
-    }
-    Ok((database_id, expected_debt_from_queue(connection)?))
-}
-
 fn expected_debt_from_queue(connection: &Connection) -> Result<BTreeMap<String, ExpectedDebt>> {
     let mut statement = connection.prepare(
         "SELECT id,status,integration_workspace_path,integration_workspace_rift_id,integration_workspace_source_rift_id,integration_workspace_cleaned_at FROM queue_items ORDER BY id",
@@ -2966,21 +3024,18 @@ fn expected_debt_from_queue(connection: &Connection) -> Result<BTreeMap<String, 
         let (item_id, raw_status, path, rift_id, source_rift_id, cleaned_at) = row?;
         require_non_empty(&item_id, "queue item ID")?;
         let status = StoredQueueStatus::parse(&raw_status)?;
-        let workspace = parse_migration_workspace(path, rift_id, source_rift_id, cleaned_at)?;
+        let workspace = parse_stored_workspace(path, rift_id, source_rift_id, cleaned_at)?;
         validate_workspace_status(status, &workspace)?;
         let target = match (status, workspace) {
-            (StoredQueueStatus::Cancelled, MigrationWorkspace::CreationIntent { path }) => {
+            (StoredQueueStatus::Cancelled, StoredWorkspace::CreationIntent { path }) => {
                 Some(TerminalWorkspaceTarget::CreationIntent { path })
             }
             (
                 StoredQueueStatus::Cancelled | StoredQueueStatus::Integrated,
-                MigrationWorkspace::Retained { identity },
+                StoredWorkspace::Retained { identity },
             ) => Some(TerminalWorkspaceTarget::Retained { identity }),
-            (_, MigrationWorkspace::NotCreated | MigrationWorkspace::Cleaned { .. }) => None,
-            (
-                _,
-                MigrationWorkspace::CreationIntent { .. } | MigrationWorkspace::Retained { .. },
-            ) => None,
+            (_, StoredWorkspace::NotCreated | StoredWorkspace::Cleaned { .. }) => None,
+            (_, StoredWorkspace::CreationIntent { .. } | StoredWorkspace::Retained { .. }) => None,
         };
         if let Some(target) = target {
             expected.insert(item_id, ExpectedDebt { target });
@@ -2989,23 +3044,23 @@ fn expected_debt_from_queue(connection: &Connection) -> Result<BTreeMap<String, 
     Ok(expected)
 }
 
-fn parse_migration_workspace(
+fn parse_stored_workspace(
     path: Option<String>,
     rift_id: Option<String>,
     source_rift_id: Option<String>,
     cleaned_at: Option<String>,
-) -> Result<MigrationWorkspace> {
+) -> Result<StoredWorkspace> {
     match (path, rift_id, source_rift_id, cleaned_at) {
-        (None, None, None, None) => Ok(MigrationWorkspace::NotCreated),
+        (None, None, None, None) => Ok(StoredWorkspace::NotCreated),
         (Some(path), None, None, None) => {
             require_non_empty(&path, "integration workspace path")?;
-            Ok(MigrationWorkspace::CreationIntent { path })
+            Ok(StoredWorkspace::CreationIntent { path })
         }
         (Some(path), Some(rift_id), Some(source_rift_id), None) => {
             require_non_empty(&path, "integration workspace path")?;
             require_non_empty(&rift_id, "integration workspace Rift ID")?;
             require_non_empty(&source_rift_id, "integration workspace source Rift ID")?;
-            Ok(MigrationWorkspace::Retained {
+            Ok(StoredWorkspace::Retained {
                 identity: WorkspaceIdentity {
                     path,
                     rift_id,
@@ -3015,32 +3070,29 @@ fn parse_migration_workspace(
         }
         (None, None, None, Some(cleaned_at)) => {
             validate_timestamp(&cleaned_at, "workspace cleanup timestamp")?;
-            Ok(MigrationWorkspace::Cleaned { cleaned_at })
+            Ok(StoredWorkspace::Cleaned { cleaned_at })
         }
         _ => anyhow::bail!("queue item has partial or contradictory workspace identity"),
     }
 }
 
-fn validate_workspace_status(
-    status: StoredQueueStatus,
-    workspace: &MigrationWorkspace,
-) -> Result<()> {
+fn validate_workspace_status(status: StoredQueueStatus, workspace: &StoredWorkspace) -> Result<()> {
     let valid = match workspace {
-        MigrationWorkspace::NotCreated => matches!(
+        StoredWorkspace::NotCreated => matches!(
             status,
             StoredQueueStatus::Ready
                 | StoredQueueStatus::Merging
                 | StoredQueueStatus::Blocked
                 | StoredQueueStatus::Cancelled
         ),
-        MigrationWorkspace::CreationIntent { .. } => {
+        StoredWorkspace::CreationIntent { .. } => {
             matches!(
                 status,
                 StoredQueueStatus::Merging | StoredQueueStatus::Cancelled
             )
         }
-        MigrationWorkspace::Retained { .. } => true,
-        MigrationWorkspace::Cleaned { .. } => status.terminal(),
+        StoredWorkspace::Retained { .. } => true,
+        StoredWorkspace::Cleaned { .. } => status.terminal(),
     };
     if !valid {
         anyhow::bail!("queue item status and workspace state are incompatible");
@@ -3048,85 +3100,35 @@ fn validate_workspace_status(
     Ok(())
 }
 
-fn validate_v10_identity(connection: &Connection) -> Result<String> {
-    crate::sqlite::validate_schema_objects(connection, "10")?;
-    let database_id = validate_database_identity(connection, "10")?;
+pub(crate) fn validate_control_contents(connection: &Connection) -> Result<()> {
     let expected = expected_debt_from_queue(connection)?;
-    validate_v10_contents(connection, &expected)?;
-    Ok(database_id)
+    validate_control_contents_against_queue(connection, &expected)
 }
 
-fn validate_v10(connection: &Connection) -> Result<()> {
-    validate_v10_identity(connection).map(|_| ())
-}
-
-pub(crate) fn validate_existing_v10_identity(connection: &Connection) -> Result<String> {
-    validate_v10_identity(connection)
-}
-
-fn validate_database_identity(connection: &Connection, expected_version: &str) -> Result<String> {
-    validate_integrity_and_foreign_keys(connection, expected_version)?;
-    let metadata_count: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM queue_metadata WHERE key IN ('workspace_schema_version','database_id')",
-        [],
-        |row| row.get(0),
-    )?;
-    if metadata_count != 2 {
-        anyhow::bail!("IQ database identity metadata is incomplete");
-    }
-    let version: String = connection.query_row(
-        "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
-        [],
-        |row| row.get(0),
-    )?;
-    if version != expected_version {
-        anyhow::bail!("expected IQ schema version {expected_version}, found {version}");
-    }
-    let database_id: String = connection.query_row(
-        "SELECT value FROM queue_metadata WHERE key='database_id'",
-        [],
-        |row| row.get(0),
-    )?;
-    require_non_empty(&database_id, "database ID")?;
-    Ok(database_id)
-}
-
-fn require_database_id(
-    connection: &Connection,
-    expected_version: &str,
-    expected_database_id: &str,
-) -> Result<()> {
-    let actual = validate_database_identity(connection, expected_version)?;
-    if actual != expected_database_id {
-        anyhow::bail!("schema v{expected_version} database ID changed during migration");
-    }
-    Ok(())
-}
-
-fn validate_integrity_and_foreign_keys(connection: &Connection, version: &str) -> Result<()> {
+fn validate_integrity_and_foreign_keys(connection: &Connection) -> Result<()> {
     let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     if integrity != "ok" {
-        anyhow::bail!("IQ schema version {version} integrity check failed: {integrity}");
+        anyhow::bail!("IQ database integrity check failed: {integrity}");
     }
     let foreign_keys: i64 =
         connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
             row.get(0)
         })?;
     if foreign_keys != 0 {
-        anyhow::bail!("IQ schema version {version} has foreign-key errors");
+        anyhow::bail!("IQ database has foreign-key errors");
     }
     Ok(())
 }
 
-fn validate_v10_contents(
+fn validate_control_contents_against_queue(
     connection: &Connection,
     expected: &BTreeMap<String, ExpectedDebt>,
 ) -> Result<()> {
-    validate_integrity_and_foreign_keys(connection, "10")?;
+    validate_integrity_and_foreign_keys(connection)?;
     validate_debt_schema(connection)?;
     let actual = validated_debt_rows(connection)?;
     if actual != *expected {
-        anyhow::bail!("schema v10 cleanup debt target set differs from queue authority");
+        anyhow::bail!("cleanup debt target set differs from queue authority");
     }
     Ok(())
 }
@@ -3179,7 +3181,7 @@ fn validate_debt_schema(connection: &Connection) -> Result<()> {
     )
     .collect::<Vec<_>>();
     if columns != expected {
-        anyhow::bail!("IQ schema version 10 has an invalid terminal cleanup debt shape");
+        anyhow::bail!("IQ has an invalid terminal cleanup debt shape");
     }
 
     let mut foreign_keys = {
@@ -3221,7 +3223,7 @@ fn validate_debt_schema(connection: &Connection) -> Result<()> {
     foreign_keys.sort();
     expected_foreign_keys.sort();
     if foreign_keys != expected_foreign_keys {
-        anyhow::bail!("IQ schema version 10 has invalid terminal cleanup debt foreign keys");
+        anyhow::bail!("IQ has invalid terminal cleanup debt foreign keys");
     }
 
     let indexes = {
@@ -3236,7 +3238,7 @@ fn validate_debt_schema(connection: &Connection) -> Result<()> {
         values
     };
     if indexes != vec![("terminal_workspace_cleanup_debt_due".into(), 0)] {
-        anyhow::bail!("IQ schema version 10 has invalid terminal cleanup debt indexes");
+        anyhow::bail!("IQ has invalid terminal cleanup debt indexes");
     }
     let due_columns = {
         let mut statement = connection.prepare(
@@ -3248,7 +3250,7 @@ fn validate_debt_schema(connection: &Connection) -> Result<()> {
         values
     };
     if due_columns != ["state", "next_retry_at"] {
-        anyhow::bail!("IQ schema version 10 has invalid terminal cleanup due index columns");
+        anyhow::bail!("IQ has invalid terminal cleanup due index columns");
     }
     Ok(())
 }
@@ -3374,247 +3376,6 @@ fn validate_timestamp(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn migrate_v8_to_v9_under_lease(
-    connection: &mut Connection,
-    database_path: &Path,
-    system_config_path: &Path,
-    _lease: &DatabaseProcessLease,
-    source: &PrimaryDatabaseIdentity,
-) -> Result<()> {
-    let system_config = SystemConfig::load(system_config_path)?;
-    let conversion = (|| -> Result<()> {
-        source.verify_authoritative(database_path)?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        reject_migration_authority(&transaction)?;
-        crate::sqlite::validate_schema_objects(&transaction, "8")?;
-        let source_database_id = validate_database_identity(&transaction, "8")?;
-        let active = active_v8_items(&transaction)?;
-        let mut conversions = Vec::new();
-        for item in active {
-            let project =
-                crate::composition::load_project_control_only(Path::new(&item.repo_path))?;
-            crate::state_repository::repository(&project.state_repository)?.verify()?;
-            let runner = item
-                .claimed
-                .as_ref()
-                .map(|_| system_config.runner_snapshot(project.model.as_deref()))
-                .transpose()?;
-            conversions.push((item, runner, project.state_repository));
-        }
-        let backup_source = open_backup_source(database_path)?;
-        let backup = create_verified_backup(&backup_source, database_path, "8")?;
-        drop(backup_source);
-        run_migration_backup_test_hook(database_path, &backup.path);
-        run_migration_primary_test_hook(database_path);
-        source.verify_authoritative(database_path)?;
-        transaction.execute_batch("DROP TABLE IF EXISTS terminal_workspace_cleanup_debt;")?;
-        transaction.execute_batch(V9_SCHEMA)?;
-        for (item, runner, state_repository) in &conversions {
-            bind_item_state_repository(&transaction, item, state_repository)?;
-            if let Some(claimed) = &item.claimed {
-                convert_item(
-                    &transaction,
-                    item,
-                    claimed,
-                    runner
-                        .as_ref()
-                        .context("claimed v8 item has no runner snapshot")?,
-                    state_repository,
-                )?;
-            }
-        }
-        transaction.execute(
-            "UPDATE prompts SET status='superseded',answer='schema_v9_agent_first' WHERE status='open'",
-            [],
-        )?;
-        transaction.execute("DELETE FROM communication_response_receipts", [])?;
-        transaction.execute("DELETE FROM communication_bindings", [])?;
-        transaction.execute_batch(
-            "DROP TABLE communication_response_receipts; DROP TABLE communication_bindings;",
-        )?;
-        require_database_id(&transaction, "8", &source_database_id)?;
-        let changed = transaction.execute(
-            "UPDATE queue_metadata SET value='9' WHERE key='workspace_schema_version' AND value='8'",
-            [],
-        )?;
-        if changed != 1 {
-            anyhow::bail!("schema v9 metadata update did not change exactly one row");
-        }
-        let claimed_count: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM queue_items WHERE status NOT IN ('integrated','cancelled') AND current_attempt_id IS NOT NULL",
-            [],
-            |row| row.get(0),
-        )?;
-        let effort_count: i64 =
-            transaction.query_row("SELECT COUNT(*) FROM integration_efforts", [], |row| {
-                row.get(0)
-            })?;
-        if claimed_count != effort_count {
-            anyhow::bail!(
-                "schema v9 conversion did not create exactly one effort per claimed active item"
-            );
-        }
-        let foreign_keys: i64 =
-            transaction.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
-                row.get(0)
-            })?;
-        if foreign_keys != 0 {
-            anyhow::bail!("schema v9 conversion has foreign-key errors");
-        }
-        require_database_id(&transaction, "9", &source_database_id)?;
-        validate_v9(&transaction)?;
-        validate_backup(&backup, "8", _lease, None)?;
-        run_migration_backup_precommit_test_hook(database_path, &backup.path);
-        source.verify_authoritative(database_path)?;
-        let _backup_guard = verify_backup_ready_for_commit(&backup)?;
-        transaction.commit()?;
-        source.verify_authoritative(database_path)?;
-        Ok(())
-    })();
-    match conversion {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            crate::sqlite::validate_schema_objects(connection, "8")?;
-            validate_database_identity(connection, "8").context(
-                "schema v9 migration failed and rollback did not preserve valid schema v8",
-            )?;
-            Err(error).context("schema v9 migration rolled back to valid schema v8")
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct BackupIdentity {
-    path: PathBuf,
-    sha256: String,
-    size: u64,
-    database_id: String,
-    device: u64,
-    inode: u64,
-    contents_sha256: String,
-}
-
-fn open_backup_source(database_path: &Path) -> Result<Connection> {
-    let connection = Connection::open_with_flags(
-        database_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )?;
-    connection.pragma_update(None, "foreign_keys", "ON")?;
-    Ok(connection)
-}
-
-fn create_verified_backup(
-    source: &Connection,
-    database_path: &Path,
-    source_version: &str,
-) -> Result<BackupIdentity> {
-    let parent = database_path
-        .parent()
-        .context("database path has no parent")?;
-    let database_id = validate_database_identity(source, source_version)?;
-    let source_contents = database_contents_digest(source)?;
-    let mut name = database_path
-        .file_name()
-        .context("database path has no file name")?
-        .to_os_string();
-    name.push(format!(
-        ".schema-v{source_version}.{}.backup",
-        Uuid::new_v4()
-    ));
-    let backup_path = parent.join(name);
-    let reserve = OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&backup_path)
-        .with_context(|| {
-            format!(
-                "reserve schema-v{source_version} backup {}",
-                backup_path.display()
-            )
-        })?;
-    let reserved_metadata = reserve.metadata()?;
-    let mut destination = Connection::open_with_flags(
-        &backup_path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )?;
-    let opened_metadata = fs::symlink_metadata(&backup_path)?;
-    if (opened_metadata.dev(), opened_metadata.ino())
-        != (reserved_metadata.dev(), reserved_metadata.ino())
-    {
-        anyhow::bail!("schema backup inode changed before SQLite backup opened");
-    }
-    {
-        let backup = Backup::new(source, &mut destination)?;
-        backup.run_to_completion(128, Duration::from_millis(10), None)?;
-    }
-    destination.pragma_update(None, "foreign_keys", "ON")?;
-    drop(destination);
-    reserve.sync_all()?;
-    let metadata = reserve.metadata()?;
-    let path_metadata = fs::symlink_metadata(&backup_path)?;
-    if (path_metadata.dev(), path_metadata.ino()) != (metadata.dev(), metadata.ino()) {
-        anyhow::bail!("schema backup inode changed during creation");
-    }
-    File::open(parent)?.sync_all()?;
-    let (sha256, size) = digest_open_file(&reserve)?;
-    let backup = BackupIdentity {
-        path: backup_path,
-        sha256,
-        size,
-        database_id,
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        contents_sha256: source_contents,
-    };
-    verify_backup_ready_for_commit(&backup)?;
-    Ok(backup)
-}
-
-fn run_migration_backup_test_hook(_database_path: &Path, _backup_path: &Path) {
-    #[cfg(debug_assertions)]
-    {
-        let mut hook = MIGRATION_BACKUP_TEST_HOOK.lock().unwrap();
-        if hook
-            .as_ref()
-            .is_some_and(|(target, _)| target == _database_path)
-        {
-            let (_, run) = hook.take().unwrap();
-            run(_backup_path);
-        }
-    }
-}
-
-fn run_migration_primary_test_hook(_database_path: &Path) {
-    #[cfg(debug_assertions)]
-    {
-        let mut hook = MIGRATION_PRIMARY_TEST_HOOK.lock().unwrap();
-        if hook
-            .as_ref()
-            .is_some_and(|(target, _)| target == _database_path)
-        {
-            let (_, run) = hook.take().unwrap();
-            run(_database_path);
-        }
-    }
-}
-
-fn run_migration_backup_precommit_test_hook(_database_path: &Path, _backup_path: &Path) {
-    #[cfg(debug_assertions)]
-    {
-        let mut hook = MIGRATION_BACKUP_PRECOMMIT_TEST_HOOK.lock().unwrap();
-        if hook
-            .as_ref()
-            .is_some_and(|(target, _)| target == _database_path)
-        {
-            let (_, run) = hook.take().unwrap();
-            run(_backup_path);
-        }
-    }
-}
-
 pub(crate) fn run_runtime_open_handoff_test_hook(_database_path: &Path) {
     #[cfg(debug_assertions)]
     {
@@ -3629,22 +3390,8 @@ pub(crate) fn run_runtime_open_handoff_test_hook(_database_path: &Path) {
     }
 }
 
-fn run_database_snapshot_test_hook(_database_path: &Path, _snapshot_path: &Path) {
-    #[cfg(debug_assertions)]
-    {
-        let mut hook = DATABASE_SNAPSHOT_TEST_HOOK.lock().unwrap();
-        if hook
-            .as_ref()
-            .is_some_and(|(target, _)| target == _database_path)
-        {
-            let (_, run) = hook.take().unwrap();
-            run(_snapshot_path);
-        }
-    }
-}
-
 #[doc(hidden)]
-pub fn reinstall_v10_triggers_for_test(connection: &Connection) -> Result<()> {
+pub fn reinstall_cleanup_triggers_for_test(connection: &Connection) -> Result<()> {
     connection.execute_batch(
         "DROP TRIGGER IF EXISTS terminal_cleanup_debt_queue_update;
          DROP TRIGGER IF EXISTS terminal_cleanup_debt_insert_guard;
@@ -3658,434 +3405,22 @@ pub fn reinstall_v10_triggers_for_test(connection: &Connection) -> Result<()> {
          DROP TRIGGER IF EXISTS terminal_cleanup_debt_delete_guard;
          DROP TRIGGER IF EXISTS terminal_cleanup_debt_cleaned;",
     )?;
-    connection.execute_batch(V10_TRIGGERS)?;
+    connection.execute_batch(CLEANUP_TRIGGERS)?;
     Ok(())
 }
 
-fn validate_backup(
-    backup: &BackupIdentity,
-    source_version: &str,
-    lease: &DatabaseProcessLease,
-    expected_v9: Option<&BTreeMap<String, ExpectedDebt>>,
-) -> Result<()> {
-    let file = verify_backup_ready_for_commit(backup)?;
-    let (digest, size) = digest_open_file(&file)?;
-    if digest != backup.sha256 || size != backup.size {
-        anyhow::bail!("schema backup digest or size changed");
-    }
-    validate_database_snapshot_with_source_under_lease(
-        &backup.path,
-        lease,
-        SnapshotInput::SidecarFreeOpenFile(&file),
-        |connection| {
-            let database_id = validate_database_identity(connection, source_version)?;
-            if database_id != backup.database_id {
-                anyhow::bail!("schema-v{source_version} backup database ID changed");
-            }
-            if let Some(expected) = expected_v9 {
-                if validate_v9(connection)?.1 != *expected {
-                    anyhow::bail!("schema-v9 backup differs from the validated source contents");
-                }
-            }
-            if database_contents_digest(connection)? != backup.contents_sha256 {
-                anyhow::bail!(
-                    "schema-v{source_version} backup differs from the full source database"
-                );
-            }
-            Ok(())
-        },
-    )?;
-    verify_backup_ready_for_commit(backup)?;
-    let (final_digest, final_size) = digest_open_file(&file)?;
-    if final_digest != backup.sha256 || final_size != backup.size {
-        anyhow::bail!("schema backup changed during validation");
-    }
-    Ok(())
-}
-
-fn verify_backup_ready_for_commit(backup: &BackupIdentity) -> Result<File> {
-    let file = open_exact_backup(backup)?;
-    verify_no_database_sidecars(&backup.path, "schema backup")?;
-    let (digest, size) = digest_open_file(&file)?;
-    if digest != backup.sha256 || size != backup.size {
-        anyhow::bail!("schema backup digest or size changed");
-    }
-    Ok(file)
-}
-
-fn open_exact_backup(backup: &BackupIdentity) -> Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOATIME)
-        .open(&backup.path)?;
-    let metadata = file.metadata()?;
-    let path_metadata = fs::symlink_metadata(&backup.path)?;
-    if !metadata.is_file()
-        || metadata.permissions().mode() & 0o777 != 0o600
-        || metadata.dev() != backup.device
-        || metadata.ino() != backup.inode
-        || path_metadata.file_type().is_symlink()
-        || !path_metadata.is_file()
-        || path_metadata.dev() != backup.device
-        || path_metadata.ino() != backup.inode
+fn run_database_snapshot_test_hook(_database_path: &Path, _snapshot_path: &Path) {
+    #[cfg(debug_assertions)]
     {
-        anyhow::bail!("schema backup lost its protected inode identity");
-    }
-    Ok(file)
-}
-
-fn digest_open_file(file: &File) -> Result<(String, u64)> {
-    let mut file = file.try_clone()?;
-    use std::io::{Seek, SeekFrom};
-    file.seek(SeekFrom::Start(0))?;
-    let mut digest = Sha256::new();
-    let size = std::io::copy(&mut file, &mut digest)?;
-    Ok((format!("{:x}", digest.finalize()), size))
-}
-
-fn database_contents_digest(connection: &Connection) -> Result<String> {
-    let mut digest = Sha256::new();
-    let mut schema = connection.prepare(
-        "SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_schema ORDER BY type,name,tbl_name",
-    )?;
-    let objects = schema.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?;
-    for object in objects {
-        let (object_type, name, table_name, sql) = object?;
-        digest_field(&mut digest, object_type.as_bytes());
-        digest_field(&mut digest, name.as_bytes());
-        digest_field(&mut digest, table_name.as_bytes());
-        digest_field(&mut digest, sql.as_bytes());
-    }
-    drop(schema);
-
-    let table_names = connection
-        .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    for table_name in table_names {
-        digest_field(&mut digest, table_name.as_bytes());
-        let quoted_table = quote_identifier(&table_name);
-        let columns = connection
-            .prepare(&format!("SELECT * FROM {quoted_table} LIMIT 0"))?
-            .column_names()
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        for column in &columns {
-            digest_field(&mut digest, column.as_bytes());
-        }
-        let order = columns
-            .iter()
-            .map(|column| {
-                let column = quote_identifier(column);
-                format!("typeof({column}),quote({column}) COLLATE BINARY")
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        let mut statement =
-            connection.prepare(&format!("SELECT * FROM {quoted_table} ORDER BY {order}"))?;
-        let rows = statement.query_map([], |row| {
-            let mut values = Vec::with_capacity(columns.len());
-            for index in 0..columns.len() {
-                values.push(match row.get_ref(index)? {
-                    ValueRef::Null => (0, Vec::new()),
-                    ValueRef::Integer(value) => (1, value.to_be_bytes().to_vec()),
-                    ValueRef::Real(value) => (2, value.to_bits().to_be_bytes().to_vec()),
-                    ValueRef::Text(value) => (3, value.to_vec()),
-                    ValueRef::Blob(value) => (4, value.to_vec()),
-                });
-            }
-            Ok(values)
-        })?;
-        for row in rows {
-            for (kind, value) in row? {
-                digest.update([kind]);
-                digest_field(&mut digest, &value);
-            }
+        let mut hook = DATABASE_SNAPSHOT_TEST_HOOK.lock().unwrap();
+        if hook
+            .as_ref()
+            .is_some_and(|(target, _)| target == _database_path)
+        {
+            let (_, run) = hook.take().unwrap();
+            run(_snapshot_path);
         }
     }
-    Ok(format!("{:x}", digest.finalize()))
-}
-
-fn digest_field(digest: &mut Sha256, value: &[u8]) {
-    digest.update((value.len() as u64).to_be_bytes());
-    digest.update(value);
-}
-
-fn quote_identifier(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
-}
-
-fn reject_migration_authority(connection: &Connection) -> Result<()> {
-    let leases: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM repo_leases WHERE expires_at>?1",
-        params![now()],
-        |row| row.get(0),
-    )?;
-    let has_daemon_leases: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='daemon_leases')",
-        [],
-        |row| row.get(0),
-    )?;
-    let daemon_leases: i64 = if has_daemon_leases {
-        connection.query_row(
-            "SELECT COUNT(*) FROM daemon_leases WHERE expires_at>?1",
-            params![now()],
-            |row| row.get(0),
-        )?
-    } else {
-        0
-    };
-    if leases != 0 || daemon_leases != 0 {
-        anyhow::bail!(
-            "schema v9 migration requires no active repository-operation or daemon lease"
-        );
-    }
-    Ok(())
-}
-
-#[derive(Clone, Debug)]
-struct V8ActiveItem {
-    id: String,
-    repo_path: String,
-    claimed: Option<V8ClaimedItem>,
-    created_at: String,
-}
-
-#[derive(Clone, Debug)]
-struct V8ClaimedItem {
-    attempt_id: String,
-    target_sha: String,
-    source_sha: String,
-    source_kind: String,
-    landing_policy: String,
-    workspace: WorkspaceIdentity,
-    status: String,
-    blocked_phase: Option<String>,
-    blocked_reason: Option<String>,
-    blocked_message: Option<String>,
-    updated_at: String,
-}
-
-fn active_v8_items(connection: &Connection) -> Result<Vec<V8ActiveItem>> {
-    let mut statement = connection.prepare(
-        "SELECT item.id,item.repo_path,item.current_attempt_id,item.target_sha,item.source_sha,attempt.target_base_sha,item.source_kind,item.landing_policy,item.integration_workspace_path,item.integration_workspace_rift_id,item.integration_workspace_source_rift_id,item.status,item.blocked_phase,item.blocked_reason,item.blocked_message,item.created_at,item.updated_at FROM queue_items item LEFT JOIN integration_attempts attempt ON attempt.id=item.current_attempt_id WHERE item.status NOT IN ('integrated','cancelled') ORDER BY item.created_at,item.id",
-    )?;
-    let items = statement
-        .query_map([], |row| {
-            let id: String = row.get(0)?;
-            let required = |value: Option<String>, field: &'static str| {
-                value.ok_or_else(|| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Null,
-                        Box::new(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("active v8 item {id} lacks {field}"),
-                        )),
-                    )
-                })
-            };
-            let attempt_id: Option<String> = row.get(2)?;
-            let target_sha: Option<String> = row.get(3)?;
-            let source_sha: Option<String> = row.get(4)?;
-            let base_sha: Option<String> = row.get(5)?;
-            let workspace_path: Option<String> = row.get(8)?;
-            let workspace_rift_id: Option<String> = row.get(9)?;
-            let workspace_source_rift_id: Option<String> = row.get(10)?;
-            let claimed = if let Some(attempt_id) = attempt_id {
-                let target_sha = required(target_sha, "target SHA")?;
-                let source_sha = required(source_sha, "source SHA")?;
-                required(base_sha, "base SHA")?;
-                Some(V8ClaimedItem {
-                    attempt_id,
-                    target_sha,
-                    source_sha,
-                    source_kind: row.get(6)?,
-                    landing_policy: row.get(7)?,
-                    workspace: WorkspaceIdentity {
-                        path: required(workspace_path, "retained Rift path")?,
-                        rift_id: required(workspace_rift_id, "retained Rift ID")?,
-                        source_rift_id: required(workspace_source_rift_id, "source Rift ID")?,
-                    },
-                    status: row.get(11)?,
-                    blocked_phase: row.get(12)?,
-                    blocked_reason: row.get(13)?,
-                    blocked_message: row.get(14)?,
-                    updated_at: row.get(16)?,
-                })
-            } else {
-                let status: String = row.get(11)?;
-                if status != "ready" {
-                    return Err(rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Null,
-                        Box::new(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("unclaimed v8 item {id} has non-ready status {status}"),
-                        )),
-                    ));
-                }
-                if target_sha.is_some()
-                    || source_sha.is_some()
-                    || base_sha.is_some()
-                    || workspace_path.is_some()
-                    || workspace_rift_id.is_some()
-                    || workspace_source_rift_id.is_some()
-                {
-                    return Err(rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Null,
-                        Box::new(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("unclaimed v8 item {id} has claimed integration state"),
-                        )),
-                    ));
-                }
-                None
-            };
-            Ok(V8ActiveItem {
-                id,
-                repo_path: row.get(1)?,
-                claimed,
-                created_at: row.get(15)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(items)
-}
-
-fn convert_item(
-    transaction: &rusqlite::Transaction<'_>,
-    item: &V8ActiveItem,
-    claimed: &V8ClaimedItem,
-    runner: &RunnerSnapshot,
-    state_repository: &StateRepositorySnapshot,
-) -> Result<()> {
-    crate::control_domain::require_sha(&claimed.target_sha, "converted target SHA")?;
-    crate::control_domain::require_sha(&claimed.source_sha, "converted source SHA")?;
-    let conflict_prompt: bool = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM prompts WHERE item_id=?1 AND status='open' AND blocked_phase='merging')",
-        params![item.id],
-        |row| row.get(0),
-    )?;
-    let state = match claimed.status.as_str() {
-        "ready" | "merging" => {
-            IntegrationEffortState::AgentReady(AgentReady { next_cycle: 1 })
-        }
-        "merged" | "validating" | "validated" | "integrating" => anyhow::bail!(
-            "candidate-bearing v8 item has no durable builder operation identity and staged-tree digest"
-        ),
-        "blocked" if conflict_prompt => {
-            IntegrationEffortState::AgentReady(AgentReady { next_cycle: 1 })
-        }
-        "blocked" => {
-            match claimed.blocked_reason.as_deref() {
-                Some("provider") => anyhow::bail!(
-                    "provider-blocked v8 item has no durable v9 candidate operation authority"
-                ),
-                Some("infra" | "dependency" | "credentials") => {
-                    if claimed.blocked_phase.as_deref() != Some("merging") {
-                        anyhow::bail!("non-merging v8 infrastructure blocker requires unavailable candidate authority");
-                    }
-                    IntegrationEffortState::InfrastructureBlocked(
-                        crate::control_domain::BlockedEffort {
-                            blocker: IntegrationBlocker::Infrastructure(
-                                crate::control_domain::InfrastructureBlocker {
-                                    component:
-                                        crate::control_domain::InfrastructureComponent::Filesystem,
-                                    operation: claimed.blocked_phase.clone().context("infrastructure-blocked v8 item has no exact phase")?,
-                                    cause:
-                                        crate::control_domain::InfrastructureCause::Unavailable {
-                                            detail: claimed.blocked_message.clone().context("infrastructure-blocked v8 item has no exact evidence")?,
-                                        },
-                                },
-                            ),
-                            resume: ResumeState::AgentReady(AgentReady { next_cycle: 1 }),
-                        },
-                    )
-                }
-                _ => anyhow::bail!("active v8 blocked item has no exact schema-v9 mapping"),
-            }
-        }
-        status => anyhow::bail!(
-            "active v8 item {} has no exact schema-v9 mapping from {status}",
-            item.id
-        ),
-    };
-    let effort_id = Uuid::new_v4().to_string();
-    state.validate_for_count(0)?;
-    transaction.execute(
-        "INSERT INTO integration_efforts(id,item_id,attempt_id,target_sha,source_sha,source_variant,landing_variant,workspace_json,runner_snapshot_json,state_repository_json,failed_cycles,state,state_json,blocker_kind,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,?11,?12,?13,?14,?15)",
-        params![effort_id,item.id,claimed.attempt_id,claimed.target_sha,claimed.source_sha,claimed.source_kind,claimed.landing_policy,serde_json::to_string(&claimed.workspace)?,serde_json::to_string(runner)?,serde_json::to_string(state_repository)?,state.name(),serde_json::to_string(&state)?,state.blocker().map(IntegrationBlocker::kind),item.created_at,claimed.updated_at],
-    )?;
-    let effort = required_effort(transaction, &effort_id)?;
-    project_queue_state(transaction, &effort, &state)?;
-    append_event_raw(
-        transaction,
-        &item.id,
-        Some(&effort_id),
-        "schema_v9_converted",
-        serde_json::json!({"old_status":claimed.status}),
-        false,
-    )?;
-    Ok(())
-}
-
-fn bind_item_state_repository(
-    transaction: &rusqlite::Transaction<'_>,
-    item: &V8ActiveItem,
-    state_repository: &StateRepositorySnapshot,
-) -> Result<()> {
-    let (provider, repository, visibility, reservation_state) = match state_repository {
-        StateRepositorySnapshot::Local => (None, None, None, "none"),
-        StateRepositorySnapshot::GithubIssue(issue) => (
-            Some("github"),
-            Some(issue.repository.as_str()),
-            Some(match issue.visibility {
-                crate::control_domain::IssueVisibility::Minimal => "minimal",
-                crate::control_domain::IssueVisibility::Full => "full",
-            }),
-            if issue.visibility == crate::control_domain::IssueVisibility::Full {
-                "pending"
-            } else {
-                "none"
-            },
-        ),
-        StateRepositorySnapshot::GitlabIssue(issue) => (
-            Some("gitlab"),
-            Some(issue.repository.as_str()),
-            Some(match issue.visibility {
-                crate::control_domain::IssueVisibility::Minimal => "minimal",
-                crate::control_domain::IssueVisibility::Full => "full",
-            }),
-            if issue.visibility == crate::control_domain::IssueVisibility::Full {
-                "pending"
-            } else {
-                "none"
-            },
-        ),
-    };
-    transaction.execute(
-        "INSERT OR IGNORE INTO item_state_repository_bindings(item_id,snapshot_json,provider,repository,visibility,reservation_state,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-        params![item.id,serde_json::to_string(state_repository)?,provider,repository,visibility,reservation_state,item.created_at],
-    )?;
-    let stored: String = transaction.query_row(
-        "SELECT snapshot_json FROM item_state_repository_bindings WHERE item_id=?1",
-        params![item.id],
-        |row| row.get(0),
-    )?;
-    if serde_json::from_str::<StateRepositorySnapshot>(&stored)?.validate()? != *state_repository {
-        anyhow::bail!("existing item repository snapshot differs from schema-v9 conversion");
-    }
-    Ok(())
 }
 
 fn map_effort(row: &rusqlite::Row<'_>) -> rusqlite::Result<IntegrationEffort> {
@@ -4169,6 +3504,7 @@ fn project_queue_state(
         return Ok(());
     }
     let (status, phase, reason, message) = match state {
+        IntegrationEffortState::ReplacementPending(_) => ("ready", None, None, None),
         IntegrationEffortState::AgentReady(_)
         | IntegrationEffortState::AgentLaunching(_)
         | IntegrationEffortState::AgentRunning(_)
@@ -4434,7 +3770,7 @@ fn git_text<const N: usize>(repository: &Path, args: [&str; N]) -> Result<String
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
-const V9_SCHEMA: &str = r#"
+const CONTROL_SCHEMA: &str = r#"
 CREATE UNIQUE INDEX IF NOT EXISTS integration_attempt_item_identity
 ON integration_attempts(id,item_id);
 
@@ -4450,7 +3786,7 @@ CREATE TABLE IF NOT EXISTS integration_efforts (
   runner_snapshot_json TEXT NOT NULL CHECK(json_valid(runner_snapshot_json)),
   state_repository_json TEXT NOT NULL CHECK(json_valid(state_repository_json)),
   failed_cycles INTEGER NOT NULL DEFAULT 0 CHECK(failed_cycles BETWEEN 0 AND 10),
-  state TEXT NOT NULL CHECK(state IN ('agent_ready','agent_launching','agent_running','candidate_building','candidate_ready','validating','guidance_required','infrastructure_blocked','cycle_limit_blocked','provider_blocked','landing','landing_uncertain','integrated','cancelled')),
+  state TEXT NOT NULL CHECK(state IN ('replacement_pending','agent_ready','agent_launching','agent_running','candidate_building','candidate_ready','validating','guidance_required','infrastructure_blocked','cycle_limit_blocked','provider_blocked','landing','landing_uncertain','integrated','cancelled')),
   state_json TEXT NOT NULL CHECK(json_valid(state_json) AND json_extract(state_json,'$.state') IS state),
   blocker_kind TEXT CHECK(blocker_kind IN ('semantic_guidance','infrastructure','cycle_limit','provider_signoff')),
   created_at TEXT NOT NULL,
@@ -4464,6 +3800,7 @@ CREATE TABLE IF NOT EXISTS integration_efforts (
     ELSE blocker_kind IS NULL END,0)),
   CHECK((state='cycle_limit_blocked')=(failed_cycles=10)),
   CHECK(COALESCE(CASE state
+    WHEN 'replacement_pending' THEN failed_cycles=0 AND json_type(state_json,'$.payload.old_attempt_id')='text' AND json_extract(state_json,'$.payload.old_attempt_id')=attempt_id AND json_type(state_json,'$.payload.replaced_at')='text'
     WHEN 'agent_ready' THEN json_type(state_json,'$.payload.next_cycle')='integer' AND json_extract(state_json,'$.payload.next_cycle')>=1
     WHEN 'agent_launching' THEN json_type(state_json,'$.payload.launch_operation_id')='text' AND json_type(state_json,'$.payload.unit_name')='text' AND json_type(state_json,'$.payload.cycle_id')='text' AND json_type(state_json,'$.payload.cycle_number')='integer' AND json_type(state_json,'$.payload.protocol_directory')='text'
     WHEN 'agent_running' THEN json_type(state_json,'$.payload.cycle_id')='text' AND json_type(state_json,'$.payload.pid')='integer' AND json_type(state_json,'$.payload.process_start_ticks')='integer' AND json_type(state_json,'$.payload.process_group_id')='integer'
@@ -4654,6 +3991,7 @@ WHEN json_type(NEW.state_json,'$')!='object'
   OR (SELECT COUNT(*) FROM json_each(NEW.state_json))!=2
   OR EXISTS(SELECT 1 FROM json_each(NEW.state_json) WHERE key NOT IN ('state','payload'))
   OR NOT CASE NEW.state
+    WHEN 'replacement_pending' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=2 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('old_attempt_id','replaced_at'))
     WHEN 'agent_ready' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=1 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('next_cycle'))
     WHEN 'agent_launching' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=8 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('launch_operation_id','unit_name','cycle_id','cycle_number','authority_lease_id','input_sha256','protocol_directory','prepared_at'))
     WHEN 'agent_running' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=12 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('launch_operation_id','unit_name','cycle_id','cycle_number','pid','process_start_ticks','process_group_id','authority_lease_id','sandbox_id','input_sha256','result','started_at'))
@@ -4680,6 +4018,7 @@ WHEN json_type(NEW.state_json,'$')!='object'
   OR (SELECT COUNT(*) FROM json_each(NEW.state_json))!=2
   OR EXISTS(SELECT 1 FROM json_each(NEW.state_json) WHERE key NOT IN ('state','payload'))
   OR NOT CASE NEW.state
+    WHEN 'replacement_pending' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=2 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('old_attempt_id','replaced_at'))
     WHEN 'agent_ready' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=1 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('next_cycle'))
     WHEN 'agent_launching' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=8 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('launch_operation_id','unit_name','cycle_id','cycle_number','authority_lease_id','input_sha256','protocol_directory','prepared_at'))
     WHEN 'agent_running' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=12 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('launch_operation_id','unit_name','cycle_id','cycle_number','pid','process_start_ticks','process_group_id','authority_lease_id','sandbox_id','input_sha256','result','started_at'))
@@ -4702,6 +4041,7 @@ END;
 CREATE TRIGGER IF NOT EXISTS integration_effort_legal_transition
 BEFORE UPDATE OF state ON integration_efforts
 WHEN NEW.state!=OLD.state AND NOT (
+  (OLD.state='replacement_pending' AND NEW.state='agent_ready') OR
   (OLD.state='agent_ready' AND NEW.state IN ('agent_launching','infrastructure_blocked','cancelled')) OR
   (OLD.state='agent_launching' AND NEW.state IN ('agent_ready','agent_running','infrastructure_blocked','cancelled')) OR
   (OLD.state='agent_running' AND NEW.state IN ('candidate_building','agent_ready','guidance_required','infrastructure_blocked','cycle_limit_blocked','cancelled')) OR
@@ -4710,7 +4050,7 @@ WHEN NEW.state!=OLD.state AND NOT (
   (OLD.state='validating' AND NEW.state IN ('validating','landing','agent_ready','guidance_required','infrastructure_blocked','provider_blocked','cycle_limit_blocked','cancelled')) OR
   (OLD.state='guidance_required' AND NEW.state IN ('agent_ready','cancelled')) OR
   (OLD.state='infrastructure_blocked' AND NEW.state IN ('agent_ready','candidate_building','candidate_ready','validating','landing','landing_uncertain','cancelled')) OR
-  (OLD.state='cycle_limit_blocked' AND NEW.state IN ('agent_ready','cancelled')) OR
+  (OLD.state='cycle_limit_blocked' AND NEW.state IN ('replacement_pending','agent_ready','cancelled')) OR
   (OLD.state='provider_blocked' AND NEW.state IN ('validating','landing','landing_uncertain','agent_ready','cancelled')) OR
   (OLD.state='landing' AND NEW.state IN ('landing_uncertain','integrated','agent_ready','provider_blocked','infrastructure_blocked','cancelled')) OR
   (OLD.state='landing_uncertain' AND NEW.state IN ('integrated','landing','agent_ready','provider_blocked','infrastructure_blocked'))
@@ -4737,7 +4077,7 @@ WHEN NOT (
   (NEW.state='candidate_building' AND EXISTS(SELECT 1 FROM integration_cycles cycle WHERE cycle.effort_id=NEW.id AND cycle.id=json_extract(NEW.state_json,'$.payload.cycle_id') AND cycle.status='resolved')) OR
   (NEW.state IN ('candidate_ready','validating','landing','landing_uncertain','provider_blocked','integrated') AND EXISTS(SELECT 1 FROM candidate_evidence candidate WHERE candidate.effort_id=NEW.id AND candidate.candidate_sha=COALESCE(json_extract(NEW.state_json,'$.payload.candidate_sha'),json_extract(NEW.state_json,'$.payload.blocker.candidate_sha')))) OR
   (NEW.state='guidance_required' AND EXISTS(SELECT 1 FROM guidance_requests request WHERE request.effort_id=NEW.id AND request.status='open')) OR
-  NEW.state IN ('agent_ready','infrastructure_blocked','cycle_limit_blocked','cancelled')
+  NEW.state IN ('replacement_pending','agent_ready','infrastructure_blocked','cycle_limit_blocked','cancelled')
 )
 BEGIN
   SELECT RAISE(ABORT,'integration effort related state is invalid');
@@ -4752,6 +4092,7 @@ WHEN EXISTS(SELECT 1 FROM integration_efforts WHERE item_id=OLD.id)
     WHERE effort.item_id=OLD.id
       AND NEW.prompt_id IS NULL
       AND NEW.status=CASE
+        WHEN effort.state='replacement_pending' THEN CASE WHEN NEW.current_attempt_id IS NULL OR NEW.current_attempt_id=effort.attempt_id THEN 'ready' ELSE 'merging' END
         WHEN effort.state IN ('agent_ready','agent_launching','agent_running','candidate_building') THEN 'merging'
         WHEN effort.state='candidate_ready' THEN 'merged'
         WHEN effort.state='validating' AND json_extract(effort.state_json,'$.payload.stage')='running' THEN 'validating'
@@ -4816,7 +4157,7 @@ BEGIN
 END;
 "#;
 
-const V10_SCHEMA: &str = r#"
+const CLEANUP_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS terminal_workspace_cleanup_debt (
   item_id TEXT NOT NULL PRIMARY KEY REFERENCES queue_items(id) ON DELETE CASCADE,
   workspace_json TEXT NOT NULL CHECK(
@@ -4846,7 +4187,7 @@ CREATE TABLE IF NOT EXISTS terminal_workspace_cleanup_debt (
 CREATE INDEX IF NOT EXISTS terminal_workspace_cleanup_debt_due ON terminal_workspace_cleanup_debt(state,next_retry_at);
 "#;
 
-const V10_TRIGGERS: &str = r#"
+const CLEANUP_TRIGGERS: &str = r#"
 CREATE TRIGGER terminal_cleanup_debt_queue_update
 BEFORE UPDATE OF status,integration_workspace_path,integration_workspace_rift_id,integration_workspace_source_rift_id,integration_workspace_cleaned_at ON queue_items
 WHEN NEW.status IN ('integrated','cancelled') AND NEW.integration_workspace_cleaned_at IS NULL

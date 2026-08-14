@@ -2,12 +2,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::ffi::{CString, OsStr};
-use std::fs::{self, OpenOptions};
-use std::io::Read;
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::MetadataExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::ffi::OsStr;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
@@ -19,19 +15,26 @@ use crate::integrator::{
 };
 use crate::sqlite::{
     CheckoutReconciliationState, CleanupState, DevelopmentWorkspace, DevelopmentWorkspaceStatus,
-    QueueItem, RegisteredRemote, RegisteredRepository, ReplacementState, ResidueDiscardState,
-    SeedRefreshState, SqliteQueue, WorkspaceIdentity, WorkspaceState,
+    EnqueueRequest, QueueItem, RegisteredRemote, RegisteredRepository, ReplacementState,
+    ResidueDiscardState, SqliteQueue, WorkspaceIdentity,
 };
 
 const LEASE_SECONDS: i64 = 30;
-const MAX_POLICY_BYTES: usize = 1024 * 1024;
+
+#[cfg(debug_assertions)]
+fn stop_composition_target_after(boundary: &str) {
+    if std::env::var("IQ_TEST_COMPOSITION_TARGET_STOP_AFTER").as_deref() == Ok(boundary) {
+        std::process::exit(82);
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn stop_composition_target_after(_boundary: &str) {}
 
 #[derive(Clone, Debug)]
 pub struct RepositoryInitOptions {
     pub target_branch: String,
     pub remote: String,
-    pub seed_path: Option<PathBuf>,
-    pub workspace_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -100,10 +103,8 @@ struct RawValidation {
 #[derive(Debug, Serialize)]
 pub struct RepositoryStatus {
     pub repository: RegisteredRepository,
-    pub integration_head: String,
-    pub integration_clean: bool,
-    pub seed_head: Option<String>,
-    pub seed_clean: bool,
+    pub owned_root_head: String,
+    pub owned_root_clean: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -232,6 +233,30 @@ impl RepositoryGuard {
         })
     }
 
+    fn acquire_wait(
+        queue: SqliteQueue,
+        integration_path: &Path,
+        repo_key: &str,
+        owner_id: &str,
+    ) -> Result<Self> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(operation) = RepositoryOperationLease::try_acquire(
+                queue.clone(),
+                integration_path,
+                repo_key,
+                owner_id,
+                LEASE_SECONDS,
+            )? {
+                return Ok(Self { operation });
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("repository queue {repo_key} has an active operation");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn ensure(&self) -> Result<()> {
         self.operation.ensure()
     }
@@ -277,118 +302,33 @@ impl RepositoryManager {
 
     pub fn init(
         &self,
-        integration_path: &Path,
+        bootstrap_path: &Path,
         options: RepositoryInitOptions,
     ) -> Result<RegisteredRepository> {
-        let integration_path = canonical_checkout(integration_path)?;
-        validate_ref_component(&options.target_branch, "target branch")?;
-        validate_git_branch(&integration_path, &options.target_branch, "target branch")?;
-        validate_ref_component(&options.remote, "remote")?;
-        let remote = resolve_remote_identity(&integration_path, &options.remote)?;
-        validate_integration_checkout(&integration_path, &options.target_branch, &remote.name)?;
-        let repo_key = repository_key(&integration_path, &options.target_branch)?;
-        let guard = RepositoryGuard::acquire(
-            self.queue.clone(),
-            &integration_path,
-            &repo_key,
-            &self.owner_id,
-        )?;
-        self.queue.save_registered_remote_intent(
-            &repo_key,
-            &self.owner_id,
-            &integration_path,
-            &options.target_branch,
-            &remote,
-        )?;
-        verify_remote_identity(&integration_path, &remote)?;
-        guard.git(
-            &integration_path,
-            ["fetch", &remote.name, &options.target_branch],
-            "fetch target during repository registration",
-        )?;
-        let target_ref = format!("refs/remotes/{}/{}", remote.name, options.target_branch);
-        let target_sha = git_output(&integration_path, ["rev-parse", &target_ref])?;
-        require_exact_integration_head(&integration_path, &target_sha)?;
-        reject_tracked_policy(&integration_path)?;
-        let state_root = self
+        crate::repository::validate_target_branch(&options.target_branch)?;
+        let storage_root = self
             .queue
             .path()
             .parent()
             .context("queue database has no state parent")?
-            .join("repositories")
-            .join(stable_component(&repo_key));
-        let seed_path = absolute_managed_path(
-            &options
-                .seed_path
-                .unwrap_or_else(|| state_root.join("seed-root/seed")),
+            .to_path_buf();
+        let provisioned =
+            self.queue
+                .provision_repository(&crate::repository::ProvisionOptions {
+                    storage_root,
+                    bootstrap_path: bootstrap_path.to_path_buf(),
+                    target: options.target_branch,
+                    remote_name: options.remote,
+                    rift_database: std::env::var_os("IQ_RIFT_DATABASE").map(PathBuf::from),
+                })?;
+        let repository = self.queue.repository(provisioned.repo_key().as_str())?;
+        let _guard = RepositoryGuard::acquire_wait(
+            self.queue.clone(),
+            &repository.owned_root_path,
+            &repository.key,
+            &self.owner_id,
         )?;
-        let workspace_root = absolute_managed_path(
-            &options
-                .workspace_root
-                .unwrap_or_else(|| state_root.join("workspaces")),
-        )?;
-        validate_managed_layout(&integration_path, &seed_path, &workspace_root)?;
-        if let Some(existing) = self.queue.repository_if_exists(&repo_key)? {
-            if existing.integration_path != integration_path
-                || existing.target_branch != options.target_branch
-                || existing.remote != remote
-                || existing.seed.path() != Some(path_text(&seed_path)?)
-                || existing.workspace_root != workspace_root
-            {
-                anyhow::bail!("repository {repo_key} is registered with different configuration");
-            }
-            if existing.seed_refresh.target_sha() != target_sha {
-                self.queue
-                    .refresh_registered_target(&repo_key, &self.owner_id, &target_sha)?;
-            }
-            let existing = self.queue.repository(&repo_key)?;
-            self.reconcile_seed(&guard, &existing)?;
-            let existing = self.queue.repository(&repo_key)?;
-            self.reconcile_seed_refresh_locked(&guard, &existing)?;
-            return self.queue.repository(&repo_key);
-        }
-        if self
-            .queue
-            .repository_for_integration_path(&integration_path)?
-            .is_some()
-        {
-            anyhow::bail!("integration checkout is already registered for another target");
-        }
-        let seed_name = seed_path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .context("seed path must have a UTF-8 leaf name")?;
-        validate_workspace_component(seed_name, "seed name")?;
-        let seed_root = seed_path.parent().context("seed path has no parent")?;
-        let seed_scope = seed_scope(&repo_key);
-        let seed_manager = self.root_manager(&integration_path, seed_root, &seed_scope, false)?;
-        if seed_manager.expected_path(seed_name)? != seed_path {
-            anyhow::bail!("seed path does not match its exact managed Rift path");
-        }
-        let timestamp = chrono::Utc::now().to_rfc3339();
-        let repository = RegisteredRepository {
-            key: repo_key.clone(),
-            integration_path: integration_path.clone(),
-            target_branch: options.target_branch,
-            remote,
-            seed: WorkspaceState::CreationIntent {
-                path: path_text(&seed_path)?.to_string(),
-            },
-            workspace_root,
-            checkout_reconciliation: CheckoutReconciliationState::Ready {
-                target_sha: target_sha.clone(),
-            },
-            seed_refresh: SeedRefreshState::Pending {
-                target_sha: target_sha.clone(),
-            },
-            created_at: timestamp.clone(),
-            updated_at: timestamp,
-        };
-        self.queue
-            .save_repository_intent(&self.owner_id, &repository)?;
-        self.create_or_reconcile_seed(&guard, &seed_manager, &repository, seed_name)?;
-        self.sync_seed_locked(&guard, &self.queue.repository(&repo_key)?)?;
-        self.queue.repository(&repo_key)
+        Ok(repository)
     }
 
     pub fn list(&self) -> Result<Vec<RegisteredRepository>> {
@@ -397,52 +337,107 @@ impl RepositoryManager {
 
     pub fn inspect_local_policy(&self, repo_key: &str) -> Result<PolicySnapshot> {
         let repository = self.queue.repository(repo_key)?;
-        verify_remote_identity(&repository.integration_path, &repository.remote)?;
         let _guard = RepositoryGuard::acquire(
             self.queue.clone(),
-            &repository.integration_path,
+            &repository.owned_root_path,
             repo_key,
             &self.owner_id,
         )?;
-        let (policy, _, _) = load_local_policy(&repository.integration_path)?;
+        let (policy, _, _) = load_local_policy(&repository.owned_root_path)?;
         Ok(policy)
     }
 
     pub fn status(&self, repo_key: &str) -> Result<RepositoryStatus> {
         let repository = self.queue.repository(repo_key)?;
-        let integration_head = git_output(&repository.integration_path, ["rev-parse", "HEAD"])?;
-        let integration_clean = is_clean(&repository.integration_path)?;
-        let seed_path = repository.seed.path().map(PathBuf::from);
-        let (seed_head, seed_clean) = match seed_path.as_deref() {
-            Some(path) if entry_exists(path)? => (
-                Some(git_output(path, ["rev-parse", "HEAD"])?),
-                is_clean(path)?,
-            ),
-            _ => (None, false),
-        };
+        let _guard = RepositoryGuard::acquire(
+            self.queue.clone(),
+            &repository.owned_root_path,
+            repo_key,
+            &self.owner_id,
+        )?;
+        let owned_root_head = git_output(&repository.owned_root_path, ["rev-parse", "HEAD"])?;
+        let owned_root_clean = is_clean(&repository.owned_root_path)?;
         Ok(RepositoryStatus {
             repository,
-            integration_head,
-            integration_clean,
-            seed_head,
-            seed_clean,
+            owned_root_head,
+            owned_root_clean,
+        })
+    }
+
+    pub fn enqueue_remote(&self, request: EnqueueRequest) -> Result<QueueItem> {
+        let repository = self.queue.repository(&request.repo_key)?;
+        let guard = RepositoryGuard::acquire(
+            self.queue.clone(),
+            &repository.owned_root_path,
+            &repository.key,
+            &self.owner_id,
+        )?;
+        if request.source_branch == repository.target_branch {
+            anyhow::bail!(
+                "source branch must not be target branch {}",
+                repository.target_branch
+            );
+        }
+        require_full_sha(&request.current_head_sha)?;
+        guard.run(
+            "git",
+            ["check-ref-format", "--branch", &request.source_branch],
+            None,
+            Duration::from_secs(20),
+            "validate source branch",
+        )?;
+        let source_ref = format!("refs/heads/{}", request.source_branch);
+        let observed = guard.run(
+            "git",
+            [
+                "ls-remote",
+                "--exit-code",
+                "--heads",
+                &repository.remote.name,
+                &source_ref,
+            ],
+            Some(&repository.owned_root_path),
+            Duration::from_secs(60),
+            "resolve exact source branch",
+        )?;
+        let observed_sha = parse_exact_remote_ref(&observed.stdout, &source_ref)?;
+        if observed_sha != request.current_head_sha {
+            anyhow::bail!(
+                "remote branch {}/{} is {observed_sha}, expected {}",
+                repository.remote.name,
+                request.source_branch,
+                request.current_head_sha
+            );
+        }
+        let state_repository =
+            load_project_control_only(&repository.owned_root_path)?.state_repository;
+        crate::state_repository::repository(&state_repository)?.verify()?;
+        self.queue.enqueue(EnqueueRequest {
+            state_repository,
+            ..request
         })
     }
 
     pub fn create_workspace(&self, repo_key: &str, name: &str) -> Result<DevelopmentWorkspace> {
         validate_workspace_component(name, "workspace name")?;
         let repository = self.queue.repository(repo_key)?;
-        verify_remote_identity(&repository.integration_path, &repository.remote)?;
         let guard = RepositoryGuard::acquire(
             self.queue.clone(),
-            &repository.integration_path,
+            &repository.owned_root_path,
             repo_key,
             &self.owner_id,
         )?;
-        self.reconcile_seed(&guard, &repository)?;
-        let base_sha = self.sync_seed_locked(&guard, &self.queue.repository(repo_key)?)?;
+        let base_sha = self.sync_owned_root_locked(&guard, &self.queue.repository(repo_key)?)?;
         let repository = self.queue.repository(repo_key)?;
         let manager = self.development_manager(&repository)?;
+        let requested_creation = self
+            .queue
+            .list_development_workspaces(Some(repo_key))?
+            .into_iter()
+            .find(|workspace| {
+                workspace.name == name && workspace.status == DevelopmentWorkspaceStatus::Creating
+            })
+            .map(|workspace| workspace.id);
         self.reconcile_development_workspaces(&guard, &repository, &manager)?;
         if let Some(existing) = self
             .queue
@@ -453,12 +448,15 @@ impl RepositoryManager {
             if existing.status == DevelopmentWorkspaceStatus::Creating {
                 return self.resume_workspace_creation(&guard, &repository, &manager, existing);
             }
+            if requested_creation.as_deref() == Some(existing.id.as_str()) {
+                return Ok(existing);
+            }
             anyhow::bail!("development workspace name is already allocated: {name}");
         }
         let id = Uuid::new_v4().to_string();
         let branch = format!("iq-{id}-{name}");
         validate_git_branch(
-            &repository.integration_path,
+            &repository.owned_root_path,
             &branch,
             "derived development branch",
         )?;
@@ -488,6 +486,13 @@ impl RepositoryManager {
 
     pub fn workspace_status(&self, id: &str) -> Result<DevelopmentWorkspaceObservation> {
         let workspace = self.queue.workspace(id)?;
+        let repository = self.queue.repository(&workspace.repo_key)?;
+        let _guard = RepositoryGuard::acquire(
+            self.queue.clone(),
+            &repository.owned_root_path,
+            &repository.key,
+            &self.owner_id,
+        )?;
         let exists = entry_exists(&workspace.path)?;
         let branch = exists
             .then(|| git_output(&workspace.path, ["branch", "--show-current"]))
@@ -518,10 +523,9 @@ impl RepositoryManager {
             anyhow::bail!("development workspace is not in a valid submission state");
         }
         let repository = self.queue.repository(&workspace.repo_key)?;
-        verify_remote_identity(&repository.integration_path, &repository.remote)?;
         let guard = RepositoryGuard::acquire(
             self.queue.clone(),
-            &repository.integration_path,
+            &repository.owned_root_path,
             &repository.key,
             &self.owner_id,
         )?;
@@ -562,9 +566,9 @@ impl RepositoryManager {
         };
         let intent_sha = submission.commit_sha.as_str();
         let private_sha =
-            resolve_optional_ref(&repository.integration_path, &submission.private_ref)?;
+            resolve_optional_ref(&repository.owned_root_path, &submission.private_ref)?;
         let staging_sha =
-            resolve_optional_ref(&repository.integration_path, &submission.staging_ref)?;
+            resolve_optional_ref(&repository.owned_root_path, &submission.staging_ref)?;
         if private_sha.as_deref().is_some_and(|sha| sha != intent_sha)
             || staging_sha.as_deref().is_some_and(|sha| sha != intent_sha)
         {
@@ -573,7 +577,7 @@ impl RepositoryManager {
         if private_sha.is_none() {
             if staging_sha.is_none() {
                 guard.git(
-                    &repository.integration_path,
+                    &repository.owned_root_path,
                     [
                         "fetch",
                         path_text(&workspace.path)?,
@@ -582,14 +586,14 @@ impl RepositoryManager {
                     "stage immutable local submission",
                 )?;
             }
-            if resolve_optional_ref(&repository.integration_path, &submission.staging_ref)?
+            if resolve_optional_ref(&repository.owned_root_path, &submission.staging_ref)?
                 .as_deref()
                 != Some(intent_sha)
             {
                 anyhow::bail!("staged local submission does not resolve to exact workspace HEAD");
             }
             guard.git(
-                &repository.integration_path,
+                &repository.owned_root_path,
                 [
                     "update-ref",
                     &submission.private_ref,
@@ -599,21 +603,21 @@ impl RepositoryManager {
                 "publish immutable local submission",
             )?;
         }
-        if resolve_optional_ref(&repository.integration_path, &submission.staging_ref)?.is_some() {
+        if resolve_optional_ref(&repository.owned_root_path, &submission.staging_ref)?.is_some() {
             guard.git(
-                &repository.integration_path,
+                &repository.owned_root_path,
                 ["update-ref", "-d", &submission.staging_ref],
                 "remove local submission staging ref",
             )?;
         }
-        if resolve_optional_ref(&repository.integration_path, &submission.private_ref)?.as_deref()
+        if resolve_optional_ref(&repository.owned_root_path, &submission.private_ref)?.as_deref()
             != Some(intent_sha)
         {
             anyhow::bail!("immutable local submission ref was not published exactly");
         }
         guard.ensure()?;
         let state_repository =
-            load_project_control_only(&repository.integration_path)?.state_repository;
+            load_project_control_only(&repository.owned_root_path)?.state_repository;
         crate::state_repository::repository(&state_repository)?.verify()?;
         self.queue.finalize_local_submission(
             &repository.key,
@@ -625,15 +629,23 @@ impl RepositoryManager {
     }
 
     pub fn remove_workspace(&self, id: &str) -> Result<DevelopmentWorkspace> {
-        let workspace = self.queue.workspace(id)?;
+        let mut workspace = self.queue.workspace(id)?;
         let repository = self.queue.repository(&workspace.repo_key)?;
-        verify_remote_identity(&repository.integration_path, &repository.remote)?;
         let guard = RepositoryGuard::acquire(
             self.queue.clone(),
-            &repository.integration_path,
+            &repository.owned_root_path,
             &repository.key,
             &self.owner_id,
         )?;
+        if workspace.status == DevelopmentWorkspaceStatus::Active {
+            workspace = self.queue.update_development_workspace_cleanup(
+                &repository.key,
+                &self.owner_id,
+                &workspace.id,
+                DevelopmentWorkspaceStatus::CleanupPending,
+                &CleanupState::OperatorRequested,
+            )?;
+        }
         let manager = self.development_manager(&repository)?;
         self.remove_workspace_locked(&guard, &repository, &manager, &workspace)
     }
@@ -641,10 +653,9 @@ impl RepositoryManager {
     pub fn discard_workspace_residue(&self, id: &str) -> Result<DevelopmentWorkspace> {
         let workspace = self.queue.workspace(id)?;
         let repository = self.queue.repository(&workspace.repo_key)?;
-        verify_remote_identity(&repository.integration_path, &repository.remote)?;
         let guard = RepositoryGuard::acquire(
             self.queue.clone(),
-            &repository.integration_path,
+            &repository.owned_root_path,
             &repository.key,
             &self.owner_id,
         )?;
@@ -802,26 +813,26 @@ impl RepositoryManager {
         &self,
         repo_key: &str,
         system_config: &crate::agent_config::SystemConfig,
-        integration_path: &Path,
-        workspace_root: &Path,
     ) -> Result<crate::integrator::TerminalCleanupAggregate> {
         let repository = self.queue.repository(repo_key)?;
-        verify_remote_identity(&repository.integration_path, &repository.remote)?;
         let guard = RepositoryGuard::acquire(
             self.queue.clone(),
-            &repository.integration_path,
+            &repository.owned_root_path,
             repo_key,
             &self.owner_id,
         )?;
         let integrator = crate::integrator::Integrator::new_with_operation_owner(
             crate::integrator::IntegratorOptions {
                 repo_key: repository.key.clone(),
-                repo_path: integration_path.to_path_buf(),
+                repo_path: repository.owned_root_path.clone(),
                 queue_db: self.queue.path().to_path_buf(),
                 owner_id: self.owner_id.clone(),
                 lease_ttl_seconds: 30,
                 base_remote: repository.remote.name.clone(),
-                workspace_root: workspace_root.to_path_buf(),
+                workspace_root: self
+                    .queue
+                    .workspace_root_path(repo_key)?
+                    .context("registered repository has no integration child root")?,
                 rift_database: None,
                 system_config: system_config.clone(),
             },
@@ -830,12 +841,10 @@ impl RepositoryManager {
         )?;
         self.cleanup_terminal_agent_artifacts(repo_key)?;
         let terminal = integrator.reset_workspaces_under_lease(&guard.operation)?;
-        self.reconcile_seed(&guard, &repository)?;
-        let repository = self.queue.repository(repo_key)?;
         let manager = self.development_manager(&repository)?;
         self.reconcile_development_workspaces(&guard, &repository, &manager)?;
         self.cleanup_replacements(&guard, &repository)?;
-        let seed_result = self.reconcile_seed_refresh_locked(&guard, &repository);
+        let refresh_result = self.reconcile_owned_root_locked(&guard, &repository);
         let mut results = Vec::new();
         for workspace in self.queue.list_development_workspaces(Some(repo_key))? {
             if matches!(
@@ -851,7 +860,7 @@ impl RepositoryManager {
                 )?);
             }
         }
-        seed_result?;
+        refresh_result?;
         Ok(crate::integrator::TerminalCleanupAggregate {
             terminal,
             development: results,
@@ -860,20 +869,17 @@ impl RepositoryManager {
 
     fn cleanup_repo_development_only(&self, repo_key: &str) -> Result<Vec<DevelopmentWorkspace>> {
         let repository = self.queue.repository(repo_key)?;
-        verify_remote_identity(&repository.integration_path, &repository.remote)?;
         let guard = RepositoryGuard::acquire(
             self.queue.clone(),
-            &repository.integration_path,
+            &repository.owned_root_path,
             repo_key,
             &self.owner_id,
         )?;
         self.cleanup_terminal_agent_artifacts(repo_key)?;
-        self.reconcile_seed(&guard, &repository)?;
-        let repository = self.queue.repository(repo_key)?;
         let manager = self.development_manager(&repository)?;
         self.reconcile_development_workspaces(&guard, &repository, &manager)?;
         self.cleanup_replacements(&guard, &repository)?;
-        let seed_result = self.reconcile_seed_refresh_locked(&guard, &repository);
+        let refresh_result = self.reconcile_owned_root_locked(&guard, &repository);
         let mut results = Vec::new();
         for workspace in self.queue.list_development_workspaces(Some(repo_key))? {
             if matches!(
@@ -889,7 +895,7 @@ impl RepositoryManager {
                 )?);
             }
         }
-        seed_result?;
+        refresh_result?;
         Ok(results)
     }
 
@@ -902,29 +908,22 @@ impl RepositoryManager {
         source: &Path,
         root: &Path,
         scope: &str,
-        child_source: bool,
+        kind: &str,
+        registry: &Path,
     ) -> Result<RiftWorkspaceManager> {
         let queue_id = self.queue.database_id()?;
-        let generation = self.queue.workspace_root_generation(scope)?;
-        let manager = if child_source {
-            RiftWorkspaceManager::new_child_source(
-                source.to_path_buf(),
-                root.to_path_buf(),
-                scope.to_string(),
-                None,
-                &queue_id,
-                generation,
-            )?
-        } else {
-            RiftWorkspaceManager::new(
-                source.to_path_buf(),
-                root.to_path_buf(),
-                scope.to_string(),
-                None,
-                &queue_id,
-                generation,
-            )?
-        };
+        let generation = self
+            .queue
+            .workspace_root_generation_state_for_kind(scope, kind)?;
+        let manager = RiftWorkspaceManager::open(
+            source.to_path_buf(),
+            root.to_path_buf(),
+            scope.to_string(),
+            kind,
+            Some(registry.to_path_buf()),
+            &queue_id,
+            generation,
+        )?;
         self.queue.register_workspace_root(
             scope,
             source,
@@ -939,131 +938,113 @@ impl RepositoryManager {
         &self,
         repository: &RegisteredRepository,
     ) -> Result<RiftWorkspaceManager> {
-        let seed = repository
-            .seed
-            .identity()
-            .context("registered repository seed has no Rift identity")?;
         self.root_manager(
-            Path::new(&seed.path),
-            &repository.workspace_root,
-            &development_scope(&repository.key),
-            true,
+            &repository.owned_root_path,
+            &repository.development_root_path,
+            &repository.key,
+            "development",
+            &repository.registry_identity,
         )
     }
 
-    fn create_or_reconcile_seed(
-        &self,
-        guard: &RepositoryGuard,
-        manager: &RiftWorkspaceManager,
-        repository: &RegisteredRepository,
-        seed_name: &str,
-    ) -> Result<()> {
-        let expected = manager.expected_path(seed_name)?;
-        let existing = manager
-            .list()?
-            .into_iter()
-            .find(|identity| Path::new(&identity.path) == expected);
-        let identity = if let Some(identity) = existing {
-            identity
-        } else {
-            let generation = self
-                .queue
-                .advance_workspace_generation(&seed_scope(&repository.key))?;
-            manager.persist_generation(generation)?;
-            let (path, rift_id) = manager.create(
-                seed_name,
-                |gate| {
-                    guard.ensure()?;
-                    gate.write_all(b"run\n")?;
-                    Ok(true)
-                },
-                || {
-                    guard.ensure()?;
-                    Ok(crate::sqlite::ExecutionAuthority::Active)
-                },
-            )?;
-            WorkspaceIdentity {
-                path: path_text(&path)?.to_string(),
-                rift_id,
-                source_rift_id: manager.source_id().to_string(),
-            }
-        };
-        manager.verify_retained(&identity)?;
-        self.queue
-            .set_repository_seed_identity(&repository.key, &self.owner_id, &identity)?;
-        Ok(())
-    }
-
-    fn reconcile_seed(
-        &self,
-        guard: &RepositoryGuard,
-        repository: &RegisteredRepository,
-    ) -> Result<()> {
-        let seed_path = PathBuf::from(
-            repository
-                .seed
-                .path()
-                .context("registered repository seed has no path")?,
-        );
-        let seed_root = seed_path.parent().context("seed path has no parent")?;
-        let manager = self.root_manager(
-            &repository.integration_path,
-            seed_root,
-            &seed_scope(&repository.key),
-            false,
-        )?;
-        match &repository.seed {
-            WorkspaceState::CreationIntent { .. } => {
-                let seed_name = seed_path
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .context("seed path has no UTF-8 name")?;
-                self.create_or_reconcile_seed(guard, &manager, repository, seed_name)
-            }
-            WorkspaceState::Retained { identity } => {
-                if manager.verify_retained(identity)? != seed_path {
-                    anyhow::bail!("registered seed moved from its exact IQ-owned path");
-                }
-                Ok(())
-            }
-            _ => anyhow::bail!("registered repository has invalid seed lifecycle state"),
-        }
-    }
-
-    fn sync_seed_locked(
+    fn sync_owned_root_locked(
         &self,
         guard: &RepositoryGuard,
         repository: &RegisteredRepository,
     ) -> Result<String> {
         validate_integration_checkout(
-            &repository.integration_path,
+            &repository.owned_root_path,
             &repository.target_branch,
             &repository.remote.name,
         )?;
-        verify_remote_identity(&repository.integration_path, &repository.remote)?;
+        verify_remote_identity(&repository.owned_root_path, &repository.remote)?;
+        let target_sha = if matches!(
+            repository.checkout_reconciliation,
+            CheckoutReconciliationState::Ready(_)
+        ) {
+            let target_full_ref = format!("refs/heads/{}", repository.target_branch);
+            let observed = guard.run(
+                "git",
+                [
+                    "ls-remote",
+                    "--exit-code",
+                    &repository.remote.name,
+                    &target_full_ref,
+                ],
+                Some(&repository.owned_root_path),
+                Duration::from_secs(60),
+                "resolve exact target before owned-root refresh",
+            )?;
+            let observed_target = parse_exact_remote_ref(&observed.stdout, &target_full_ref)?;
+            self.queue.update_checkout_reconciliation(
+                &repository.key,
+                &self.owner_id,
+                &CheckoutReconciliationState::pending(&observed_target)?,
+            )?;
+            stop_composition_target_after("observation");
+            observed_target
+        } else {
+            repository.checkout_reconciliation.target_sha().to_string()
+        };
+        let private_ref = format!(
+            "refs/iq/repository-targets/{}/{}",
+            repository.key, target_sha
+        );
+        let exact_refspec = format!("+{target_sha}:{private_ref}");
         guard.git(
-            &repository.integration_path,
-            ["fetch", &repository.remote.name, &repository.target_branch],
-            "fetch target during seed refresh",
+            &repository.owned_root_path,
+            [
+                "fetch",
+                "--no-tags",
+                &repository.remote.name,
+                &exact_refspec,
+            ],
+            "fetch exact target during owned-root refresh",
+        )?;
+        let private_sha = git_output(&repository.owned_root_path, ["rev-parse", &private_ref])?;
+        if private_sha != target_sha {
+            anyhow::bail!("private target ref differs from durable checkout observation");
+        }
+        guard.git(
+            &repository.owned_root_path,
+            ["cat-file", "-e", &format!("{target_sha}^{{commit}}")],
+            "verify exact owned-root target object",
         )?;
         let target_ref = format!(
             "refs/remotes/{}/{}",
             repository.remote.name, repository.target_branch
         );
-        let target_sha = git_output(&repository.integration_path, ["rev-parse", &target_ref])?;
-        self.sync_seed_to_target_locked(guard, repository, &target_sha)
+        guard.git(
+            &repository.owned_root_path,
+            ["update-ref", &target_ref, &target_sha],
+            "publish exact owned-root target ref",
+        )?;
+        let published_sha = git_output(&repository.owned_root_path, ["rev-parse", &target_ref])?;
+        if published_sha != target_sha {
+            anyhow::bail!("published target differs from durable checkout observation");
+        }
+        reconcile_registered_checkout(
+            &self.queue,
+            repository,
+            &self.owner_id,
+            &target_sha,
+            |path, target_sha| {
+                guard.git(
+                    path,
+                    ["reset", "--hard", target_sha],
+                    "reset owned root to exact fetched target",
+                )
+            },
+        )?;
+        Ok(target_sha)
     }
 
-    fn reconcile_seed_refresh_locked(
+    fn reconcile_owned_root_locked(
         &self,
         guard: &RepositoryGuard,
         repository: &RegisteredRepository,
     ) -> Result<String> {
-        let checkout_target = match &repository.checkout_reconciliation {
-            CheckoutReconciliationState::Ready { target_sha }
-            | CheckoutReconciliationState::Pending { target_sha }
-            | CheckoutReconciliationState::Failed { target_sha, .. } => target_sha,
-        };
+        let checkout_target = repository.checkout_reconciliation.target_sha();
         reconcile_registered_checkout(
             &self.queue,
             repository,
@@ -1077,97 +1058,7 @@ impl RepositoryManager {
                 )
             },
         )?;
-        match &repository.seed_refresh {
-            SeedRefreshState::Ready { target_sha } => Ok(target_sha.clone()),
-            SeedRefreshState::Pending { target_sha }
-            | SeedRefreshState::Failed { target_sha, .. } => {
-                self.sync_seed_to_target_locked(guard, repository, target_sha)
-            }
-        }
-    }
-
-    fn sync_seed_to_target_locked(
-        &self,
-        guard: &RepositoryGuard,
-        repository: &RegisteredRepository,
-        target_sha: &str,
-    ) -> Result<String> {
-        reconcile_registered_checkout(
-            &self.queue,
-            repository,
-            &self.owner_id,
-            target_sha,
-            |path, target_sha| {
-                guard.git(
-                    path,
-                    ["reset", "--hard", target_sha],
-                    "reset registered checkout to exact fetched target",
-                )
-            },
-        )?;
-        self.queue.update_seed_refresh(
-            &repository.key,
-            &self.owner_id,
-            &SeedRefreshState::Pending {
-                target_sha: target_sha.to_string(),
-            },
-        )?;
-        let result = (|| {
-            let seed = repository
-                .seed
-                .identity()
-                .context("registered seed has no Rift identity")?;
-            let seed_path = Path::new(&seed.path);
-            guard.git(
-                seed_path,
-                [
-                    "fetch",
-                    path_text(&repository.integration_path)?,
-                    target_sha,
-                ],
-                "fetch exact target into seed",
-            )?;
-            guard.git(
-                seed_path,
-                ["checkout", "--force", "--detach", target_sha],
-                "detach seed at exact target",
-            )?;
-            guard.git(
-                seed_path,
-                ["reset", "--hard", target_sha],
-                "reset seed to exact target",
-            )?;
-            guard.git(seed_path, ["clean", "-ffd"], "clean refreshed seed")?;
-            if git_output(seed_path, ["rev-parse", "HEAD"])? != target_sha
-                || !is_clean(seed_path)?
-                || !git_output(seed_path, ["branch", "--show-current"])?.is_empty()
-            {
-                anyhow::bail!("seed did not reach exact clean detached target state");
-            }
-            guard.ensure()?;
-            Ok(target_sha.to_string())
-        })();
-        match result {
-            Ok(target_sha) => {
-                self.queue.update_seed_refresh(
-                    &repository.key,
-                    &self.owner_id,
-                    &SeedRefreshState::Ready {
-                        target_sha: target_sha.clone(),
-                    },
-                )?;
-                Ok(target_sha)
-            }
-            Err(error) => {
-                let state = SeedRefreshState::Failed {
-                    target_sha: target_sha.to_string(),
-                    message: format!("{error:#}"),
-                };
-                self.queue
-                    .update_seed_refresh(&repository.key, &self.owner_id, &state)?;
-                Err(error)
-            }
-        }
+        Ok(checkout_target.to_string())
     }
 
     fn resume_workspace_creation(
@@ -1188,9 +1079,12 @@ impl RepositoryManager {
         let identity = if let Some(identity) = existing {
             identity
         } else {
-            let scope = development_scope(&repository.key);
-            let generation = self.queue.advance_workspace_generation(&scope)?;
-            manager.persist_generation(generation)?;
+            let generation = self
+                .queue
+                .begin_development_workspace_generation(&repository.key)?;
+            manager.reconcile_pending_generation(generation)?;
+            self.queue
+                .complete_workspace_generation(&repository.key, "development", generation)?;
             let (path, rift_id) = manager.create(
                 &workspace.id,
                 |gate| {
@@ -1313,7 +1207,12 @@ impl RepositoryManager {
             );
         }
         let Some(identity) = workspace.identity.as_ref() else {
-            if workspace.status != DevelopmentWorkspaceStatus::Creating {
+            if workspace.status != DevelopmentWorkspaceStatus::Creating
+                && !matches!(
+                    workspace.cleanup,
+                    CleanupState::OperatorRequested | CleanupState::OperatorFailed { .. }
+                )
+            {
                 anyhow::bail!("workspace cleanup has no durable Rift identity");
             }
             if entry_exists(&workspace.path)? {
@@ -1336,9 +1235,12 @@ impl RepositoryManager {
         if let Some(actual) = retained.as_ref() {
             let actual_path = Path::new(&actual.path);
             if !is_clean(actual_path)? || has_git_operation(actual_path)? {
-                let state = CleanupState::Failed {
-                    message: "workspace is dirty or has an active Git operation; IQ preserved it"
-                        .into(),
+                let message =
+                    "workspace is dirty or has an active Git operation; IQ preserved it".into();
+                let state = if workspace.cleanup == CleanupState::OperatorRequested {
+                    CleanupState::OperatorFailed { message }
+                } else {
+                    CleanupState::Failed { message }
                 };
                 self.queue.update_development_workspace_cleanup(
                     &repository.key,
@@ -1352,7 +1254,12 @@ impl RepositoryManager {
                     workspace.id
                 );
             }
-            if workspace.status != DevelopmentWorkspaceStatus::Creating {
+            if workspace.status != DevelopmentWorkspaceStatus::Creating
+                && !matches!(
+                    workspace.cleanup,
+                    CleanupState::OperatorRequested | CleanupState::OperatorFailed { .. }
+                )
+            {
                 let integrated_sha = self
                     .queue
                     .integrated_submission_sha(&workspace.id)?
@@ -1432,10 +1339,11 @@ impl RepositoryManager {
             .workspace_root_path(&repository.key)?
             .context("replacement cleanup has no persisted integration workspace root")?;
         let manager = self.root_manager(
-            &repository.integration_path,
+            &repository.owned_root_path,
             &integration_root,
             &repository.key,
-            false,
+            "integration",
+            &repository.registry_identity,
         )?;
         let mut preserved_dirty = Vec::new();
         for item in items {
@@ -1472,6 +1380,22 @@ impl RepositoryManager {
     }
 }
 
+pub(crate) fn parse_exact_remote_ref(output: &[u8], expected_ref: &str) -> Result<String> {
+    let output = std::str::from_utf8(output).context("remote ref output is not UTF-8")?;
+    let mut lines = output.lines();
+    let line = lines.next().context("remote ref did not resolve")?;
+    if lines.next().is_some() {
+        anyhow::bail!("remote ref resolved more than once");
+    }
+    let mut fields = line.split_whitespace();
+    let sha = fields.next().context("remote ref has no object ID")?;
+    if fields.next() != Some(expected_ref) || fields.next().is_some() {
+        anyhow::bail!("remote ref output differs from requested ref");
+    }
+    require_full_sha(sha)?;
+    Ok(sha.to_string())
+}
+
 pub(crate) fn reconcile_registered_checkout(
     queue: &SqliteQueue,
     repository: &RegisteredRepository,
@@ -1481,63 +1405,52 @@ pub(crate) fn reconcile_registered_checkout(
 ) -> Result<()> {
     require_full_sha(target_sha)?;
     validate_integration_checkout(
-        &repository.integration_path,
+        &repository.owned_root_path,
         &repository.target_branch,
         &repository.remote.name,
     )?;
-    verify_remote_identity(&repository.integration_path, &repository.remote)?;
+    verify_remote_identity(&repository.owned_root_path, &repository.remote)?;
     let remote_ref = format!(
         "refs/remotes/{}/{}",
         repository.remote.name, repository.target_branch
     );
-    let fetched_target = git_output(&repository.integration_path, ["rev-parse", &remote_ref])?;
+    let fetched_target = git_output(&repository.owned_root_path, ["rev-parse", &remote_ref])?;
     if fetched_target != target_sha {
         anyhow::bail!(
             "fetched target {fetched_target} differs from checkout reconciliation target {target_sha}"
         );
     }
-    let head = git_output(&repository.integration_path, ["rev-parse", "HEAD"])?;
-    if matches!(
-        &repository.checkout_reconciliation,
-        CheckoutReconciliationState::Ready { target_sha: ready } if ready == target_sha
-    ) && head == target_sha
-    {
+    let head = git_output(&repository.owned_root_path, ["rev-parse", "HEAD"])?;
+    if repository.checkout_reconciliation.is_ready_for(target_sha) && head == target_sha {
         return Ok(());
     }
     queue.update_checkout_reconciliation(
         &repository.key,
         owner_id,
-        &CheckoutReconciliationState::Pending {
-            target_sha: target_sha.to_string(),
-        },
+        &CheckoutReconciliationState::pending(target_sha)?,
     )?;
     let result = (|| {
         if head != target_sha {
-            reset(&repository.integration_path, target_sha)?;
+            reset(&repository.owned_root_path, target_sha)?;
         }
         validate_integration_checkout(
-            &repository.integration_path,
+            &repository.owned_root_path,
             &repository.target_branch,
             &repository.remote.name,
         )?;
-        require_exact_integration_head(&repository.integration_path, target_sha)
+        require_exact_integration_head(&repository.owned_root_path, target_sha)
     })();
     match result {
         Ok(()) => queue.update_checkout_reconciliation(
             &repository.key,
             owner_id,
-            &CheckoutReconciliationState::Ready {
-                target_sha: target_sha.to_string(),
-            },
+            &CheckoutReconciliationState::ready(target_sha)?,
         ),
         Err(error) => {
             queue.update_checkout_reconciliation(
                 &repository.key,
                 owner_id,
-                &CheckoutReconciliationState::Failed {
-                    target_sha: target_sha.to_string(),
-                    message: format!("{error:#}"),
-                },
+                &CheckoutReconciliationState::failed(target_sha, &format!("{error:#}"))?,
             )?;
             Err(error)
         }
@@ -1557,67 +1470,10 @@ pub fn load_project_control_only(repo: &Path) -> Result<ProjectControlPolicy> {
 pub fn load_project_control_policy(
     repo: &Path,
 ) -> Result<(PolicySnapshot, String, String, ProjectControlPolicy)> {
-    reject_tracked_policy(repo)?;
-    let config_directory = repo.join(".iq");
-    let config_path = config_directory.join("config.json");
-    let directory_metadata = match fs::symlink_metadata(&config_directory) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return default_project_control_policy()
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("inspect {}", config_directory.display()))
-        }
+    let Some(contents) = crate::repository::read_local_policy_bytes(repo)? else {
+        return default_project_control_policy();
     };
-    if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
-        anyhow::bail!(
-            "local IQ policy directory must be a regular non-symlink directory: {}",
-            config_directory.display()
-        );
-    }
-    let directory = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(&config_directory)
-        .with_context(|| {
-            format!(
-                "open local IQ policy directory {}",
-                config_directory.display()
-            )
-        })?;
-    verify_policy_directory(&config_directory, &directory, &directory_metadata)?;
-    let file_name = CString::new("config.json").expect("static policy file name has no NUL");
-    let descriptor = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            file_name.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        )
-    };
-    if descriptor < 0 {
-        let error = std::io::Error::last_os_error();
-        verify_policy_directory(&config_directory, &directory, &directory_metadata)?;
-        if error.kind() == std::io::ErrorKind::NotFound {
-            return default_project_control_policy();
-        }
-        return Err(error).context("open local IQ policy config.json");
-    }
-    let file = unsafe { fs::File::from_raw_fd(descriptor) };
-    verify_policy_directory(&config_directory, &directory, &directory_metadata)?;
-    let metadata = file
-        .metadata()
-        .context("inspect open local IQ policy config.json")?;
-    if !metadata.is_file() {
-        anyhow::bail!("local IQ policy config.json must be a regular non-symlink file");
-    }
-    let mut contents = Vec::new();
-    file.take((MAX_POLICY_BYTES + 1) as u64)
-        .read_to_end(&mut contents)
-        .context("read local IQ policy config.json")?;
-    verify_policy_directory(&config_directory, &directory, &directory_metadata)?;
-    if contents.len() > MAX_POLICY_BYTES {
-        anyhow::bail!("local IQ policy exceeds the {MAX_POLICY_BYTES} byte limit");
-    }
+    let config_path = repo.join(".iq/config.json");
     let raw: RawConfig = serde_json::from_slice(&contents).with_context(|| {
         format!(
             "parse strict versioned local policy {}",
@@ -1666,28 +1522,6 @@ fn default_project_control_policy() -> Result<(PolicySnapshot, String, String, P
             state_repository: StateRepositorySnapshot::Local,
         },
     ))
-}
-
-fn verify_policy_directory(
-    path: &Path,
-    directory: &fs::File,
-    original: &fs::Metadata,
-) -> Result<()> {
-    let current = fs::symlink_metadata(path)
-        .with_context(|| format!("reinspect local IQ policy directory {}", path.display()))?;
-    let open = directory
-        .metadata()
-        .with_context(|| format!("inspect open local IQ policy directory {}", path.display()))?;
-    if current.file_type().is_symlink()
-        || !current.is_dir()
-        || original.dev() != open.dev()
-        || original.ino() != open.ino()
-        || current.dev() != open.dev()
-        || current.ino() != open.ino()
-    {
-        anyhow::bail!("local IQ policy directory identity changed while reading policy");
-    }
-    Ok(())
 }
 
 fn canonical_policy_snapshot(policy: ValidationPolicy) -> Result<(PolicySnapshot, String, String)> {
@@ -1775,17 +1609,6 @@ fn exact_nonblank(value: String, label: &str) -> Result<String> {
         anyhow::bail!("{label} must be non-empty and must not have surrounding whitespace");
     }
     Ok(value)
-}
-
-fn canonical_checkout(path: &Path) -> Result<PathBuf> {
-    let path = path
-        .canonicalize()
-        .with_context(|| format!("resolve integration checkout {}", path.display()))?;
-    if fs::symlink_metadata(&path)?.file_type().is_symlink() || !path.is_dir() {
-        anyhow::bail!("integration checkout must be a real directory");
-    }
-    path_text(&path)?;
-    Ok(path)
 }
 
 pub(crate) fn resolve_remote_identity(repo: &Path, name: &str) -> Result<RegisteredRemote> {
@@ -1879,43 +1702,6 @@ fn entry_exists(path: &Path) -> Result<bool> {
     }
 }
 
-fn absolute_managed_path(path: &Path) -> Result<PathBuf> {
-    let path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    for component in path.components() {
-        if matches!(
-            component,
-            std::path::Component::ParentDir | std::path::Component::CurDir
-        ) {
-            anyhow::bail!(
-                "managed path must not contain dot aliases: {}",
-                path.display()
-            );
-        }
-    }
-    let mut existing = path.as_path();
-    let mut missing = Vec::new();
-    while !existing.exists() {
-        missing.push(
-            existing
-                .file_name()
-                .context("managed path has no existing ancestor")?,
-        );
-        existing = existing
-            .parent()
-            .context("managed path has no existing ancestor")?;
-    }
-    let mut resolved = existing.canonicalize()?;
-    for component in missing.into_iter().rev() {
-        resolved.push(component);
-    }
-    path_text(&resolved)?;
-    Ok(resolved)
-}
-
 fn validate_integration_checkout(path: &Path, target: &str, remote: &str) -> Result<()> {
     if !path.join(".git").is_dir() {
         anyhow::bail!("registered integration checkout must be a primary Git checkout");
@@ -1940,19 +1726,6 @@ fn require_exact_integration_head(path: &Path, target_sha: &str) -> Result<()> {
         anyhow::bail!(
             "integration checkout HEAD {head} differs from exact fetched target {target_sha}"
         );
-    }
-    Ok(())
-}
-
-fn validate_managed_layout(integration: &Path, seed: &Path, workspaces: &Path) -> Result<()> {
-    for (left, right) in [
-        (integration, seed),
-        (integration, workspaces),
-        (seed, workspaces),
-    ] {
-        if left == right || left.starts_with(right) || right.starts_with(left) {
-            anyhow::bail!("integration, seed, and development workspace paths must not overlap");
-        }
     }
     Ok(())
 }
@@ -2071,22 +1844,6 @@ fn require_full_sha(value: &str) -> Result<()> {
         anyhow::bail!("Git object identity must be a full hexadecimal object ID");
     }
     Ok(())
-}
-
-fn repository_key(path: &Path, target: &str) -> Result<String> {
-    Ok(format!("{}::{target}", path_text(path)?))
-}
-
-fn seed_scope(repo_key: &str) -> String {
-    format!("composition-seed:{repo_key}")
-}
-
-fn development_scope(repo_key: &str) -> String {
-    format!("composition-development:{repo_key}")
-}
-
-fn stable_component(value: &str) -> String {
-    format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
 fn path_text(path: &Path) -> Result<&str> {

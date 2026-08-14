@@ -695,7 +695,6 @@ pub fn remove_protocol_cycle(workspace: &Path, cycle_id: &str) -> Result<()> {
 }
 
 fn remove_protocol_quarantines(workspace: &Path, root_file: &File, cycle_id: &str) -> Result<()> {
-    let prefix = format!(".remove-{cycle_id}-");
     let deterministic = format!(".remove-{cycle_id}");
     let root = workspace.join(".iq-agent-protocol");
     let mut quarantines = Vec::new();
@@ -704,10 +703,7 @@ fn remove_protocol_quarantines(workspace: &Path, root_file: &File, cycle_id: &st
         let Some(name) = name.to_str() else {
             continue;
         };
-        let legacy = name.strip_prefix(&prefix).is_some_and(|suffix| {
-            Uuid::parse_str(suffix).is_ok_and(|identity| identity.to_string() == suffix)
-        });
-        if name == deterministic || legacy {
+        if name == deterministic {
             quarantines.push(name.to_string());
         }
     }

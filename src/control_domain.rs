@@ -132,6 +132,7 @@ pub struct SandboxIdentity {
     deny_unknown_fields
 )]
 pub enum IntegrationEffortState {
+    ReplacementPending(ReplacementPending),
     AgentReady(AgentReady),
     AgentLaunching(AgentLaunching),
     AgentRunning(AgentRunning),
@@ -151,6 +152,7 @@ pub enum IntegrationEffortState {
 impl IntegrationEffortState {
     pub fn name(&self) -> &'static str {
         match self {
+            Self::ReplacementPending(_) => "replacement_pending",
             Self::AgentReady(_) => "agent_ready",
             Self::AgentLaunching(_) => "agent_launching",
             Self::AgentRunning(_) => "agent_running",
@@ -194,6 +196,15 @@ impl IntegrationEffortState {
 
     pub fn validate_for_count(&self, failed_cycles: u8) -> Result<()> {
         match self {
+            Self::ReplacementPending(value)
+                if failed_cycles != 0
+                    || value.old_attempt_id.is_empty()
+                    || value.replaced_at.is_empty() =>
+            {
+                anyhow::bail!(
+                    "replacement_pending requires its old attempt, replacement time, and zero failed cycles"
+                )
+            }
             Self::GuidanceRequired(value)
                 if !matches!(value.blocker, IntegrationBlocker::SemanticGuidance(_)) =>
             {
@@ -243,6 +254,13 @@ impl IntegrationEffortState {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplacementPending {
+    pub old_attempt_id: String,
+    pub replaced_at: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -451,10 +469,16 @@ pub struct Landing {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SignoffDisposition {
-    NotRequired,
+    NoValidation {
+        policy_digest: String,
+    },
+    ValidationWithoutSignoff {
+        policy_digest: String,
+    },
     Evidence {
         evidence_id: String,
         candidate_sha: String,
+        policy_digest: String,
     },
 }
 

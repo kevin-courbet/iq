@@ -12,7 +12,6 @@ use iq::control_domain::{
 use iq::control_store::ControlStore;
 use iq::sqlite::SqliteQueue;
 use sha2::Digest;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -45,7 +44,7 @@ fn input() -> AgentInput {
             candidate_sha: None,
         },
         repository: RepositoryIdentity {
-            repo_key: "/repo::main".into(),
+            repo_key: "00000000-0000-4000-8000-000000000001".into(),
             target_branch: "main".into(),
         },
         source: SourceVariant::RemoteBranch {
@@ -147,9 +146,10 @@ fn terminal_cleanup_rejects_replacement_rift_before_artifact_removal() {
             path: root,
             source: Path::new("/source").to_path_buf(),
             source_rift_id: "source-rift".into(),
-            scope: "fixture::main".into(),
+            scope: "00000000-0000-4000-8000-000000000001".into(),
             registry_identity: "registry".into(),
             generation: 0,
+            pending_generation: None,
         },
         &artifacts,
     )
@@ -182,9 +182,10 @@ fn terminal_cleanup_removes_exact_sandbox_when_original_rift_is_absent() {
         path: root,
         source: Path::new("/source").to_path_buf(),
         source_rift_id: "source-rift".into(),
-        scope: "fixture::main".into(),
+        scope: "00000000-0000-4000-8000-000000000001".into(),
         registry_identity: "registry".into(),
         generation: 0,
+        pending_generation: None,
     };
 
     iq::agent_runner::cleanup_terminal_cycle_artifacts(&root_identity, &artifacts).unwrap();
@@ -216,6 +217,32 @@ fn repository_policy_is_one_strict_variant() {
         allowed_responders: vec!["Octo".into(), "octo".into()],
     });
     assert!(duplicate.validate().is_err());
+}
+
+#[test]
+fn signoff_disposition_requires_one_exact_evidence_variant() {
+    use iq::control_domain::SignoffDisposition;
+
+    for valid in [
+        serde_json::json!({"kind":"no_validation","policy_digest":"a".repeat(64)}),
+        serde_json::json!({"kind":"validation_without_signoff","policy_digest":"b".repeat(64)}),
+        serde_json::json!({
+            "kind":"evidence",
+            "evidence_id":"evidence-1",
+            "candidate_sha":"c".repeat(40),
+            "policy_digest":"d".repeat(64)
+        }),
+    ] {
+        serde_json::from_value::<SignoffDisposition>(valid).unwrap();
+    }
+    for invalid in [
+        serde_json::json!({"kind":"no_validation"}),
+        serde_json::json!({"kind":"validation_without_signoff","policy_digest":"a".repeat(64),"host_policy":true}),
+        serde_json::json!({"kind":"not_required","policy_digest":"a".repeat(64)}),
+        serde_json::json!({"kind":"evidence","evidence_id":"evidence-1","candidate_sha":"c".repeat(40)}),
+    ] {
+        assert!(serde_json::from_value::<SignoffDisposition>(invalid).is_err());
+    }
 }
 
 #[test]
@@ -333,6 +360,7 @@ fn unix_socket_api_enforces_private_modes_and_serves_durable_inbox() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn daemon_lifetime_fences_outlive_api_server_failure() {
     let temp = tempdir().unwrap();
     let database = temp.path().join("queue.db");
@@ -455,7 +483,10 @@ fn api_watch_producer_failure_shuts_down_and_joins_silent_worker() {
         .recv_timeout(Duration::from_secs(2))
         .expect("producer failure did not stop the control API");
     let error = format!("{:#}", result.unwrap_err());
-    assert!(error.contains("queue database identity changed while IQ was running"));
+    assert!(
+        error.contains("queue database identity changed while IQ was running"),
+        "{error}"
+    );
     thread.join().unwrap();
     assert_stream_closed(&mut silent);
     assert_stream_closed(&mut watch_client);
@@ -632,182 +663,6 @@ fn unix_socket_event_stream_reports_expired_cursor() {
 }
 
 #[test]
-fn explicit_v8_migration_creates_verified_private_backup() {
-    let temp = tempdir().unwrap();
-    let database = temp.path().join("queue.db");
-    drop(iq::sqlite::SqliteQueue::open(&database).unwrap());
-    let connection = rusqlite::Connection::open(&database).unwrap();
-    iq::sqlite::force_test_schema_version(&connection, "8").unwrap();
-    drop(connection);
-    let system = temp.path().join("system.yaml");
-    std::fs::write(&system, system_config(temp.path())).unwrap();
-
-    drop(iq::sqlite::SqliteQueue::migrate_v8(&database, &system).unwrap());
-
-    let backup = std::fs::read_dir(temp.path())
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.starts_with("queue.db.schema-v8") && name.ends_with(".backup")
-                })
-        })
-        .unwrap();
-    let metadata = std::fs::metadata(&backup).unwrap();
-    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-    let backup_connection = rusqlite::Connection::open(&backup).unwrap();
-    let backup_version: String = backup_connection
-        .query_row(
-            "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(backup_version, "8");
-    let migrated = rusqlite::Connection::open(&database).unwrap();
-    let migrated_version: String = migrated
-        .query_row(
-            "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(migrated_version, "10");
-}
-
-#[test]
-fn v8_ready_local_submission_and_claimed_conflict_migrate_with_exact_authority() {
-    let temp = tempdir().unwrap();
-    let repository = temp.path().join("repo");
-    std::fs::create_dir(&repository).unwrap();
-    git(&repository, ["init"]);
-    let database = temp.path().join("queue.db");
-    let target_sha = sha('1');
-    let source_sha = sha('2');
-    let ready_sha = sha('3');
-    let ready_base_sha = sha('4');
-    let ready_item_id = "4b6d66b7-d46d-442d-8704-fc909e110478";
-    let ready_workspace_id = "workspace-v8-ready";
-    let ready_submission_id = "submission-v8-ready";
-    let ready_private_ref = "refs/iq/submissions/v8-ready";
-    let item_id = "arbitrary-eight-conflict-item";
-    let attempt_id = "attempt-v8";
-    let prompt_id = "prompt-v8";
-    let retained = temp.path().join("retained");
-    std::fs::create_dir(&retained).unwrap();
-    let conflict_paths = (1..=8)
-        .map(|index| format!("conflict-{index}.txt"))
-        .collect::<Vec<_>>();
-    let conflicts = serde_json::json!({
-        "files":conflict_paths,
-        "target_sha":target_sha,
-        "source_sha":source_sha
-    });
-    let connection = rusqlite::Connection::open(&database).unwrap();
-    iq::sqlite::initialize_test_schema(&connection, "8").unwrap();
-    connection
-        .execute_batch(
-            "DROP TRIGGER registered_repository_remote_insert;
-             DROP TRIGGER queue_items_local_source_insert;",
-        )
-        .unwrap();
-    connection.execute(
-        "INSERT INTO registered_repositories(repo_key,integration_path,target_branch,remote,seed_path,workspace_root,checkout_reconciliation_json,seed_refresh_json,created_at,updated_at) VALUES('fixture::main',?1,'main','origin',?2,?3,?4,?5,'2025-12-31T00:00:00Z','2025-12-31T00:00:00Z')",
-        rusqlite::params![repository.as_os_str().as_bytes(),temp.path().join("seed").as_os_str().as_bytes(),temp.path().join("development-workspaces").as_os_str().as_bytes(),serde_json::json!({"state":"ready","target_sha":ready_base_sha}).to_string(),serde_json::json!({"state":"ready","target_sha":ready_base_sha}).to_string()],
-    ).unwrap();
-    connection.execute(
-        "INSERT INTO development_workspaces(id,repo_key,name,path,branch,base_sha,status,cleanup_json,created_at,updated_at) VALUES(?1,'fixture::main','ready-local',?2,'iq-ready-local',?3,'submitted','{\"state\":\"pending\"}','2025-12-31T00:00:00Z','2025-12-31T00:00:00Z')",
-        rusqlite::params![ready_workspace_id,temp.path().join("ready-development-workspace").as_os_str().as_bytes(),ready_base_sha],
-    ).unwrap();
-    connection.execute(
-        "INSERT INTO local_submissions(id,queue_item_id,repo_key,workspace_id,base_sha,commit_sha,private_ref,staging_ref,state,created_at) VALUES(?1,?2,'fixture::main',?3,?4,?5,?6,'refs/iq/staging/v8-ready','queued','2025-12-31T00:00:00Z')",
-        rusqlite::params![ready_submission_id,ready_item_id,ready_workspace_id,ready_base_sha,ready_sha,ready_private_ref],
-    ).unwrap();
-    connection.execute(
-        "INSERT INTO queue_items(id,repo_key,repo_path,source_branch,target_branch,producer_metadata_json,validation_evidence_json,status,current_head_sha,landing_state_json,source_kind,source_ref,submission_id,landing_policy,created_at,updated_at) VALUES(?1,'fixture::main',?2,?3,'main','{\"worker\":\"W-ready\"}','[]','ready',?4,'{\"state\":\"ready\"}','local_submission',?3,?5,'squash','2025-12-31T00:00:00Z','2025-12-31T00:00:00Z')",
-        rusqlite::params![ready_item_id,repository.to_str().unwrap(),ready_private_ref,ready_sha,ready_submission_id],
-    ).unwrap();
-    connection
-        .execute(
-            "INSERT INTO queue_items(id,repo_key,repo_path,source_branch,target_branch,producer_metadata_json,validation_evidence_json,status,current_head_sha,current_attempt_id,blocked_phase,blocked_reason,blocked_message,prompt_id,conflict_json,integration_workspace_path,integration_workspace_rift_id,integration_workspace_source_rift_id,target_sha,source_sha,landing_state_json,source_kind,source_ref,landing_policy,created_at,updated_at) VALUES(?1,'fixture::main',?2,'agent/conflict','main','{\"worker\":\"W001\"}','[]','blocked',?3,?4,'merging','needs_user_input','legacy conflict',?5,?6,?7,'rift-1','source-rift-1',?8,?3,'{\"state\":\"ready\"}','remote_branch','agent/conflict','direct','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
-            rusqlite::params![item_id,repository.to_str().unwrap(),source_sha,attempt_id,prompt_id,conflicts.to_string(),retained.to_str().unwrap(),target_sha],
-        )
-        .unwrap();
-    connection.execute(
-        "INSERT INTO integration_attempts(id,item_id,attempt_number,source_head_sha,target_base_sha,started_at) VALUES(?1,?2,1,?3,?4,'2026-01-01T00:00:00Z')",
-        rusqlite::params![attempt_id,item_id,source_sha,target_sha],
-    ).unwrap();
-    connection.execute(
-        "INSERT INTO prompts(id,item_id,attempt_id,blocked_phase,status,question,created_by,created_at) VALUES(?1,?2,?3,'merging','open','Resolve conflict','iq','2026-01-01T00:00:00Z')",
-        rusqlite::params![prompt_id,item_id,attempt_id],
-    ).unwrap();
-    iq::sqlite::force_test_schema_version(&connection, "8").unwrap();
-    drop(connection);
-    let system = temp.path().join("system.yaml");
-    std::fs::write(&system, system_config(temp.path())).unwrap();
-
-    let migrated = iq::sqlite::SqliteQueue::migrate_v8(&database, &system).unwrap();
-    let store = ControlStore::open(migrated.path()).unwrap();
-    assert!(store.effort_for_item(ready_item_id).unwrap().is_none());
-    let ready = migrated.get_item(ready_item_id).unwrap();
-    assert_eq!(ready.id, ready_item_id);
-    assert_eq!(ready.status, iq::core::QueueStatus::Ready);
-    assert_eq!(ready.current_attempt_id, None);
-    assert_eq!(ready.target_sha, None);
-    assert_eq!(ready.source_sha, None);
-    assert!(ready.workspace.identity().is_none());
-    let migrated_connection = rusqlite::Connection::open(&database).unwrap();
-    let ready_created_at: String = migrated_connection
-        .query_row(
-            "SELECT created_at FROM queue_items WHERE id=?1",
-            [ready_item_id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(ready_created_at, "2025-12-31T00:00:00Z");
-    let submission = migrated.local_submission(ready_submission_id).unwrap();
-    assert_eq!(submission.queue_item_id, ready_item_id);
-    assert_eq!(submission.workspace_id, ready_workspace_id);
-    assert_eq!(submission.commit_sha, ready_sha);
-    assert_eq!(submission.private_ref, ready_private_ref);
-    assert_eq!(submission.state, iq::sqlite::LocalSubmissionState::Queued);
-    let workspace = migrated.workspace(ready_workspace_id).unwrap();
-    assert_eq!(
-        workspace.status,
-        iq::sqlite::DevelopmentWorkspaceStatus::Submitted
-    );
-
-    let effort = store.effort_for_item(item_id).unwrap().unwrap();
-
-    assert_eq!(effort.attempt_id, attempt_id);
-    assert_eq!(effort.target_sha, target_sha);
-    assert_eq!(effort.source_sha, source_sha);
-    assert_eq!(effort.source_variant, "remote_branch");
-    assert_eq!(effort.landing_variant, "direct");
-    assert_eq!(effort.workspace.path, retained.to_str().unwrap());
-    assert_eq!(effort.workspace.rift_id, "rift-1");
-    assert_eq!(effort.workspace.source_rift_id, "source-rift-1");
-    assert_eq!(effort.item_id, item_id);
-    assert!(matches!(
-        effort.state,
-        IntegrationEffortState::AgentReady(_)
-    ));
-    let migrated_item = migrated.get_item(item_id).unwrap();
-    assert_eq!(migrated_item.status, iq::core::QueueStatus::Merging);
-    assert_eq!(
-        migrated_item.conflict.unwrap()["files"]
-            .as_array()
-            .unwrap()
-            .len(),
-        8
-    );
-    assert_eq!(migrated.get_prompt(prompt_id).unwrap().status, "superseded");
-    assert_eq!(store.inbox(10).unwrap().len(), 1);
-}
-
-#[test]
 fn omitted_notifications_use_non_zero_defaults() {
     let temp = tempdir().unwrap();
     let system = temp.path().join("system.yaml");
@@ -902,7 +757,25 @@ fn api_retry_resumes_provider_gate_without_consuming_an_agent_cycle() {
         .unwrap();
     fixture
         .store
-        .start_validation(&effort.id, "policy-digest")
+        .start_validation(&effort.id, &"a".repeat(64))
+        .unwrap();
+    rusqlite::Connection::open(&fixture.database)
+        .unwrap()
+        .execute(
+            "UPDATE integration_attempts SET validated_commit_sha=?1 WHERE id='attempt-1'",
+            [sha('9')],
+        )
+        .unwrap();
+    assert!(fixture
+        .store
+        .complete_validation(&effort.id, &candidate_sha)
+        .is_err());
+    rusqlite::Connection::open(&fixture.database)
+        .unwrap()
+        .execute(
+            "UPDATE integration_attempts SET validated_commit_sha=?1 WHERE id='attempt-1'",
+            [&candidate_sha],
+        )
         .unwrap();
     fixture
         .store
@@ -953,6 +826,7 @@ fn api_retry_resumes_provider_gate_without_consuming_an_agent_cycle() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn failed_landing_recomposition_preserves_one_recoverable_uncertain_state() {
     let fixture = effort_fixture();
     let effort = fixture.store.effort_for_item("item-1").unwrap().unwrap();
@@ -1000,11 +874,7 @@ fn failed_landing_recomposition_preserves_one_recoverable_uncertain_state() {
         .unwrap();
     fixture
         .store
-        .start_validation(&effort.id, "policy-digest")
-        .unwrap();
-    fixture
-        .store
-        .complete_validation(&effort.id, &candidate_sha)
+        .start_validation(&effort.id, &"a".repeat(64))
         .unwrap();
     rusqlite::Connection::open(&fixture.database)
         .unwrap()
@@ -1015,12 +885,18 @@ fn failed_landing_recomposition_preserves_one_recoverable_uncertain_state() {
         .unwrap();
     fixture
         .store
+        .complete_validation(&effort.id, &candidate_sha)
+        .unwrap();
+    fixture
+        .store
         .begin_landing(
             &effort.id,
             &sha('1'),
             "lease-1",
             "command-1",
-            iq::control_domain::SignoffDisposition::NotRequired,
+            iq::control_domain::SignoffDisposition::NoValidation {
+                policy_digest: "a".repeat(64),
+            },
         )
         .unwrap();
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
@@ -1095,25 +971,13 @@ fn effort_cancellation_restores_local_submission_workspace() {
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
         .execute(
-            "INSERT INTO registered_remote_identities(repo_key,integration_path,target_branch,remote_name,fetch_url,push_url,created_at) VALUES('fixture::main',X'01','main','origin','file:///repo','file:///repo','test')",
-            [],
-        )
-        .unwrap();
-    connection
-        .execute(
-            "INSERT INTO registered_repositories(repo_key,integration_path,target_branch,remote,seed_path,workspace_root,checkout_reconciliation_json,seed_refresh_json,created_at,updated_at) VALUES('fixture::main',X'01','main','origin',X'02',X'03','{}','{}','test','test')",
-            [],
-        )
-        .unwrap();
-    connection
-        .execute(
-            "INSERT INTO development_workspaces(id,repo_key,name,path,branch,base_sha,status,cleanup_json,created_at,updated_at) VALUES('workspace-1','fixture::main','test',X'04','iq-test',?1,'submitted','{\"state\":\"pending\"}','test','test')",
+            "INSERT INTO development_workspaces(id,repo_key,name,path,branch,base_sha,status,cleanup_json,created_at,updated_at) VALUES('workspace-1','00000000-0000-4000-8000-000000000001','test',X'04','iq-test',?1,'submitted','{\"state\":\"pending\"}','test','test')",
             [sha('1')],
         )
         .unwrap();
     connection
         .execute(
-            "INSERT INTO local_submissions(id,queue_item_id,repo_key,workspace_id,base_sha,commit_sha,private_ref,staging_ref,state,created_at) VALUES('submission-1','item-1','fixture::main','workspace-1',?1,?2,'refs/iq/submissions/test','refs/iq/staging/test','creating','test')",
+            "INSERT INTO local_submissions(id,queue_item_id,repo_key,workspace_id,base_sha,commit_sha,private_ref,staging_ref,state,created_at) VALUES('submission-1','item-1','00000000-0000-4000-8000-000000000001','workspace-1',?1,?2,'refs/iq/submissions/test','refs/iq/staging/test','creating','test')",
             rusqlite::params![sha('1'),sha('2')],
         )
         .unwrap();
@@ -1605,6 +1469,13 @@ fn minimal_issue_binding_creates_nothing_until_blocked_then_reuses_one_issue() {
     let temp = tempdir().unwrap();
     let database = temp.path().join("queue.db");
     let queue = iq::sqlite::SqliteQueue::open(&database).unwrap();
+    queue
+        .register_control_plane_fixture_repository(
+            "00000000-0000-4000-8000-000000000001",
+            "/repo",
+            "main",
+        )
+        .unwrap();
     let repository = StateRepositorySnapshot::GitlabIssue(IssueRepositorySnapshot {
         repository: "group/project".into(),
         visibility: IssueVisibility::Minimal,
@@ -1612,10 +1483,8 @@ fn minimal_issue_binding_creates_nothing_until_blocked_then_reuses_one_issue() {
     });
     let item = queue
         .enqueue(iq::sqlite::EnqueueRequest {
-            repo_key: "fixture::main".into(),
-            repo_path: "/repo".into(),
+            repo_key: "00000000-0000-4000-8000-000000000001".into(),
             source_branch: "agent/minimal".into(),
-            target_branch: "main".into(),
             current_head_sha: sha('2'),
             pr_url: None,
             producer_metadata: serde_json::json!({"worker":"test"}),
@@ -1746,7 +1615,7 @@ fn notification_fake_receives_one_bounded_deduplicated_delivery() {
             &fixture.effort_id,
             "integration_blocked",
             serde_json::json!({
-                "repository":"fixture::main",
+                "repository":"00000000-0000-4000-8000-000000000001",
                 "blocker_kind":"infrastructure",
                 "reason":"sandbox unavailable"
             }),
@@ -2364,7 +2233,7 @@ fn record_notification_alert(fixture: &EffortFixture) {
             &fixture.effort_id,
             "integration_blocked",
             serde_json::json!({
-                "repository":"fixture::main",
+                "repository":"00000000-0000-4000-8000-000000000001",
                 "blocker_kind":"infrastructure",
                 "reason":"sandbox unavailable"
             }),
@@ -2383,10 +2252,19 @@ fn bare_store_fixture() -> EffortFixture {
     let temp = tempdir().unwrap();
     let database = temp.path().join("queue.db");
     let store = ControlStore::open_test_database(&database).unwrap();
+    let queue = SqliteQueue::open(&database).unwrap();
+    queue
+        .register_control_plane_fixture_repository(
+            "00000000-0000-4000-8000-000000000001",
+            "/repo",
+            "main",
+        )
+        .unwrap();
+    drop(queue);
     let connection = rusqlite::Connection::open(&database).unwrap();
     connection
         .execute(
-            "INSERT INTO queue_items(id,repo_key,repo_path,source_branch,target_branch,producer_metadata_json,validation_evidence_json,status,current_head_sha,current_attempt_id,source_kind,source_ref,landing_policy,created_at,updated_at) VALUES('item-1','fixture::main','/repo','agent/test','main','{}','[]','merging','111','attempt-1','remote_branch','agent/test','direct','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            "INSERT INTO queue_items(id,repo_key,source_branch,producer_metadata_json,validation_evidence_json,status,current_head_sha,current_attempt_id,source_kind,source_ref,landing_policy,created_at,updated_at) VALUES('item-1','00000000-0000-4000-8000-000000000001','agent/test','{}','[]','merging','111','attempt-1','remote_branch','agent/test','direct','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
             [],
         )
         .unwrap();

@@ -6,7 +6,10 @@
 
 ## Decision
 
-IQ uses Rift as its only integration-workspace backend. Each repository managed by IQ must already be a Rift root. IQ creates item workspaces with copy-on-write reuse of the complete source workspace, including dependency and build artifacts, then resets tracked state to the exact target base before merging.
+ADR 0008 supersedes this ADR's repository-root and child-root clauses. The
+Rift-only backend and cleanup decisions remain in force.
+
+IQ uses Rift as its only integration-workspace backend. The IQ-owned full checkout is an independent Rift root. IQ creates direct child item Rifts with copy-on-write reuse of the complete source workspace, including dependency and build artifacts, then resets tracked state to the exact target base before merging.
 
 Blocked and otherwise recoverable items retain their Rift. Integrated and cancelled items retain durable queue history but no workspace. See ADR 0007 for terminal cleanup behavior.
 

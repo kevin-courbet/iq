@@ -26,7 +26,7 @@ Whole-conflict `use source` and `use target` prompts are removed from normal int
 - Clean and conflicted composition use one semantic integration path.
 - Candidate identity and all evidence remain under IQ authority.
 - One repository variant prevents simultaneous or contradictory projections.
-- SQLite migration must preserve active effort identities and remove the old prompt and transport authority without a runtime compatibility path.
+- SQLite remains the sole lifecycle authority for active effort identities.
 - OpenCode needs an OS-enforced sandbox; prompt permissions are not a security boundary.
 - Local API availability and notification availability can fail independently.
 - Notification delivery with an unknown external outcome is not retried automatically.

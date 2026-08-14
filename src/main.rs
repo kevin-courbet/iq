@@ -2,21 +2,20 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use iq::composition::{RepositoryInitOptions, RepositoryManager};
 use iq::integrator::{
-    verify_rift_workspace_config, workspace_status, HostSignoffPolicy, IntegrationPolicy,
-    Integrator, IntegratorOptions, SignoffPolicy,
+    verify_rift_workspace_config_with_queue, workspace_status, IntegrationPolicy, Integrator,
+    IntegratorOptions, RepositoryOperationLease,
 };
 use iq::sqlite::{Attempt, EnqueueRequest, QueueItem, SqliteQueue, SqliteQueueReader};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
 use uuid::Uuid;
 
 #[derive(Parser, Debug)]
@@ -30,10 +29,6 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    Migrate {
-        #[arg(long)]
-        system_config: Option<PathBuf>,
-    },
     Repo {
         #[command(subcommand)]
         command: RepoCommand,
@@ -57,35 +52,21 @@ enum Command {
         #[arg(long, conflicts_with = "next", required_unless_present = "next")]
         resume: Option<String>,
         #[arg(long)]
-        repo_path: PathBuf,
-        #[arg(long)]
-        repo_key: Option<String>,
-        #[arg(long, default_value = "main")]
-        target: String,
-        #[arg(long, default_value = "origin")]
-        remote: String,
-        #[arg(long)]
-        workspace_root: Option<PathBuf>,
+        repo_key: String,
         #[arg(long)]
         owner: Option<String>,
     },
     Enqueue {
         #[arg(long)]
-        repo_path: PathBuf,
-        #[arg(long)]
-        repo_key: Option<String>,
+        repo_key: String,
         #[arg(long)]
         source: String,
-        #[arg(long, default_value = "main")]
-        target: String,
         #[arg(long)]
         head: String,
         #[arg(long)]
         pr_url: Option<String>,
         #[arg(long)]
         producer: Option<String>,
-        #[arg(long, default_value = "origin")]
-        remote: String,
     },
     List,
     Inbox {
@@ -187,15 +168,7 @@ enum Command {
     #[command(hide = true)]
     RemoteExec {
         #[arg(long)]
-        repo_path: PathBuf,
-        #[arg(long)]
         repo_key: String,
-        #[arg(long, default_value = "main")]
-        target: String,
-        #[arg(long, default_value = "origin")]
-        remote: String,
-        #[arg(long)]
-        workspace_root: PathBuf,
     },
 }
 
@@ -203,17 +176,13 @@ enum Command {
 struct CleanupArgs {
     #[arg(
         long,
-        conflicts_with_all = ["repo_key", "system_config", "repo_path", "workspace_root"]
+        conflicts_with_all = ["repo_key", "system_config"]
     )]
     workspace: Option<String>,
     #[arg(long, required_unless_present = "workspace")]
     repo_key: Option<String>,
     #[arg(long, required_unless_present = "workspace")]
     system_config: Option<PathBuf>,
-    #[arg(long, required_unless_present = "workspace")]
-    repo_path: Option<PathBuf>,
-    #[arg(long, required_unless_present = "workspace")]
-    workspace_root: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -225,10 +194,6 @@ enum RepoCommand {
         target: String,
         #[arg(long, default_value = "origin")]
         remote: String,
-        #[arg(long)]
-        seed: Option<PathBuf>,
-        #[arg(long)]
-        workspace_root: Option<PathBuf>,
     },
     List,
     Status {
@@ -276,8 +241,6 @@ enum ConfigCommand {
         reconcile_lock: PathBuf,
         #[arg(long)]
         bootstrap: bool,
-        #[arg(long)]
-        workspace_root: PathBuf,
     },
     /// Verify a staged generation against its manifest and current input CAS.
     VerifyGeneration {
@@ -338,27 +301,13 @@ enum RemoteCommand {
 enum WorkspaceCommand {
     Status {
         #[arg(long)]
-        repo_path: PathBuf,
-        #[arg(long)]
-        repo_key: Option<String>,
-        #[arg(long, default_value = "origin")]
-        remote: String,
-        #[arg(long)]
-        workspace_root: Option<PathBuf>,
-        #[arg(long)]
-        owner: Option<String>,
+        repo_key: String,
     },
     Reset {
         #[arg(long)]
         system_config: PathBuf,
         #[arg(long)]
-        repo_path: PathBuf,
-        #[arg(long)]
-        repo_key: Option<String>,
-        #[arg(long, default_value = "origin")]
-        remote: String,
-        #[arg(long)]
-        workspace_root: Option<PathBuf>,
+        repo_key: String,
         #[arg(long)]
         owner: Option<String>,
     },
@@ -392,32 +341,29 @@ fn main() -> Result<()> {
         None => SqliteQueue::default_db_path()?,
     };
     match cli.command {
-        Command::Migrate { system_config } => {
-            let queue = SqliteQueue::migrate(&db_path, system_config.as_deref())?;
-            print_json(&json!({"schema_version": 10, "database": queue.path()}))?;
-        }
-        Command::Repo { command } => {
-            let manager = RepositoryManager::new(SqliteQueue::open(&db_path)?);
-            match command {
-                RepoCommand::Init {
-                    path,
-                    target,
-                    remote,
-                    seed,
-                    workspace_root,
-                } => print_json(&manager.init(
+        Command::Repo { command } => match command {
+            RepoCommand::Init {
+                path,
+                target,
+                remote,
+            } => {
+                iq::repository::validate_target_branch(&target)?;
+                let manager = RepositoryManager::new(SqliteQueue::open(&db_path)?);
+                print_json(&manager.init(
                     &path,
                     RepositoryInitOptions {
                         target_branch: target,
                         remote,
-                        seed_path: seed,
-                        workspace_root,
                     },
-                )?)?,
-                RepoCommand::List => print_json(&manager.list()?)?,
-                RepoCommand::Status { repo_key } => print_json(&manager.status(&repo_key)?)?,
+                )?)?
             }
-        }
+            RepoCommand::List => {
+                print_json(&RepositoryManager::new(SqliteQueue::open(&db_path)?).list()?)?
+            }
+            RepoCommand::Status { repo_key } => print_json(
+                &RepositoryManager::new(SqliteQueue::open(&db_path)?).status(&repo_key)?,
+            )?,
+        },
         Command::DevWorkspace { command } => {
             let manager = RepositoryManager::new(SqliteQueue::open(&db_path)?);
             match command {
@@ -452,8 +398,6 @@ fn main() -> Result<()> {
             repo_key,
             workspace,
             system_config,
-            repo_path,
-            workspace_root,
         }) => {
             let manager = RepositoryManager::new(SqliteQueue::open(&db_path)?);
             if let Some(workspace) = workspace {
@@ -462,40 +406,20 @@ fn main() -> Result<()> {
                 let repo_key = repo_key.context("repository cleanup requires --repo-key")?;
                 let system_config =
                     system_config.context("repository cleanup requires --system-config")?;
-                let repo_path = repo_path.context("repository cleanup requires --repo-path")?;
-                let workspace_root =
-                    workspace_root.context("repository cleanup requires --workspace-root")?;
                 let system = iq::agent_config::SystemConfig::load(&system_config)?;
-                print_json(&manager.cleanup_repo_with_system(
-                    &repo_key,
-                    &system,
-                    &repo_path,
-                    &workspace_root,
-                )?)?;
+                print_json(&manager.cleanup_repo_with_system(&repo_key, &system)?)?;
             }
         }
         Command::Integrate {
             next: _,
             system_config,
             resume,
-            repo_path,
             repo_key,
-            target,
-            remote,
-            workspace_root,
             owner,
         } => {
             let system = iq::agent_config::SystemConfig::load(&system_config)?;
             let integrator = Integrator::new(integrator_options_with_system_config(
-                integrator_options(
-                    db_path,
-                    repo_path,
-                    repo_key,
-                    &target,
-                    remote,
-                    workspace_root,
-                    owner,
-                )?,
+                integrator_options(db_path, repo_key, owner)?,
                 &system,
             ))?;
             if let Some(item) = resume {
@@ -505,37 +429,20 @@ fn main() -> Result<()> {
             }
         }
         Command::Enqueue {
-            repo_path,
             repo_key,
             source,
-            target,
             head,
             pr_url,
             producer,
-            remote,
         } => {
             let queue = SqliteQueue::open(&db_path)?;
-            let repo_path = canonical_repo_path(&repo_path, "enqueue repository")?;
-            let repo_key = match repo_key {
-                Some(repo_key) => repo_key,
-                None => default_repo_key(&repo_path, &target)?,
-            };
-            validate_branch_handoff(&repo_path, &remote, &source, &target, &head)?;
-            let state_repository =
-                iq::composition::load_project_control_only(&repo_path)?.state_repository;
-            iq::state_repository::repository(&state_repository)?.verify()?;
-            let item = queue.enqueue(EnqueueRequest {
+            let item = RepositoryManager::new(queue.clone()).enqueue_remote(EnqueueRequest {
                 repo_key,
-                repo_path: repo_path
-                    .to_str()
-                    .context("canonical enqueue repository path is not valid UTF-8")?
-                    .to_string(),
                 source_branch: source,
-                target_branch: target,
                 current_head_sha: head,
                 pr_url,
                 producer_metadata: json!({ "producer": producer }),
-                state_repository,
+                state_repository: iq::control_domain::StateRepositorySnapshot::Local,
             })?;
             iq::state_repository::reserve_full_issue(&queue.validated_control_store()?, &item.id)?;
             print_json(&item)?;
@@ -665,45 +572,27 @@ fn main() -> Result<()> {
             print_json(&read_evidence(&queue, &queued, phase)?)?;
         }
         Command::Workspace { command } => match command {
-            WorkspaceCommand::Status {
-                repo_path,
-                repo_key,
-                remote: _,
-                workspace_root: _,
-                owner: _,
-            } => {
-                let repo_key = match repo_key {
-                    Some(repo_key) => repo_key,
-                    None => {
-                        let repo_path = canonical_existing_repo_path(
-                            &repo_path,
-                            "workspace status repository",
-                        )?;
-                        default_repo_key(&repo_path, "main")?
-                    }
-                };
-                let queue = SqliteQueueReader::open(&db_path)?;
-                print_json(&workspace_status(&queue, &repo_key)?)?;
+            WorkspaceCommand::Status { repo_key } => {
+                let reader = SqliteQueueReader::open(&db_path)?;
+                let queue = SqliteQueue::open(&db_path)?;
+                let repository = queue.repository(&repo_key)?;
+                let _operation = RepositoryOperationLease::acquire(
+                    queue,
+                    &repository.owned_root_path,
+                    &repo_key,
+                    &format!("iq-workspace-status-{}", Uuid::new_v4()),
+                    30,
+                )?;
+                print_json(&workspace_status(&reader, &repo_key)?)?;
             }
             WorkspaceCommand::Reset {
                 system_config,
-                repo_path,
                 repo_key,
-                remote,
-                workspace_root,
                 owner,
             } => {
                 let system = iq::agent_config::SystemConfig::load(&system_config)?;
                 let integrator = Integrator::new(integrator_options_with_system_config(
-                    integrator_options(
-                        db_path,
-                        repo_path,
-                        repo_key,
-                        "main",
-                        remote,
-                        workspace_root,
-                        owner,
-                    )?,
+                    integrator_options(db_path, repo_key, owner)?,
                     &system,
                 ))?;
                 print_json(&integrator.reset_workspaces()?)?;
@@ -727,13 +616,7 @@ fn main() -> Result<()> {
                 interval_seconds,
             )?;
         }
-        Command::RemoteExec {
-            repo_path,
-            repo_key,
-            target,
-            remote,
-            workspace_root,
-        } => run_remote_exec(db_path, repo_path, repo_key, target, remote, workspace_root)?,
+        Command::RemoteExec { repo_key } => run_remote_exec(db_path, repo_key)?,
         Command::Doctor {
             config,
             system_config,
@@ -746,7 +629,6 @@ fn main() -> Result<()> {
                 staged_directory,
                 reconcile_lock,
                 bootstrap,
-                workspace_root,
             } => reconcile_config(
                 &current_config,
                 &desired_inventory,
@@ -754,7 +636,6 @@ fn main() -> Result<()> {
                 &staged_directory,
                 &reconcile_lock,
                 bootstrap,
-                &workspace_root,
             )?,
             ConfigCommand::VerifyGeneration {
                 generation,
@@ -785,127 +666,71 @@ fn run_doctor(
     let notification_health = queue
         .notification_dispatcher(system_config.notifications.clone())?
         .health();
-    let repository_manager = RepositoryManager::new(queue.clone());
-    let gh = std::env::var("IQ_GITHUB_CLI").unwrap_or_else(|_| "gh".into());
     let mut results = Vec::new();
-    for validated in config.repos {
-        let ValidatedDaemonRepo {
-            repo,
-            canonical_repo_path,
-            repo_key,
-            target,
-            remote,
-            validation,
-        } = validated;
-        let registered = queue.repository_if_exists(&repo_key)?.is_some();
-        if registered && (validation != ValidationConfig::None || repo.signoff.is_some()) {
-            anyhow::bail!(
-                "registered repository {repo_key} rejects daemon validation and signoff settings"
-            );
-        }
+    for repo_key in config.repo_keys {
+        let repository = queue.repository(&repo_key)?;
+        let operation = RepositoryOperationLease::acquire(
+            queue.clone(),
+            &repository.owned_root_path,
+            &repo_key,
+            &format!("iq-doctor-{}", Uuid::new_v4()),
+            30,
+        )?;
         let workspace_root = integrator_options_with_system_config(
-            integrator_options(
+            integrator_options_from_queue(
                 queue_db.to_path_buf(),
-                canonical_repo_path.clone(),
-                Some(repo_key.clone()),
-                &target,
-                remote.clone(),
-                repo.workspace_root.clone(),
+                &queue,
+                repo_key.clone(),
                 Some("iq-doctor".into()),
             )?,
             &system_config,
         )
         .workspace_root;
-        verify_rift_workspace_config(
-            &canonical_repo_path,
+        operation.ensure()?;
+        verify_rift_workspace_config_with_queue(
+            &queue,
+            &repository.owned_root_path,
             &workspace_root,
             &repo_key,
-            None,
-            queue_db,
+            Some(&repository.registry_identity),
         )?;
-        let output = ProcessCommand::new("git")
-            .args([
+        let output = operation.run_command(
+            "git",
+            [
                 "ls-remote",
                 "--heads",
-                remote.as_str(),
-                &format!("refs/heads/{target}"),
-            ])
-            .current_dir(&canonical_repo_path)
-            .output()
-            .with_context(|| format!("query {remote}/{target}"))?;
-        if !output.status.success() || output.stdout.is_empty() {
+                repository.remote.name.as_str(),
+                &format!("refs/heads/{}", repository.target_branch),
+            ],
+            Some(&repository.owned_root_path),
+            std::time::Duration::from_secs(60),
+            "query repository target",
+        )?;
+        if output.stdout.is_empty() {
             anyhow::bail!(
-                "cannot resolve {remote}/{target} from {}: {}",
-                canonical_repo_path.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
+                "cannot resolve {}/{} from {}",
+                repository.remote.name,
+                repository.target_branch,
+                repository.owned_root_path.display(),
             );
         }
-        if let Some(signoff) = &repo.signoff {
-            let login_output = ProcessCommand::new(&gh)
-                .args(["api", "user", "--jq", ".login"])
-                .output()
-                .with_context(|| format!("run {gh} api user"))?;
-            if !login_output.status.success() {
-                anyhow::bail!(
-                    "gh authentication check failed: {}",
-                    String::from_utf8_lossy(&login_output.stderr).trim()
-                );
-            }
-            let login = String::from_utf8_lossy(&login_output.stdout)
-                .trim()
-                .to_string();
-            if login != signoff.trusted_creator {
-                anyhow::bail!(
-                    "gh login {login} does not match trusted status creator {}",
-                    signoff.trusted_creator
-                );
-            }
-            let access = ProcessCommand::new(&gh)
-                .args([
-                    "repo",
-                    "view",
-                    signoff.repository.as_str(),
-                    "--json",
-                    "nameWithOwner",
-                ])
-                .output()
-                .with_context(|| format!("run {gh} repo view {}", signoff.repository))?;
-            if !access.status.success() {
-                anyhow::bail!(
-                    "gh user {login} cannot access {}: {}",
-                    signoff.repository,
-                    String::from_utf8_lossy(&access.stderr).trim()
-                );
-            }
-        }
-        let validation_report = if registered {
-            let policy = repository_manager.inspect_local_policy(&repo_key)?;
-            json!({
-                "authority": "local_integration_checkout",
-                "policy": policy.policy,
-            })
+        operation.ensure()?;
+        let (policy, _, _) = iq::composition::load_local_policy(&repository.owned_root_path)?;
+        let authority = if policy.policy == iq::composition::ValidationPolicy::None {
+            "none"
         } else {
-            match &validation {
-                ValidationConfig::None => json!({
-                    "authority": "none",
-                    "policy": {"mode": "none"},
-                }),
-                ValidationConfig::Command { command } => json!({
-                    "authority": "daemon",
-                    "policy": {
-                        "mode": "command",
-                        "command": command,
-                        "signoff_required": repo.signoff.is_some(),
-                    },
-                }),
-            }
+            "owned_root"
         };
+        let validation_report = json!({
+            "authority": authority,
+            "policy": policy.policy,
+        });
         results.push(json!({
             "repo_key": repo_key,
-            "repo_path": canonical_repo_path,
+            "repo_path": repository.owned_root_path,
             "workspace_root": workspace_root,
-            "target": target,
-            "remote": remote,
+            "target": repository.target_branch,
+            "remote": repository.remote.name,
             "validation": validation_report,
         }));
     }
@@ -926,14 +751,7 @@ fn run_doctor(
     print_json(&results)
 }
 
-fn run_remote_exec(
-    db_path: PathBuf,
-    repo_path: PathBuf,
-    repo_key: String,
-    target: String,
-    remote: String,
-    _workspace_root: PathBuf,
-) -> Result<()> {
+fn run_remote_exec(db_path: PathBuf, repo_key: String) -> Result<()> {
     let original = std::env::var("SSH_ORIGINAL_COMMAND")
         .context("remote-exec requires SSH_ORIGINAL_COMMAND")?;
     let args = shell_words::split(&original).context("parse SSH_ORIGINAL_COMMAND")?;
@@ -946,23 +764,13 @@ fn run_remote_exec(
             producer,
         } => {
             let queue = SqliteQueue::open(&db_path)?;
-            let repo_path = canonical_repo_path(&repo_path, "remote enqueue repository")?;
-            validate_branch_handoff(&repo_path, &remote, &source, &target, &head)?;
-            let state_repository =
-                iq::composition::load_project_control_only(&repo_path)?.state_repository;
-            iq::state_repository::repository(&state_repository)?.verify()?;
-            let item = queue.enqueue(EnqueueRequest {
+            let item = RepositoryManager::new(queue.clone()).enqueue_remote(EnqueueRequest {
                 repo_key,
-                repo_path: repo_path
-                    .to_str()
-                    .context("canonical remote enqueue repository path is not valid UTF-8")?
-                    .to_string(),
                 source_branch: source,
-                target_branch: target,
                 current_head_sha: head,
                 pr_url,
                 producer_metadata: json!({ "producer": producer }),
-                state_repository,
+                state_repository: iq::control_domain::StateRepositorySnapshot::Local,
             })?;
             iq::state_repository::reserve_full_issue(&queue.validated_control_store()?, &item.id)?;
             print_json(&item)?;
@@ -1022,82 +830,32 @@ fn require_remote_item_scope(item: &QueueItem, repo_key: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_branch_handoff(
-    repo_path: &std::path::Path,
-    remote: &str,
-    branch: &str,
-    target: &str,
-    expected_head: &str,
-) -> Result<()> {
-    if branch == target {
-        anyhow::bail!("source branch must not be target branch {target}");
-    }
-    if !matches!(expected_head.len(), 40 | 64)
-        || !expected_head.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        anyhow::bail!("expected head must be a full hexadecimal Git object ID");
-    }
-    let ref_check = ProcessCommand::new("git")
-        .args(["check-ref-format", "--branch", branch])
-        .output()
-        .context("validate source branch name")?;
-    if !ref_check.status.success() {
-        anyhow::bail!("invalid source branch name: {branch}");
-    }
-    let reference = format!("refs/heads/{branch}");
-    let output = ProcessCommand::new("git")
-        .args(["ls-remote", "--heads", remote, reference.as_str()])
-        .current_dir(repo_path)
-        .output()
-        .with_context(|| format!("query {remote}/{branch} from {}", repo_path.display()))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "failed to query {remote}/{branch}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let remote_head = String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    if remote_head.is_empty() {
-        anyhow::bail!("remote branch {remote}/{branch} does not exist");
-    }
-    if remote_head != expected_head {
-        anyhow::bail!("remote branch {remote}/{branch} is {remote_head}, expected {expected_head}");
-    }
-    Ok(())
-}
-
 fn integrator_options(
     queue_db: PathBuf,
-    repo_path: PathBuf,
-    repo_key: Option<String>,
-    target: &str,
-    remote: String,
-    workspace_root: Option<PathBuf>,
+    repo_key: String,
     owner: Option<String>,
 ) -> Result<IntegratorOptions> {
-    let repo_path = canonical_existing_repo_path(&repo_path, "integrator repository")?;
-    let repo_key = match repo_key {
-        Some(repo_key) => repo_key,
-        None => default_repo_key(&repo_path, target)?,
-    };
-    let workspace_root = workspace_root.unwrap_or_else(|| {
-        queue_db
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join("workspaces")
-            .join(workspace_scope(&repo_key))
-    });
+    let queue = SqliteQueue::open(&queue_db)?;
+    integrator_options_from_queue(queue_db, &queue, repo_key, owner)
+}
+
+fn integrator_options_from_queue(
+    queue_db: PathBuf,
+    queue: &SqliteQueue,
+    repo_key: String,
+    owner: Option<String>,
+) -> Result<IntegratorOptions> {
+    let repository = queue.repository(&repo_key)?;
+    let workspace_root = queue
+        .workspace_root_path(&repo_key)?
+        .context("registered repository has no integration child root")?;
     Ok(IntegratorOptions {
         repo_key,
-        repo_path,
+        repo_path: repository.owned_root_path,
         queue_db,
         owner_id: owner.unwrap_or_else(|| format!("iq-{}", std::process::id())),
         lease_ttl_seconds: 30,
-        base_remote: remote,
+        base_remote: repository.remote.name,
         workspace_root,
         rift_database: None,
         system_config: iq::agent_config::SystemConfig {
@@ -1137,37 +895,6 @@ fn integrator_options_with_system_config(
 ) -> IntegratorOptions {
     options.system_config = system_config.clone();
     options
-}
-
-fn workspace_scope(repo_key: &str) -> String {
-    let hash = repo_key
-        .as_bytes()
-        .iter()
-        .fold(0xcbf29ce484222325_u64, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-        });
-    format!("{hash:016x}")
-}
-
-fn default_repo_key(repo_path: &std::path::Path, target: &str) -> Result<String> {
-    let path = repo_path
-        .to_str()
-        .context("canonical repository path is not valid UTF-8")?;
-    Ok(format!("{path}::{target}"))
-}
-
-fn canonical_existing_repo_path(path: &Path, label: &str) -> Result<PathBuf> {
-    let canonical = path
-        .canonicalize()
-        .with_context(|| format!("resolve {label} {}", path.display()))?;
-    require_utf8_path(&canonical, label)?;
-    if !canonical.is_dir() {
-        anyhow::bail!(
-            "{label} path must be an existing directory: {}",
-            path.display()
-        );
-    }
-    Ok(canonical)
 }
 
 fn read_evidence(
@@ -1365,42 +1092,19 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DaemonConfig {
-    repos: Vec<DaemonRepoConfig>,
+struct RuntimeDaemonConfig {
+    repos: Vec<RuntimeDaemonRepository>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DaemonRepoConfig {
-    repo_path: PathBuf,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    repo_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    target: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    remote: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    workspace_root: Option<PathBuf>,
-    validation: ValidationConfig,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    signoff: Option<SignoffPolicy>,
-    #[serde(default)]
-    state_repository: iq::control_domain::StateRepositorySnapshot,
-}
-
-#[derive(Debug, Clone)]
-struct ValidatedDaemonConfig {
-    repos: Vec<ValidatedDaemonRepo>,
-}
-
-#[derive(Debug, Clone)]
-struct ValidatedDaemonRepo {
-    repo: DaemonRepoConfig,
-    canonical_repo_path: PathBuf,
+struct RuntimeDaemonRepository {
     repo_key: String,
-    target: String,
-    remote: String,
-    validation: ValidationConfig,
+}
+
+#[derive(Debug)]
+struct ValidatedRuntimeDaemonConfig {
+    repo_keys: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1413,57 +1117,14 @@ struct DesiredInventory {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DesiredRepository {
-    repo_path: PathBuf,
-    target: String,
-    validation: ValidationConfig,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
-enum ValidationConfig {
-    None,
-    Command { command: String },
+    repo_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ManagerState {
     manager_id: String,
-    boundaries: Vec<ManagerBoundary>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ManagerBoundary {
-    repo_path: PathBuf,
-    target: String,
-    repo_key: String,
-    ownership: ManagerOwnership,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum ManagerOwnership {
-    Adopted {
-        original_validation: ValidationConfig,
-        last_applied_validation: ValidationConfig,
-    },
-    Created {
-        baseline: Box<RepositoryBaseline>,
-        last_applied_validation: ValidationConfig,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
-struct RepositoryBaseline {
-    repo_path: PathBuf,
-    repo_key: String,
-    target: String,
-    remote: Option<String>,
-    workspace_root: Option<PathBuf>,
-    signoff: Option<SignoffPolicy>,
-    state_repository: iq::control_domain::StateRepositorySnapshot,
+    repo_keys: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1497,18 +1158,6 @@ struct GenerationManifest {
     files: Vec<GeneratedFileDigest>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct Boundary {
-    canonical_path: PathBuf,
-    target: String,
-}
-
-impl Boundary {
-    fn key(&self) -> String {
-        format!("{}::{}", self.canonical_path.display(), self.target)
-    }
-}
-
 fn reconcile_config(
     current_config_path: &Path,
     desired_inventory_path: &Path,
@@ -1516,7 +1165,6 @@ fn reconcile_config(
     staged_directory: &Path,
     lock_path: &Path,
     bootstrap: bool,
-    workspace_root: &Path,
 ) -> Result<()> {
     validate_reconcile_paths(
         current_config_path,
@@ -1545,10 +1193,10 @@ fn reconcile_config(
     let manager_id = require_exact_nonblank(&inventory.manager_id, "desired inventory manager_id")?;
 
     let current_config = match current_config_bytes.as_deref() {
-        Some(bytes) => parse_daemon_config(bytes, current_config_path)?,
-        None => DaemonConfig { repos: Vec::new() },
+        Some(bytes) => serde_yaml::from_slice::<RuntimeDaemonConfig>(bytes)
+            .with_context(|| format!("parse daemon config {}", current_config_path.display()))?,
+        None => RuntimeDaemonConfig { repos: Vec::new() },
     };
-
     let current_state = match current_state_bytes.as_deref() {
         Some(bytes) => serde_json::from_slice::<ManagerState>(bytes).with_context(|| {
             format!(
@@ -1558,182 +1206,76 @@ fn reconcile_config(
         })?,
         None if bootstrap => ManagerState {
             manager_id: manager_id.to_string(),
-            boundaries: Vec::new(),
+            repo_keys: Vec::new(),
         },
         None => anyhow::bail!(
             "current manager state is missing; pass --bootstrap for first reconciliation"
         ),
     };
-    validate_manager_state(&current_state, manager_id)?;
-
-    let desired = normalize_desired_repositories(&inventory.repositories)?;
-    let current = index_config_repositories(&current_config)?;
-    let owned = index_manager_boundaries(&current_state)?;
-    let workspace_root = if desired
-        .iter()
-        .any(|(boundary, _)| !current.contains_key(&boundary.key()))
-    {
-        Some(require_workspace_root(workspace_root)?)
-    } else {
-        None
-    };
-
-    for (boundary_key, owned_entry) in &owned {
-        let current_repo = current.get(boundary_key).ok_or_else(|| {
-            anyhow::anyhow!("owned manager boundary {boundary_key} is missing from current config")
-        })?;
-        if config_repo_key(current_repo, &config_boundary_for_matching(current_repo)?)?
-            != owned_entry.repo_key
-        {
-            anyhow::bail!(
-                "owned manager boundary {boundary_key} has repo_key {}, expected {}",
-                config_repo_key(current_repo, &config_boundary_for_matching(current_repo)?)?,
-                owned_entry.repo_key
-            );
-        }
+    if current_state.manager_id != manager_id {
+        anyhow::bail!("current manager state belongs to a different manager");
     }
 
-    let desired_by_key = desired
-        .iter()
-        .map(|(boundary, intent)| (boundary.key(), (boundary, intent)))
-        .collect::<HashMap<_, _>>();
-    let mut effective_repos = Vec::with_capacity(current_config.repos.len() + desired.len());
-    let mut next_boundaries = Vec::with_capacity(desired.len());
-    for repo in &current_config.repos {
-        let boundary = config_boundary_for_matching(repo)?;
-        let boundary_key = boundary.key();
-        if let Some(managed) = owned.get(&boundary_key) {
-            let desired_repo = desired_by_key.get(&boundary_key);
-            match &managed.ownership {
-                ManagerOwnership::Adopted {
-                    original_validation,
-                    last_applied_validation,
-                } => {
-                    let current_validation = validation_state_for_repo(repo)?;
-                    if current_validation != *last_applied_validation {
-                        anyhow::bail!("app-owned validation changed externally for {boundary_key}");
-                    }
-                    if let Some((_, intent)) = desired_repo {
-                        let next_validation = validate_validation_config(intent)?;
-                        effective_repos.push(apply_validation_state(
-                            canonicalize_repo_path(repo.clone(), &boundary),
-                            &next_validation,
-                        )?);
-                        next_boundaries.push(ManagerBoundary {
-                            repo_path: boundary.canonical_path.clone(),
-                            target: boundary.target.clone(),
-                            repo_key: managed.repo_key.clone(),
-                            ownership: ManagerOwnership::Adopted {
-                                original_validation: original_validation.clone(),
-                                last_applied_validation: next_validation,
-                            },
-                        });
-                    } else {
-                        // Adoption is reversible: restore original app-visible validation,
-                        // retain all consumer-owned policy, then release ownership.
-                        effective_repos.push(apply_validation_state(
-                            canonicalize_repo_path(repo.clone(), &boundary),
-                            original_validation,
-                        )?);
-                    }
-                }
-                ManagerOwnership::Created {
-                    baseline,
-                    last_applied_validation,
-                } => {
-                    if !matches_baseline(repo, baseline)? {
-                        anyhow::bail!(
-                            "manager-created boundary {boundary_key} policy changed externally; refusing destructive removal or overwrite"
-                        );
-                    }
-                    let current_validation = validation_state_for_repo(repo)?;
-                    if current_validation != *last_applied_validation {
-                        anyhow::bail!("app-owned validation changed externally for {boundary_key}");
-                    }
-                    if let Some((_, intent)) = desired_repo {
-                        let next_validation = validate_validation_config(intent)?;
-                        effective_repos
-                            .push(apply_validation_state(repo.clone(), &next_validation)?);
-                        next_boundaries.push(ManagerBoundary {
-                            repo_path: boundary.canonical_path.clone(),
-                            target: boundary.target.clone(),
-                            repo_key: managed.repo_key.clone(),
-                            ownership: ManagerOwnership::Created {
-                                baseline: baseline.clone(),
-                                last_applied_validation: next_validation,
-                            },
-                        });
-                    }
-                }
+    let mut current_keys = HashSet::new();
+    let current_repos = current_config
+        .repos
+        .into_iter()
+        .map(|repository| {
+            let repo_key = validate_repo_key(&repository.repo_key, "current config repo_key")?;
+            if !current_keys.insert(repo_key.clone()) {
+                anyhow::bail!("current config duplicates repo_key {repo_key}");
             }
-        } else if let Some((_, intent)) = desired_by_key.get(&boundary_key) {
-            let original_validation = validation_state_for_repo(repo)?;
-            let next_validation = validate_validation_config(intent)?;
-            effective_repos.push(apply_validation_state(
-                canonicalize_repo_path(repo.clone(), &boundary),
-                &next_validation,
-            )?);
-            next_boundaries.push(ManagerBoundary {
-                repo_path: boundary.canonical_path.clone(),
-                target: boundary.target.clone(),
-                repo_key: config_repo_key(repo, &boundary)?,
-                ownership: ManagerOwnership::Adopted {
-                    original_validation,
-                    last_applied_validation: next_validation,
-                },
-            });
-        } else {
-            effective_repos.push(repo.clone());
+            Ok(RuntimeDaemonRepository { repo_key })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut managed_keys = HashSet::new();
+    for repo_key in &current_state.repo_keys {
+        let repo_key = validate_repo_key(repo_key, "manager state repo_key")?;
+        if !managed_keys.insert(repo_key.clone()) {
+            anyhow::bail!("manager state duplicates repo_key {repo_key}");
+        }
+        if !current_keys.contains(&repo_key) {
+            anyhow::bail!("manager-owned repository {repo_key} is missing from current config");
         }
     }
-
-    for (boundary, intent) in &desired {
-        if current.contains_key(&boundary.key()) {
+    let mut desired_keys = HashSet::new();
+    let desired_repos = inventory
+        .repositories
+        .into_iter()
+        .map(|repository| {
+            let repo_key = validate_repo_key(&repository.repo_key, "desired repository repo_key")?;
+            if !desired_keys.insert(repo_key.clone()) {
+                anyhow::bail!("desired inventory duplicates repo_key {repo_key}");
+            }
+            Ok(RuntimeDaemonRepository { repo_key })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut effective_repos = current_repos
+        .into_iter()
+        .filter(|repository| !managed_keys.contains(&repository.repo_key))
+        .collect::<Vec<_>>();
+    for repository in desired_repos {
+        if effective_repos
+            .iter()
+            .any(|current| current.repo_key == repository.repo_key)
+        {
             continue;
         }
-        let repo_key = default_repo_key(&boundary.canonical_path, &boundary.target)?;
-        let repo = DaemonRepoConfig {
-            repo_path: boundary.canonical_path.clone(),
-            repo_key: Some(repo_key.clone()),
-            target: Some(boundary.target.clone()),
-            remote: Some("origin".into()),
-            workspace_root: Some(stable_workspace_root(
-                workspace_root
-                    .as_deref()
-                    .context("workspace root required for new repository boundary")?,
-                boundary,
-            )),
-            validation: ValidationConfig::None,
-            signoff: None,
-            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
-        };
-        let next_validation = validate_validation_config(intent)?;
-        effective_repos.push(apply_validation_state(repo.clone(), &next_validation)?);
-        next_boundaries.push(ManagerBoundary {
-            repo_path: boundary.canonical_path.clone(),
-            target: boundary.target.clone(),
-            repo_key,
-            ownership: ManagerOwnership::Created {
-                baseline: Box::new(repository_baseline(&repo)?),
-                last_applied_validation: next_validation,
-            },
-        });
+        effective_repos.push(repository);
     }
-
-    let effective_config = DaemonConfig {
+    effective_repos.sort_by(|left, right| left.repo_key.cmp(&right.repo_key));
+    let effective_config = RuntimeDaemonConfig {
         repos: effective_repos,
     };
-    let validated_effective = validate_daemon_config(&effective_config, false)?;
     let staged_config_bytes = serde_yaml::to_string(&effective_config)
         .context("serialize staged daemon config")?
         .into_bytes();
-
-    validate_workspace_roots(&validated_effective)?;
+    let mut next_repo_keys = desired_keys.into_iter().collect::<Vec<_>>();
+    next_repo_keys.sort();
     let staged_state = ManagerState {
         manager_id: manager_id.to_string(),
-        boundaries: next_boundaries,
+        repo_keys: next_repo_keys,
     };
-    validate_manager_state(&staged_state, manager_id)?;
     let staged_state_bytes =
         serde_json::to_vec_pretty(&staged_state).context("serialize staged manager state")?;
 
@@ -1773,11 +1315,7 @@ fn reconcile_config(
     )?;
     print_json(&ReconcileOutput {
         manager_id: manager_id.to_string(),
-        repo_keys: staged_state
-            .boundaries
-            .iter()
-            .map(|entry| entry.repo_key.clone())
-            .collect(),
+        repo_keys: staged_state.repo_keys.clone(),
         staged_directory: staged_directory.display().to_string(),
         action,
     })
@@ -1803,7 +1341,7 @@ fn generated_file_digest(path: &str, bytes: &[u8]) -> GeneratedFileDigest {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
-    hex_digest(&digest)
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn verify_generation(
@@ -1840,481 +1378,6 @@ fn verify_generation(
         anyhow::bail!("current manager state drifted from generation manifest base snapshot");
     }
     print_json(&json!({"verified": true}))
-}
-
-fn normalize_desired_repositories(
-    repositories: &[DesiredRepository],
-) -> Result<Vec<(Boundary, ValidationConfig)>> {
-    let mut boundaries = HashSet::new();
-    let mut repo_keys = HashSet::new();
-    repositories
-        .iter()
-        .map(|repository| {
-            let path = canonical_repo_path(&repository.repo_path, "desired repository")?;
-            let target = validate_target(&repository.target, "desired repository target")?;
-            let boundary = Boundary {
-                canonical_path: path,
-                target: target.to_string(),
-            };
-            if !boundaries.insert(boundary.key()) {
-                anyhow::bail!(
-                    "desired inventory duplicates repository target {}",
-                    boundary.key()
-                );
-            }
-            let repo_key = default_repo_key(&boundary.canonical_path, &boundary.target)?;
-            if !repo_keys.insert(repo_key.clone()) {
-                anyhow::bail!("desired inventory duplicates repo_key {repo_key}");
-            }
-            Ok((
-                boundary,
-                validate_validation_config(&repository.validation)?,
-            ))
-        })
-        .collect()
-}
-
-fn validate_validation_config(validation: &ValidationConfig) -> Result<ValidationConfig> {
-    Ok(match validation {
-        ValidationConfig::None => ValidationConfig::None,
-        ValidationConfig::Command { command } => ValidationConfig::Command {
-            command: require_exact_nonblank(command, "validation command")?.to_string(),
-        },
-    })
-}
-
-fn validation_state_for_repo(repo: &DaemonRepoConfig) -> Result<ValidationConfig> {
-    validate_validation_config(&repo.validation)
-}
-
-fn apply_validation_state(
-    mut repo: DaemonRepoConfig,
-    state: &ValidationConfig,
-) -> Result<DaemonRepoConfig> {
-    repo.validation = validate_validation_config(state)?;
-    Ok(repo)
-}
-
-fn canonicalize_repo_path(mut repo: DaemonRepoConfig, boundary: &Boundary) -> DaemonRepoConfig {
-    repo.repo_path = boundary.canonical_path.clone();
-    repo
-}
-
-fn config_repo_key(repo: &DaemonRepoConfig, boundary: &Boundary) -> Result<String> {
-    match repo.repo_key.clone() {
-        Some(repo_key) => Ok(repo_key),
-        None => default_repo_key(&boundary.canonical_path, &boundary.target),
-    }
-}
-
-fn repository_baseline(repo: &DaemonRepoConfig) -> Result<RepositoryBaseline> {
-    Ok(RepositoryBaseline {
-        repo_path: repo.repo_path.clone(),
-        repo_key: match repo.repo_key.clone() {
-            Some(repo_key) => repo_key,
-            None => default_repo_key(&repo.repo_path, repo.target.as_deref().unwrap_or("main"))?,
-        },
-        target: repo.target.clone().unwrap_or_else(|| "main".into()),
-        remote: repo.remote.clone(),
-        workspace_root: repo.workspace_root.clone(),
-        signoff: repo.signoff.clone(),
-        state_repository: repo.state_repository.clone(),
-    })
-}
-
-fn matches_baseline(repo: &DaemonRepoConfig, baseline: &RepositoryBaseline) -> Result<bool> {
-    Ok(repo.repo_key.as_deref() == Some(baseline.repo_key.as_str())
-        && repo.target.as_deref().unwrap_or("main") == baseline.target
-        && repository_baseline(repo)? == *baseline)
-}
-
-fn validate_daemon_config(
-    config: &DaemonConfig,
-    require_nonempty: bool,
-) -> Result<ValidatedDaemonConfig> {
-    if require_nonempty && config.repos.is_empty() {
-        anyhow::bail!("daemon config has no repos");
-    }
-    let mut repo_keys = HashSet::new();
-    let mut boundaries = HashSet::new();
-    let mut repos = Vec::with_capacity(config.repos.len());
-    for repo in &config.repos {
-        let canonical_repo_path = canonical_repo_path(&repo.repo_path, "configured repository")?;
-        let target = configured_target(repo)?;
-        let boundary = Boundary {
-            canonical_path: canonical_repo_path.clone(),
-            target: target.clone(),
-        };
-        let repo_key = match repo
-            .repo_key
-            .clone()
-            .map(|key| require_exact_nonblank(&key, "repo_key").map(str::to_string))
-            .transpose()?
-        {
-            Some(repo_key) => repo_key,
-            None => default_repo_key(&canonical_repo_path, &target)?,
-        };
-        if repo_key.rsplit_once("::").map(|(_, scope)| scope) != Some(boundary.target.as_str()) {
-            anyhow::bail!(
-                "repo_key {repo_key} does not match configured target {}",
-                boundary.target
-            );
-        }
-        if !repo_keys.insert(repo_key.clone()) {
-            anyhow::bail!("daemon config duplicates repo_key {repo_key}");
-        }
-        if !boundaries.insert(boundary.key()) {
-            anyhow::bail!(
-                "daemon config duplicates repository target {}",
-                boundary.key()
-            );
-        }
-        let remote = repo
-            .remote
-            .as_deref()
-            .map(|value| require_exact_nonblank(value, "remote").map(str::to_string))
-            .transpose()?
-            .unwrap_or_else(|| "origin".into());
-        if let Some(workspace_root) = &repo.workspace_root {
-            if !workspace_root.is_absolute() {
-                anyhow::bail!(
-                    "workspace_root must be absolute: {}",
-                    workspace_root.display()
-                );
-            }
-            workspace_path_identity(workspace_root)?;
-            if workspace_root.exists() && !workspace_root.is_dir() {
-                anyhow::bail!(
-                    "workspace_root must be a directory: {}",
-                    workspace_root.display()
-                );
-            }
-        }
-        let validation = validate_validation_config(&repo.validation)?;
-        if validation == ValidationConfig::None && repo.signoff.is_some() {
-            anyhow::bail!("signoff requires validation mode command");
-        }
-        validate_signoff(repo.signoff.as_ref())?;
-        repo.state_repository.clone().validate()?;
-        repos.push(ValidatedDaemonRepo {
-            repo: repo.clone(),
-            canonical_repo_path,
-            repo_key,
-            target,
-            remote,
-            validation,
-        });
-    }
-    Ok(ValidatedDaemonConfig { repos })
-}
-
-fn configured_target(repo: &DaemonRepoConfig) -> Result<String> {
-    let target = repo.target.as_deref().unwrap_or("main");
-    validate_target(target, "configured target")
-}
-
-fn validate_target(target: &str, label: &str) -> Result<String> {
-    let target = require_exact_nonblank(target, label)?;
-    let output = ProcessCommand::new("git")
-        .args(["check-ref-format", "--branch", target])
-        .output()
-        .with_context(|| format!("validate {label} {target}"))?;
-    if !output.status.success() {
-        anyhow::bail!("{label} is not a valid Git branch name: {target}");
-    }
-    Ok(target.to_string())
-}
-
-fn validate_signoff(signoff: Option<&SignoffPolicy>) -> Result<()> {
-    let Some(signoff) = signoff else {
-        return Ok(());
-    };
-    require_exact_nonblank(&signoff.command, "signoff command")?;
-    require_exact_nonblank(&signoff.repository, "signoff repository")?;
-    require_exact_nonblank(&signoff.trusted_creator, "signoff trusted_creator")?;
-    if signoff.required_contexts.is_empty() {
-        anyhow::bail!("signoff required_contexts must not be empty");
-    }
-    for context in &signoff.required_contexts {
-        require_exact_nonblank(context, "signoff required context")?;
-    }
-    Ok(())
-}
-
-fn index_config_repositories(config: &DaemonConfig) -> Result<HashMap<String, &DaemonRepoConfig>> {
-    let mut indexed = HashMap::new();
-    for repo in &config.repos {
-        let boundary = config_boundary_for_matching(repo)?;
-        if indexed.insert(boundary.key(), repo).is_some() {
-            anyhow::bail!("daemon config contains duplicate repository boundary");
-        }
-    }
-    Ok(indexed)
-}
-
-fn index_manager_boundaries(state: &ManagerState) -> Result<HashMap<String, ManagerBoundary>> {
-    let mut indexed = HashMap::new();
-    let mut repo_keys = HashSet::new();
-    let mut workspace_roots = HashMap::<PathBuf, String>::new();
-    for entry in &state.boundaries {
-        let path = manager_state_repo_path(entry)?;
-        let target = validate_target(&entry.target, "manager state target")?;
-        let repo_key =
-            require_exact_nonblank(&entry.repo_key, "manager state repo_key")?.to_string();
-        if repo_key.rsplit_once("::").map(|(_, scope)| scope) != Some(target.as_str()) {
-            anyhow::bail!("manager state repo_key {repo_key} does not match target {target}");
-        }
-        if !repo_keys.insert(repo_key.clone()) {
-            anyhow::bail!("manager state duplicates repo_key {repo_key}");
-        }
-        let boundary = Boundary {
-            canonical_path: path.clone(),
-            target: target.clone(),
-        };
-        validate_manager_ownership(entry, &boundary, &repo_key)?;
-        if let ManagerOwnership::Created { baseline, .. } = &entry.ownership {
-            if let Some(workspace_root) = baseline.workspace_root.as_ref() {
-                if !workspace_root.is_absolute() {
-                    anyhow::bail!(
-                        "manager-created workspace_root must be absolute: {}",
-                        workspace_root.display()
-                    );
-                }
-                if let Some(previous) = workspace_roots
-                    .insert(workspace_path_identity(workspace_root)?, repo_key.clone())
-                {
-                    anyhow::bail!(
-                        "manager boundaries {previous} and {repo_key} share workspace_root {}",
-                        workspace_root.display()
-                    );
-                }
-            }
-        }
-        if indexed
-            .insert(
-                boundary.key(),
-                ManagerBoundary {
-                    repo_path: path,
-                    target: target.to_string(),
-                    repo_key,
-                    ownership: entry.ownership.clone(),
-                },
-            )
-            .is_some()
-        {
-            anyhow::bail!(
-                "manager state duplicates repository boundary {}",
-                boundary.key()
-            );
-        }
-    }
-    Ok(indexed)
-}
-
-fn validate_manager_state(state: &ManagerState, expected_manager_id: &str) -> Result<()> {
-    let manager_id = require_exact_nonblank(&state.manager_id, "manager state manager_id")?;
-    if manager_id != expected_manager_id {
-        anyhow::bail!(
-            "manager mismatch: current manager state belongs to {manager_id}, desired inventory belongs to {expected_manager_id}"
-        );
-    }
-    index_manager_boundaries(state)?;
-    Ok(())
-}
-
-fn validate_manager_ownership(
-    entry: &ManagerBoundary,
-    boundary: &Boundary,
-    repo_key: &str,
-) -> Result<()> {
-    let validate_validation = |state: &ValidationConfig, label: &str| -> Result<()> {
-        if let ValidationConfig::Command { command } = state {
-            require_exact_nonblank(command, label)?;
-        }
-        Ok(())
-    };
-    match &entry.ownership {
-        ManagerOwnership::Adopted {
-            original_validation,
-            last_applied_validation,
-        } => {
-            validate_validation(original_validation, "original validation command")?;
-            validate_validation(last_applied_validation, "last applied validation command")?;
-        }
-        ManagerOwnership::Created {
-            baseline,
-            last_applied_validation,
-        } => {
-            validate_validation(last_applied_validation, "last applied validation command")?;
-            if baseline.repo_key != repo_key
-                || baseline.repo_path != entry.repo_path
-                || baseline.target != boundary.target
-            {
-                anyhow::bail!(
-                    "manager-created baseline identity does not match boundary {repo_key}"
-                );
-            }
-            require_exact_nonblank(&baseline.target, "manager-created baseline target")?;
-        }
-    }
-    Ok(())
-}
-
-fn config_boundary_for_matching(repo: &DaemonRepoConfig) -> Result<Boundary> {
-    let target = configured_target(repo)?;
-    Ok(Boundary {
-        canonical_path: canonical_repo_path_or_missing(&repo.repo_path, "configured repository")?,
-        target,
-    })
-}
-
-fn manager_state_repo_path(entry: &ManagerBoundary) -> Result<PathBuf> {
-    match &entry.ownership {
-        ManagerOwnership::Adopted { .. } => {
-            canonical_repo_path(&entry.repo_path, "manager state repository")
-        }
-        ManagerOwnership::Created { .. } => {
-            canonical_repo_path_or_missing(&entry.repo_path, "manager state repository")
-        }
-    }
-}
-
-fn canonical_repo_path(path: &Path, label: &str) -> Result<PathBuf> {
-    if !path.is_absolute() {
-        anyhow::bail!("{label} path must be absolute: {}", path.display());
-    }
-    let canonical = path
-        .canonicalize()
-        .with_context(|| format!("resolve {label} {}", path.display()))?;
-    require_utf8_path(&canonical, label)?;
-    if !canonical.is_dir() {
-        anyhow::bail!(
-            "{label} path must be an existing directory: {}",
-            path.display()
-        );
-    }
-    Ok(canonical)
-}
-
-fn canonical_repo_path_or_missing(path: &Path, label: &str) -> Result<PathBuf> {
-    if !path.is_absolute() {
-        anyhow::bail!("{label} path must be absolute: {}", path.display());
-    }
-    match path.canonicalize() {
-        Ok(canonical) if canonical.is_dir() => {
-            require_utf8_path(&canonical, label)?;
-            Ok(canonical)
-        }
-        Ok(_) => anyhow::bail!("{label} path must be a directory: {}", path.display()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            require_utf8_path(path, label)?;
-            Ok(path.to_path_buf())
-        }
-        Err(error) => Err(error).with_context(|| format!("resolve {label} {}", path.display())),
-    }
-}
-
-fn require_utf8_path(path: &Path, label: &str) -> Result<()> {
-    if path.to_str().is_none() {
-        anyhow::bail!("{label} canonical path is not valid UTF-8");
-    }
-    Ok(())
-}
-
-fn workspace_path_identity(path: &Path) -> Result<PathBuf> {
-    reject_dot_aliases(path, "workspace root")?;
-    if !path.is_absolute() {
-        anyhow::bail!("workspace root must be absolute: {}", path.display());
-    }
-    if path.exists() {
-        let canonical = path
-            .canonicalize()
-            .with_context(|| format!("resolve workspace root {}", path.display()));
-        return canonical;
-    }
-    let mut missing = Vec::new();
-    let mut cursor = path.to_path_buf();
-    while !cursor.exists() {
-        let name = cursor
-            .file_name()
-            .with_context(|| format!("workspace root has no file name {}", cursor.display()))?;
-        missing.push(name.to_os_string());
-        cursor = cursor
-            .parent()
-            .with_context(|| format!("workspace root has no existing ancestor {}", path.display()))?
-            .to_path_buf();
-    }
-    let mut identity = cursor
-        .canonicalize()
-        .with_context(|| format!("resolve workspace root ancestor {}", cursor.display()))?;
-    for component in missing.iter().rev() {
-        identity.push(component);
-    }
-    Ok(identity)
-}
-
-fn reject_dot_aliases(path: &Path, label: &str) -> Result<()> {
-    if path.components().any(|component| {
-        matches!(
-            component,
-            std::path::Component::CurDir | std::path::Component::ParentDir
-        )
-    }) {
-        anyhow::bail!(
-            "{label} must not contain . or .. path components: {}",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-fn require_workspace_root(path: &Path) -> Result<PathBuf> {
-    reject_dot_aliases(path, "workspace root")?;
-    if !path.is_absolute() {
-        anyhow::bail!("workspace root must be absolute: {}", path.display());
-    }
-    workspace_path_identity(path)?;
-    let canonical = path
-        .canonicalize()
-        .with_context(|| format!("resolve workspace root {}", path.display()))?;
-    if !canonical.is_dir() {
-        anyhow::bail!(
-            "workspace root must be an existing directory: {}",
-            path.display()
-        );
-    }
-    Ok(canonical)
-}
-
-fn stable_workspace_root(root: &Path, boundary: &Boundary) -> PathBuf {
-    let digest = Sha256::digest(boundary.key().as_bytes());
-    root.join(format!("repo-{}", hex_digest(&digest)))
-}
-
-fn hex_digest(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn validate_workspace_roots(config: &ValidatedDaemonConfig) -> Result<()> {
-    let mut owners = HashMap::<PathBuf, String>::new();
-    for validated_repo in &config.repos {
-        let key = validated_repo.repo_key.clone();
-        let Some(workspace_root) = validated_repo.repo.workspace_root.as_ref() else {
-            continue;
-        };
-        let workspace_root_identity = workspace_path_identity(workspace_root)?;
-        if let Some(previous) = owners.insert(workspace_root_identity, key.clone()) {
-            anyhow::bail!(
-                "repository boundaries {previous} and {key} share workspace_root {}",
-                workspace_root.display()
-            );
-        }
-    }
-    Ok(())
-}
-
-fn parse_daemon_config(bytes: &[u8], path: &Path) -> Result<DaemonConfig> {
-    serde_yaml::from_slice(bytes).with_context(|| format!("parse daemon config {}", path.display()))
 }
 
 fn read_optional_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
@@ -2632,6 +1695,15 @@ fn require_exact_nonblank<'a>(value: &'a str, field: &str) -> Result<&'a str> {
     Ok(value)
 }
 
+fn validate_repo_key(value: &str, field: &str) -> Result<String> {
+    let value = require_exact_nonblank(value, field)?;
+    let parsed = Uuid::parse_str(value).with_context(|| format!("{field} must be a UUID"))?;
+    if parsed.to_string() != value {
+        anyhow::bail!("{field} must use canonical lowercase UUID form");
+    }
+    Ok(value.to_string())
+}
+
 struct DaemonApiTask {
     shutdown: Option<std::sync::mpsc::Sender<()>>,
     result: std::sync::mpsc::Receiver<Result<()>>,
@@ -2719,45 +1791,21 @@ fn run_daemon_config(
     notifications.mark_started_unknown_after_restart()?;
     iq::state_repository::process_issue_reservation_outbox(&control_store, 1000)?;
     let mut runners = Vec::new();
-    for validated in config.repos {
-        let ValidatedDaemonRepo {
-            repo,
-            canonical_repo_path,
-            repo_key,
-            target,
-            remote,
-            validation,
-        } = validated;
-        let registered = queue.repository_if_exists(&repo_key)?.is_some();
-        if registered && (validation != ValidationConfig::None || repo.signoff.is_some()) {
-            anyhow::bail!(
-                "registered repository {repo_key} rejects daemon validation and signoff settings"
-            );
-        }
+    for repo_key in config.repo_keys {
         let options = integrator_options_with_system_config(
-            integrator_options(
+            integrator_options_from_queue(
                 db_path.clone(),
-                canonical_repo_path,
-                Some(repo_key.clone()),
-                &target,
-                remote,
-                repo.workspace_root,
+                &queue,
+                repo_key.clone(),
                 owner.clone(),
             )?,
             &system_config,
         );
-        let policy = match validation {
-            ValidationConfig::Command { command } => IntegrationPolicy::Validation {
-                command,
-                signoff: repo
-                    .signoff
-                    .map(HostSignoffPolicy::Required)
-                    .unwrap_or(HostSignoffPolicy::None),
-            },
-            ValidationConfig::None => IntegrationPolicy::NoValidation,
-        };
-        let integrator =
-            Integrator::new_with_policy_and_validated_queue(options, policy, queue.clone())?;
+        let integrator = Integrator::new_with_policy_and_validated_queue(
+            options,
+            IntegrationPolicy::NoValidation,
+            queue.clone(),
+        )?;
         runners.push((repo_key, integrator));
     }
     let mut api_task = if once {
@@ -2851,54 +1899,27 @@ fn write_ready_file(path: &std::path::Path) -> Result<()> {
         .with_context(|| format!("publish daemon ready file {}", path.display()))
 }
 
-fn read_daemon_config(config_path: &std::path::Path) -> Result<ValidatedDaemonConfig> {
+fn read_daemon_config(config_path: &std::path::Path) -> Result<ValidatedRuntimeDaemonConfig> {
     let contents = std::fs::read_to_string(config_path)
         .with_context(|| format!("read daemon config {}", config_path.display()))?;
-    let config: DaemonConfig = serde_yaml::from_str(&contents)
-        .with_context(|| format!("parse daemon config {}", config_path.display()))?;
-    validate_daemon_config(&config, true)
+    parse_runtime_daemon_config(&contents)
+        .with_context(|| format!("parse daemon config {}", config_path.display()))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn daemon_validation_requires_explicit_none_or_command_mode() {
-        let none = parse_daemon_config(
-            b"repos:\n  - repo_path: /repo\n    validation:\n      mode: none\n",
-            Path::new("iq.yaml"),
-        )
-        .unwrap();
-        assert_eq!(none.repos[0].validation, ValidationConfig::None);
-
-        let command = parse_daemon_config(
-            b"repos:\n  - repo_path: /repo\n    validation:\n      mode: command\n      command: git diff --check\n",
-            Path::new("iq.yaml"),
-        )
-        .unwrap();
-        assert_eq!(
-            command.repos[0].validation,
-            ValidationConfig::Command {
-                command: "git diff --check".into()
-            }
-        );
-
-        for ambiguous in [
-            b"repos:\n  - repo_path: /repo\n    validation:\n      mode: auto\n".as_slice(),
-            b"repos:\n  - repo_path: /repo\n    validation_command: git diff --check\n".as_slice(),
-            b"repos:\n  - repo_path: /repo\n".as_slice(),
-        ] {
-            assert!(parse_daemon_config(ambiguous, Path::new("iq.yaml")).is_err());
-        }
-
-        assert!(serde_json::from_slice::<DesiredInventory>(
-            br#"{"manager_id":"manager","repositories":[{"repo_path":"/repo","target":"main","validation":{"mode":"auto"}}]}"#,
-        )
-        .is_err());
-        assert!(serde_json::from_slice::<ManagerState>(
-            br#"{"manager_id":"manager","boundaries":[{"repo_path":"/repo","target":"main","repo_key":"repo::main","ownership":{"kind":"adopted","original_validation":{"kind":"auto"},"last_applied_validation":{"kind":"auto"}}}]}"#,
-        )
-        .is_err());
+fn parse_runtime_daemon_config(contents: &str) -> Result<ValidatedRuntimeDaemonConfig> {
+    let config: RuntimeDaemonConfig =
+        serde_yaml::from_str(contents).context("parse runtime daemon config")?;
+    if config.repos.is_empty() {
+        anyhow::bail!("daemon config has no repos");
     }
+    let mut unique = HashSet::new();
+    let repo_keys = config
+        .repos
+        .into_iter()
+        .map(|repository| validate_repo_key(&repository.repo_key, "daemon repository repo_key"))
+        .collect::<Result<Vec<_>>>()?;
+    if repo_keys.iter().any(|repo_key| !unique.insert(repo_key)) {
+        anyhow::bail!("daemon config duplicates a repository key");
+    }
+    Ok(ValidatedRuntimeDaemonConfig { repo_keys })
 }
