@@ -3465,72 +3465,72 @@ fn create_verified_backup(
     Ok(backup)
 }
 
-fn run_migration_backup_test_hook(database_path: &Path, backup_path: &Path) {
+fn run_migration_backup_test_hook(_database_path: &Path, _backup_path: &Path) {
     #[cfg(debug_assertions)]
     {
         let mut hook = MIGRATION_BACKUP_TEST_HOOK.lock().unwrap();
         if hook
             .as_ref()
-            .is_some_and(|(target, _)| target == database_path)
+            .is_some_and(|(target, _)| target == _database_path)
         {
             let (_, run) = hook.take().unwrap();
-            run(backup_path);
+            run(_backup_path);
         }
     }
 }
 
-fn run_migration_primary_test_hook(database_path: &Path) {
+fn run_migration_primary_test_hook(_database_path: &Path) {
     #[cfg(debug_assertions)]
     {
         let mut hook = MIGRATION_PRIMARY_TEST_HOOK.lock().unwrap();
         if hook
             .as_ref()
-            .is_some_and(|(target, _)| target == database_path)
+            .is_some_and(|(target, _)| target == _database_path)
         {
             let (_, run) = hook.take().unwrap();
-            run(database_path);
+            run(_database_path);
         }
     }
 }
 
-fn run_migration_backup_precommit_test_hook(database_path: &Path, backup_path: &Path) {
+fn run_migration_backup_precommit_test_hook(_database_path: &Path, _backup_path: &Path) {
     #[cfg(debug_assertions)]
     {
         let mut hook = MIGRATION_BACKUP_PRECOMMIT_TEST_HOOK.lock().unwrap();
         if hook
             .as_ref()
-            .is_some_and(|(target, _)| target == database_path)
+            .is_some_and(|(target, _)| target == _database_path)
         {
             let (_, run) = hook.take().unwrap();
-            run(backup_path);
+            run(_backup_path);
         }
     }
 }
 
-pub(crate) fn run_runtime_open_handoff_test_hook(database_path: &Path) {
+pub(crate) fn run_runtime_open_handoff_test_hook(_database_path: &Path) {
     #[cfg(debug_assertions)]
     {
         let mut hook = RUNTIME_OPEN_HANDOFF_TEST_HOOK.lock().unwrap();
         if hook
             .as_ref()
-            .is_some_and(|(target, _)| target == database_path)
+            .is_some_and(|(target, _)| target == _database_path)
         {
             let (_, run) = hook.take().unwrap();
-            run(database_path);
+            run(_database_path);
         }
     }
 }
 
-fn run_database_snapshot_test_hook(database_path: &Path, snapshot_path: &Path) {
+fn run_database_snapshot_test_hook(_database_path: &Path, _snapshot_path: &Path) {
     #[cfg(debug_assertions)]
     {
         let mut hook = DATABASE_SNAPSHOT_TEST_HOOK.lock().unwrap();
         if hook
             .as_ref()
-            .is_some_and(|(target, _)| target == database_path)
+            .is_some_and(|(target, _)| target == _database_path)
         {
             let (_, run) = hook.take().unwrap();
-            run(snapshot_path);
+            run(_snapshot_path);
         }
     }
 }
