@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rusqlite::{
-    backup::Backup, params, Connection, OpenFlags, OptionalExtension, TransactionBehavior,
+    backup::Backup, params, types::ValueRef, Connection, OpenFlags, OptionalExtension,
+    TransactionBehavior,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -13,6 +15,64 @@ use std::process::Command;
 use std::time::Duration;
 use uuid::Uuid;
 
+#[cfg(debug_assertions)]
+type MigrationBackupTestHook = Option<(PathBuf, fn(&Path))>;
+
+#[cfg(debug_assertions)]
+static MIGRATION_BACKUP_TEST_HOOK: std::sync::Mutex<MigrationBackupTestHook> =
+    std::sync::Mutex::new(None);
+
+#[cfg(debug_assertions)]
+static MIGRATION_PRIMARY_TEST_HOOK: std::sync::Mutex<MigrationBackupTestHook> =
+    std::sync::Mutex::new(None);
+
+#[cfg(debug_assertions)]
+static MIGRATION_BACKUP_PRECOMMIT_TEST_HOOK: std::sync::Mutex<MigrationBackupTestHook> =
+    std::sync::Mutex::new(None);
+
+#[cfg(debug_assertions)]
+static RUNTIME_OPEN_HANDOFF_TEST_HOOK: std::sync::Mutex<MigrationBackupTestHook> =
+    std::sync::Mutex::new(None);
+
+#[cfg(debug_assertions)]
+static DATABASE_SNAPSHOT_TEST_HOOK: std::sync::Mutex<MigrationBackupTestHook> =
+    std::sync::Mutex::new(None);
+
+#[doc(hidden)]
+#[cfg(debug_assertions)]
+pub fn set_migration_backup_test_hook(database_path: &Path, hook: Option<fn(&Path)>) {
+    *MIGRATION_BACKUP_TEST_HOOK.lock().unwrap() =
+        hook.map(|hook| (database_path.to_path_buf(), hook));
+}
+
+#[doc(hidden)]
+#[cfg(debug_assertions)]
+pub fn set_migration_primary_test_hook(database_path: &Path, hook: Option<fn(&Path)>) {
+    *MIGRATION_PRIMARY_TEST_HOOK.lock().unwrap() =
+        hook.map(|hook| (database_path.to_path_buf(), hook));
+}
+
+#[doc(hidden)]
+#[cfg(debug_assertions)]
+pub fn set_migration_backup_precommit_test_hook(database_path: &Path, hook: Option<fn(&Path)>) {
+    *MIGRATION_BACKUP_PRECOMMIT_TEST_HOOK.lock().unwrap() =
+        hook.map(|hook| (database_path.to_path_buf(), hook));
+}
+
+#[doc(hidden)]
+#[cfg(debug_assertions)]
+pub fn set_runtime_open_handoff_test_hook(database_path: &Path, hook: Option<fn(&Path)>) {
+    *RUNTIME_OPEN_HANDOFF_TEST_HOOK.lock().unwrap() =
+        hook.map(|hook| (database_path.to_path_buf(), hook));
+}
+
+#[doc(hidden)]
+#[cfg(debug_assertions)]
+pub fn set_database_snapshot_test_hook(database_path: &Path, hook: Option<fn(&Path)>) {
+    *DATABASE_SNAPSHOT_TEST_HOOK.lock().unwrap() =
+        hook.map(|hook| (database_path.to_path_buf(), hook));
+}
+
 use crate::agent_config::SystemConfig;
 use crate::control_domain::{
     AgentLaunching, AgentReady, IntegrationBlocker, IntegrationEffortState, ResumeState,
@@ -20,10 +80,15 @@ use crate::control_domain::{
 };
 use crate::sqlite::WorkspaceIdentity;
 
-pub const SCHEMA_VERSION: &str = "9";
+pub const SCHEMA_VERSION: &str = "10";
 
 pub struct DatabaseProcessLease {
     file: File,
+    authority_path: PathBuf,
+    authority_device: u64,
+    authority_inode: u64,
+    directory_device: u64,
+    directory_inode: u64,
 }
 
 impl DatabaseProcessLease {
@@ -36,25 +101,393 @@ impl DatabaseProcessLease {
     }
 
     fn acquire_with_mode(database_path: &Path, mode: libc::c_int) -> Result<Self> {
-        let parent = database_path
-            .parent()
-            .context("database path has no parent")?;
-        let name = database_path
-            .file_name()
-            .context("database path has no file name")?;
-        let path = parent.join(format!("{}.control.lock", name.to_string_lossy()));
+        let path = database_lock_path(database_path)?;
         let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOATIME)
             .open(&path)?;
+        Self::acquire_file(database_path, path, file, mode)
+    }
+
+    pub(crate) fn acquire_existing_exclusive(database_path: &Path) -> Result<Self> {
+        let lock_path = database_lock_path(database_path)?;
+        match fs::symlink_metadata(&lock_path) {
+            Ok(_) => {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOATIME)
+                    .open(&lock_path)?;
+                Self::acquire_file(database_path, lock_path, file, libc::LOCK_EX)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOATIME)
+                    .open(database_path)?;
+                let lease = Self::acquire_file(
+                    database_path,
+                    database_path.to_path_buf(),
+                    file,
+                    libc::LOCK_EX,
+                )?;
+                match fs::symlink_metadata(&lock_path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(lease),
+                    Ok(_) => {
+                        drop(lease);
+                        let file = OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOATIME)
+                            .open(&lock_path)?;
+                        Self::acquire_file(database_path, lock_path, file, libc::LOCK_EX)
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn acquire_file(
+        database_path: &Path,
+        authority_path: PathBuf,
+        file: File,
+        mode: libc::c_int,
+    ) -> Result<Self> {
+        let parent = database_path
+            .parent()
+            .context("database path has no parent")?;
+        let metadata = file.metadata()?;
+        let authority_metadata = fs::symlink_metadata(&authority_path)?;
+        let path_metadata = fs::symlink_metadata(parent)?;
+        if !metadata.is_file()
+            || authority_metadata.file_type().is_symlink()
+            || !authority_metadata.is_file()
+            || (metadata.dev(), metadata.ino())
+                != (authority_metadata.dev(), authority_metadata.ino())
+            || path_metadata.file_type().is_symlink()
+            || !path_metadata.is_dir()
+        {
+            anyhow::bail!("IQ database process fence lost its authoritative inode identity");
+        }
         if unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) } != 0 {
             return Err(std::io::Error::last_os_error())
                 .context("acquire exclusive IQ database process lease");
         }
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            authority_path,
+            authority_device: metadata.dev(),
+            authority_inode: metadata.ino(),
+            directory_device: path_metadata.dev(),
+            directory_inode: path_metadata.ino(),
+        })
+    }
+
+    pub(crate) fn verify_authority(&self, database_path: &Path) -> Result<()> {
+        let parent = database_path
+            .parent()
+            .context("database path has no parent")?;
+        let metadata = fs::symlink_metadata(parent)?;
+        let authority_metadata = self.file.metadata()?;
+        let authority_path_metadata = fs::symlink_metadata(&self.authority_path)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || (metadata.dev(), metadata.ino()) != (self.directory_device, self.directory_inode)
+            || !authority_metadata.is_file()
+            || authority_path_metadata.file_type().is_symlink()
+            || !authority_path_metadata.is_file()
+            || (authority_metadata.dev(), authority_metadata.ino())
+                != (self.authority_device, self.authority_inode)
+            || (authority_path_metadata.dev(), authority_path_metadata.ino())
+                != (self.authority_device, self.authority_inode)
+        {
+            anyhow::bail!("IQ database process lease lost its authoritative fence identity");
+        }
+        Ok(())
+    }
+}
+
+fn database_lock_path(database_path: &Path) -> Result<PathBuf> {
+    let name = database_path
+        .file_name()
+        .context("database path has no file name")?;
+    let mut lock_name = name.to_os_string();
+    lock_name.push(".control.lock");
+    Ok(database_path.with_file_name(lock_name))
+}
+
+struct SnapshotSource {
+    path: PathBuf,
+    file: File,
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+    sha256: String,
+}
+
+impl SnapshotSource {
+    fn copy(path: &Path, destination: &Path) -> Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOATIME)
+            .open(path)
+            .with_context(|| format!("open IQ database snapshot source {}", path.display()))?;
+        Self::copy_open_file(path, destination, &file)
+    }
+
+    fn copy_open_file(path: &Path, destination: &Path, file: &File) -> Result<Self> {
+        let file = file.try_clone()?;
+        let metadata = file.metadata()?;
+        let path_metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file()
+            || path_metadata.file_type().is_symlink()
+            || !path_metadata.is_file()
+            || (path_metadata.dev(), path_metadata.ino()) != (metadata.dev(), metadata.ino())
+        {
+            anyhow::bail!("IQ database snapshot source lost its authoritative inode identity");
+        }
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(destination)?;
+        let mut input = file.try_clone()?;
+        let mut digest = Sha256::new();
+        use std::io::{Read, Seek, SeekFrom, Write};
+        input.seek(SeekFrom::Start(0))?;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = input.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+            output.write_all(&buffer[..read])?;
+        }
+        output.sync_all()?;
+        let copied_sha256 = format!("{:x}", digest.finalize());
+        let (destination_sha256, destination_size) = digest_open_file(&output)?;
+        if destination_size != metadata.len()
+            || destination_sha256 != copied_sha256
+            || output.metadata()?.permissions().mode() & 0o777 != 0o600
+        {
+            anyhow::bail!("IQ database snapshot copy is not exact and private");
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+            sha256: copied_sha256,
+        })
+    }
+
+    fn verify_unchanged(&self) -> Result<()> {
+        let metadata = self.file.metadata()?;
+        let path_metadata = fs::symlink_metadata(&self.path)?;
+        if path_metadata.file_type().is_symlink()
+            || !path_metadata.is_file()
+            || (metadata.dev(), metadata.ino()) != (self.device, self.inode)
+            || (path_metadata.dev(), path_metadata.ino()) != (self.device, self.inode)
+            || metadata.len() != self.size
+            || metadata.mtime() != self.modified_seconds
+            || metadata.mtime_nsec() != self.modified_nanoseconds
+            || metadata.ctime() != self.changed_seconds
+            || metadata.ctime_nsec() != self.changed_nanoseconds
+            || digest_open_file(&self.file)?.0 != self.sha256
+        {
+            anyhow::bail!("IQ database snapshot source changed during validation");
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_database_snapshot<T>(
+    database_path: &Path,
+    validate: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    let lease = DatabaseProcessLease::acquire_existing_exclusive(database_path)?;
+    validate_database_snapshot_under_lease(database_path, &lease, validate)
+}
+
+pub(crate) fn validate_database_snapshot_under_lease<T>(
+    database_path: &Path,
+    lease: &DatabaseProcessLease,
+    validate: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    validate_database_snapshot_with_source_under_lease(
+        database_path,
+        lease,
+        SnapshotInput::AuthoritativeDatabase,
+        validate,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum SnapshotInput<'a> {
+    AuthoritativeDatabase,
+    SidecarFreeOpenFile(&'a File),
+}
+
+fn validate_database_snapshot_with_source_under_lease<T>(
+    database_path: &Path,
+    lease: &DatabaseProcessLease,
+    input: SnapshotInput<'_>,
+    validate: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    lease.verify_authority(database_path)?;
+    let temporary = tempfile::Builder::new()
+        .prefix("iq-database-validation-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .context("create private IQ database validation directory")?;
+    if temporary.path().metadata()?.permissions().mode() & 0o777 != 0o700 {
+        anyhow::bail!("IQ database validation directory is not private");
+    }
+    run_database_snapshot_test_hook(database_path, temporary.path());
+    let result = (|| {
+        let database_name = database_path
+            .file_name()
+            .context("database path has no file name")?;
+        let snapshot_path = temporary.path().join(database_name);
+        let mut sources = vec![match input {
+            SnapshotInput::AuthoritativeDatabase => {
+                SnapshotSource::copy(database_path, &snapshot_path)?
+            }
+            SnapshotInput::SidecarFreeOpenFile(file) => {
+                verify_no_database_sidecars(database_path, "schema backup")?;
+                SnapshotSource::copy_open_file(database_path, &snapshot_path, file)?
+            }
+        }];
+        if matches!(input, SnapshotInput::AuthoritativeDatabase) {
+            for suffix in ["-wal", "-shm"] {
+                let mut sidecar_name = database_name.to_os_string();
+                sidecar_name.push(suffix);
+                let source_path = database_path.with_file_name(&sidecar_name);
+                match fs::symlink_metadata(&source_path) {
+                    Ok(_) => sources.push(SnapshotSource::copy(
+                        &source_path,
+                        &temporary.path().join(sidecar_name),
+                    )?),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        lease.verify_authority(database_path)?;
+        for source in &sources {
+            source.verify_unchanged()?;
+        }
+        let connection = Connection::open_with_flags(
+            &snapshot_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        let validated = validate(&connection);
+        drop(connection);
+        for source in &sources {
+            source.verify_unchanged()?;
+        }
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar_name = database_name.to_os_string();
+            sidecar_name.push(suffix);
+            let source_path = database_path.with_file_name(sidecar_name);
+            if !sources.iter().any(|source| source.path == source_path)
+                && fs::symlink_metadata(&source_path).is_ok()
+            {
+                anyhow::bail!("IQ database sidecar appeared during snapshot validation");
+            }
+        }
+        if matches!(input, SnapshotInput::SidecarFreeOpenFile(_)) {
+            verify_no_database_sidecars(database_path, "schema backup")?;
+        }
+        lease.verify_authority(database_path)?;
+        validated
+    })();
+    let cleanup = temporary
+        .close()
+        .context("remove private IQ database validation directory");
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(validation), Err(cleanup)) => Err(cleanup).context(format!(
+            "database validation also failed before cleanup: {validation:#}"
+        )),
+    }
+}
+
+fn verify_no_database_sidecars(database_path: &Path, label: &str) -> Result<()> {
+    let database_name = database_path
+        .file_name()
+        .context("database path has no file name")?;
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar_name = database_name.to_os_string();
+        sidecar_name.push(suffix);
+        let sidecar_path = database_path.with_file_name(sidecar_name);
+        match fs::symlink_metadata(&sidecar_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => anyhow::bail!("{label} has a forbidden {suffix} sidecar"),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+pub struct PrimaryDatabaseIdentity {
+    file: File,
+    device: u64,
+    inode: u64,
+}
+
+impl PrimaryDatabaseIdentity {
+    pub(crate) fn open(database_path: &Path) -> Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(database_path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            anyhow::bail!("queue database must be a regular non-symlink file");
+        }
+        let identity = Self {
+            file,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        identity.verify_authoritative(database_path)?;
+        Ok(identity)
+    }
+
+    pub(crate) fn verify_authoritative(&self, database_path: &Path) -> Result<()> {
+        let open_metadata = self.file.metadata()?;
+        let path_metadata = fs::symlink_metadata(database_path)?;
+        if path_metadata.file_type().is_symlink()
+            || !path_metadata.is_file()
+            || (open_metadata.dev(), open_metadata.ino()) != (self.device, self.inode)
+            || (path_metadata.dev(), path_metadata.ino()) != (self.device, self.inode)
+        {
+            anyhow::bail!("primary IQ database lost its authoritative inode identity");
+        }
+        Ok(())
     }
 }
 
@@ -88,6 +521,53 @@ pub struct TerminalCycleArtifacts {
     pub item_id: String,
     pub cycle_id: String,
     pub workspace: WorkspaceIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TerminalWorkspacePreservationReason {
+    Dirty,
+    ActiveGitOperation,
+    DirtyAndActiveGitOperation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TerminalWorkspaceTarget {
+    CreationIntent { path: String },
+    Retained { identity: WorkspaceIdentity },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TerminalWorkspaceCleanupState {
+    Pending,
+    Preserved {
+        reason: TerminalWorkspacePreservationReason,
+        observation_count: u8,
+        next_retry_at: DateTime<Utc>,
+        alert_event_id: String,
+    },
+}
+
+impl TerminalWorkspacePreservationReason {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Dirty => "dirty",
+            Self::ActiveGitOperation => "active_git_operation",
+            Self::DirtyAndActiveGitOperation => "both",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalWorkspaceCleanupDebt {
+    pub item_id: String,
+    pub target: TerminalWorkspaceTarget,
+    pub state: TerminalWorkspaceCleanupState,
+}
+
+impl TerminalWorkspaceCleanupDebt {
+    pub fn is_preserved(&self) -> bool {
+        matches!(self.state, TerminalWorkspaceCleanupState::Preserved { .. })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -285,7 +765,14 @@ impl ControlStore {
         let path = path.canonicalize()?;
         let store = Self { path };
         store.validate_schema()?;
+        drop(DatabaseProcessLease::acquire(&store.path)?);
         Ok(store)
+    }
+
+    pub(crate) fn open_validated(path: &Path) -> Result<Self> {
+        Ok(Self {
+            path: path.canonicalize()?,
+        })
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -323,6 +810,170 @@ impl ControlStore {
             .collect::<std::result::Result<Vec<_>, _>>()
             .context("read terminal cycle artifacts")?;
         Ok(artifacts)
+    }
+
+    pub fn terminal_workspace_cleanup_debt(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<TerminalWorkspaceCleanupDebt>> {
+        let connection = self.connect(false)?;
+        connection.query_row(
+            "SELECT item_id,workspace_json,target_kind,state,reason,observation_count,next_retry_at,alert_event_id FROM terminal_workspace_cleanup_debt WHERE item_id=?1",
+            params![item_id],
+            |row| {
+                let workspace = parse_terminal_target(&row.get::<_, String>(2)?, &row.get::<_, String>(1)?)?;
+                let state: String = row.get(3)?;
+                let reason: Option<String> = row.get(4)?;
+                let reason = reason.map(|value| match value.as_str() {
+                    "dirty" => Ok(TerminalWorkspacePreservationReason::Dirty),
+                    "active_git_operation" => Ok(TerminalWorkspacePreservationReason::ActiveGitOperation),
+                    "both" => Ok(TerminalWorkspacePreservationReason::DirtyAndActiveGitOperation),
+                    _ => Err(rusqlite::Error::InvalidQuery),
+                }).transpose()?;
+                let count: u8 = row.get::<_, i64>(5)?.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?;
+                let next_retry_at = DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?
+                    .with_timezone(&Utc);
+                let alert_event_id: Option<String> = row.get(7)?;
+                let state = match state.as_str() {
+                    "pending" if reason.is_none() && count == 0 && alert_event_id.is_none() => TerminalWorkspaceCleanupState::Pending,
+                    "preserved" => TerminalWorkspaceCleanupState::Preserved {
+                        reason: reason.context("preserved debt has no reason").map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        observation_count: count,
+                        next_retry_at,
+                        alert_event_id: alert_event_id.context("preserved debt has no alert").map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    },
+                    _ => return Err(rusqlite::Error::InvalidQuery),
+                };
+                Ok(TerminalWorkspaceCleanupDebt { item_id: row.get(0)?, target: workspace, state })
+            },
+        ).optional().context("read terminal workspace cleanup debt")
+    }
+
+    pub fn record_terminal_workspace_preserved(
+        &self,
+        item_id: &str,
+        target: &TerminalWorkspaceTarget,
+        observed: &WorkspaceIdentity,
+        dirty: bool,
+        active_git_operation: bool,
+    ) -> Result<TerminalWorkspaceCleanupDebt> {
+        if !dirty && !active_git_operation {
+            anyhow::bail!("preservation requires a dirty or active Git observation");
+        }
+        let mut connection = self.connect(true)?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let prior: i64 = tx
+            .query_row(
+                "SELECT observation_count FROM terminal_workspace_cleanup_debt WHERE item_id=?1",
+                params![item_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let count = prior.saturating_add(1).min(255);
+        let seconds = 30_i64
+            .saturating_mul(1_i64 << (count.saturating_sub(1).min(7)))
+            .min(3600);
+        let reason = match (dirty, active_git_operation) {
+            (true, true) => TerminalWorkspacePreservationReason::DirtyAndActiveGitOperation,
+            (true, false) => TerminalWorkspacePreservationReason::Dirty,
+            (false, true) => TerminalWorkspacePreservationReason::ActiveGitOperation,
+            (false, false) => unreachable!(),
+        };
+        let alert_event_id: Option<String> = tx
+            .query_row(
+                "SELECT alert_event_id FROM terminal_workspace_cleanup_debt WHERE item_id=?1",
+                params![item_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let alert_event_id = match alert_event_id {
+            Some(id) => id,
+            None => {
+                let id = Uuid::new_v4().to_string();
+                let effort_id: Option<String> = tx
+                    .query_row(
+                        "SELECT id FROM integration_efforts WHERE item_id=?1",
+                        params![item_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let repository: String = tx.query_row(
+                    "SELECT repo_key FROM queue_items WHERE id=?1",
+                    params![item_id],
+                    |row| row.get(0),
+                )?;
+                let target_payload = match target {
+                    TerminalWorkspaceTarget::CreationIntent { path } => {
+                        serde_json::json!({"state":"creation_intent","path":path})
+                    }
+                    TerminalWorkspaceTarget::Retained { identity } => {
+                        serde_json::json!({"state":"retained","path":identity.path,"rift_id":identity.rift_id,"source_rift_id":identity.source_rift_id})
+                    }
+                };
+                tx.execute("INSERT INTO durable_events(id,item_id,effort_id,event_type,payload_json,alert,created_at) VALUES(?1,?2,?3,'terminal_workspace_preserved',json_object('repository',?4,'blocker_kind','workspace_cleanup','reason',?5,'target',json(?6)),1,?7)", params![id,item_id,effort_id,repository,reason.as_str(),target_payload.to_string(),now()])?;
+                tx.execute("INSERT OR IGNORE INTO notification_deliveries(event_id,backend,state,attempt_count,next_attempt_at,created_at,updated_at) SELECT ?1,backend,'pending',0,?2,?2,?2 FROM notification_backends WHERE enabled=1", params![id,now()])?;
+                id
+            }
+        };
+        let next_retry_at = Utc::now() + chrono::Duration::seconds(seconds);
+        let (target_kind, target_json) = match target {
+            TerminalWorkspaceTarget::CreationIntent { path } => {
+                if observed.path != *path {
+                    anyhow::bail!("observed Rift path differs from creation intent");
+                }
+                (
+                    "creation_intent",
+                    serde_json::json!({"path": path}).to_string(),
+                )
+            }
+            TerminalWorkspaceTarget::Retained { identity } => {
+                if identity != observed {
+                    anyhow::bail!("observed Rift identity differs from retained authority");
+                }
+                ("retained", serde_json::to_string(identity)?)
+            }
+        };
+        tx.execute("INSERT INTO terminal_workspace_cleanup_debt(item_id,workspace_json,target_kind,state,reason,observation_count,next_retry_at,alert_event_id,created_at,updated_at) VALUES(?1,?2,?3,'preserved',?4,?5,?6,?7,?8,?8) ON CONFLICT(item_id) DO UPDATE SET workspace_json=excluded.workspace_json,target_kind=excluded.target_kind,state='preserved',reason=excluded.reason,observation_count=excluded.observation_count,next_retry_at=excluded.next_retry_at,alert_event_id=excluded.alert_event_id,updated_at=excluded.updated_at", params![item_id,target_json,target_kind,reason.as_str(),count,next_retry_at.to_rfc3339(),alert_event_id,now()])?;
+        tx.commit()?;
+        self.terminal_workspace_cleanup_debt(item_id)?
+            .context("preserved terminal cleanup debt disappeared")
+    }
+
+    pub fn create_terminal_workspace_cleanup_debt(
+        &self,
+        item_id: &str,
+        target: &WorkspaceIdentity,
+    ) -> Result<()> {
+        let mut connection = self.connect(true)?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("INSERT OR IGNORE INTO terminal_workspace_cleanup_debt(item_id,workspace_json,target_kind,state,reason,observation_count,next_retry_at,alert_event_id,created_at,updated_at) VALUES(?1,?2,'retained','pending',NULL,0,?3,NULL,?3,?3)", params![item_id,serde_json::to_string(target)?,now()])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn create_terminal_creation_intent_debt(&self, item_id: &str, path: &str) -> Result<()> {
+        let mut connection = self.connect(true)?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO terminal_workspace_cleanup_debt(item_id,workspace_json,target_kind,state,reason,observation_count,next_retry_at,alert_event_id,created_at,updated_at) VALUES(?1,json_object('path',?2),'creation_intent','pending',NULL,0,?3,NULL,?3,?3)",
+            params![item_id, path, now()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn clear_terminal_workspace_cleanup_debt(&self, item_id: &str) -> Result<()> {
+        let mut connection = self.connect(true)?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM terminal_workspace_cleanup_debt WHERE item_id=?1",
+            params![item_id],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn agent_evidence(
@@ -1397,6 +2048,10 @@ impl ControlStore {
             event_id: event_id.clone(),
         });
         transaction.execute(
+            "INSERT OR IGNORE INTO terminal_workspace_cleanup_debt(item_id,workspace_json,target_kind,state,reason,observation_count,next_retry_at,alert_event_id,created_at,updated_at) VALUES(?1,?2,'retained','pending',NULL,0,?3,NULL,?3,?3)",
+            params![effort.item_id, serde_json::to_string(&effort.workspace)?, now()],
+        )?;
+        transaction.execute(
             "UPDATE integration_attempts SET landed_commit_sha=?1,result='integrated',finished_at=?2 WHERE id=?3 AND item_id=?4",
             params![landed_sha,now(),effort.attempt_id,effort.item_id],
         )?;
@@ -1892,6 +2547,10 @@ impl ControlStore {
             reason: reason.to_string(),
             cancelled_at: now(),
         });
+        transaction.execute(
+            "INSERT OR IGNORE INTO terminal_workspace_cleanup_debt(item_id,workspace_json,target_kind,state,reason,observation_count,next_retry_at,alert_event_id,created_at,updated_at) VALUES(?1,?2,'retained','pending',NULL,0,?3,NULL,?3,?3)",
+            params![effort.item_id, serde_json::to_string(&effort.workspace)?, now()],
+        )?;
         update_state(&transaction, &effort, &state)?;
         append_event(
             &transaction,
@@ -1982,28 +2641,7 @@ impl ControlStore {
     }
 
     fn validate_schema(&self) -> Result<()> {
-        let connection = self.connect(false)?;
-        let version: String = connection.query_row(
-            "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
-            [],
-            |row| row.get(0),
-        )?;
-        if version != SCHEMA_VERSION {
-            anyhow::bail!("control store requires IQ schema version 9");
-        }
-        let integrity: String =
-            connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
-        if integrity != "ok" {
-            anyhow::bail!("IQ schema version 9 integrity check failed: {integrity}");
-        }
-        let foreign_keys: i64 =
-            connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
-                row.get(0)
-            })?;
-        if foreign_keys != 0 {
-            anyhow::bail!("IQ schema version 9 has foreign-key errors");
-        }
-        Ok(())
+        validate_database_snapshot(&self.path, validate_v10)
     }
 
     fn connect(&self, write: bool) -> Result<Connection> {
@@ -2022,47 +2660,646 @@ impl ControlStore {
     pub fn open_test_database(path: &Path) -> Result<Self> {
         let connection = Connection::open(path)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        connection.execute_batch(
-            "CREATE TABLE queue_items(id TEXT PRIMARY KEY,status TEXT NOT NULL DEFAULT 'merging',current_attempt_id TEXT,blocked_phase TEXT,blocked_reason TEXT,blocked_message TEXT,prompt_id TEXT,conflict_json TEXT,target_sha TEXT,source_sha TEXT,landed_commit_sha TEXT,landing_state_json TEXT NOT NULL DEFAULT '{\"state\":\"ready\"}',source_kind TEXT NOT NULL DEFAULT 'remote_branch',submission_id TEXT,replacement_json TEXT,updated_at TEXT NOT NULL DEFAULT 'test'); CREATE TABLE integration_attempts(id TEXT PRIMARY KEY,item_id TEXT,target_base_sha TEXT,merge_commit_sha TEXT,validated_commit_sha TEXT,landed_commit_sha TEXT,validation_command TEXT,validation_exit_code INTEGER,validation_log_path TEXT,signoff_evidence_json TEXT,moved_base_json TEXT,finished_at TEXT,result TEXT); CREATE TABLE development_workspaces(id TEXT PRIMARY KEY,status TEXT NOT NULL,cleanup_json TEXT NOT NULL,updated_at TEXT NOT NULL); CREATE TABLE local_submissions(id TEXT PRIMARY KEY,workspace_id TEXT NOT NULL,state TEXT NOT NULL,replaces_item_id TEXT); CREATE TABLE prompts(id TEXT PRIMARY KEY,item_id TEXT NOT NULL,status TEXT NOT NULL); CREATE TABLE queue_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL); INSERT INTO queue_metadata VALUES('workspace_schema_version','9');",
-        )?;
-        install_fresh_v9(&connection)?;
+        crate::sqlite::initialize_test_schema(&connection, "10")?;
         drop(connection);
         Self::open(path)
     }
 }
 
-pub fn install_fresh_v9(connection: &Connection) -> Result<()> {
+pub(crate) fn install_v9_schema_objects(connection: &Connection) -> Result<()> {
     connection.execute_batch(V9_SCHEMA)?;
-    connection.execute(
-        "INSERT INTO queue_metadata(key,value) VALUES('workspace_schema_version','9') ON CONFLICT(key) DO UPDATE SET value='9'",
-        [],
-    )?;
     Ok(())
 }
 
-pub fn migrate_v8_to_v9(
+pub(crate) fn install_v10_schema_objects(connection: &Connection) -> Result<()> {
+    connection.execute_batch(V10_SCHEMA)?;
+    connection.execute_batch(V10_TRIGGERS)?;
+    Ok(())
+}
+
+pub fn install_fresh_v10(connection: &Connection) -> Result<()> {
+    install_v9_schema_objects(connection)?;
+    install_v10_schema_objects(connection)
+}
+
+#[allow(dead_code)]
+pub fn install_fresh_v9(connection: &Connection) -> Result<()> {
+    install_fresh_v10(connection)
+}
+
+pub(crate) fn migrate_v9_to_v10_under_lease(
+    connection: &mut Connection,
+    database_path: &Path,
+    _lease: &DatabaseProcessLease,
+    source: &PrimaryDatabaseIdentity,
+) -> Result<()> {
+    let migration = (|| -> Result<()> {
+        source.verify_authoritative(database_path)?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        reject_migration_authority(&tx)?;
+        let (source_database_id, expected) = validate_v9(&tx)?;
+        let backup_source = open_backup_source(database_path)?;
+        let backup = create_verified_backup(&backup_source, database_path, "9")?;
+        drop(backup_source);
+        run_migration_backup_test_hook(database_path, &backup.path);
+        run_migration_primary_test_hook(database_path);
+        source.verify_authoritative(database_path)?;
+        validate_backup(&backup, "9", _lease, Some(&expected))?;
+        install_v10_schema_objects(&tx)?;
+        let timestamp = now();
+        for (item_id, target) in &expected {
+            let (target_kind, workspace_json) = target.storage()?;
+            tx.execute(
+                "INSERT INTO terminal_workspace_cleanup_debt(item_id,workspace_json,target_kind,state,reason,observation_count,next_retry_at,alert_event_id,created_at,updated_at) VALUES(?1,?2,?3,'pending',NULL,0,?4,NULL,?4,?4)",
+                params![item_id, workspace_json, target_kind, timestamp],
+            )?;
+        }
+        require_database_id(&tx, "9", &source_database_id)?;
+        validate_v10_contents(&tx, &expected)?;
+        let changed = tx.execute(
+            "UPDATE queue_metadata SET value='10' WHERE key='workspace_schema_version' AND value='9'",
+            [],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("schema v10 metadata update did not change exactly one row");
+        }
+        require_database_id(&tx, "10", &source_database_id)?;
+        validate_v10(&tx)?;
+        run_migration_backup_precommit_test_hook(database_path, &backup.path);
+        source.verify_authoritative(database_path)?;
+        let _backup_guard = verify_backup_ready_for_commit(&backup)?;
+        tx.commit()?;
+        source.verify_authoritative(database_path)?;
+        Ok(())
+    })();
+    match migration {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if validate_v9(connection).is_err() {
+                anyhow::bail!(
+                    "schema v10 migration failed and rollback did not preserve valid schema v9: {error:#}"
+                );
+            }
+            Err(error).context("schema v10 migration rolled back to valid schema v9")
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MigrationWorkspace {
+    NotCreated,
+    CreationIntent { path: String },
+    Retained { identity: WorkspaceIdentity },
+    Cleaned { cleaned_at: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExpectedDebt {
+    target: TerminalWorkspaceTarget,
+}
+
+impl ExpectedDebt {
+    fn storage(&self) -> Result<(&'static str, String)> {
+        match &self.target {
+            TerminalWorkspaceTarget::CreationIntent { path } => Ok((
+                "creation_intent",
+                serde_json::to_string(&CreationIntentJson { path })?,
+            )),
+            TerminalWorkspaceTarget::Retained { identity } => {
+                Ok(("retained", serde_json::to_string(identity)?))
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CreationIntentJson<'a> {
+    path: &'a str,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredCreationIntent {
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredWorkspaceIdentity {
+    path: String,
+    rift_id: String,
+    source_rift_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StoredQueueStatus {
+    Ready,
+    Merging,
+    Merged,
+    Validating,
+    Validated,
+    Integrating,
+    Integrated,
+    Blocked,
+    Cancelled,
+}
+
+impl StoredQueueStatus {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "ready" => Ok(Self::Ready),
+            "merging" => Ok(Self::Merging),
+            "merged" => Ok(Self::Merged),
+            "validating" => Ok(Self::Validating),
+            "validated" => Ok(Self::Validated),
+            "integrating" => Ok(Self::Integrating),
+            "integrated" => Ok(Self::Integrated),
+            "blocked" => Ok(Self::Blocked),
+            "cancelled" => Ok(Self::Cancelled),
+            _ => anyhow::bail!("unknown queue status {value}"),
+        }
+    }
+
+    fn terminal(self) -> bool {
+        matches!(self, Self::Integrated | Self::Cancelled)
+    }
+}
+
+fn validate_v9(connection: &Connection) -> Result<(String, BTreeMap<String, ExpectedDebt>)> {
+    crate::sqlite::validate_schema_objects(connection, "9")?;
+    let database_id = validate_database_identity(connection, "9")?;
+    let debt_objects: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('terminal_workspace_cleanup_debt','terminal_workspace_cleanup_debt_due')",
+        [],
+        |row| row.get(0),
+    )?;
+    if debt_objects != 0 {
+        anyhow::bail!("IQ schema version 9 contains schema v10 cleanup debt objects");
+    }
+    Ok((database_id, expected_debt_from_queue(connection)?))
+}
+
+fn expected_debt_from_queue(connection: &Connection) -> Result<BTreeMap<String, ExpectedDebt>> {
+    let mut statement = connection.prepare(
+        "SELECT id,status,integration_workspace_path,integration_workspace_rift_id,integration_workspace_source_rift_id,integration_workspace_cleaned_at FROM queue_items ORDER BY id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+        ))
+    })?;
+    let mut expected = BTreeMap::new();
+    for row in rows {
+        let (item_id, raw_status, path, rift_id, source_rift_id, cleaned_at) = row?;
+        require_non_empty(&item_id, "queue item ID")?;
+        let status = StoredQueueStatus::parse(&raw_status)?;
+        let workspace = parse_migration_workspace(path, rift_id, source_rift_id, cleaned_at)?;
+        validate_workspace_status(status, &workspace)?;
+        let target = match (status, workspace) {
+            (StoredQueueStatus::Cancelled, MigrationWorkspace::CreationIntent { path }) => {
+                Some(TerminalWorkspaceTarget::CreationIntent { path })
+            }
+            (
+                StoredQueueStatus::Cancelled | StoredQueueStatus::Integrated,
+                MigrationWorkspace::Retained { identity },
+            ) => Some(TerminalWorkspaceTarget::Retained { identity }),
+            (_, MigrationWorkspace::NotCreated | MigrationWorkspace::Cleaned { .. }) => None,
+            (
+                _,
+                MigrationWorkspace::CreationIntent { .. } | MigrationWorkspace::Retained { .. },
+            ) => None,
+        };
+        if let Some(target) = target {
+            expected.insert(item_id, ExpectedDebt { target });
+        }
+    }
+    Ok(expected)
+}
+
+fn parse_migration_workspace(
+    path: Option<String>,
+    rift_id: Option<String>,
+    source_rift_id: Option<String>,
+    cleaned_at: Option<String>,
+) -> Result<MigrationWorkspace> {
+    match (path, rift_id, source_rift_id, cleaned_at) {
+        (None, None, None, None) => Ok(MigrationWorkspace::NotCreated),
+        (Some(path), None, None, None) => {
+            require_non_empty(&path, "integration workspace path")?;
+            Ok(MigrationWorkspace::CreationIntent { path })
+        }
+        (Some(path), Some(rift_id), Some(source_rift_id), None) => {
+            require_non_empty(&path, "integration workspace path")?;
+            require_non_empty(&rift_id, "integration workspace Rift ID")?;
+            require_non_empty(&source_rift_id, "integration workspace source Rift ID")?;
+            Ok(MigrationWorkspace::Retained {
+                identity: WorkspaceIdentity {
+                    path,
+                    rift_id,
+                    source_rift_id,
+                },
+            })
+        }
+        (None, None, None, Some(cleaned_at)) => {
+            validate_timestamp(&cleaned_at, "workspace cleanup timestamp")?;
+            Ok(MigrationWorkspace::Cleaned { cleaned_at })
+        }
+        _ => anyhow::bail!("queue item has partial or contradictory workspace identity"),
+    }
+}
+
+fn validate_workspace_status(
+    status: StoredQueueStatus,
+    workspace: &MigrationWorkspace,
+) -> Result<()> {
+    let valid = match workspace {
+        MigrationWorkspace::NotCreated => matches!(
+            status,
+            StoredQueueStatus::Ready
+                | StoredQueueStatus::Merging
+                | StoredQueueStatus::Blocked
+                | StoredQueueStatus::Cancelled
+        ),
+        MigrationWorkspace::CreationIntent { .. } => {
+            matches!(
+                status,
+                StoredQueueStatus::Merging | StoredQueueStatus::Cancelled
+            )
+        }
+        MigrationWorkspace::Retained { .. } => true,
+        MigrationWorkspace::Cleaned { .. } => status.terminal(),
+    };
+    if !valid {
+        anyhow::bail!("queue item status and workspace state are incompatible");
+    }
+    Ok(())
+}
+
+fn validate_v10_identity(connection: &Connection) -> Result<String> {
+    crate::sqlite::validate_schema_objects(connection, "10")?;
+    let database_id = validate_database_identity(connection, "10")?;
+    let expected = expected_debt_from_queue(connection)?;
+    validate_v10_contents(connection, &expected)?;
+    Ok(database_id)
+}
+
+fn validate_v10(connection: &Connection) -> Result<()> {
+    validate_v10_identity(connection).map(|_| ())
+}
+
+pub(crate) fn validate_existing_v10_identity(connection: &Connection) -> Result<String> {
+    validate_v10_identity(connection)
+}
+
+fn validate_database_identity(connection: &Connection, expected_version: &str) -> Result<String> {
+    validate_integrity_and_foreign_keys(connection, expected_version)?;
+    let metadata_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM queue_metadata WHERE key IN ('workspace_schema_version','database_id')",
+        [],
+        |row| row.get(0),
+    )?;
+    if metadata_count != 2 {
+        anyhow::bail!("IQ database identity metadata is incomplete");
+    }
+    let version: String = connection.query_row(
+        "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
+        [],
+        |row| row.get(0),
+    )?;
+    if version != expected_version {
+        anyhow::bail!("expected IQ schema version {expected_version}, found {version}");
+    }
+    let database_id: String = connection.query_row(
+        "SELECT value FROM queue_metadata WHERE key='database_id'",
+        [],
+        |row| row.get(0),
+    )?;
+    require_non_empty(&database_id, "database ID")?;
+    Ok(database_id)
+}
+
+fn require_database_id(
+    connection: &Connection,
+    expected_version: &str,
+    expected_database_id: &str,
+) -> Result<()> {
+    let actual = validate_database_identity(connection, expected_version)?;
+    if actual != expected_database_id {
+        anyhow::bail!("schema v{expected_version} database ID changed during migration");
+    }
+    Ok(())
+}
+
+fn validate_integrity_and_foreign_keys(connection: &Connection, version: &str) -> Result<()> {
+    let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        anyhow::bail!("IQ schema version {version} integrity check failed: {integrity}");
+    }
+    let foreign_keys: i64 =
+        connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if foreign_keys != 0 {
+        anyhow::bail!("IQ schema version {version} has foreign-key errors");
+    }
+    Ok(())
+}
+
+fn validate_v10_contents(
+    connection: &Connection,
+    expected: &BTreeMap<String, ExpectedDebt>,
+) -> Result<()> {
+    validate_integrity_and_foreign_keys(connection, "10")?;
+    validate_debt_schema(connection)?;
+    let actual = validated_debt_rows(connection)?;
+    if actual != *expected {
+        anyhow::bail!("schema v10 cleanup debt target set differs from queue authority");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ColumnShape {
+    name: String,
+    declared_type: String,
+    not_null: bool,
+    primary_key_position: i64,
+}
+
+fn validate_debt_schema(connection: &Connection) -> Result<()> {
+    let columns = {
+        let mut statement = connection.prepare(
+            "SELECT name,type,\"notnull\",pk FROM pragma_table_info('terminal_workspace_cleanup_debt') ORDER BY cid",
+        )?;
+        let values = statement
+            .query_map([], |row| {
+                Ok(ColumnShape {
+                    name: row.get(0)?,
+                    declared_type: row.get(1)?,
+                    not_null: row.get::<_, i64>(2)? == 1,
+                    primary_key_position: row.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        values
+    };
+    let expected = [
+        ("item_id", "TEXT", true, 1),
+        ("workspace_json", "TEXT", true, 0),
+        ("target_kind", "TEXT", true, 0),
+        ("state", "TEXT", true, 0),
+        ("reason", "TEXT", false, 0),
+        ("observation_count", "INTEGER", true, 0),
+        ("next_retry_at", "TEXT", true, 0),
+        ("alert_event_id", "TEXT", false, 0),
+        ("created_at", "TEXT", true, 0),
+        ("updated_at", "TEXT", true, 0),
+    ]
+    .into_iter()
+    .map(
+        |(name, declared_type, not_null, primary_key_position)| ColumnShape {
+            name: name.into(),
+            declared_type: declared_type.into(),
+            not_null,
+            primary_key_position,
+        },
+    )
+    .collect::<Vec<_>>();
+    if columns != expected {
+        anyhow::bail!("IQ schema version 10 has an invalid terminal cleanup debt shape");
+    }
+
+    let mut foreign_keys = {
+        let mut statement = connection.prepare(
+            "SELECT \"table\",\"from\",\"to\",on_update,on_delete,match FROM pragma_foreign_key_list('terminal_workspace_cleanup_debt') ORDER BY id",
+        )?;
+        let values = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        values
+    };
+    let mut expected_foreign_keys = vec![
+        (
+            "durable_events".into(),
+            "alert_event_id".into(),
+            "id".into(),
+            "NO ACTION".into(),
+            "NO ACTION".into(),
+            "NONE".into(),
+        ),
+        (
+            "queue_items".into(),
+            "item_id".into(),
+            "id".into(),
+            "NO ACTION".into(),
+            "CASCADE".into(),
+            "NONE".into(),
+        ),
+    ];
+    foreign_keys.sort();
+    expected_foreign_keys.sort();
+    if foreign_keys != expected_foreign_keys {
+        anyhow::bail!("IQ schema version 10 has invalid terminal cleanup debt foreign keys");
+    }
+
+    let indexes = {
+        let mut statement = connection.prepare(
+            "SELECT name,\"unique\" FROM pragma_index_list('terminal_workspace_cleanup_debt') WHERE origin='c' ORDER BY name",
+        )?;
+        let values = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        values
+    };
+    if indexes != vec![("terminal_workspace_cleanup_debt_due".into(), 0)] {
+        anyhow::bail!("IQ schema version 10 has invalid terminal cleanup debt indexes");
+    }
+    let due_columns = {
+        let mut statement = connection.prepare(
+            "SELECT name FROM pragma_index_info('terminal_workspace_cleanup_debt_due') ORDER BY seqno",
+        )?;
+        let values = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        values
+    };
+    if due_columns != ["state", "next_retry_at"] {
+        anyhow::bail!("IQ schema version 10 has invalid terminal cleanup due index columns");
+    }
+    Ok(())
+}
+
+fn validated_debt_rows(connection: &Connection) -> Result<BTreeMap<String, ExpectedDebt>> {
+    let mut statement = connection.prepare(
+        "SELECT debt.item_id,debt.workspace_json,debt.target_kind,debt.state,debt.reason,debt.observation_count,debt.next_retry_at,debt.alert_event_id,debt.created_at,debt.updated_at,event.item_id,event.event_type,event.alert FROM terminal_workspace_cleanup_debt debt LEFT JOIN durable_events event ON event.id=debt.alert_event_id ORDER BY debt.item_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, String>(9)?,
+            row.get::<_, Option<String>>(10)?,
+            row.get::<_, Option<String>>(11)?,
+            row.get::<_, Option<i64>>(12)?,
+        ))
+    })?;
+    let mut actual = BTreeMap::new();
+    for row in rows {
+        let (
+            item_id,
+            workspace_json,
+            target_kind,
+            state,
+            reason,
+            observation_count,
+            next_retry_at,
+            alert_event_id,
+            created_at,
+            updated_at,
+            event_item_id,
+            event_type,
+            event_alert,
+        ) = row?;
+        require_non_empty(&item_id, "cleanup debt item ID")?;
+        let target = parse_stored_target(&target_kind, &workspace_json)?;
+        let count: u8 = observation_count
+            .try_into()
+            .context("cleanup debt observation count is outside 0..=255")?;
+        validate_timestamp(&next_retry_at, "cleanup debt retry timestamp")?;
+        validate_timestamp(&created_at, "cleanup debt creation timestamp")?;
+        validate_timestamp(&updated_at, "cleanup debt update timestamp")?;
+        match state.as_str() {
+            "pending" if reason.is_none() && count == 0 && alert_event_id.is_none() => {}
+            "preserved" if count > 0 => {
+                parse_preservation_reason(reason.as_deref())?;
+                let alert_event_id = alert_event_id
+                    .as_deref()
+                    .context("preserved cleanup debt has no alert event ID")?;
+                require_non_empty(alert_event_id, "cleanup debt alert event ID")?;
+                if event_item_id.as_deref() != Some(item_id.as_str())
+                    || event_type.as_deref() != Some("terminal_workspace_preserved")
+                    || event_alert != Some(1)
+                {
+                    anyhow::bail!("preserved cleanup debt has the wrong alert event authority");
+                }
+            }
+            "pending" | "preserved" => {
+                anyhow::bail!("cleanup debt state fields are inconsistent")
+            }
+            _ => anyhow::bail!("unknown cleanup debt state {state}"),
+        }
+        if actual.insert(item_id, ExpectedDebt { target }).is_some() {
+            anyhow::bail!("duplicate cleanup debt item ID");
+        }
+    }
+    Ok(actual)
+}
+
+fn parse_stored_target(kind: &str, raw: &str) -> Result<TerminalWorkspaceTarget> {
+    match kind {
+        "creation_intent" => {
+            let stored: StoredCreationIntent =
+                serde_json::from_str(raw).context("parse creation-intent cleanup target")?;
+            require_non_empty(&stored.path, "creation-intent path")?;
+            Ok(TerminalWorkspaceTarget::CreationIntent { path: stored.path })
+        }
+        "retained" => {
+            let stored: StoredWorkspaceIdentity =
+                serde_json::from_str(raw).context("parse retained cleanup target")?;
+            require_non_empty(&stored.path, "retained workspace path")?;
+            require_non_empty(&stored.rift_id, "retained Rift ID")?;
+            require_non_empty(&stored.source_rift_id, "retained source Rift ID")?;
+            Ok(TerminalWorkspaceTarget::Retained {
+                identity: WorkspaceIdentity {
+                    path: stored.path,
+                    rift_id: stored.rift_id,
+                    source_rift_id: stored.source_rift_id,
+                },
+            })
+        }
+        _ => anyhow::bail!("unknown cleanup debt target kind {kind}"),
+    }
+}
+
+fn parse_preservation_reason(value: Option<&str>) -> Result<TerminalWorkspacePreservationReason> {
+    match value {
+        Some("dirty") => Ok(TerminalWorkspacePreservationReason::Dirty),
+        Some("active_git_operation") => Ok(TerminalWorkspacePreservationReason::ActiveGitOperation),
+        Some("both") => Ok(TerminalWorkspacePreservationReason::DirtyAndActiveGitOperation),
+        Some(value) => anyhow::bail!("unknown cleanup debt preservation reason {value}"),
+        None => anyhow::bail!("preserved cleanup debt has no reason"),
+    }
+}
+
+fn require_non_empty(value: &str, label: &str) -> Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{label} must not be empty");
+    }
+    Ok(())
+}
+
+fn validate_timestamp(value: &str, label: &str) -> Result<()> {
+    DateTime::parse_from_rfc3339(value).with_context(|| format!("{label} is not RFC 3339"))?;
+    Ok(())
+}
+
+pub(crate) fn migrate_v8_to_v9_under_lease(
     connection: &mut Connection,
     database_path: &Path,
     system_config_path: &Path,
+    _lease: &DatabaseProcessLease,
+    source: &PrimaryDatabaseIdentity,
 ) -> Result<()> {
-    let _lease = DatabaseProcessLease::acquire_exclusive(database_path)?;
     let system_config = SystemConfig::load(system_config_path)?;
-    reject_migration_authority(connection)?;
-    let active = active_v8_items(connection)?;
-    let mut conversions = Vec::new();
-    for item in active {
-        let project = crate::composition::load_project_control_only(Path::new(&item.repo_path))?;
-        crate::state_repository::repository(&project.state_repository)?.verify()?;
-        let runner = item
-            .claimed
-            .as_ref()
-            .map(|_| system_config.runner_snapshot(project.model.as_deref()))
-            .transpose()?;
-        conversions.push((item, runner, project.state_repository));
-    }
-    let backup = verified_backup(connection, database_path)?;
     let conversion = (|| -> Result<()> {
+        source.verify_authoritative(database_path)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        reject_migration_authority(&transaction)?;
+        crate::sqlite::validate_schema_objects(&transaction, "8")?;
+        let source_database_id = validate_database_identity(&transaction, "8")?;
+        let active = active_v8_items(&transaction)?;
+        let mut conversions = Vec::new();
+        for item in active {
+            let project =
+                crate::composition::load_project_control_only(Path::new(&item.repo_path))?;
+            crate::state_repository::repository(&project.state_repository)?.verify()?;
+            let runner = item
+                .claimed
+                .as_ref()
+                .map(|_| system_config.runner_snapshot(project.model.as_deref()))
+                .transpose()?;
+            conversions.push((item, runner, project.state_repository));
+        }
+        let backup_source = open_backup_source(database_path)?;
+        let backup = create_verified_backup(&backup_source, database_path, "8")?;
+        drop(backup_source);
+        run_migration_backup_test_hook(database_path, &backup.path);
+        run_migration_primary_test_hook(database_path);
+        source.verify_authoritative(database_path)?;
+        transaction.execute_batch("DROP TABLE IF EXISTS terminal_workspace_cleanup_debt;")?;
         transaction.execute_batch(V9_SCHEMA)?;
         for (item, runner, state_repository) in &conversions {
             bind_item_state_repository(&transaction, item, state_repository)?;
@@ -2087,10 +3324,14 @@ pub fn migrate_v8_to_v9(
         transaction.execute_batch(
             "DROP TABLE communication_response_receipts; DROP TABLE communication_bindings;",
         )?;
-        transaction.execute(
-            "UPDATE queue_metadata SET value='9' WHERE key='workspace_schema_version'",
+        require_database_id(&transaction, "8", &source_database_id)?;
+        let changed = transaction.execute(
+            "UPDATE queue_metadata SET value='9' WHERE key='workspace_schema_version' AND value='8'",
             [],
         )?;
+        if changed != 1 {
+            anyhow::bail!("schema v9 metadata update did not change exactly one row");
+        }
         let claimed_count: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM queue_items WHERE status NOT IN ('integrated','cancelled') AND current_attempt_id IS NOT NULL",
             [],
@@ -2112,30 +3353,26 @@ pub fn migrate_v8_to_v9(
         if foreign_keys != 0 {
             anyhow::bail!("schema v9 conversion has foreign-key errors");
         }
+        require_database_id(&transaction, "9", &source_database_id)?;
+        validate_v9(&transaction)?;
+        validate_backup(&backup, "8", _lease, None)?;
+        run_migration_backup_precommit_test_hook(database_path, &backup.path);
+        source.verify_authoritative(database_path)?;
+        let _backup_guard = verify_backup_ready_for_commit(&backup)?;
         transaction.commit()?;
+        source.verify_authoritative(database_path)?;
         Ok(())
     })();
-    if let Err(error) = conversion {
-        let version: String = connection.query_row(
-            "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
-            [],
-            |row| row.get(0),
-        )?;
-        let integrity: String =
-            connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
-        if version != "8" || integrity != "ok" {
-            anyhow::bail!(
-                "schema v9 migration failed and source v8 proof failed; backup is {}: {error:#}",
-                backup.path.display()
-            );
+    match conversion {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            crate::sqlite::validate_schema_objects(connection, "8")?;
+            validate_database_identity(connection, "8").context(
+                "schema v9 migration failed and rollback did not preserve valid schema v8",
+            )?;
+            Err(error).context("schema v9 migration rolled back to valid schema v8")
         }
-        return Err(error).context(format!(
-            "schema v9 migration rolled back; verified backup is {}",
-            backup.path.display()
-        ));
     }
-    validate_backup_file(&backup.path, &backup.sha256, backup.size)?;
-    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -2143,19 +3380,40 @@ struct BackupIdentity {
     path: PathBuf,
     sha256: String,
     size: u64,
+    database_id: String,
+    device: u64,
+    inode: u64,
+    contents_sha256: String,
 }
 
-fn verified_backup(source: &Connection, database_path: &Path) -> Result<BackupIdentity> {
+fn open_backup_source(database_path: &Path) -> Result<Connection> {
+    let connection = Connection::open_with_flags(
+        database_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    Ok(connection)
+}
+
+fn create_verified_backup(
+    source: &Connection,
+    database_path: &Path,
+    source_version: &str,
+) -> Result<BackupIdentity> {
     let parent = database_path
         .parent()
         .context("database path has no parent")?;
-    let backup_path = parent.join(format!(
-        "{}.schema-v8.backup",
-        database_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .context("database name is not UTF-8")?
+    let database_id = validate_database_identity(source, source_version)?;
+    let source_contents = database_contents_digest(source)?;
+    let mut name = database_path
+        .file_name()
+        .context("database path has no file name")?
+        .to_os_string();
+    name.push(format!(
+        ".schema-v{source_version}.{}.backup",
+        Uuid::new_v4()
     ));
+    let backup_path = parent.join(name);
     let reserve = OpenOptions::new()
         .create_new(true)
         .read(true)
@@ -2163,76 +3421,298 @@ fn verified_backup(source: &Connection, database_path: &Path) -> Result<BackupId
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&backup_path)
-        .with_context(|| format!("reserve schema-v8 backup {}", backup_path.display()))?;
-    drop(reserve);
+        .with_context(|| {
+            format!(
+                "reserve schema-v{source_version} backup {}",
+                backup_path.display()
+            )
+        })?;
+    let reserved_metadata = reserve.metadata()?;
     let mut destination = Connection::open_with_flags(
         &backup_path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
+    let opened_metadata = fs::symlink_metadata(&backup_path)?;
+    if (opened_metadata.dev(), opened_metadata.ino())
+        != (reserved_metadata.dev(), reserved_metadata.ino())
+    {
+        anyhow::bail!("schema backup inode changed before SQLite backup opened");
+    }
     {
         let backup = Backup::new(source, &mut destination)?;
         backup.run_to_completion(128, Duration::from_millis(10), None)?;
     }
-    destination.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
-    let version: String = destination.query_row(
-        "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
-        [],
-        |row| row.get(0),
-    )?;
-    let database_id: String = destination.query_row(
-        "SELECT value FROM queue_metadata WHERE key='database_id'",
-        [],
-        |row| row.get(0),
-    )?;
-    let source_id: String = source.query_row(
-        "SELECT value FROM queue_metadata WHERE key='database_id'",
-        [],
-        |row| row.get(0),
-    )?;
-    let integrity: String =
-        destination.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
-    if version != "8" || database_id != source_id || integrity != "ok" {
-        anyhow::bail!("schema-v8 SQLite backup verification failed");
-    }
+    destination.pragma_update(None, "foreign_keys", "ON")?;
     drop(destination);
-    File::open(&backup_path)?.sync_all()?;
+    reserve.sync_all()?;
+    let metadata = reserve.metadata()?;
+    let path_metadata = fs::symlink_metadata(&backup_path)?;
+    if (path_metadata.dev(), path_metadata.ino()) != (metadata.dev(), metadata.ino()) {
+        anyhow::bail!("schema backup inode changed during creation");
+    }
     File::open(parent)?.sync_all()?;
-    let (sha256, size) = digest_file(&backup_path)?;
-    Ok(BackupIdentity {
+    let (sha256, size) = digest_open_file(&reserve)?;
+    let backup = BackupIdentity {
         path: backup_path,
         sha256,
         size,
-    })
+        database_id,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        contents_sha256: source_contents,
+    };
+    verify_backup_ready_for_commit(&backup)?;
+    Ok(backup)
 }
 
-fn validate_backup_file(path: &Path, expected_digest: &str, expected_size: u64) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.permissions().mode() & 0o777 != 0o600
+fn run_migration_backup_test_hook(database_path: &Path, backup_path: &Path) {
+    #[cfg(debug_assertions)]
     {
-        anyhow::bail!("schema-v8 backup lost its protected regular-file identity");
+        let mut hook = MIGRATION_BACKUP_TEST_HOOK.lock().unwrap();
+        if hook
+            .as_ref()
+            .is_some_and(|(target, _)| target == database_path)
+        {
+            let (_, run) = hook.take().unwrap();
+            run(backup_path);
+        }
     }
-    let (digest, size) = digest_file(path)?;
-    if digest != expected_digest || size != expected_size {
-        anyhow::bail!("schema-v8 backup digest or size changed");
+}
+
+fn run_migration_primary_test_hook(database_path: &Path) {
+    #[cfg(debug_assertions)]
+    {
+        let mut hook = MIGRATION_PRIMARY_TEST_HOOK.lock().unwrap();
+        if hook
+            .as_ref()
+            .is_some_and(|(target, _)| target == database_path)
+        {
+            let (_, run) = hook.take().unwrap();
+            run(database_path);
+        }
+    }
+}
+
+fn run_migration_backup_precommit_test_hook(database_path: &Path, backup_path: &Path) {
+    #[cfg(debug_assertions)]
+    {
+        let mut hook = MIGRATION_BACKUP_PRECOMMIT_TEST_HOOK.lock().unwrap();
+        if hook
+            .as_ref()
+            .is_some_and(|(target, _)| target == database_path)
+        {
+            let (_, run) = hook.take().unwrap();
+            run(backup_path);
+        }
+    }
+}
+
+pub(crate) fn run_runtime_open_handoff_test_hook(database_path: &Path) {
+    #[cfg(debug_assertions)]
+    {
+        let mut hook = RUNTIME_OPEN_HANDOFF_TEST_HOOK.lock().unwrap();
+        if hook
+            .as_ref()
+            .is_some_and(|(target, _)| target == database_path)
+        {
+            let (_, run) = hook.take().unwrap();
+            run(database_path);
+        }
+    }
+}
+
+fn run_database_snapshot_test_hook(database_path: &Path, snapshot_path: &Path) {
+    #[cfg(debug_assertions)]
+    {
+        let mut hook = DATABASE_SNAPSHOT_TEST_HOOK.lock().unwrap();
+        if hook
+            .as_ref()
+            .is_some_and(|(target, _)| target == database_path)
+        {
+            let (_, run) = hook.take().unwrap();
+            run(snapshot_path);
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn reinstall_v10_triggers_for_test(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "DROP TRIGGER IF EXISTS terminal_cleanup_debt_queue_update;
+         DROP TRIGGER IF EXISTS terminal_cleanup_debt_insert_guard;
+         DROP TRIGGER IF EXISTS terminal_cleanup_debt_update_guard;
+         DROP TRIGGER IF EXISTS terminal_cleanup_debt_exact_target_insert;
+         DROP TRIGGER IF EXISTS terminal_cleanup_debt_exact_target_update;
+         DROP TRIGGER IF EXISTS terminal_cleanup_debt_alert_insert_guard;
+         DROP TRIGGER IF EXISTS terminal_cleanup_debt_alert_update_guard;
+         DROP TRIGGER IF EXISTS terminal_cleanup_debt_alert_event_update_guard;
+         DROP TRIGGER IF EXISTS terminal_cleanup_debt_alert_event_delete_guard;
+         DROP TRIGGER IF EXISTS terminal_cleanup_debt_delete_guard;
+         DROP TRIGGER IF EXISTS terminal_cleanup_debt_cleaned;",
+    )?;
+    connection.execute_batch(V10_TRIGGERS)?;
+    Ok(())
+}
+
+fn validate_backup(
+    backup: &BackupIdentity,
+    source_version: &str,
+    lease: &DatabaseProcessLease,
+    expected_v9: Option<&BTreeMap<String, ExpectedDebt>>,
+) -> Result<()> {
+    let file = verify_backup_ready_for_commit(backup)?;
+    let (digest, size) = digest_open_file(&file)?;
+    if digest != backup.sha256 || size != backup.size {
+        anyhow::bail!("schema backup digest or size changed");
+    }
+    validate_database_snapshot_with_source_under_lease(
+        &backup.path,
+        lease,
+        SnapshotInput::SidecarFreeOpenFile(&file),
+        |connection| {
+            let database_id = validate_database_identity(connection, source_version)?;
+            if database_id != backup.database_id {
+                anyhow::bail!("schema-v{source_version} backup database ID changed");
+            }
+            if let Some(expected) = expected_v9 {
+                if validate_v9(connection)?.1 != *expected {
+                    anyhow::bail!("schema-v9 backup differs from the validated source contents");
+                }
+            }
+            if database_contents_digest(connection)? != backup.contents_sha256 {
+                anyhow::bail!(
+                    "schema-v{source_version} backup differs from the full source database"
+                );
+            }
+            Ok(())
+        },
+    )?;
+    verify_backup_ready_for_commit(backup)?;
+    let (final_digest, final_size) = digest_open_file(&file)?;
+    if final_digest != backup.sha256 || final_size != backup.size {
+        anyhow::bail!("schema backup changed during validation");
     }
     Ok(())
 }
 
-fn digest_file(path: &Path) -> Result<(String, u64)> {
-    let before = fs::symlink_metadata(path)?;
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    let opened = file.metadata()?;
-    if (before.dev(), before.ino()) != (opened.dev(), opened.ino()) {
-        anyhow::bail!("backup changed while opening");
+fn verify_backup_ready_for_commit(backup: &BackupIdentity) -> Result<File> {
+    let file = open_exact_backup(backup)?;
+    verify_no_database_sidecars(&backup.path, "schema backup")?;
+    let (digest, size) = digest_open_file(&file)?;
+    if digest != backup.sha256 || size != backup.size {
+        anyhow::bail!("schema backup digest or size changed");
     }
+    Ok(file)
+}
+
+fn open_exact_backup(backup: &BackupIdentity) -> Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOATIME)
+        .open(&backup.path)?;
+    let metadata = file.metadata()?;
+    let path_metadata = fs::symlink_metadata(&backup.path)?;
+    if !metadata.is_file()
+        || metadata.permissions().mode() & 0o777 != 0o600
+        || metadata.dev() != backup.device
+        || metadata.ino() != backup.inode
+        || path_metadata.file_type().is_symlink()
+        || !path_metadata.is_file()
+        || path_metadata.dev() != backup.device
+        || path_metadata.ino() != backup.inode
+    {
+        anyhow::bail!("schema backup lost its protected inode identity");
+    }
+    Ok(file)
+}
+
+fn digest_open_file(file: &File) -> Result<(String, u64)> {
+    let mut file = file.try_clone()?;
+    use std::io::{Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0))?;
     let mut digest = Sha256::new();
     let size = std::io::copy(&mut file, &mut digest)?;
     Ok((format!("{:x}", digest.finalize()), size))
+}
+
+fn database_contents_digest(connection: &Connection) -> Result<String> {
+    let mut digest = Sha256::new();
+    let mut schema = connection.prepare(
+        "SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_schema ORDER BY type,name,tbl_name",
+    )?;
+    let objects = schema.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    for object in objects {
+        let (object_type, name, table_name, sql) = object?;
+        digest_field(&mut digest, object_type.as_bytes());
+        digest_field(&mut digest, name.as_bytes());
+        digest_field(&mut digest, table_name.as_bytes());
+        digest_field(&mut digest, sql.as_bytes());
+    }
+    drop(schema);
+
+    let table_names = connection
+        .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for table_name in table_names {
+        digest_field(&mut digest, table_name.as_bytes());
+        let quoted_table = quote_identifier(&table_name);
+        let columns = connection
+            .prepare(&format!("SELECT * FROM {quoted_table} LIMIT 0"))?
+            .column_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        for column in &columns {
+            digest_field(&mut digest, column.as_bytes());
+        }
+        let order = columns
+            .iter()
+            .map(|column| {
+                let column = quote_identifier(column);
+                format!("typeof({column}),quote({column}) COLLATE BINARY")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut statement =
+            connection.prepare(&format!("SELECT * FROM {quoted_table} ORDER BY {order}"))?;
+        let rows = statement.query_map([], |row| {
+            let mut values = Vec::with_capacity(columns.len());
+            for index in 0..columns.len() {
+                values.push(match row.get_ref(index)? {
+                    ValueRef::Null => (0, Vec::new()),
+                    ValueRef::Integer(value) => (1, value.to_be_bytes().to_vec()),
+                    ValueRef::Real(value) => (2, value.to_bits().to_be_bytes().to_vec()),
+                    ValueRef::Text(value) => (3, value.to_vec()),
+                    ValueRef::Blob(value) => (4, value.to_vec()),
+                });
+            }
+            Ok(values)
+        })?;
+        for row in rows {
+            for (kind, value) in row? {
+                digest.update([kind]);
+                digest_field(&mut digest, &value);
+            }
+        }
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn digest_field(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value);
+}
+
+fn quote_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 fn reject_migration_authority(connection: &Connection) -> Result<()> {
@@ -3227,3 +4707,204 @@ BEGIN
   SELECT RAISE(ABORT,'queue lifecycle is a projection of integration_effort');
 END;
 "#;
+
+const V10_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS terminal_workspace_cleanup_debt (
+  item_id TEXT NOT NULL PRIMARY KEY REFERENCES queue_items(id) ON DELETE CASCADE,
+  workspace_json TEXT NOT NULL CHECK(
+    json_valid(workspace_json)
+    AND json_type(workspace_json,'$')='object'
+    AND json_type(workspace_json,'$.path')='text'
+    AND length(json_extract(workspace_json,'$.path'))>0
+    AND ((target_kind='creation_intent'
+          AND json_type(workspace_json,'$.rift_id') IS NULL
+          AND json_type(workspace_json,'$.source_rift_id') IS NULL)
+      OR (target_kind='retained'
+          AND json_type(workspace_json,'$.rift_id')='text'
+          AND length(json_extract(workspace_json,'$.rift_id'))>0
+          AND json_type(workspace_json,'$.source_rift_id')='text'
+          AND length(json_extract(workspace_json,'$.source_rift_id'))>0))
+  ),
+  target_kind TEXT NOT NULL CHECK(target_kind IN ('creation_intent','retained')),
+  state TEXT NOT NULL CHECK(state IN ('pending','preserved')),
+  reason TEXT CHECK(reason IN ('dirty','active_git_operation','both') OR reason IS NULL),
+  observation_count INTEGER NOT NULL CHECK(observation_count BETWEEN 0 AND 255),
+  next_retry_at TEXT NOT NULL,
+  alert_event_id TEXT UNIQUE REFERENCES durable_events(id),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK((state='pending' AND reason IS NULL AND observation_count=0 AND alert_event_id IS NULL) OR (state='preserved' AND reason IS NOT NULL AND observation_count>0 AND alert_event_id IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS terminal_workspace_cleanup_debt_due ON terminal_workspace_cleanup_debt(state,next_retry_at);
+"#;
+
+const V10_TRIGGERS: &str = r#"
+CREATE TRIGGER terminal_cleanup_debt_queue_update
+BEFORE UPDATE OF status,integration_workspace_path,integration_workspace_rift_id,integration_workspace_source_rift_id,integration_workspace_cleaned_at ON queue_items
+WHEN NEW.status IN ('integrated','cancelled') AND NEW.integration_workspace_cleaned_at IS NULL
+  AND (NEW.integration_workspace_path IS NOT NULL)
+  AND NOT EXISTS (
+    SELECT 1 FROM terminal_workspace_cleanup_debt debt
+    WHERE debt.item_id=NEW.id
+      AND ((NEW.integration_workspace_rift_id IS NULL AND NEW.integration_workspace_source_rift_id IS NULL
+            AND debt.target_kind='creation_intent'
+            AND json_extract(debt.workspace_json,'$.path')=NEW.integration_workspace_path)
+        OR (NEW.integration_workspace_rift_id IS NOT NULL AND NEW.integration_workspace_source_rift_id IS NOT NULL
+            AND debt.target_kind='retained'
+            AND json_extract(debt.workspace_json,'$.path')=NEW.integration_workspace_path
+            AND json_extract(debt.workspace_json,'$.rift_id')=NEW.integration_workspace_rift_id
+            AND json_extract(debt.workspace_json,'$.source_rift_id')=NEW.integration_workspace_source_rift_id))
+  )
+BEGIN
+  SELECT RAISE(ABORT,'terminal queue transition requires exact cleanup debt');
+END;
+
+CREATE TRIGGER terminal_cleanup_debt_insert_guard
+BEFORE INSERT ON terminal_workspace_cleanup_debt
+WHEN NOT EXISTS (
+  SELECT 1 FROM queue_items item WHERE item.id=NEW.item_id
+    AND item.integration_workspace_cleaned_at IS NULL
+    AND ((item.integration_workspace_rift_id IS NULL AND item.integration_workspace_source_rift_id IS NULL
+          AND item.integration_workspace_path IS NOT NULL AND NEW.target_kind='creation_intent'
+          AND json_extract(NEW.workspace_json,'$.path')=item.integration_workspace_path)
+      OR (item.integration_workspace_rift_id IS NOT NULL AND item.integration_workspace_source_rift_id IS NOT NULL
+          AND NEW.target_kind='retained'
+          AND json_extract(NEW.workspace_json,'$.path')=item.integration_workspace_path
+          AND json_extract(NEW.workspace_json,'$.rift_id')=item.integration_workspace_rift_id
+          AND json_extract(NEW.workspace_json,'$.source_rift_id')=item.integration_workspace_source_rift_id))
+)
+BEGIN
+  SELECT RAISE(ABORT,'cleanup debt must match queue workspace authority');
+END;
+
+CREATE TRIGGER terminal_cleanup_debt_update_guard
+BEFORE UPDATE OF item_id,workspace_json,target_kind ON terminal_workspace_cleanup_debt
+WHEN NOT EXISTS (
+  SELECT 1 FROM queue_items item WHERE item.id=NEW.item_id
+    AND item.integration_workspace_cleaned_at IS NULL
+    AND ((item.integration_workspace_rift_id IS NULL AND item.integration_workspace_source_rift_id IS NULL
+          AND item.integration_workspace_path IS NOT NULL AND NEW.target_kind='creation_intent'
+          AND json_extract(NEW.workspace_json,'$.path')=item.integration_workspace_path)
+      OR (item.integration_workspace_rift_id IS NOT NULL AND item.integration_workspace_source_rift_id IS NOT NULL
+          AND NEW.target_kind='retained'
+          AND json_extract(NEW.workspace_json,'$.path')=item.integration_workspace_path
+          AND json_extract(NEW.workspace_json,'$.rift_id')=item.integration_workspace_rift_id
+          AND json_extract(NEW.workspace_json,'$.source_rift_id')=item.integration_workspace_source_rift_id))
+)
+BEGIN
+  SELECT RAISE(ABORT,'cleanup debt must match queue workspace authority');
+END;
+
+CREATE TRIGGER terminal_cleanup_debt_exact_target_insert
+BEFORE INSERT ON terminal_workspace_cleanup_debt
+WHEN (NEW.target_kind='creation_intent' AND (
+       (SELECT COUNT(*) FROM json_each(NEW.workspace_json))!=1
+       OR EXISTS(SELECT 1 FROM json_each(NEW.workspace_json) WHERE key NOT IN ('path'))))
+  OR (NEW.target_kind='retained' AND (
+       (SELECT COUNT(*) FROM json_each(NEW.workspace_json))!=3
+       OR EXISTS(SELECT 1 FROM json_each(NEW.workspace_json) WHERE key NOT IN ('path','rift_id','source_rift_id'))))
+BEGIN
+  SELECT RAISE(ABORT,'cleanup debt target keys are invalid');
+END;
+
+CREATE TRIGGER terminal_cleanup_debt_exact_target_update
+BEFORE UPDATE OF workspace_json,target_kind ON terminal_workspace_cleanup_debt
+WHEN (NEW.target_kind='creation_intent' AND (
+       (SELECT COUNT(*) FROM json_each(NEW.workspace_json))!=1
+       OR EXISTS(SELECT 1 FROM json_each(NEW.workspace_json) WHERE key NOT IN ('path'))))
+  OR (NEW.target_kind='retained' AND (
+       (SELECT COUNT(*) FROM json_each(NEW.workspace_json))!=3
+       OR EXISTS(SELECT 1 FROM json_each(NEW.workspace_json) WHERE key NOT IN ('path','rift_id','source_rift_id'))))
+BEGIN
+  SELECT RAISE(ABORT,'cleanup debt target keys are invalid');
+END;
+
+CREATE TRIGGER terminal_cleanup_debt_alert_insert_guard
+BEFORE INSERT ON terminal_workspace_cleanup_debt
+WHEN NEW.state='preserved' AND NOT EXISTS (
+  SELECT 1 FROM durable_events event
+  WHERE event.id=NEW.alert_event_id
+    AND event.item_id=NEW.item_id
+    AND event.event_type='terminal_workspace_preserved'
+    AND event.alert=1
+)
+BEGIN
+  SELECT RAISE(ABORT,'preserved cleanup debt requires its alert event authority');
+END;
+
+CREATE TRIGGER terminal_cleanup_debt_alert_update_guard
+BEFORE UPDATE OF item_id,state,alert_event_id ON terminal_workspace_cleanup_debt
+WHEN NEW.state='preserved' AND NOT EXISTS (
+  SELECT 1 FROM durable_events event
+  WHERE event.id=NEW.alert_event_id
+    AND event.item_id=NEW.item_id
+    AND event.event_type='terminal_workspace_preserved'
+    AND event.alert=1
+)
+BEGIN
+  SELECT RAISE(ABORT,'preserved cleanup debt requires its alert event authority');
+END;
+
+CREATE TRIGGER terminal_cleanup_debt_alert_event_update_guard
+BEFORE UPDATE OF id,item_id,event_type,alert ON durable_events
+WHEN EXISTS (
+  SELECT 1 FROM terminal_workspace_cleanup_debt debt
+  WHERE debt.alert_event_id=OLD.id AND debt.state='preserved'
+) AND NOT (
+  NEW.id=OLD.id
+  AND NEW.item_id=(SELECT item_id FROM terminal_workspace_cleanup_debt WHERE alert_event_id=OLD.id)
+  AND NEW.event_type='terminal_workspace_preserved'
+  AND NEW.alert=1
+)
+BEGIN
+  SELECT RAISE(ABORT,'preserved cleanup debt alert event authority is immutable');
+END;
+
+CREATE TRIGGER terminal_cleanup_debt_alert_event_delete_guard
+BEFORE DELETE ON durable_events
+WHEN EXISTS (
+  SELECT 1 FROM terminal_workspace_cleanup_debt debt
+  WHERE debt.alert_event_id=OLD.id AND debt.state='preserved'
+)
+BEGIN
+  SELECT RAISE(ABORT,'preserved cleanup debt alert event authority is required');
+END;
+
+CREATE TRIGGER terminal_cleanup_debt_delete_guard
+BEFORE DELETE ON terminal_workspace_cleanup_debt
+WHEN EXISTS (
+  SELECT 1 FROM queue_items item WHERE item.id=OLD.item_id
+    AND item.status IN ('integrated','cancelled')
+    AND item.integration_workspace_cleaned_at IS NULL
+    AND item.integration_workspace_path IS NOT NULL
+)
+BEGIN
+  SELECT RAISE(ABORT,'terminal queue workspace requires cleanup debt');
+END;
+
+CREATE TRIGGER terminal_cleanup_debt_cleaned
+AFTER UPDATE OF integration_workspace_cleaned_at ON queue_items
+WHEN NEW.integration_workspace_cleaned_at IS NOT NULL
+BEGIN
+  DELETE FROM terminal_workspace_cleanup_debt WHERE item_id=NEW.id;
+END;
+"#;
+
+fn parse_terminal_target(kind: &str, raw: &str) -> rusqlite::Result<TerminalWorkspaceTarget> {
+    match kind {
+        "creation_intent" => {
+            let value: serde_json::Value = serde_json::from_str(raw).map_err(json_error)?;
+            let path = value
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(rusqlite::Error::InvalidQuery)?;
+            Ok(TerminalWorkspaceTarget::CreationIntent {
+                path: path.to_string(),
+            })
+        }
+        "retained" => Ok(TerminalWorkspaceTarget::Retained {
+            identity: serde_json::from_str(raw).map_err(json_error)?,
+        }),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}

@@ -707,7 +707,10 @@ pub mod sqlite {
             Some("8") => anyhow::bail!(
                 "IQ schema version 8 requires explicit migration with a verified system configuration path"
             ),
-            Some("9") => Ok(()),
+            Some("9") => anyhow::bail!(
+                "IQ schema version 9 requires explicit migration"
+            ),
+            Some("10") => Ok(()),
             Some(version) => anyhow::bail!("unsupported IQ schema version {version}"),
             None => anyhow::bail!("existing IQ database has no standalone schema version"),
         }
@@ -862,6 +865,67 @@ pub mod sqlite {
                 .canonicalize()
                 .with_context(|| format!("resolve queue db parent {}", parent.display()))?
                 .join(file_name);
+            let lease = if preexisting_identity.is_some() {
+                crate::control_store::DatabaseProcessLease::acquire_existing_exclusive(&path)?
+            } else {
+                crate::control_store::DatabaseProcessLease::acquire_exclusive(&path)?
+            };
+            let source = preexisting_identity
+                .map(|_| crate::control_store::PrimaryDatabaseIdentity::open(&path))
+                .transpose()?;
+            if let Some(expected) = preexisting_identity {
+                let current = fs::symlink_metadata(&path)?;
+                if expected != (current.dev(), current.ino()) {
+                    anyhow::bail!(
+                        "queue database identity changed before validation: {}",
+                        path.display()
+                    );
+                }
+            }
+            let (initialize, validated_database_id) = if source.is_some() {
+                crate::control_store::validate_database_snapshot_under_lease(
+                    &path,
+                    &lease,
+                    |validation| {
+                        let existing_tables: i64 = validation.query_row(
+                            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+                            [],
+                            |row| row.get(0),
+                        )?;
+                        if existing_tables > 0 {
+                            let metadata_exists: bool = validation.query_row(
+                                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='queue_metadata')",
+                                [],
+                                |row| row.get(0),
+                            )?;
+                            if !metadata_exists {
+                                anyhow::bail!(
+                                    "existing IQ database has no standalone schema identity"
+                                );
+                            }
+                            let version: Option<String> = validation
+                                .query_row(
+                                    "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
+                                    [],
+                                    |row| row.get(0),
+                                )
+                                .optional()?;
+                            require_current_schema_version(version.as_deref())?;
+                            let database_id =
+                                crate::control_store::validate_existing_v10_identity(validation)?;
+                            return Ok((false, Some(database_id)));
+                        }
+                        Ok((true, None))
+                    },
+                )?
+            } else {
+                (true, None)
+            };
+            crate::control_store::run_runtime_open_handoff_test_hook(&path);
+            lease.verify_authority(&path)?;
+            if let Some(source) = &source {
+                source.verify_authoritative(&path)?;
+            }
             let mut conn = Connection::open_with_flags(
                 &path,
                 OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -870,62 +934,10 @@ pub mod sqlite {
             )
             .with_context(|| format!("open queue db {}", path.display()))?;
             conn.busy_timeout(Self::MIGRATION_BUSY_TIMEOUT)?;
-            conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.pragma_update(None, "foreign_keys", "ON")?;
-            let existing_tables: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
-                [],
-                |row| row.get(0),
-            )?;
-            if existing_tables > 0 {
-                let metadata_exists: bool = conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='queue_metadata')",
-                    [],
-                    |row| row.get(0),
-                )?;
-                if !metadata_exists {
-                    anyhow::bail!("existing IQ database has no standalone schema identity");
-                }
-                let version: Option<String> = conn
-                    .query_row(
-                        "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                require_current_schema_version(version.as_deref())?;
+            if let Some(source) = &source {
+                source.verify_authoritative(&path)?;
             }
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute_batch(SCHEMA)?;
-            tx.execute(
-                "INSERT OR IGNORE INTO queue_metadata (key,value) VALUES ('database_id',?1)",
-                params![Uuid::new_v4().to_string()],
-            )?;
-            let workspace_schema_version: Option<String> = tx
-                .query_row(
-                    "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if workspace_schema_version
-                .as_deref()
-                .is_some_and(|version| version != "9")
-            {
-                anyhow::bail!(
-                    "unsupported workspace schema version {}",
-                    workspace_schema_version.as_deref().unwrap_or_default()
-                );
-            }
-            tx.execute_batch(COMPOSITION_SCHEMA)?;
-            tx.execute_batch(QUEUE_SOURCE_TRIGGERS)?;
-            tx.execute_batch(REGISTERED_CHECKOUT_TRIGGERS)?;
-            tx.execute_batch(LANDING_STATE_TRIGGERS)?;
-            tx.execute_batch(REGISTERED_REMOTE_TRIGGERS)?;
-            crate::control_store::install_fresh_v9(&tx)?;
-            tx.execute_batch(WORKSPACE_STATE_TRIGGERS)?;
-            tx.commit()?;
-            crate::control_store::ControlStore::open(&path)?;
             let metadata = fs::symlink_metadata(&path)
                 .with_context(|| format!("inspect queue db {}", path.display()))?;
             if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -939,10 +951,50 @@ pub mod sqlite {
                     path.display()
                 );
             }
+            if initialize {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                install_schema(&tx, "10")?;
+                tx.execute(
+                    "INSERT INTO queue_metadata (key,value) VALUES ('database_id',?1)",
+                    params![Uuid::new_v4().to_string()],
+                )?;
+                tx.execute(
+                    "INSERT INTO queue_metadata (key,value) VALUES ('workspace_schema_version','10')",
+                    [],
+                )?;
+                tx.commit()?;
+            }
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            let authoritative_database_id =
+                crate::control_store::validate_existing_v10_identity(&conn)?;
+            if validated_database_id
+                .as_ref()
+                .is_some_and(|expected| expected != &authoritative_database_id)
+            {
+                anyhow::bail!("queue database identity changed after snapshot validation");
+            }
+            lease.verify_authority(&path)?;
+            if let Some(source) = &source {
+                source.verify_authoritative(&path)?;
+            }
+            let final_metadata = fs::symlink_metadata(&path)
+                .with_context(|| format!("inspect queue db {}", path.display()))?;
+            if final_metadata.file_type().is_symlink() || !final_metadata.is_file() {
+                anyhow::bail!("queue database must be a regular file: {}", path.display());
+            }
+            if (final_metadata.dev(), final_metadata.ino()) != (metadata.dev(), metadata.ino()) {
+                anyhow::bail!(
+                    "queue database identity changed while opening: {}",
+                    path.display()
+                );
+            }
+            drop(conn);
+            drop(source);
+            drop(lease);
             Ok(Self {
                 path,
-                database_dev: metadata.dev(),
-                database_ino: metadata.ino(),
+                database_dev: final_metadata.dev(),
+                database_ino: final_metadata.ino(),
             })
         }
 
@@ -957,16 +1009,15 @@ pub mod sqlite {
                 path.file_name()
                     .context("queue database path has no file name")?,
             );
-            let metadata = fs::symlink_metadata(&canonical)?;
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                anyhow::bail!("queue database must be a regular non-symlink file");
-            }
+            let lease = crate::control_store::DatabaseProcessLease::acquire_exclusive(&canonical)?;
+            let source = crate::control_store::PrimaryDatabaseIdentity::open(&canonical)?;
             let mut connection = Connection::open_with_flags(
                 &canonical,
                 OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
             )?;
             connection.busy_timeout(Self::MIGRATION_BUSY_TIMEOUT)?;
             connection.pragma_update(None, "foreign_keys", "ON")?;
+            source.verify_authoritative(&canonical)?;
             let version: String = connection.query_row(
                 "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
                 [],
@@ -975,12 +1026,103 @@ pub mod sqlite {
             if version != "8" {
                 anyhow::bail!("explicit schema migration requires version 8, found {version}");
             }
-            crate::control_store::migrate_v8_to_v9(
+            crate::control_store::migrate_v8_to_v9_under_lease(
                 &mut connection,
                 &canonical,
                 system_config_path,
+                &lease,
+                &source,
+            )?;
+            crate::control_store::migrate_v9_to_v10_under_lease(
+                &mut connection,
+                &canonical,
+                &lease,
+                &source,
+            )?;
+            source.verify_authoritative(&canonical)?;
+            drop(connection);
+            source.verify_authoritative(&canonical)?;
+            drop(source);
+            drop(lease);
+            Self::open(&canonical)
+        }
+
+        pub fn migrate(path: &Path, system_config_path: Option<&Path>) -> Result<Self> {
+            let absolute = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir()?.join(path)
+            };
+            let parent = absolute
+                .parent()
+                .context("queue database path has no parent")?;
+            let canonical = parent.canonicalize()?.join(
+                absolute
+                    .file_name()
+                    .context("queue database path has no file name")?,
+            );
+            let connection = Connection::open_with_flags(
+                &canonical,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?;
+            let version: String = connection.query_row(
+                "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
+                [],
+                |row| row.get(0),
             )?;
             drop(connection);
+            match version.as_str() {
+                "8" => Self::migrate_v8(
+                    &canonical,
+                    system_config_path.context(
+                        "schema v8 migration requires a verified system configuration path",
+                    )?,
+                ),
+                "9" => Self::migrate_v9(&canonical),
+                _ => anyhow::bail!(
+                    "explicit schema migration requires version 8 or 9, found {version}"
+                ),
+            }
+        }
+
+        pub fn migrate_v9(path: &Path) -> Result<Self> {
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir()?.join(path)
+            };
+            let parent = path.parent().context("queue database path has no parent")?;
+            let canonical = parent.canonicalize()?.join(
+                path.file_name()
+                    .context("queue database path has no file name")?,
+            );
+            let lease = crate::control_store::DatabaseProcessLease::acquire_exclusive(&canonical)?;
+            let source = crate::control_store::PrimaryDatabaseIdentity::open(&canonical)?;
+            let mut connection = Connection::open_with_flags(
+                &canonical,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?;
+            connection.pragma_update(None, "foreign_keys", "ON")?;
+            source.verify_authoritative(&canonical)?;
+            let version: String = connection.query_row(
+                "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
+                [],
+                |row| row.get(0),
+            )?;
+            if version != "9" {
+                anyhow::bail!("explicit schema migration requires version 9, found {version}");
+            }
+            crate::control_store::migrate_v9_to_v10_under_lease(
+                &mut connection,
+                &canonical,
+                &lease,
+                &source,
+            )?;
+            source.verify_authoritative(&canonical)?;
+            drop(connection);
+            source.verify_authoritative(&canonical)?;
+            drop(source);
+            drop(lease);
             Self::open(&canonical)
         }
 
@@ -2200,6 +2342,23 @@ DROP TABLE queue_items_v6;"#,
                     )?;
                 }
             }
+            if target == QueueStatus::Cancelled {
+                match &item.workspace {
+                    WorkspaceState::CreationIntent { path } => {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO terminal_workspace_cleanup_debt(item_id,workspace_json,target_kind,state,reason,observation_count,next_retry_at,alert_event_id,created_at,updated_at) VALUES(?1,json_object('path',?2),'creation_intent','pending',NULL,0,?3,NULL,?3,?3)",
+                            params![item_id, path, now()],
+                        )?;
+                    }
+                    WorkspaceState::Retained { identity } => {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO terminal_workspace_cleanup_debt(item_id,workspace_json,target_kind,state,reason,observation_count,next_retry_at,alert_event_id,created_at,updated_at) VALUES(?1,?2,'retained','pending',NULL,0,?3,NULL,?3,?3)",
+                            params![item_id, serde_json::to_string(identity)?, now()],
+                        )?;
+                    }
+                    WorkspaceState::NotCreated | WorkspaceState::Cleaned { .. } => {}
+                }
+            }
             tx.execute(
                 "UPDATE queue_items SET status=?1,replacement_json=CASE WHEN ?1='cancelled' THEN NULL ELSE replacement_json END,updated_at=?2 WHERE id=?3",
                 params![target.to_string(), now(), item_id],
@@ -3147,6 +3306,15 @@ DROP TABLE queue_items_v6;"#,
                     "workspace_cleaned",
                     "removed terminal Rift workspace and reclaimed Rift trash",
                 )?;
+            } else {
+                let still_cleaned: bool = tx.query_row(
+                    "SELECT integration_workspace_cleaned_at IS NOT NULL FROM queue_items WHERE id=?1",
+                    params![item_id],
+                    |row| row.get(0),
+                )?;
+                if !still_cleaned {
+                    anyhow::bail!("terminal workspace cleanup state changed concurrently");
+                }
             }
             tx.commit()?;
             Ok(())
@@ -3907,50 +4075,71 @@ DROP TABLE queue_items_v6;"#,
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 anyhow::bail!("queue database must be a regular file: {}", path.display());
             }
+            if (original_metadata.dev(), original_metadata.ino())
+                != (metadata.dev(), metadata.ino())
+            {
+                anyhow::bail!(
+                    "queue database identity changed while resolving: {}",
+                    path.display()
+                );
+            }
+            let lease =
+                crate::control_store::DatabaseProcessLease::acquire_existing_exclusive(&path)?;
+            let source = crate::control_store::PrimaryDatabaseIdentity::open(&path)?;
+            let current_metadata = fs::symlink_metadata(&path)?;
+            if (metadata.dev(), metadata.ino()) != (current_metadata.dev(), current_metadata.ino())
+            {
+                anyhow::bail!(
+                    "queue database identity changed before validation: {}",
+                    path.display()
+                );
+            }
             let reader = Self {
                 path: path.clone(),
                 database_dev: metadata.dev(),
                 database_ino: metadata.ino(),
             };
+            let validated_database_id =
+                crate::control_store::validate_database_snapshot_under_lease(
+                    &path,
+                    &lease,
+                    |conn| {
+                        let metadata_exists: bool = conn.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='queue_metadata')",
+                            [],
+                            |row| row.get(0),
+                        )?;
+                        if !metadata_exists {
+                            anyhow::bail!("existing IQ database has no standalone schema identity");
+                        }
+                        let workspace_schema_version: Option<String> = conn
+                            .query_row(
+                                "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
+                                [],
+                                |row| row.get(0),
+                            )
+                            .optional()?;
+                        require_current_schema_version(workspace_schema_version.as_deref())?;
+                        crate::control_store::validate_existing_v10_identity(conn)
+                    },
+                )?;
+            crate::control_store::run_runtime_open_handoff_test_hook(&path);
+            lease.verify_authority(&path)?;
+            source.verify_authoritative(&path)?;
             let conn = reader
                 .connect(Self::BUSY_TIMEOUT)
                 .with_context(|| format!("open existing queue db {}", path.display()))?;
-            let metadata_exists: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='queue_metadata')",
-                [],
-                |row| row.get(0),
-            )?;
-            if !metadata_exists {
-                anyhow::bail!("existing IQ database has no standalone schema identity");
+            source.verify_authoritative(&path)?;
+            let authoritative_database_id =
+                crate::control_store::validate_existing_v10_identity(&conn)?;
+            if authoritative_database_id != validated_database_id {
+                anyhow::bail!("queue database identity changed after snapshot validation");
             }
-            let workspace_schema_version: Option<String> = conn
-                .query_row(
-                    "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            require_current_schema_version(workspace_schema_version.as_deref())?;
-            let columns = {
-                let mut statement = conn.prepare("PRAGMA table_info(queue_items)")?;
-                let columns = statement
-                    .query_map([], |row| row.get::<_, String>(1))?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                columns
-            };
-            if !columns.iter().any(|column| column == "landing_state_json")
-                || !columns
-                    .iter()
-                    .any(|column| column == "integration_workspace_rift_id")
-                || !columns
-                    .iter()
-                    .any(|column| column == "integration_workspace_source_rift_id")
-                || !columns
-                    .iter()
-                    .any(|column| column == "integration_workspace_cleaned_at")
-            {
-                anyhow::bail!("IQ schema version 9 is missing required queue columns");
-            }
+            lease.verify_authority(&path)?;
+            source.verify_authoritative(&path)?;
+            drop(conn);
+            drop(source);
+            drop(lease);
             Ok(reader)
         }
 
@@ -4703,6 +4892,218 @@ DROP TABLE queue_items_v6;"#,
         Utc::now().to_rfc3339()
     }
 
+    fn install_schema(connection: &Connection, version: &str) -> Result<()> {
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS iq_sqlite_sequence_seed(id INTEGER PRIMARY KEY AUTOINCREMENT);
+             DROP TABLE iq_sqlite_sequence_seed;",
+        )?;
+        connection.execute_batch(SCHEMA)?;
+        connection.execute_batch(COMPOSITION_SCHEMA)?;
+        connection.execute_batch(QUEUE_SOURCE_TRIGGERS)?;
+        connection.execute_batch(REGISTERED_CHECKOUT_TRIGGERS)?;
+        connection.execute_batch(LANDING_STATE_TRIGGERS)?;
+        connection.execute_batch(REGISTERED_REMOTE_TRIGGERS)?;
+        connection.execute_batch(WORKSPACE_STATE_TRIGGERS)?;
+        match version {
+            "8" => {
+                connection.execute_batch("DROP INDEX integration_attempt_item_identity;")?;
+            }
+            "9" => {
+                connection.execute_batch(
+                    "DROP TABLE communication_response_receipts; DROP TABLE communication_bindings;",
+                )?;
+                crate::control_store::install_v9_schema_objects(connection)?;
+            }
+            "10" => {
+                connection.execute_batch(
+                    "DROP TABLE communication_response_receipts; DROP TABLE communication_bindings;",
+                )?;
+                crate::control_store::install_v9_schema_objects(connection)?;
+                crate::control_store::install_v10_schema_objects(connection)?;
+            }
+            _ => anyhow::bail!("unsupported expected schema version {version}"),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_schema_objects(connection: &Connection, version: &str) -> Result<()> {
+        let expected = Connection::open_in_memory()?;
+        expected.pragma_update(None, "foreign_keys", "ON")?;
+        install_schema(&expected, version)?;
+        let expected_objects = schema_objects(&expected)?;
+        let actual_objects = schema_objects(connection)?;
+        if actual_objects != expected_objects {
+            if let Some((identity, _)) = expected_objects
+                .iter()
+                .find(|(identity, _)| !actual_objects.contains_key(*identity))
+            {
+                anyhow::bail!(
+                    "IQ schema version {version} is missing {} {}",
+                    identity.0,
+                    identity.1
+                );
+            }
+            if let Some((identity, _)) = actual_objects
+                .iter()
+                .find(|(identity, _)| !expected_objects.contains_key(*identity))
+            {
+                anyhow::bail!(
+                    "IQ schema version {version} has unknown {} {}",
+                    identity.0,
+                    identity.1
+                );
+            }
+            let identity = expected_objects
+                .keys()
+                .find(|identity| actual_objects.get(*identity) != expected_objects.get(*identity))
+                .context("schema object maps differ without an identifiable object")?;
+            anyhow::bail!(
+                "IQ schema version {version} has malformed {} {}",
+                identity.0,
+                identity.1
+            );
+        }
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn force_test_schema_version(connection: &Connection, version: &str) -> Result<()> {
+        if !matches!(version, "8" | "9") {
+            anyhow::bail!("test schema version must be 8 or 9");
+        }
+        let expected = Connection::open_in_memory()?;
+        expected.pragma_update(None, "foreign_keys", "ON")?;
+        install_schema(&expected, version)?;
+        let expected_objects = schema_objects(&expected)?;
+        let actual_objects = schema_objects(connection)?;
+        connection.pragma_update(None, "foreign_keys", "OFF")?;
+        for object_type in ["trigger", "index", "table"] {
+            for (actual_type, name) in actual_objects.keys() {
+                if actual_type == object_type
+                    && !name.starts_with("sqlite_")
+                    && !expected_objects.contains_key(&(actual_type.clone(), name.clone()))
+                {
+                    connection.execute_batch(&format!(
+                        "DROP {object_type} IF EXISTS {};",
+                        quote_schema_identifier(name)
+                    ))?;
+                }
+            }
+        }
+        install_schema(connection, version)?;
+        connection.execute(
+            "UPDATE queue_metadata SET value=?1 WHERE key='workspace_schema_version'",
+            [version],
+        )?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        validate_schema_objects(connection, version)
+    }
+
+    #[doc(hidden)]
+    pub fn initialize_test_schema(connection: &Connection, version: &str) -> Result<()> {
+        install_schema(connection, version)?;
+        connection.execute(
+            "INSERT INTO queue_metadata(key,value) VALUES('workspace_schema_version',?1)",
+            [version],
+        )?;
+        connection.execute(
+            "INSERT INTO queue_metadata(key,value) VALUES('database_id',?1)",
+            params![format!("fixture-v{version}")],
+        )?;
+        validate_schema_objects(connection, version)
+    }
+
+    fn schema_objects(
+        connection: &Connection,
+    ) -> Result<std::collections::BTreeMap<(String, String), String>> {
+        let mut statement =
+            connection.prepare("SELECT type,name,sql FROM sqlite_schema ORDER BY type,name")?;
+        let objects = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .filter_map(|row| match row {
+                Ok((object_type, name, None))
+                    if object_type == "index"
+                        && name.starts_with("sqlite_autoindex_")
+                        && name["sqlite_autoindex_".len()..]
+                            .rsplit_once('_')
+                            .is_some_and(|(table, ordinal)| {
+                                !table.is_empty()
+                                    && ordinal.parse::<u32>().is_ok_and(|value| value > 0)
+                            }) =>
+                {
+                    None
+                }
+                Ok((object_type, name, sql)) => Some(Ok((
+                    (object_type, name),
+                    canonical_schema_sql(sql.as_deref().unwrap_or_default()),
+                ))),
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(objects)
+    }
+
+    fn canonical_schema_sql(sql: &str) -> String {
+        #[derive(Clone, Copy)]
+        enum Quote {
+            Single,
+            Double,
+            Backtick,
+            Bracket,
+        }
+
+        let mut canonical = String::with_capacity(sql.len());
+        let mut quote = None;
+        let mut whitespace = false;
+        let mut chars = sql.chars().peekable();
+        while let Some(character) = chars.next() {
+            if let Some(active) = quote {
+                canonical.push(character);
+                let closing = match active {
+                    Quote::Single => '\'',
+                    Quote::Double => '"',
+                    Quote::Backtick => '`',
+                    Quote::Bracket => ']',
+                };
+                if character == closing {
+                    if !matches!(active, Quote::Bracket) && chars.peek() == Some(&closing) {
+                        canonical.push(chars.next().unwrap());
+                    } else {
+                        quote = None;
+                    }
+                }
+                continue;
+            }
+            if character.is_ascii_whitespace() {
+                whitespace = !canonical.is_empty();
+            } else {
+                if whitespace {
+                    canonical.push(' ');
+                    whitespace = false;
+                }
+                canonical.push(character);
+                quote = match character {
+                    '\'' => Some(Quote::Single),
+                    '"' => Some(Quote::Double),
+                    '`' => Some(Quote::Backtick),
+                    '[' => Some(Quote::Bracket),
+                    _ => None,
+                };
+            }
+        }
+        canonical
+    }
+
+    fn quote_schema_identifier(value: &str) -> String {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    }
+
     const WORKSPACE_STATE_TRIGGERS: &str = r#"
 DROP TRIGGER IF EXISTS queue_items_workspace_state_insert;
 DROP TRIGGER IF EXISTS queue_items_workspace_state_update;
@@ -4851,10 +5252,6 @@ CREATE TABLE IF NOT EXISTS communication_response_receipts (
   created_at TEXT NOT NULL,
   PRIMARY KEY(binding_id, external_response_id)
 );
-
--- Schema v9 has no communication transport authority.
-DROP TABLE IF EXISTS communication_response_receipts;
-DROP TABLE IF EXISTS communication_bindings;
 
 CREATE TABLE IF NOT EXISTS repo_leases (
   repo_key TEXT PRIMARY KEY,
@@ -5135,6 +5532,30 @@ pub mod integrator {
         pub workspace_root: PathBuf,
         pub rift_database: Option<PathBuf>,
         pub system_config: crate::agent_config::SystemConfig,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum TerminalCleanupMode {
+        Automatic,
+        OperatorRequested,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+    pub enum TerminalCleanupOutcome {
+        Removed { path: PathBuf },
+        Preserved { path: PathBuf, reason: String },
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+    pub struct TerminalCleanupReport {
+        pub mode: String,
+        pub outcomes: Vec<TerminalCleanupOutcome>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+    pub struct TerminalCleanupAggregate {
+        pub terminal: TerminalCleanupReport,
+        pub development: Vec<crate::sqlite::DevelopmentWorkspace>,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -7752,12 +8173,12 @@ pub mod integrator {
     }
 
     pub(crate) fn verify_terminal_workspace_root(
-        queue_database: &Path,
+        queue: &SqliteQueue,
         repo_key: &str,
         root: &crate::sqlite::WorkspaceRootIdentity,
     ) -> Result<()> {
         let marker = root.path.join(".iq-workspace-owner.json");
-        let queue_database_id = SqliteQueueReader::open(queue_database)?.database_id()?;
+        let queue_database_id = queue.database_id()?;
         let owner: crate::sqlite::RiftWorkspaceRootOwner =
             serde_json::from_slice(&read_regular_file(&marker, "IQ workspace owner marker")?)?;
         if owner.version != 3
@@ -7804,7 +8225,7 @@ pub mod integrator {
         repo_key: &str,
         repair_deleted_cycles: bool,
     ) -> Result<()> {
-        let store = crate::control_store::ControlStore::open(queue.path())?;
+        let store = crate::control_store::ControlStore::open_validated(queue.path())?;
         let cycles = store.terminal_cycle_artifacts(repo_key)?;
         let mut roots = HashSet::new();
         for cycle in cycles {
@@ -7832,7 +8253,7 @@ pub mod integrator {
                         canonical_root.display()
                     )
                 })?;
-            verify_terminal_workspace_root(queue.path(), repo_key, &workspace_root)?;
+            verify_terminal_workspace_root(queue, repo_key, &workspace_root)?;
             crate::agent_runner::cleanup_terminal_cycle_artifacts(&workspace_root, &cycle)?;
             roots.insert(workspace_root.path);
         }
@@ -7840,7 +8261,7 @@ pub mod integrator {
             let repair_root = queue
                 .registered_workspace_root_identity(repo_key)?
                 .context("deleted-cycle repair has no persisted workspace root authority")?;
-            verify_terminal_workspace_root(queue.path(), repo_key, &repair_root)?;
+            verify_terminal_workspace_root(queue, repo_key, &repair_root)?;
             let canonical_root = repair_root.path.canonicalize().with_context(|| {
                 format!(
                     "resolve deleted-cycle repair root {}",
@@ -7859,7 +8280,7 @@ pub mod integrator {
                 let workspace_root = queue
                     .workspace_root_identity(repo_key, &root)?
                     .context("deleted-cycle repair lost persisted workspace root authority")?;
-                verify_terminal_workspace_root(queue.path(), repo_key, &workspace_root)?;
+                verify_terminal_workspace_root(queue, repo_key, &workspace_root)?;
                 let mut sandboxes = Vec::new();
                 for entry in fs::read_dir(&root)? {
                     let path = entry?.path();
@@ -8173,9 +8594,31 @@ pub mod integrator {
             Self::new_with_policy(options, IntegrationPolicy::NoValidation)
         }
 
+        pub(crate) fn new_with_operation_owner(
+            options: IntegratorOptions,
+            lease_owner_id: String,
+            validated_queue: SqliteQueue,
+        ) -> Result<Self> {
+            Self::new_with_policy_and_owner(
+                options,
+                IntegrationPolicy::NoValidation,
+                Some(lease_owner_id),
+                Some(validated_queue),
+            )
+        }
+
         pub fn new_with_policy(
+            options: IntegratorOptions,
+            policy: IntegrationPolicy,
+        ) -> Result<Self> {
+            Self::new_with_policy_and_owner(options, policy, None, None)
+        }
+
+        fn new_with_policy_and_owner(
             mut options: IntegratorOptions,
             policy: IntegrationPolicy,
+            lease_owner_id: Option<String>,
+            validated_queue: Option<SqliteQueue>,
         ) -> Result<Self> {
             options.repo_path = options.repo_path.canonicalize().with_context(|| {
                 format!(
@@ -8197,7 +8640,16 @@ pub mod integrator {
             if options.workspace_root.is_relative() {
                 options.workspace_root = std::env::current_dir()?.join(&options.workspace_root);
             }
-            let queue = SqliteQueue::open(&options.queue_db)?;
+            let queue = match validated_queue {
+                Some(queue) => {
+                    let requested = options.queue_db.canonicalize()?;
+                    if requested != queue.path() {
+                        anyhow::bail!("validated queue path differs from integrator queue path");
+                    }
+                    queue
+                }
+                None => SqliteQueue::open(&options.queue_db)?,
+            };
             options.queue_db = queue.path().to_path_buf();
             queue.validate_repository_binding(&options.repo_key, &options.repo_path, target)?;
             let registered = Self::verify_registered_remote_identity_for(
@@ -8226,8 +8678,9 @@ pub mod integrator {
             )?;
             options.workspace_root = workspaces.root.clone();
             let policy = validate_host_policy(policy)?;
-            let control_store = crate::control_store::ControlStore::open(queue.path())?;
-            let lease_owner_id = format!("{}:{}", options.owner_id, Uuid::new_v4());
+            let control_store = crate::control_store::ControlStore::open_validated(queue.path())?;
+            let lease_owner_id = lease_owner_id
+                .unwrap_or_else(|| format!("{}:{}", options.owner_id, Uuid::new_v4()));
             queue.register_workspace_root(
                 &options.repo_key,
                 &workspaces.source,
@@ -8343,7 +8796,9 @@ pub mod integrator {
             };
             cleanup_terminal_agent_artifacts(&self.queue, &self.options.repo_key, false)?;
             self.synchronize_workspace_generation()?;
-            self.with_lease_heartbeat("workspace cleanup", || self.reconcile_workspaces())?;
+            self.with_lease_heartbeat("workspace cleanup", || {
+                self.reconcile_workspaces(TerminalCleanupMode::Automatic)
+            })?;
             let Some(active) = self.queue.oldest_active_item(&self.options.repo_key)? else {
                 return Ok(None);
             };
@@ -9023,13 +9478,43 @@ pub mod integrator {
                             .into_iter()
                             .find(|identity| Path::new(&identity.path) == expected)
                             .context("terminal workspace creation path has unknown occupancy")?;
+                        let actual_path = Path::new(&actual.path);
+                        let dirty = workspace_dirty(actual_path)?.is_some();
+                        let active_git_operation =
+                            crate::composition::has_git_operation(actual_path)?;
+                        if dirty || active_git_operation {
+                            self.control_store.record_terminal_workspace_preserved(
+                                &item.id,
+                                &crate::control_store::TerminalWorkspaceTarget::Retained {
+                                    identity: actual.clone(),
+                                },
+                                &actual,
+                                dirty,
+                                active_git_operation,
+                            )?;
+                            return Ok(());
+                        }
                         self.remove_clean_terminal_workspace(&actual)?;
                     }
                 }
                 WorkspaceState::Retained { identity } => {
                     let actual = self.workspaces.resolve_retained(identity)?;
                     if let Some(actual) = actual.as_ref() {
-                        self.require_clean_terminal_workspace(actual)?;
+                        let path = Path::new(&actual.path);
+                        let dirty = workspace_dirty(path)?.is_some();
+                        let active_git_operation = crate::composition::has_git_operation(path)?;
+                        if dirty || active_git_operation {
+                            self.control_store.record_terminal_workspace_preserved(
+                                &item.id,
+                                &crate::control_store::TerminalWorkspaceTarget::Retained {
+                                    identity: identity.clone(),
+                                },
+                                actual,
+                                dirty,
+                                active_git_operation,
+                            )?;
+                            return Ok(());
+                        }
                         self.remove_retained_workspace(identity)?;
                     } else {
                         self.remove_retained_workspace(identity)?;
@@ -12193,7 +12678,7 @@ pub mod integrator {
             workspace_status(&self.queue.reader(), &self.options.repo_key)
         }
 
-        pub fn reset_workspaces(&self) -> Result<Vec<PathBuf>> {
+        pub fn reset_workspaces(&self) -> Result<TerminalCleanupReport> {
             self.ensure_registered_remote_identity()?;
             let _operation = RepositoryOperationLease::acquire(
                 self.queue.clone(),
@@ -12204,7 +12689,26 @@ pub mod integrator {
             )?;
             cleanup_terminal_agent_artifacts(&self.queue, &self.options.repo_key, false)?;
             self.synchronize_workspace_generation()?;
-            self.with_lease_heartbeat("workspace cleanup", || self.reconcile_workspaces())
+            self.with_lease_heartbeat("workspace cleanup", || {
+                self.reconcile_workspaces(TerminalCleanupMode::OperatorRequested)
+            })
+        }
+
+        pub(crate) fn reset_workspaces_under_lease(
+            &self,
+            operation: &RepositoryOperationLease,
+        ) -> Result<TerminalCleanupReport> {
+            if operation.repo_key != self.options.repo_key
+                || operation.owner_id != self.lease_owner_id
+            {
+                anyhow::bail!("terminal cleanup operation authority differs from integrator");
+            }
+            operation.ensure()?;
+            self.ensure_registered_remote_identity()?;
+            self.synchronize_workspace_generation()?;
+            self.with_lease_heartbeat("workspace cleanup", || {
+                self.reconcile_workspaces(TerminalCleanupMode::OperatorRequested)
+            })
         }
 
         fn synchronize_workspace_generation(&self) -> Result<()> {
@@ -12214,7 +12718,9 @@ pub mod integrator {
             self.workspaces.synchronize_generation(generation)
         }
 
-        fn reconcile_workspaces(&self) -> Result<Vec<PathBuf>> {
+        fn reconcile_workspaces(&self, mode: TerminalCleanupMode) -> Result<TerminalCleanupReport> {
+            self.ensure_repo_lease()?;
+            self.workspaces.verify_root_identity()?;
             if self
                 .queue
                 .has_workspace_gc_debt(&self.workspaces.registry_identity)?
@@ -12258,7 +12764,7 @@ pub mod integrator {
                 }
             }
             let mut retained_ids = HashSet::new();
-            let mut removed = Vec::new();
+            let mut outcomes = Vec::new();
             for item in &items {
                 let expected = self.workspaces.expected_path(&item.id)?;
                 let terminal = matches!(
@@ -12278,6 +12784,8 @@ pub mod integrator {
                                 expected.display()
                             );
                         }
+                        self.control_store
+                            .clear_terminal_workspace_cleanup_debt(&item.id)?;
                     }
                     WorkspaceState::NotCreated => {
                         if entry_exists(&expected)? {
@@ -12306,8 +12814,65 @@ pub mod integrator {
                             .find(|candidate| Path::new(&candidate.path) == expected);
                         if terminal {
                             if let Some(identity) = existing {
+                                if identity.path != path.as_str()
+                                    || identity.source_rift_id != self.workspaces.source_id
+                                {
+                                    anyhow::bail!(
+                                        "item {} actual Rift identity differs from creation intent authority",
+                                        item.id
+                                    );
+                                }
+                                self.control_store.create_terminal_creation_intent_debt(
+                                    &item.id,
+                                    &identity.path,
+                                )?;
+                                let debt = self
+                                    .control_store
+                                    .terminal_workspace_cleanup_debt(&item.id)?
+                                    .context("terminal creation intent has no cleanup debt")?;
+                                if debt.target
+                                    != (crate::control_store::TerminalWorkspaceTarget::CreationIntent {
+                                        path: path.clone(),
+                                    })
+                                {
+                                    anyhow::bail!(
+                                        "terminal workspace cleanup debt target differs from creation intent authority"
+                                    );
+                                }
+                                if mode == TerminalCleanupMode::Automatic
+                                    && matches!(
+                                        debt.state,
+                                        crate::control_store::TerminalWorkspaceCleanupState::Preserved {
+                                            next_retry_at,
+                                            ..
+                                        } if next_retry_at > chrono::Utc::now()
+                                    )
+                                {
+                                    retained_ids.insert(identity.rift_id.clone());
+                                    continue;
+                                }
+                                let dirty = workspace_dirty(Path::new(&identity.path))?.is_some();
+                                let active_git_operation = crate::composition::has_git_operation(
+                                    Path::new(&identity.path),
+                                )?;
+                                if dirty || active_git_operation {
+                                    self.control_store.record_terminal_workspace_preserved(
+                                        &item.id,
+                                        &crate::control_store::TerminalWorkspaceTarget::CreationIntent { path: path.clone() },
+                                        identity,
+                                        dirty,
+                                        active_git_operation,
+                                    )?;
+                                    retained_ids.insert(identity.rift_id.clone());
+                                    outcomes.push(TerminalCleanupOutcome::Preserved {
+                                        path: identity.path.clone().into(),
+                                        reason: "dirty_or_active_git_operation".into(),
+                                    });
+                                    continue;
+                                }
                                 if self.remove_retained_workspace(identity)? {
-                                    removed.push(expected);
+                                    outcomes
+                                        .push(TerminalCleanupOutcome::Removed { path: expected });
                                 }
                             } else if entry_exists(&expected)? {
                                 anyhow::bail!(
@@ -12373,9 +12938,81 @@ pub mod integrator {
                             .find(|candidate| candidate.rift_id == identity.rift_id);
                         match existing {
                             Some(actual) if terminal => {
-                                self.require_clean_terminal_workspace(actual)?;
+                                if actual.path != identity.path {
+                                    anyhow::bail!(
+                                        "item {} Rift {} moved from {} to {}",
+                                        item.id,
+                                        identity.rift_id,
+                                        identity.path,
+                                        actual.path
+                                    );
+                                }
+                                if actual.source_rift_id != identity.source_rift_id {
+                                    anyhow::bail!(
+                                        "item {} Rift {} source changed from {} to {}",
+                                        item.id,
+                                        identity.rift_id,
+                                        identity.source_rift_id,
+                                        actual.source_rift_id
+                                    );
+                                }
+                                if let Some(debt) = self
+                                    .control_store
+                                    .terminal_workspace_cleanup_debt(&item.id)?
+                                {
+                                    if !matches!(
+                                        debt.target,
+                                        crate::control_store::TerminalWorkspaceTarget::Retained { .. }
+                                    ) {
+                                        anyhow::bail!(
+                                            "terminal workspace cleanup debt target kind differs from retained queue authority"
+                                        );
+                                    }
+                                    if let crate::control_store::TerminalWorkspaceTarget::Retained { identity: debt_identity } = &debt.target {
+                                        if debt_identity != identity {
+                                            anyhow::bail!(
+                                                "terminal workspace cleanup debt identity differs from queue authority"
+                                            );
+                                        }
+                                    }
+                                    if mode == TerminalCleanupMode::Automatic
+                                        && matches!(
+                                            debt.state,
+                                            crate::control_store::TerminalWorkspaceCleanupState::Preserved {
+                                                next_retry_at,
+                                                ..
+                                            } if next_retry_at > chrono::Utc::now()
+                                        )
+                                    {
+                                        retained_ids.insert(actual.rift_id.clone());
+                                        continue;
+                                    }
+                                }
+                                let path = Path::new(&actual.path);
+                                let dirty = workspace_dirty(path)?.is_some();
+                                let active_git_operation =
+                                    crate::composition::has_git_operation(path)?;
+                                if dirty || active_git_operation {
+                                    self.control_store.record_terminal_workspace_preserved(
+                                        &item.id,
+                                        &crate::control_store::TerminalWorkspaceTarget::Retained {
+                                            identity: identity.clone(),
+                                        },
+                                        actual,
+                                        dirty,
+                                        active_git_operation,
+                                    )?;
+                                    retained_ids.insert(actual.rift_id.clone());
+                                    outcomes.push(TerminalCleanupOutcome::Preserved {
+                                        path: actual.path.clone().into(),
+                                        reason: "dirty_or_active_git_operation".into(),
+                                    });
+                                    continue;
+                                }
                                 self.remove_retained_workspace(identity)?;
-                                removed.push(PathBuf::from(&actual.path));
+                                outcomes.push(TerminalCleanupOutcome::Removed {
+                                    path: PathBuf::from(&actual.path),
+                                });
                                 self.queue.mark_workspace_cleaned(&item.id)?;
                             }
                             Some(actual) if actual.path != identity.path => anyhow::bail!(
@@ -12411,10 +13048,17 @@ pub mod integrator {
                     continue;
                 }
                 if self.remove_retained_workspace(&identity)? {
-                    removed.push(workspace);
+                    outcomes.push(TerminalCleanupOutcome::Removed { path: workspace });
                 }
             }
-            Ok(removed)
+            Ok(TerminalCleanupReport {
+                mode: match mode {
+                    TerminalCleanupMode::Automatic => "automatic",
+                    TerminalCleanupMode::OperatorRequested => "operator_requested",
+                }
+                .into(),
+                outcomes,
+            })
         }
 
         fn fetch_for_merge<I, S>(&self, item: &QueueItem, attempt: &Attempt, args: I) -> Result<()>

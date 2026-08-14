@@ -134,6 +134,7 @@ fn migrated_ready_item_creates_exact_attempt_effort_and_runner_when_claimed() {
             },
         )
         .unwrap();
+    git(&fixture.repo, ["checkout", "main"]).unwrap();
     let target_head = git_output(&fixture.repo, ["rev-parse", "HEAD"]).unwrap();
     let workspace = manager
         .create_workspace(&repository.key, "migrated-ready")
@@ -150,8 +151,12 @@ fn migrated_ready_item_creates_exact_attempt_effort_and_runner_when_claimed() {
     drop(queue);
     let db = fixture.temp.path().join("queues.db");
     let connection = rusqlite::Connection::open(&db).unwrap();
+    iq::sqlite::initialize_test_schema(&connection, "8").unwrap();
     connection
-        .execute_batch(include_str!("fixtures/schema-v8-active.sql"))
+        .execute_batch(
+            "DROP TRIGGER registered_repository_remote_insert;
+             DROP TRIGGER queue_items_local_source_insert;",
+        )
         .unwrap();
     connection
         .execute("ATTACH DATABASE ?1 AS setup", [setup_db.to_str().unwrap()])
@@ -168,6 +173,7 @@ fn migrated_ready_item_creates_exact_attempt_effort_and_runner_when_claimed() {
              DETACH DATABASE setup;",
         )
         .unwrap();
+    iq::sqlite::force_test_schema_version(&connection, "8").unwrap();
     drop(connection);
     let system_path = fixture.temp.path().join("system.yaml");
     fs::write(
@@ -1484,6 +1490,818 @@ fn unsupported_provider_url_blocks_the_authoritative_effort() {
                 && detail.contains(&resume.candidate_sha)
     ));
     assert_eq!(resume.stage, iq::control_domain::ValidationStage::Gates);
+}
+
+fn registered_terminal_fixture() -> (GitFixture, SqliteQueue, iq::sqlite::RegisteredRepository) {
+    let fixture = GitFixture::new(false);
+    std::env::set_var("IQ_RIFT_DATABASE", &fixture.rift_database);
+    let db = fixture.temp.path().join("queues.db");
+    let queue = SqliteQueue::open(&db).unwrap();
+    let manager = RepositoryManager::new(queue.clone());
+    let repository = manager
+        .init(
+            &fixture.repo,
+            RepositoryInitOptions {
+                target_branch: "main".into(),
+                remote: "origin".into(),
+                seed_path: Some(fixture.temp.path().join("seed-root/seed")),
+                workspace_root: Some(fixture.temp.path().join("development-workspaces")),
+            },
+        )
+        .unwrap();
+    (fixture, queue, repository)
+}
+
+fn enqueue_fixture_item(
+    fixture: &GitFixture,
+    queue: &SqliteQueue,
+    repository: &iq::sqlite::RegisteredRepository,
+    branch: &str,
+) -> iq::sqlite::QueueItem {
+    let head = fixture.create_source_branch(branch, &format!("{branch}.txt"), "feature\n");
+    git(&fixture.repo, ["checkout", "main"]).unwrap();
+    queue
+        .enqueue(EnqueueRequest {
+            repo_key: repository.key.clone(),
+            repo_path: fixture.repo.to_string_lossy().to_string(),
+            source_branch: branch.into(),
+            target_branch: "main".into(),
+            current_head_sha: head,
+            pr_url: None,
+            producer_metadata: serde_json::json!({"worker":"terminal-test"}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
+        })
+        .unwrap()
+}
+
+fn cancelled_retained_integrator_fixture() -> (
+    GitFixture,
+    SqliteQueue,
+    iq::sqlite::RegisteredRepository,
+    iq::sqlite::QueueItem,
+    std::path::PathBuf,
+) {
+    let (fixture, queue, repository) = registered_terminal_fixture();
+    let first = enqueue_fixture_item(&fixture, &queue, &repository, "agent/terminal-first");
+    let db = fixture.temp.path().join("queues.db");
+    let integrator = fixture
+        .integrator(IntegratorOptions {
+            repo_key: repository.key.clone(),
+            repo_path: fixture.repo.clone(),
+            queue_db: db.clone(),
+            owner_id: "terminal-first".into(),
+            lease_ttl_seconds: 30,
+            base_remote: "origin".into(),
+            workspace_root: fixture.temp.path().join("integration-workspaces"),
+            rift_database: Some(fixture.rift_database.clone()),
+            system_config: fixture.system_config(),
+        })
+        .unwrap();
+    std::env::remove_var("IQ_TEST_MODEL_KEY");
+    assert!(integrator.run_once().is_err());
+    std::env::set_var("IQ_TEST_MODEL_KEY", "fixture-model-key");
+    let store = ControlStore::open(&db).unwrap();
+    let effort = store.effort_for_item(&first.id).unwrap().unwrap();
+    let retained = std::path::PathBuf::from(&effort.workspace.path);
+    store
+        .cancel(&effort.id, "test", "terminal fixture")
+        .unwrap();
+    (fixture, queue, repository, first, retained)
+}
+
+#[test]
+fn dirty_cancelled_terminal_rift_does_not_block_later_ready_item() {
+    let (fixture, queue, repository, _first, retained) = cancelled_retained_integrator_fixture();
+    fs::write(retained.join("dirty.txt"), "preserve\n").unwrap();
+    let later = enqueue_fixture_item(&fixture, &queue, &repository, "agent/terminal-later");
+    let db = fixture.temp.path().join("queues.db");
+    let integrator = fixture
+        .integrator(IntegratorOptions {
+            repo_key: repository.key.clone(),
+            repo_path: fixture.repo.clone(),
+            queue_db: db,
+            owner_id: "terminal-later".into(),
+            lease_ttl_seconds: 30,
+            base_remote: "origin".into(),
+            workspace_root: fixture.temp.path().join("integration-workspaces"),
+            rift_database: Some(fixture.rift_database.clone()),
+            system_config: fixture.system_config(),
+        })
+        .unwrap();
+    let processed = integrator.run_once().unwrap().unwrap();
+    assert_eq!(processed.id, later.id);
+    assert_eq!(processed.status, QueueStatus::Integrated);
+    assert!(retained.exists());
+}
+
+#[test]
+fn active_bisect_in_clean_cancelled_terminal_rift_is_preserved_and_fifo_progresses() {
+    let (fixture, queue, repository, _first, retained) = cancelled_retained_integrator_fixture();
+    git(&retained, ["reset", "--hard"]).unwrap();
+    git(&retained, ["clean", "-fd"]).unwrap();
+    git(&retained, ["bisect", "start", "HEAD", "HEAD~1"]).unwrap();
+    let status = git_output(
+        &retained,
+        ["status", "--porcelain=v1", "--untracked-files=all"],
+    )
+    .unwrap();
+    assert!(status.is_empty(), "{status}");
+    let bisect_start = git_output(&retained, ["rev-parse", "--git-path", "BISECT_START"]).unwrap();
+    let bisect_start = Path::new(&bisect_start);
+    assert!(if bisect_start.is_absolute() {
+        bisect_start.exists()
+    } else {
+        retained.join(bisect_start).exists()
+    });
+    let later = enqueue_fixture_item(&fixture, &queue, &repository, "agent/terminal-git-later");
+    let db = fixture.temp.path().join("queues.db");
+    let integrator = fixture
+        .integrator(IntegratorOptions {
+            repo_key: repository.key.clone(),
+            repo_path: fixture.repo.clone(),
+            queue_db: db,
+            owner_id: "terminal-git-later".into(),
+            lease_ttl_seconds: 30,
+            base_remote: "origin".into(),
+            workspace_root: fixture.temp.path().join("integration-workspaces"),
+            rift_database: Some(fixture.rift_database.clone()),
+            system_config: fixture.system_config(),
+        })
+        .unwrap();
+    let processed = integrator.run_once().unwrap().unwrap();
+    assert_eq!(processed.id, later.id);
+    assert_eq!(processed.status, QueueStatus::Integrated);
+    assert!(retained.exists());
+}
+
+#[test]
+fn landed_dirty_terminal_rift_is_preserved_while_later_item_progresses_then_removed_clean() {
+    let (fixture, queue, repository) = registered_terminal_fixture();
+    let first = enqueue_fixture_item(&fixture, &queue, &repository, "agent/integrated-first");
+    let db = fixture.temp.path().join("queues.db");
+    let options = IntegratorOptions {
+        repo_key: repository.key.clone(),
+        repo_path: fixture.repo.clone(),
+        queue_db: db.clone(),
+        owner_id: "integrated-terminal-cleanup".into(),
+        lease_ttl_seconds: 30,
+        base_remote: "origin".into(),
+        workspace_root: fixture.temp.path().join("integration-workspaces"),
+        rift_database: Some(fixture.rift_database.clone()),
+        system_config: fixture.system_config(),
+    };
+    let retained = options.workspace_root.join(&first.id);
+    let post_receive = fixture.remote.join("hooks/post-receive");
+    git(&fixture.remote, ["config", "core.hooksPath", "hooks"]).unwrap();
+    fs::write(
+        &post_receive,
+        format!(
+            "#!/bin/sh\nprintf 'preserve\\n' > '{}'\n",
+            retained.join("dirty-after-landing.txt").display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(
+        &post_receive,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    let integrated = fixture
+        .integrator(options.clone())
+        .unwrap()
+        .run_once()
+        .unwrap()
+        .unwrap();
+    assert_eq!(integrated.id, first.id);
+    assert_eq!(integrated.status, QueueStatus::Integrated);
+    fs::remove_file(&post_receive).unwrap();
+    assert!(retained.join("dirty-after-landing.txt").exists());
+    let later = enqueue_fixture_item(&fixture, &queue, &repository, "agent/integrated-later");
+
+    let progressed = fixture
+        .integrator(options.clone())
+        .unwrap()
+        .run_once()
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(progressed.id, later.id);
+    assert_eq!(progressed.status, QueueStatus::Integrated);
+    assert!(retained.exists());
+    assert!(ControlStore::open(&db)
+        .unwrap()
+        .terminal_workspace_cleanup_debt(&first.id)
+        .unwrap()
+        .is_some_and(|debt| debt.is_preserved()));
+
+    fs::remove_file(retained.join("dirty-after-landing.txt")).unwrap();
+    git(&retained, ["reset", "--hard"]).unwrap();
+    let report = fixture
+        .integrator(options)
+        .unwrap()
+        .reset_workspaces()
+        .unwrap();
+    assert!(report.outcomes.iter().any(|outcome| matches!(
+        outcome,
+        iq::integrator::TerminalCleanupOutcome::Removed { path } if path == &retained
+    )));
+    assert!(!retained.exists());
+    assert!(matches!(
+        queue.get_item(&first.id).unwrap().workspace,
+        iq::sqlite::WorkspaceState::Cleaned { .. }
+    ));
+}
+
+#[test]
+fn operator_reset_bypasses_due_time_and_removes_cleaned_terminal_rift() {
+    let (fixture, _queue, repository, _first, retained) = cancelled_retained_integrator_fixture();
+    fs::write(retained.join("dirty.txt"), "preserve\n").unwrap();
+    let db = fixture.temp.path().join("queues.db");
+    let options = IntegratorOptions {
+        repo_key: repository.key.clone(),
+        repo_path: fixture.repo.clone(),
+        queue_db: db.clone(),
+        owner_id: "operator-reset-real".into(),
+        lease_ttl_seconds: 30,
+        base_remote: "origin".into(),
+        workspace_root: fixture.temp.path().join("integration-workspaces"),
+        rift_database: Some(fixture.rift_database.clone()),
+        system_config: fixture.system_config(),
+    };
+    let integrator = fixture.integrator(options.clone()).unwrap();
+    let preserved = integrator.reset_workspaces().unwrap();
+    assert!(preserved.outcomes.iter().any(|outcome| matches!(
+        outcome,
+        iq::integrator::TerminalCleanupOutcome::Preserved { .. }
+    )));
+    fs::remove_file(retained.join("dirty.txt")).unwrap();
+    git(&retained, ["reset", "--hard"]).unwrap();
+    let merge_head = git_output(&retained, ["rev-parse", "--git-path", "MERGE_HEAD"]).unwrap();
+    if Path::new(&merge_head).exists() {
+        fs::remove_file(merge_head).unwrap();
+    }
+    let removed = fixture
+        .integrator(options)
+        .unwrap()
+        .reset_workspaces()
+        .unwrap();
+    assert!(
+        removed.outcomes.iter().any(|outcome| matches!(
+            outcome,
+            iq::integrator::TerminalCleanupOutcome::Removed { .. }
+        )),
+        "report={removed:?} path_exists={}",
+        retained.exists()
+    );
+    assert!(!retained.exists());
+    let store = ControlStore::open(&db).unwrap();
+    assert!(store
+        .terminal_workspace_cleanup_debt(&_first.id)
+        .unwrap()
+        .is_none());
+    assert!(!store
+        .effort_for_item(&_first.id)
+        .unwrap()
+        .unwrap()
+        .workspace
+        .path
+        .is_empty());
+}
+
+#[test]
+fn iq_cleanup_cli_retries_terminal_integration_cleanup_and_reports_structure() {
+    let (fixture, _queue, repository, first, retained) = cancelled_retained_integrator_fixture();
+    let db = fixture.temp.path().join("queues.db");
+    fs::write(retained.join("dirty.txt"), "preserve\n").unwrap();
+    let integrator = fixture
+        .integrator(IntegratorOptions {
+            repo_key: repository.key.clone(),
+            repo_path: fixture.repo.clone(),
+            queue_db: db.clone(),
+            owner_id: "cli-preserve".into(),
+            lease_ttl_seconds: 30,
+            base_remote: "origin".into(),
+            workspace_root: fixture.temp.path().join("integration-workspaces"),
+            rift_database: Some(fixture.rift_database.clone()),
+            system_config: fixture.system_config(),
+        })
+        .unwrap();
+    let preserved = integrator.reset_workspaces().unwrap();
+    assert!(preserved.outcomes.iter().any(|outcome| matches!(
+        outcome,
+        iq::integrator::TerminalCleanupOutcome::Preserved { .. }
+    )));
+    fs::remove_file(retained.join("dirty.txt")).unwrap();
+    git(&retained, ["reset", "--hard"]).unwrap();
+    let merge_head = git_output(&retained, ["rev-parse", "--git-path", "MERGE_HEAD"]).unwrap();
+    if Path::new(&merge_head).exists() {
+        fs::remove_file(merge_head).unwrap();
+    }
+    let config_path = fixture.temp.path().join("system.yaml");
+    let config = fixture.system_config();
+    let yaml = format!(
+        "integration_agent:\n  runner: opencode\n  executable: {}\n  agent: iq-integration\n  model: test/model\n  cycle_timeout_seconds: 30\n  max_log_bytes: 1048576\n  max_result_bytes: 1048576\n  max_processes: 16\n  memory_bytes: 268435456\n  cpu_seconds: 30\n  writable_bytes: 16777216\n  open_files: 128\n  credential_env: IQ_TEST_MODEL_KEY\ncontrol_plane:\n  unix_socket: {}\n  max_request_bytes: 4096\n  max_free_text_bytes: 1024\n  max_response_bytes: 4096\n  max_concurrent_clients: 2\n  max_client_queue_bytes: 4096\n  max_stream_backlog_events: 100\n  client_idle_seconds: 5\nnotifications:\n  backends: []\n  max_attempts: 2\n  max_event_age_seconds: 60\n  projection_debt_alert_seconds: 60\n",
+        config.integration_agent.executable.display(),
+        config.control_plane.unix_socket.display()
+    );
+    fs::write(&config_path, yaml).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_iq"))
+        .env("IQ_RIFT_DATABASE", &fixture.rift_database)
+        .args([
+            "--queue-db",
+            db.to_str().unwrap(),
+            "cleanup",
+            "--repo-key",
+            repository.key.as_str(),
+            "--system-config",
+            config_path.to_str().unwrap(),
+            "--repo-path",
+            fixture.repo.to_str().unwrap(),
+            "--workspace-root",
+            fixture
+                .temp
+                .path()
+                .join("integration-workspaces")
+                .to_str()
+                .unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["terminal"]["mode"], "operator_requested");
+    assert_eq!(
+        report["terminal"]["outcomes"][0]["Removed"]["path"],
+        retained.to_str().unwrap()
+    );
+    assert!(report["development"].is_array());
+    assert!(!retained.exists());
+    let store = ControlStore::open(&db).unwrap();
+    assert!(store
+        .terminal_workspace_cleanup_debt(&first.id)
+        .unwrap()
+        .is_none());
+    let item = SqliteQueue::open(&db).unwrap().get_item(&first.id).unwrap();
+    assert!(matches!(
+        item.workspace,
+        iq::sqlite::WorkspaceState::Cleaned { .. }
+    ));
+}
+
+#[test]
+fn iq_cleanup_cli_removes_one_workspace_without_repository_arguments() {
+    let (fixture, queue, repository) = registered_terminal_fixture();
+    let manager = RepositoryManager::new(queue.clone());
+    let workspace = manager
+        .create_workspace(&repository.key, "workspace-only-cleanup")
+        .unwrap();
+    fs::write(workspace.path.join("workspace-only.txt"), "cleanup\n").unwrap();
+    git(&workspace.path, ["add", "workspace-only.txt"]).unwrap();
+    git(&workspace.path, ["commit", "-m", "workspace-only"]).unwrap();
+    let (_, item) = manager.submit(&workspace.id, None).unwrap();
+    let db = fixture.temp.path().join("queues.db");
+    let integrated = fixture
+        .integrator(IntegratorOptions {
+            repo_key: repository.key.clone(),
+            repo_path: fixture.repo.clone(),
+            queue_db: db.clone(),
+            owner_id: "workspace-only-integration".into(),
+            lease_ttl_seconds: 30,
+            base_remote: "origin".into(),
+            workspace_root: fixture.temp.path().join("integration-workspaces"),
+            rift_database: Some(fixture.rift_database.clone()),
+            system_config: fixture.system_config(),
+        })
+        .unwrap()
+        .run_once()
+        .unwrap()
+        .unwrap();
+    assert_eq!(integrated.id, item.id);
+    assert_eq!(integrated.status, QueueStatus::Integrated);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_iq"))
+        .env("IQ_RIFT_DATABASE", &fixture.rift_database)
+        .args([
+            "--queue-db",
+            db.to_str().unwrap(),
+            "cleanup",
+            "--workspace",
+            workspace.id.as_str(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let removed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(removed["id"], workspace.id);
+    assert_eq!(removed["status"], "removed");
+    assert!(!workspace.path.exists());
+}
+
+#[test]
+fn creation_intent_terminal_preservation_keeps_authoritative_target_and_alert_payload() {
+    let fixture = GitFixture::new(false);
+    std::env::set_var("IQ_RIFT_DATABASE", &fixture.rift_database);
+    let db = fixture.temp.path().join("queues.db");
+    let queue = SqliteQueue::open(&db).unwrap();
+    let repo_key = format!("{}::main", fixture.repo.display());
+    let item = queue
+        .enqueue(EnqueueRequest {
+            repo_key: repo_key.clone(),
+            repo_path: fixture.repo.to_string_lossy().to_string(),
+            source_branch: "agent/creation-intent".into(),
+            target_branch: "main".into(),
+            current_head_sha: fixture.create_source_branch(
+                "agent/creation-intent",
+                "creation-intent.txt",
+                "feature\n",
+            ),
+            pr_url: None,
+            producer_metadata: serde_json::json!({}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
+        })
+        .unwrap();
+    let _ = queue.claim_next_ready(&repo_key).unwrap().unwrap();
+    git(&fixture.repo, ["checkout", "main"]).unwrap();
+    let manager = RepositoryManager::new(queue.clone());
+    let repository = manager
+        .init(
+            &fixture.repo,
+            RepositoryInitOptions {
+                target_branch: "main".into(),
+                remote: "origin".into(),
+                seed_path: Some(fixture.temp.path().join("seed-root/seed")),
+                workspace_root: Some(fixture.temp.path().join("development-workspaces")),
+            },
+        )
+        .unwrap();
+    fs::create_dir_all(fixture.repo.join(".iq")).unwrap();
+    fs::write(
+        fixture.repo.join(".iq/config.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "integration": {
+                "validation": {"command": "git diff --check"},
+                "signoff": {"mode": "none"}
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let workspace_root = fixture.temp.path().join("integration-workspaces");
+    let expected = workspace_root.join(&item.id);
+    queue
+        .set_workspace_intent(&item.id, expected.to_str().unwrap())
+        .unwrap();
+    let integrator_options = IntegratorOptions {
+        repo_key: repository.key.clone(),
+        repo_path: fixture.repo.clone(),
+        queue_db: db.clone(),
+        owner_id: "creation-intent-preserve".into(),
+        lease_ttl_seconds: 30,
+        base_remote: "origin".into(),
+        workspace_root: workspace_root.clone(),
+        rift_database: Some(fixture.rift_database.clone()),
+        system_config: fixture.system_config(),
+    };
+    drop(fixture.integrator(integrator_options.clone()).unwrap());
+    let output = Command::new("rift")
+        .args([
+            "--database",
+            fixture.rift_database.to_str().unwrap(),
+            "create",
+            "--copy-all",
+            "--no-hooks",
+            "--name",
+            item.id.as_str(),
+            "--into",
+            workspace_root.to_str().unwrap(),
+            fixture.repo.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        Path::new(String::from_utf8_lossy(&output.stdout).trim()),
+        expected
+    );
+    queue
+        .transition_item(&item.id, QueueStatus::Cancelled)
+        .unwrap();
+    fs::write(expected.join("dirty.txt"), "preserve\n").unwrap();
+    let integrator = fixture.integrator(integrator_options).unwrap();
+    let report = integrator.reset_workspaces().unwrap();
+    assert!(report.outcomes.iter().any(|outcome| matches!(
+        outcome,
+        iq::integrator::TerminalCleanupOutcome::Preserved { .. }
+    )));
+    assert!(expected.exists());
+    let store = ControlStore::open(&db).unwrap();
+    let debt = store
+        .terminal_workspace_cleanup_debt(&item.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        debt.target,
+        iq::control_store::TerminalWorkspaceTarget::CreationIntent {
+            path: expected.to_str().unwrap().into()
+        }
+    );
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    let payload: serde_json::Value = connection
+        .query_row(
+            "SELECT payload_json FROM durable_events WHERE item_id=?1 AND event_type='terminal_workspace_preserved'",
+            [&item.id],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|raw| serde_json::from_str(&raw).unwrap())
+        .unwrap();
+    assert_eq!(payload["repository"], repository.key);
+    assert_eq!(payload["blocker_kind"], "workspace_cleanup");
+    assert_eq!(payload["reason"], "dirty");
+    assert_eq!(payload["target"]["path"], expected.to_str().unwrap());
+    assert!(payload["target"].get("rift_id").is_none());
+    let deliveries: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM notification_deliveries WHERE event_id=(SELECT id FROM durable_events WHERE item_id=?1 AND event_type='terminal_workspace_preserved') AND redelivery_of IS NULL",
+            [&item.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(deliveries, 0);
+}
+
+#[test]
+fn automatic_creation_intent_retry_before_due_keeps_observation_and_processes_later_item() {
+    let fixture = GitFixture::new(false);
+    std::env::set_var("IQ_RIFT_DATABASE", &fixture.rift_database);
+    let db = fixture.temp.path().join("queues.db");
+    let queue = SqliteQueue::open(&db).unwrap();
+    let repo_key = format!("{}::main", fixture.repo.display());
+    let first = queue
+        .enqueue(EnqueueRequest {
+            repo_key: repo_key.clone(),
+            repo_path: fixture.repo.to_string_lossy().to_string(),
+            source_branch: "agent/intent-backoff".into(),
+            target_branch: "main".into(),
+            current_head_sha: fixture.create_source_branch(
+                "agent/intent-backoff",
+                "intent-backoff.txt",
+                "feature\n",
+            ),
+            pr_url: None,
+            producer_metadata: serde_json::json!({}),
+            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
+        })
+        .unwrap();
+    let (_, _) = queue.claim_next_ready(&repo_key).unwrap().unwrap();
+    git(&fixture.repo, ["checkout", "main"]).unwrap();
+    let manager = RepositoryManager::new(queue.clone());
+    let repository = manager
+        .init(
+            &fixture.repo,
+            RepositoryInitOptions {
+                target_branch: "main".into(),
+                remote: "origin".into(),
+                seed_path: Some(fixture.temp.path().join("seed-root/seed")),
+                workspace_root: Some(fixture.temp.path().join("development-workspaces")),
+            },
+        )
+        .unwrap();
+    let workspace_root = fixture.temp.path().join("integration-workspaces");
+    let expected = workspace_root.join(&first.id);
+    queue
+        .set_workspace_intent(&first.id, expected.to_str().unwrap())
+        .unwrap();
+    let options = IntegratorOptions {
+        repo_key: repository.key.clone(),
+        repo_path: fixture.repo.clone(),
+        queue_db: db.clone(),
+        owner_id: "creation-intent-backoff".into(),
+        lease_ttl_seconds: 30,
+        base_remote: "origin".into(),
+        workspace_root: workspace_root.clone(),
+        rift_database: Some(fixture.rift_database.clone()),
+        system_config: fixture.system_config(),
+    };
+    drop(fixture.integrator(options.clone()).unwrap());
+    let output = Command::new("rift")
+        .args([
+            "--database",
+            fixture.rift_database.to_str().unwrap(),
+            "create",
+            "--copy-all",
+            "--no-hooks",
+            "--name",
+            first.id.as_str(),
+            "--into",
+            workspace_root.to_str().unwrap(),
+            fixture.repo.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    queue
+        .transition_item(&first.id, QueueStatus::Cancelled)
+        .unwrap();
+    fs::write(expected.join("dirty.txt"), "preserve\n").unwrap();
+    fixture
+        .integrator(options.clone())
+        .unwrap()
+        .reset_workspaces()
+        .unwrap();
+    let store = ControlStore::open(&db).unwrap();
+    let before = store
+        .terminal_workspace_cleanup_debt(&first.id)
+        .unwrap()
+        .unwrap();
+    let later = enqueue_fixture_item(&fixture, &queue, &repository, "agent/intent-later");
+
+    let processed = fixture
+        .integrator(options)
+        .unwrap()
+        .run_once()
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(processed.id, later.id);
+    assert_eq!(processed.status, QueueStatus::Integrated);
+    assert_eq!(
+        ControlStore::open(&db)
+            .unwrap()
+            .terminal_workspace_cleanup_debt(&first.id)
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    assert!(expected.exists());
+    let item = queue.get_item(&first.id).unwrap();
+    assert!(matches!(
+        item.workspace,
+        iq::sqlite::WorkspaceState::CreationIntent { .. }
+    ));
+}
+
+#[test]
+fn automatic_retry_rejects_mismatched_debt_authority_before_backoff() {
+    let (fixture, queue, repository, first, retained) = cancelled_retained_integrator_fixture();
+    let db = fixture.temp.path().join("queues.db");
+    fs::write(retained.join("dirty.txt"), "preserve\n").unwrap();
+    let options = IntegratorOptions {
+        repo_key: repository.key.clone(),
+        repo_path: fixture.repo.clone(),
+        queue_db: db.clone(),
+        owner_id: "authority-validation".into(),
+        lease_ttl_seconds: 30,
+        base_remote: "origin".into(),
+        workspace_root: fixture.temp.path().join("integration-workspaces"),
+        rift_database: Some(fixture.rift_database.clone()),
+        system_config: fixture.system_config(),
+    };
+    let integrator = fixture.integrator(options.clone()).unwrap();
+    let preserved = integrator.reset_workspaces().unwrap();
+    assert!(preserved.outcomes.iter().any(|outcome| matches!(
+        outcome,
+        iq::integrator::TerminalCleanupOutcome::Preserved { .. }
+    )));
+    let later = enqueue_fixture_item(&fixture, &queue, &repository, "agent/authority-later");
+    let store = ControlStore::open(&db).unwrap();
+    let before = store
+        .terminal_workspace_cleanup_debt(&first.id)
+        .unwrap()
+        .unwrap();
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch("DROP TRIGGER terminal_cleanup_debt_update_guard;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE terminal_workspace_cleanup_debt SET workspace_json=json_set(workspace_json,'$.path',?1) WHERE item_id=?2",
+            rusqlite::params![retained.with_file_name("moved-by-external-input").to_string_lossy(), first.id],
+        )
+        .unwrap();
+    iq::control_store::reinstall_v10_triggers_for_test(&connection).unwrap();
+    let error = integrator.run_once().unwrap_err();
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("terminal workspace cleanup debt identity differs from queue authority"),
+        "{error}"
+    );
+    assert!(retained.exists());
+    assert_eq!(
+        queue.get_item(&later.id).unwrap().status,
+        QueueStatus::Ready
+    );
+    let after = store
+        .terminal_workspace_cleanup_debt(&first.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.state, before.state);
+}
+
+#[test]
+fn repeated_operator_retry_reopen_keeps_one_alert_and_caps_backoff() {
+    let (fixture, queue, repository, first, retained) = cancelled_retained_integrator_fixture();
+    let db = fixture.temp.path().join("queues.db");
+    let log = fixture.temp.path().join("notification.log");
+    let notify = fixture.temp.path().join("notify");
+    fs::write(
+        &notify,
+        format!("#!/bin/sh\nprintf 'invoked\\n' >> '{}'\n", log.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&notify, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let notification = iq::notifications::NotificationDispatcher::new(
+        &db,
+        iq::agent_config::NotificationConfig {
+            backends: vec![iq::agent_config::NotificationBackendConfig::Wslg {
+                executable: notify.clone(),
+            }],
+            max_attempts: 3,
+            max_event_age_seconds: 3600,
+            projection_debt_alert_seconds: 60,
+        },
+    );
+    notification.configure().unwrap();
+    fs::write(retained.join("dirty.txt"), "preserve\n").unwrap();
+    let make_integrator = || {
+        fixture
+            .integrator(IntegratorOptions {
+                repo_key: repository.key.clone(),
+                repo_path: fixture.repo.clone(),
+                queue_db: db.clone(),
+                owner_id: "retry-reopen".into(),
+                lease_ttl_seconds: 30,
+                base_remote: "origin".into(),
+                workspace_root: fixture.temp.path().join("integration-workspaces"),
+                rift_database: Some(fixture.rift_database.clone()),
+                system_config: fixture.system_config(),
+            })
+            .unwrap()
+    };
+    let before_tenth = chrono::Utc::now();
+    for _ in 0..10 {
+        make_integrator().reset_workspaces().unwrap();
+    }
+    let after_tenth = chrono::Utc::now();
+    let store = ControlStore::open(&db).unwrap();
+    let debt = store
+        .terminal_workspace_cleanup_debt(&first.id)
+        .unwrap()
+        .unwrap();
+    let (count, next_retry_at) = match debt.state {
+        iq::control_store::TerminalWorkspaceCleanupState::Preserved {
+            observation_count,
+            next_retry_at,
+            ..
+        } => (observation_count, next_retry_at),
+        iq::control_store::TerminalWorkspaceCleanupState::Pending => {
+            panic!("missing preserved debt")
+        }
+    };
+    assert_eq!(count, 10);
+    assert!(next_retry_at >= before_tenth + chrono::Duration::hours(1));
+    assert!(next_retry_at <= after_tenth + chrono::Duration::hours(1));
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    let event_count: i64 = connection.query_row("SELECT COUNT(*) FROM durable_events WHERE item_id=?1 AND event_type='terminal_workspace_preserved'", [&first.id], |row| row.get(0)).unwrap();
+    let delivery_count: i64 = connection.query_row("SELECT COUNT(*) FROM notification_deliveries WHERE event_id=(SELECT alert_event_id FROM terminal_workspace_cleanup_debt WHERE item_id=?1) AND redelivery_of IS NULL", [&first.id], |row| row.get(0)).unwrap();
+    assert_eq!((event_count, delivery_count), (1, 1));
+    assert_eq!(notification.dispatch_once().unwrap(), 1);
+    assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 1);
+    let before_retry = chrono::Utc::now();
+    make_integrator().reset_workspaces().unwrap();
+    let after_retry = chrono::Utc::now();
+    let debt = ControlStore::open(&db)
+        .unwrap()
+        .terminal_workspace_cleanup_debt(&first.id)
+        .unwrap()
+        .unwrap();
+    let next_retry_at = match debt.state {
+        iq::control_store::TerminalWorkspaceCleanupState::Preserved { next_retry_at, .. } => {
+            next_retry_at
+        }
+        iq::control_store::TerminalWorkspaceCleanupState::Pending => panic!("missing debt"),
+    };
+    assert!(next_retry_at >= before_retry + chrono::Duration::hours(1));
+    assert!(next_retry_at <= after_retry + chrono::Duration::hours(1));
+    assert!(queue
+        .get_item(&first.id)
+        .unwrap()
+        .workspace
+        .path()
+        .is_some());
 }
 
 #[test]

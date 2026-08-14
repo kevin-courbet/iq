@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use iq::composition::{RepositoryInitOptions, RepositoryManager};
 use iq::integrator::{
     verify_rift_workspace_config, workspace_status, HostSignoffPolicy, IntegrationPolicy,
@@ -32,7 +32,7 @@ struct Cli {
 enum Command {
     Migrate {
         #[arg(long)]
-        system_config: PathBuf,
+        system_config: Option<PathBuf>,
     },
     Repo {
         #[command(subcommand)]
@@ -48,12 +48,7 @@ enum Command {
         #[arg(long)]
         replace: Option<String>,
     },
-    Cleanup {
-        #[arg(long)]
-        repo_key: Option<String>,
-        #[arg(long)]
-        workspace: Option<String>,
-    },
+    Cleanup(CleanupArgs),
     Integrate {
         #[arg(long)]
         system_config: PathBuf,
@@ -202,6 +197,23 @@ enum Command {
         #[arg(long)]
         workspace_root: PathBuf,
     },
+}
+
+#[derive(Args, Debug)]
+struct CleanupArgs {
+    #[arg(
+        long,
+        conflicts_with_all = ["repo_key", "system_config", "repo_path", "workspace_root"]
+    )]
+    workspace: Option<String>,
+    #[arg(long, required_unless_present = "workspace")]
+    repo_key: Option<String>,
+    #[arg(long, required_unless_present = "workspace")]
+    system_config: Option<PathBuf>,
+    #[arg(long, required_unless_present = "workspace")]
+    repo_path: Option<PathBuf>,
+    #[arg(long, required_unless_present = "workspace")]
+    workspace_root: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -381,8 +393,8 @@ fn main() -> Result<()> {
     };
     match cli.command {
         Command::Migrate { system_config } => {
-            let queue = SqliteQueue::migrate_v8(&db_path, &system_config)?;
-            print_json(&json!({"schema_version": 9, "database": queue.path()}))?;
+            let queue = SqliteQueue::migrate(&db_path, system_config.as_deref())?;
+            print_json(&json!({"schema_version": 10, "database": queue.path()}))?;
         }
         Command::Repo { command } => {
             let manager = RepositoryManager::new(SqliteQueue::open(&db_path)?);
@@ -439,23 +451,30 @@ fn main() -> Result<()> {
             )?;
             print_json(&(submission, item))?;
         }
-        Command::Cleanup {
+        Command::Cleanup(CleanupArgs {
             repo_key,
             workspace,
-        } => {
+            system_config,
+            repo_path,
+            workspace_root,
+        }) => {
             let manager = RepositoryManager::new(SqliteQueue::open(&db_path)?);
             if let Some(workspace) = workspace {
                 print_json(&manager.remove_workspace(&workspace)?)?;
             } else {
-                let repo_keys = match repo_key {
-                    Some(repo_key) => vec![repo_key],
-                    None => manager.list()?.into_iter().map(|repo| repo.key).collect(),
-                };
-                let mut cleaned = Vec::new();
-                for repo_key in repo_keys {
-                    cleaned.extend(manager.cleanup_repo(&repo_key)?);
-                }
-                print_json(&cleaned)?;
+                let repo_key = repo_key.context("repository cleanup requires --repo-key")?;
+                let system_config =
+                    system_config.context("repository cleanup requires --system-config")?;
+                let repo_path = repo_path.context("repository cleanup requires --repo-path")?;
+                let workspace_root =
+                    workspace_root.context("repository cleanup requires --workspace-root")?;
+                let system = iq::agent_config::SystemConfig::load(&system_config)?;
+                print_json(&manager.cleanup_repo_with_system(
+                    &repo_key,
+                    &system,
+                    &repo_path,
+                    &workspace_root,
+                )?)?;
             }
         }
         Command::Integrate {

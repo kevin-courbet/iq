@@ -795,6 +795,70 @@ impl RepositoryManager {
     }
 
     pub fn cleanup_repo(&self, repo_key: &str) -> Result<Vec<DevelopmentWorkspace>> {
+        self.cleanup_repo_development_only(repo_key)
+    }
+
+    pub fn cleanup_repo_with_system(
+        &self,
+        repo_key: &str,
+        system_config: &crate::agent_config::SystemConfig,
+        integration_path: &Path,
+        workspace_root: &Path,
+    ) -> Result<crate::integrator::TerminalCleanupAggregate> {
+        let repository = self.queue.repository(repo_key)?;
+        verify_remote_identity(&repository.integration_path, &repository.remote)?;
+        let guard = RepositoryGuard::acquire(
+            self.queue.clone(),
+            &repository.integration_path,
+            repo_key,
+            &self.owner_id,
+        )?;
+        let integrator = crate::integrator::Integrator::new_with_operation_owner(
+            crate::integrator::IntegratorOptions {
+                repo_key: repository.key.clone(),
+                repo_path: integration_path.to_path_buf(),
+                queue_db: self.queue.path().to_path_buf(),
+                owner_id: self.owner_id.clone(),
+                lease_ttl_seconds: 30,
+                base_remote: repository.remote.name.clone(),
+                workspace_root: workspace_root.to_path_buf(),
+                rift_database: None,
+                system_config: system_config.clone(),
+            },
+            self.owner_id.clone(),
+            self.queue.clone(),
+        )?;
+        self.cleanup_terminal_agent_artifacts(repo_key)?;
+        let terminal = integrator.reset_workspaces_under_lease(&guard.operation)?;
+        self.reconcile_seed(&guard, &repository)?;
+        let repository = self.queue.repository(repo_key)?;
+        let manager = self.development_manager(&repository)?;
+        self.reconcile_development_workspaces(&guard, &repository, &manager)?;
+        self.cleanup_replacements(&guard, &repository)?;
+        let seed_result = self.reconcile_seed_refresh_locked(&guard, &repository);
+        let mut results = Vec::new();
+        for workspace in self.queue.list_development_workspaces(Some(repo_key))? {
+            if matches!(
+                workspace.status,
+                DevelopmentWorkspaceStatus::CleanupPending
+                    | DevelopmentWorkspaceStatus::CleanupFailed
+            ) {
+                results.push(self.remove_workspace_locked(
+                    &guard,
+                    &repository,
+                    &manager,
+                    &workspace,
+                )?);
+            }
+        }
+        seed_result?;
+        Ok(crate::integrator::TerminalCleanupAggregate {
+            terminal,
+            development: results,
+        })
+    }
+
+    fn cleanup_repo_development_only(&self, repo_key: &str) -> Result<Vec<DevelopmentWorkspace>> {
         let repository = self.queue.repository(repo_key)?;
         verify_remote_identity(&repository.integration_path, &repository.remote)?;
         let guard = RepositoryGuard::acquire(
@@ -1918,6 +1982,7 @@ pub(crate) fn has_git_operation(path: &Path) -> Result<bool> {
         "MERGE_HEAD",
         "CHERRY_PICK_HEAD",
         "REVERT_HEAD",
+        "BISECT_START",
         "rebase-merge",
         "rebase-apply",
     ] {
