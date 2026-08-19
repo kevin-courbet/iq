@@ -1,19 +1,18 @@
 # ADR 0008: IQ-Owned Repository Roots
 
-- Status: Accepted
+- Status: Superseded in part by ADR 0009
 - Date: 2026-08-14
 - Decider: Kevin Courbet
 - Supersedes: ADR 0002 and ADR 0003 repository-root, key, and target clauses; ADR 0004 policy-location clauses
 
 ## Decision
 
-IQ supports exactly one target branch for each remote repository. The target is
-`main` or `master`. Exact fetch and push URL identity has one durable owner row.
-That row owns one repository UUID and one immutable target before provisioning
-starts and after the repository becomes ready.
+ADR 0009 supersedes the authority model in this section. Current policy stores
+one repository UUID, canonical repository identity, and `main` or `master`
+target. Schema 4 has no separate remote-owner authority.
 
-IQ owns one full checkout for each remote repository. This checkout is the Git
-and ref authority and the independent Rift root. All development and
+IQ owns one full checkout for each repository. This checkout is a materialized
+view of canonical Git authority and the independent Rift root. All development and
 integration Rifts are direct children of this root.
 
 A user checkout is registration input only. IQ does not persist
@@ -22,11 +21,10 @@ or deletion does not affect IQ. Registration first stores the absolute lexical
 request path and options. A retry uses that request identity before it resolves
 the bootstrap checkout, so the same spelling remains valid after rename or
 deletion. Multiple request paths can bind one repository UUID when they resolve
-the same remote and target. After secure remote identity resolution, an
-existing remote owner is authoritative before any new target observation. A
-ready repository returns directly, and an active intent resumes its durable
-plan without reading the bootstrap target or remote target again unless its
-recorded object is missing at the fetch phase.
+the same canonical policy. After secure policy resolution, an existing policy
+row is authoritative before any new target observation. A ready repository
+returns directly, and an active intent resumes its durable plan only while its
+canonical identity remains valid.
 
 The fetched remote target ref is the target source of truth. A fetched or
 imported source SHA is immutable. IQ records each target observation before it
@@ -73,7 +71,8 @@ operation acquires the kernel process lock, replaces its durable heartbeat row,
 and verifies this identity before it can read or mutate repository state. A
 dead process cannot delay recovery until heartbeat expiry.
 
-IQ installs only its current schema, currently marker `3`. An existing database
+IQ installs only its current schema, currently marker `4`. Runtime rejects
+schema 3; the separate offline migration preserves its history. An existing database
 with an incompatible marker or shape, including an empty file, is rejected
 without mutation. For a missing destination, IQ creates and validates one
 private sibling database, syncs it, publishes it with an atomic no-replace
@@ -86,9 +85,9 @@ rename, and syncs the parent directory.
 - The owned Rift root has no ancestors.
 - The development and integration roots are exact direct children of the owned
   root and use the same persisted Rift registry file identity.
-- SQLite records exact owned-root, remote, target, Rift, child-root, generation,
+- SQLite records exact policy, owned-root, target, Rift, child-root, generation,
   provisioning, and cleanup identities.
-- A repository row cannot exist without its exact remote-owner row, and one
-  remote owner cannot have both a provisioning intent and a ready repository.
+- A repository row cannot exist without its exact policy row, and one
+  repository cannot have both a provisioning intent and a ready repository.
 - Queue items refer to a repository key and do not store repository paths or
   target branches.

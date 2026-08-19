@@ -9,10 +9,10 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: &str = "3";
+pub const SCHEMA_VERSION: &str = "4";
 pub const INTERNAL_REMOTE_NAME: &str = "iq-target";
 const POLICY_PATH: &str = ".iq/config.json";
 const MAX_POLICY_BYTES: u64 = 1024 * 1024;
@@ -92,6 +92,20 @@ pub struct ChildWorkspaceRoots {
 struct RiftVerified {
     rift: RiftRootIdentity,
     policy_sha256: Option<String>,
+    git_binding: crate::git_command::RepositoryBinding,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProvisionedGit {
+    git_binding: crate::git_command::RepositoryBinding,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProvisionedPolicy {
+    git_binding: crate::git_command::RepositoryBinding,
+    policy_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -104,6 +118,35 @@ struct RiftVerified {
 enum ProvisioningLifecycle {
     Reserved,
     StagingDirectory,
+    GitInitialized(ProvisionedGit),
+    RemoteConfigured(ProvisionedGit),
+    TargetFetched(ProvisionedGit),
+    TargetCheckedOut(ProvisionedGit),
+    RootPublished(ProvisionedGit),
+    PolicyPublished(ProvisionedPolicy),
+    RiftInitialized(ProvisionedPolicy),
+    RiftVerified(RiftVerified),
+    OwnerPublished(RiftVerified),
+    ChildRootsPublished(RiftVerified),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Schema3RiftVerified {
+    rift: RiftRootIdentity,
+    policy_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    content = "identity",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum Schema3ProvisioningLifecycle {
+    Reserved,
+    StagingDirectory,
     GitInitialized,
     RemoteConfigured,
     TargetFetched,
@@ -111,9 +154,9 @@ enum ProvisioningLifecycle {
     RootPublished,
     PolicyPublished { policy_sha256: Option<String> },
     RiftInitialized { policy_sha256: Option<String> },
-    RiftVerified(RiftVerified),
-    OwnerPublished(RiftVerified),
-    ChildRootsPublished(RiftVerified),
+    RiftVerified(Schema3RiftVerified),
+    OwnerPublished(Schema3RiftVerified),
+    ChildRootsPublished(Schema3RiftVerified),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -122,6 +165,7 @@ pub struct OwnedRepositoryRoot {
     path: PathBuf,
     rift: RiftRootIdentity,
     remote: RemoteIdentity,
+    canonical_repository: crate::repository_policy::GitRepository,
     target: String,
     children: ChildWorkspaceRoots,
     source_sha: String,
@@ -158,12 +202,60 @@ impl OwnedRepositoryRoot {
 }
 
 #[derive(Clone, Debug)]
-pub struct ProvisionOptions {
-    pub storage_root: PathBuf,
-    pub bootstrap_path: PathBuf,
-    pub target: String,
-    pub remote_name: String,
-    pub rift_database: Option<PathBuf>,
+pub(crate) struct ProvisionOptions {
+    pub(crate) preflight: PreflightedProvision,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreflightedProvision {
+    storage_root: PathBuf,
+    bootstrap_identity: PathBuf,
+    bootstrap_path: PathBuf,
+    bootstrap_binding: crate::git_command::RepositoryBinding,
+    target: String,
+    rift_database: PathBuf,
+    repository_policy: crate::repository_policy::VerifiedRepositoryPolicy,
+    source_sha: String,
+    policy: Option<Vec<u8>>,
+}
+
+impl PreflightedProvision {
+    pub(crate) fn capture(
+        storage_root: PathBuf,
+        bootstrap_path: &Path,
+        rift_database: Option<PathBuf>,
+        repository_policy: crate::repository_policy::VerifiedRepositoryPolicy,
+    ) -> Result<Self> {
+        let storage_root = absolute_path(&storage_root)?;
+        require_absolute_directory(&storage_root, "owned repository storage root")?;
+        let target = repository_policy.target_branch.clone();
+        validate_target_branch(&target)?;
+        let rift_database = planned_rift_database(rift_database.as_deref())?;
+        let bootstrap_identity = absolute_path(bootstrap_path)?;
+        let bootstrap_path = canonical_git_root(bootstrap_path)?;
+        let bootstrap_binding = crate::git_command::expected_binding(&bootstrap_path)?;
+        if bootstrap_binding.object_format != repository_policy.canonical_repository.object_format()
+        {
+            anyhow::bail!("bootstrap Git object format differs from repository policy");
+        }
+        let source_sha = remote_target_sha(
+            &bootstrap_path,
+            &repository_policy.canonical_repository,
+            &target,
+        )?;
+        let policy = read_bootstrap_policy(&bootstrap_path)?;
+        Ok(Self {
+            storage_root,
+            bootstrap_identity,
+            bootstrap_path,
+            bootstrap_binding,
+            target,
+            rift_database,
+            repository_policy,
+            source_sha,
+            policy,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -174,6 +266,7 @@ struct ProvisionPlan {
     staging_path: PathBuf,
     target: String,
     remote: RemoteIdentity,
+    canonical_repository: crate::repository_policy::GitRepository,
     rift_database: PathBuf,
     source_sha: String,
     policy: Option<Vec<u8>>,
@@ -184,13 +277,21 @@ pub(crate) fn provision(
     connection: &mut Connection,
     options: &ProvisionOptions,
 ) -> Result<OwnedRepositoryRoot> {
-    let mut options = options.clone();
-    options.storage_root = absolute_path(&options.storage_root)?;
-    let requested_rift_database = planned_rift_database(options.rift_database.as_deref())?;
-    options.rift_database = Some(requested_rift_database.clone());
-    validate_target_branch(&options.target)?;
-    require_absolute_directory(&options.storage_root, "owned repository storage root")?;
-    let bootstrap_identity = absolute_path(&options.bootstrap_path)?;
+    let options = options.preflight.clone();
+    options.repository_policy.reverify()?;
+    options.bootstrap_binding.verify()?;
+    if canonical_git_root(&options.bootstrap_path)? != options.bootstrap_path
+        || read_bootstrap_policy(&options.bootstrap_path)? != options.policy
+        || remote_target_sha(
+            &options.bootstrap_path,
+            &options.repository_policy.canonical_repository,
+            &options.target,
+        )? != options.source_sha
+    {
+        anyhow::bail!("repository registration preflight changed before reservation");
+    }
+    let requested_rift_database = options.rift_database.clone();
+    let bootstrap_identity = options.bootstrap_identity.clone();
     let request_repo_key = prepare_bootstrap_request(connection, &options, &bootstrap_identity)?;
     let persisted = load_intent_by_bootstrap(connection, &bootstrap_identity)?;
     let (plan, newly_reserved) = if let Some((plan, _)) = persisted {
@@ -225,6 +326,7 @@ pub(crate) fn provision(
                     existing.target
                 );
             }
+            require_existing_policy(connection, existing.repo_key(), &options.repository_policy)?;
             return Ok(existing);
         }
         let (plan, _) = load_intent_by_repo_key(connection, &repo_key)?.context(
@@ -246,9 +348,17 @@ pub(crate) fn provision(
         }
         (plan, false)
     } else {
-        let bootstrap_path = canonical_git_root(&options.bootstrap_path)?;
-        let remote = remote_identity(&bootstrap_path, &options.remote_name)?;
-        if let Some(existing) = find_registered(connection, &remote)? {
+        let remote = RemoteIdentity {
+            fetch_url: options
+                .repository_policy
+                .canonical_repository
+                .operational_fetch_url(),
+            push_url: options
+                .repository_policy
+                .canonical_repository
+                .operational_push_url(),
+        };
+        if let Some(existing) = find_registered(connection, &options.repository_policy)? {
             require_requested_locations(
                 connection,
                 &bootstrap_identity,
@@ -263,10 +373,12 @@ pub(crate) fn provision(
                     existing.target
                 );
             }
+            require_existing_policy(connection, existing.repo_key(), &options.repository_policy)?;
             link_bootstrap_request(connection, &bootstrap_identity, existing.repo_key.as_str())?;
             return Ok(existing);
         }
-        if let Some((repo_key, target)) = find_remote_owner(connection, &remote)? {
+        if let Some((repo_key, target)) = find_remote_owner(connection, &options.repository_policy)?
+        {
             if target != options.target {
                 anyhow::bail!("remote is already reserved with immutable target {target}");
             }
@@ -278,6 +390,11 @@ pub(crate) fn provision(
                     &repository_storage_root(existing.path(), existing.repo_key())?,
                     &requested_rift_database,
                     &existing.rift().registry_identity,
+                )?;
+                require_existing_policy(
+                    connection,
+                    existing.repo_key(),
+                    &options.repository_policy,
                 )?;
                 link_bootstrap_request(connection, &bootstrap_identity, repo_key.as_str())?;
                 return Ok(existing);
@@ -299,15 +416,13 @@ pub(crate) fn provision(
             link_bootstrap_request(connection, &bootstrap_identity, repo_key.as_str())?;
             (plan, false)
         } else {
-            let source_sha = remote_target_sha(&remote.fetch_url, &options.target)?;
-            let policy = read_bootstrap_policy(&bootstrap_path)?;
             let (plan, _, newly_reserved) = reserve_plan(
                 connection,
                 &options,
                 bootstrap_identity,
                 remote,
-                source_sha,
-                policy,
+                options.source_sha.clone(),
+                options.policy.clone(),
             )?;
             (plan, newly_reserved)
         }
@@ -330,6 +445,58 @@ pub(crate) fn provision(
         .context("repository provisioning intent disappeared before ready publication")
         .and_then(|json| serde_json::from_str(&json).context("decode provisioning lifecycle"))?;
     loop {
+        plan.canonical_repository.verify_local_bare()?;
+        if let ProvisioningLifecycle::TargetCheckedOut(state) = &lifecycle {
+            if entry_exists(&plan.path)? && !entry_exists(&plan.staging_path)? {
+                let relocated = state.git_binding.verify_relocated(&plan.path)?;
+                lifecycle = advance(
+                    connection,
+                    &plan,
+                    &plan.repo_key,
+                    "root",
+                    ProvisioningLifecycle::RootPublished(ProvisionedGit {
+                        git_binding: relocated,
+                    }),
+                )?;
+                continue;
+            }
+        }
+        match &lifecycle {
+            ProvisioningLifecycle::GitInitialized(state)
+            | ProvisioningLifecycle::RemoteConfigured(state)
+            | ProvisioningLifecycle::TargetFetched(state)
+            | ProvisioningLifecycle::TargetCheckedOut(state) => {
+                let active = if entry_exists(&plan.staging_path)? {
+                    &plan.staging_path
+                } else {
+                    &plan.path
+                };
+                verify_stored_provisioning_binding(active, &state.git_binding)?;
+            }
+            ProvisioningLifecycle::RootPublished(state) => {
+                verify_stored_provisioning_binding(&plan.path, &state.git_binding)?;
+            }
+            ProvisioningLifecycle::PolicyPublished(state) => {
+                if let Err(binding_error) =
+                    verify_stored_provisioning_binding(&plan.path, &state.git_binding)
+                {
+                    verify_completed_rift_initialization(&plan).with_context(|| {
+                        format!(
+                            "provisioning Git binding changed outside the exact Rift initialization effect: {binding_error:#}"
+                        )
+                    })?;
+                }
+            }
+            ProvisioningLifecycle::RiftInitialized(state) => {
+                verify_stored_provisioning_binding(&plan.path, &state.git_binding)?;
+            }
+            ProvisioningLifecycle::RiftVerified(state)
+            | ProvisioningLifecycle::OwnerPublished(state)
+            | ProvisioningLifecycle::ChildRootsPublished(state) => {
+                verify_stored_provisioning_binding(&plan.path, &state.git_binding)?;
+            }
+            ProvisioningLifecycle::Reserved | ProvisioningLifecycle::StagingDirectory => {}
+        }
         verify_completed_effects(connection, &plan, &lifecycle)?;
         lifecycle = match lifecycle {
             ProvisioningLifecycle::Reserved => {
@@ -344,75 +511,96 @@ pub(crate) fn provision(
             }
             ProvisioningLifecycle::StagingDirectory => {
                 initialize_git(&plan)?;
+                let state = ProvisionedGit {
+                    git_binding: crate::git_command::RepositoryBinding::capture(
+                        &plan.staging_path,
+                    )?,
+                };
                 advance(
                     connection,
                     &plan,
                     &plan.repo_key,
                     "git_init",
-                    ProvisioningLifecycle::GitInitialized,
+                    ProvisioningLifecycle::GitInitialized(state),
                 )?
             }
-            ProvisioningLifecycle::GitInitialized => {
+            ProvisioningLifecycle::GitInitialized(state) => {
                 configure_remote(&plan)?;
                 advance(
                     connection,
                     &plan,
                     &plan.repo_key,
                     "remote",
-                    ProvisioningLifecycle::RemoteConfigured,
+                    ProvisioningLifecycle::RemoteConfigured(state),
                 )?
             }
-            ProvisioningLifecycle::RemoteConfigured => {
-                fetch_target(&plan)?;
+            ProvisioningLifecycle::RemoteConfigured(state) => {
+                fetch_target(connection, &plan)?;
                 advance(
                     connection,
                     &plan,
                     &plan.repo_key,
                     "fetch",
-                    ProvisioningLifecycle::TargetFetched,
+                    ProvisioningLifecycle::TargetFetched(state),
                 )?
             }
-            ProvisioningLifecycle::TargetFetched => {
+            ProvisioningLifecycle::TargetFetched(state) => {
                 checkout_target(&plan)?;
                 advance(
                     connection,
                     &plan,
                     &plan.repo_key,
                     "checkout",
-                    ProvisioningLifecycle::TargetCheckedOut,
+                    ProvisioningLifecycle::TargetCheckedOut(state),
                 )?
             }
-            ProvisioningLifecycle::TargetCheckedOut => {
+            ProvisioningLifecycle::TargetCheckedOut(_) => {
                 publish_root(&plan)?;
+                let state = ProvisionedGit {
+                    git_binding: crate::git_command::RepositoryBinding::capture(&plan.path)?,
+                };
                 advance(
                     connection,
                     &plan,
                     &plan.repo_key,
                     "root",
-                    ProvisioningLifecycle::RootPublished,
+                    ProvisioningLifecycle::RootPublished(state),
                 )?
             }
-            ProvisioningLifecycle::RootPublished => {
+            ProvisioningLifecycle::RootPublished(state) => {
                 let policy_sha256 = copy_policy(&plan)?;
                 advance(
                     connection,
                     &plan,
                     &plan.repo_key,
                     "policy",
-                    ProvisioningLifecycle::PolicyPublished { policy_sha256 },
+                    ProvisioningLifecycle::PolicyPublished(ProvisionedPolicy {
+                        git_binding: state.git_binding,
+                        policy_sha256,
+                    }),
                 )?
             }
-            ProvisioningLifecycle::PolicyPublished { policy_sha256 } => {
-                provision_rift(&plan.path, Some(&plan.rift_database))?;
+            ProvisioningLifecycle::PolicyPublished(state) => {
+                provision_rift(&plan.path, Some(&plan.rift_database), || {
+                    require_provisioning_phase(connection, &plan.repo_key, "policy_published")
+                })?;
+                let git_binding = crate::git_command::replace_authorized_binding(&plan.path)?;
                 advance(
                     connection,
                     &plan,
                     &plan.repo_key,
                     "rift_init",
-                    ProvisioningLifecycle::RiftInitialized { policy_sha256 },
+                    ProvisioningLifecycle::RiftInitialized(ProvisionedPolicy {
+                        git_binding,
+                        policy_sha256: state.policy_sha256,
+                    }),
                 )?
             }
-            ProvisioningLifecycle::RiftInitialized { policy_sha256 } => {
+            ProvisioningLifecycle::RiftInitialized(state) => {
+                provision_rift(&plan.path, Some(&plan.rift_database), || {
+                    require_provisioning_phase(connection, &plan.repo_key, "rift_initialized")
+                })?;
+                verify_stored_provisioning_binding(&plan.path, &state.git_binding)?;
                 verify_independent_rift_root(&plan.path, Some(&plan.rift_database))?;
                 let registry_identity = rift_registry_identity(Some(&plan.rift_database))?;
                 let registry_metadata = fs::metadata(&registry_identity)?;
@@ -424,7 +612,8 @@ pub(crate) fn provision(
                         registry_inode: registry_metadata.ino(),
                         generation: 0,
                     },
-                    policy_sha256,
+                    policy_sha256: state.policy_sha256,
+                    git_binding: state.git_binding,
                 };
                 advance(
                     connection,
@@ -476,13 +665,46 @@ pub(crate) fn provision(
     }
 }
 
+fn verify_stored_provisioning_binding(
+    expected_path: &Path,
+    binding: &crate::git_command::RepositoryBinding,
+) -> Result<()> {
+    if binding.top_level != expected_path {
+        anyhow::bail!("provisioning Git binding has a different lifecycle path");
+    }
+    binding.verify()?;
+    crate::git_command::register_binding(binding)?;
+    Ok(())
+}
+
+fn require_existing_policy(
+    connection: &Connection,
+    repo_key: &RepoKey,
+    expected: &crate::repository_policy::RepositoryPolicy,
+) -> Result<()> {
+    let stored: (String, String, String, String, String) = connection.query_row(
+        "SELECT operation_state_json,canonical_repository_json,target_branch,integration_policy,replication_policy_json FROM repository_policies WHERE repo_key=?1",
+        [repo_key.as_str()],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+    )?;
+    if stored.0 != serde_json::to_string(&expected.operation_state)?
+        || stored.1 != serde_json::to_string(&expected.canonical_repository)?
+        || stored.2 != expected.target_branch
+        || stored.3 != expected.integration_policy.to_string()
+        || stored.4 != serde_json::to_string(&expected.replication_policy)?
+    {
+        anyhow::bail!("registered repository has a different explicit policy");
+    }
+    Ok(())
+}
+
 fn load_intent_by_bootstrap(
     connection: &Connection,
     bootstrap_path: &Path,
 ) -> Result<Option<(ProvisionPlan, ProvisioningLifecycle)>> {
     let stored = connection
         .query_row(
-            "SELECT repo_key,owned_root_path,staging_root_path,rift_registry_path,target_branch,fetch_url,push_url,source_sha,policy_bytes,lifecycle_json,created_at FROM repository_provisioning_intents WHERE bootstrap_path=?1",
+            "SELECT intent.repo_key,intent.owned_root_path,intent.staging_root_path,intent.rift_registry_path,policy.target_branch,policy.canonical_repository_json,intent.source_sha,intent.policy_bytes,intent.lifecycle_json,intent.created_at FROM repository_provisioning_intents intent JOIN repository_policies policy ON policy.repo_key=intent.repo_key WHERE intent.bootstrap_path=?1",
             [bootstrap_path.as_os_str().as_bytes()],
             |row| {
                 Ok((
@@ -493,10 +715,9 @@ fn load_intent_by_bootstrap(
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, Option<Vec<u8>>>(8)?,
+                    row.get::<_, Option<Vec<u8>>>(7)?,
+                    row.get::<_, String>(8)?,
                     row.get::<_, String>(9)?,
-                    row.get::<_, String>(10)?,
                 ))
             },
         )
@@ -509,15 +730,19 @@ fn load_intent_by_bootstrap(
                 staging_path,
                 rift_database,
                 target,
-                fetch_url,
-                push_url,
+                canonical_repository,
                 source_sha,
                 policy,
                 lifecycle,
                 created_at,
             )| {
                 validate_target_branch(&target)?;
-                crate::control_domain::require_sha(&source_sha, "provisioning source SHA")?;
+                let remote = remote_from_policy_json(&canonical_repository)?;
+                let canonical_repository: crate::repository_policy::GitRepository =
+                    serde_json::from_str(&canonical_repository)?;
+                canonical_repository
+                    .object_format()
+                    .require_oid(&source_sha, "provisioning source SHA")?;
                 let repo_key = RepoKey::from_stored(repo_key)?;
                 let path = path_from_bytes(path);
                 let plan = ProvisionPlan {
@@ -526,10 +751,8 @@ fn load_intent_by_bootstrap(
                     path,
                     staging_path: path_from_bytes(staging_path),
                     target,
-                    remote: RemoteIdentity {
-                        fetch_url,
-                        push_url,
-                    },
+                    remote,
+                    canonical_repository,
                     rift_database: path_from_bytes(rift_database),
                     source_sha,
                     policy,
@@ -547,7 +770,7 @@ fn load_intent_by_repo_key(
 ) -> Result<Option<(ProvisionPlan, ProvisioningLifecycle)>> {
     connection
         .query_row(
-            "SELECT owned_root_path,staging_root_path,rift_registry_path,target_branch,fetch_url,push_url,source_sha,policy_bytes,lifecycle_json,created_at FROM repository_provisioning_intents WHERE repo_key=?1",
+            "SELECT intent.owned_root_path,intent.staging_root_path,intent.rift_registry_path,policy.target_branch,policy.canonical_repository_json,intent.source_sha,intent.policy_bytes,intent.lifecycle_json,intent.created_at FROM repository_provisioning_intents intent JOIN repository_policies policy ON policy.repo_key=intent.repo_key WHERE intent.repo_key=?1",
             [repo_key.as_str()],
             |row| {
                 Ok((
@@ -557,16 +780,19 @@ fn load_intent_by_repo_key(
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, Option<Vec<u8>>>(7)?,
+                    row.get::<_, Option<Vec<u8>>>(6)?,
+                    row.get::<_, String>(7)?,
                     row.get::<_, String>(8)?,
-                    row.get::<_, String>(9)?,
                 ))
             },
         )
         .optional()?
         .map(|stored| {
-            crate::control_domain::require_sha(&stored.6, "provisioning source SHA")?;
+            let canonical_repository: crate::repository_policy::GitRepository =
+                serde_json::from_str(&stored.4)?;
+            canonical_repository
+                .object_format()
+                .require_oid(&stored.5, "provisioning source SHA")?;
             let path = path_from_bytes(stored.0);
             let plan = ProvisionPlan {
                     storage_root: repository_storage_root(&path, repo_key)?,
@@ -575,17 +801,23 @@ fn load_intent_by_repo_key(
                     staging_path: path_from_bytes(stored.1),
                     rift_database: path_from_bytes(stored.2),
                     target: stored.3,
-                    remote: RemoteIdentity {
-                        fetch_url: stored.4,
-                        push_url: stored.5,
-                    },
-                    source_sha: stored.6,
-                    policy: stored.7,
-                    created_at: stored.9,
+                    remote: remote_from_policy_json(&stored.4)?,
+                    canonical_repository,
+                    source_sha: stored.5,
+                    policy: stored.6,
+                    created_at: stored.8,
             };
-            Ok((plan, serde_json::from_str(&stored.8)?))
+            Ok((plan, serde_json::from_str(&stored.7)?))
         })
         .transpose()
+}
+
+fn remote_from_policy_json(json: &str) -> Result<RemoteIdentity> {
+    let repository: crate::repository_policy::GitRepository = serde_json::from_str(json)?;
+    Ok(RemoteIdentity {
+        fetch_url: repository.operational_fetch_url(),
+        push_url: repository.operational_push_url(),
+    })
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf> {
@@ -639,37 +871,28 @@ fn require_requested_locations(
 
 fn prepare_bootstrap_request(
     connection: &mut Connection,
-    options: &ProvisionOptions,
+    options: &PreflightedProvision,
     request_path: &Path,
 ) -> Result<Option<RepoKey>> {
-    let storage_root = absolute_path(&options.storage_root)?;
-    let rift_database = planned_rift_database(options.rift_database.as_deref())?;
+    let storage_root = &options.storage_root;
+    let rift_database = &options.rift_database;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let timestamp = chrono::Utc::now().to_rfc3339();
     transaction.execute(
-        "INSERT INTO repository_bootstrap_requests(request_path,target_branch,remote_name,storage_root_path,rift_registry_path,repo_key,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,NULL,?6,?6) ON CONFLICT(request_path) DO NOTHING",
-        params![request_path.as_os_str().as_bytes(),options.target,options.remote_name,storage_root.as_os_str().as_bytes(),rift_database.as_os_str().as_bytes(),timestamp],
+        "INSERT INTO repository_bootstrap_requests(request_path,storage_root_path,rift_registry_path,repo_key,created_at,updated_at) VALUES(?1,?2,?3,NULL,?4,?4) ON CONFLICT(request_path) DO NOTHING",
+        params![request_path.as_os_str().as_bytes(),storage_root.as_os_str().as_bytes(),rift_database.as_os_str().as_bytes(),timestamp],
     )?;
     let stored = transaction.query_row(
-        "SELECT target_branch,remote_name,storage_root_path,rift_registry_path,repo_key FROM repository_bootstrap_requests WHERE request_path=?1",
+        "SELECT storage_root_path,rift_registry_path,repo_key FROM repository_bootstrap_requests WHERE request_path=?1",
         [request_path.as_os_str().as_bytes()],
-        |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, Vec<u8>>(2)?,row.get::<_, Vec<u8>>(3)?,row.get::<_, Option<String>>(4)?)),
+        |row| Ok((row.get::<_, Vec<u8>>(0)?,row.get::<_, Vec<u8>>(1)?,row.get::<_, Option<String>>(2)?)),
     )?;
-    if stored.0 != options.target {
-        anyhow::bail!(
-            "bootstrap request is already reserved with immutable target {}",
-            stored.0
-        );
-    }
-    if stored.1 != options.remote_name
-        || path_from_bytes(stored.2) != storage_root
-        || path_from_bytes(stored.3) != rift_database
-    {
+    if path_from_bytes(stored.0) != *storage_root || path_from_bytes(stored.1) != *rift_database {
         anyhow::bail!(
             "bootstrap request identity is already bound to different repository options"
         );
     }
-    let repo_key = stored.4.map(RepoKey::from_stored).transpose()?;
+    let repo_key = stored.2.map(RepoKey::from_stored).transpose()?;
     transaction.commit()?;
     Ok(repo_key)
 }
@@ -723,23 +946,36 @@ fn planned_rift_database(explicit: Option<&Path>) -> Result<PathBuf> {
 
 fn reserve_plan(
     connection: &mut Connection,
-    options: &ProvisionOptions,
+    options: &PreflightedProvision,
     bootstrap_request: PathBuf,
     remote: RemoteIdentity,
     source_sha: String,
     policy: Option<Vec<u8>>,
 ) -> Result<(ProvisionPlan, ProvisioningLifecycle, bool)> {
-    let rift_database = planned_rift_database(options.rift_database.as_deref())?;
+    let rift_database = options.rift_database.clone();
     wait_at_reservation_barrier()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let ownership_key = options
+        .repository_policy
+        .canonical_repository
+        .canonical_ownership_key()?;
     let owner = transaction
         .query_row(
-            "SELECT repo_key,target_branch FROM repository_remote_owners WHERE fetch_url=?1 AND push_url=?2",
-            params![remote.fetch_url, remote.push_url],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            "SELECT ownership.repo_key,policy.target_branch,ownership.role FROM physical_repository_ownership ownership JOIN repository_policies policy ON policy.repo_key=ownership.repo_key WHERE ownership.identity_key=?1",
+            [&ownership_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
         .optional()?;
-    let (repo_key, newly_reserved) = if let Some((repo_key, target)) = owner {
+    let (repo_key, newly_reserved) = if let Some((repo_key, target, role)) = owner {
+        if role != "canonical" {
+            anyhow::bail!("canonical repository is already reserved as a replica");
+        }
         if target != options.target {
             anyhow::bail!("remote is already reserved with immutable target {target}");
         }
@@ -747,14 +983,33 @@ fn reserve_plan(
     } else {
         let repo_key = RepoKey::new();
         transaction.execute(
-            "INSERT INTO repository_remote_owners(repo_key,fetch_url,push_url,target_branch,created_at) VALUES(?1,?2,?3,?4,?5)",
-            params![repo_key.as_str(),remote.fetch_url,remote.push_url,options.target,chrono::Utc::now().to_rfc3339()],
+            "INSERT INTO repository_policies(repo_key,revision,operation_state_json,canonical_repository_json,canonical_ownership_key,target_branch,integration_policy,replication_policy_json,created_at,updated_at) VALUES(?1,1,?2,?3,?4,?5,?6,?7,?8,?8)",
+            params![repo_key.as_str(),serde_json::to_string(&options.repository_policy.operation_state)?,serde_json::to_string(&options.repository_policy.canonical_repository)?,ownership_key,options.repository_policy.target_branch,options.repository_policy.integration_policy.to_string(),serde_json::to_string(&options.repository_policy.replication_policy)?,chrono::Utc::now().to_rfc3339()],
+        )?;
+        crate::sqlite::reserve_policy_physical_ownership(
+            &transaction,
+            repo_key.as_str(),
+            &options.repository_policy,
         )?;
         (repo_key, true)
     };
+    let stored_policy: (String, String, String, String, String) = transaction.query_row(
+        "SELECT operation_state_json,canonical_repository_json,target_branch,integration_policy,replication_policy_json FROM repository_policies WHERE repo_key=?1",
+        [repo_key.as_str()],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+    )?;
+    let expected_policy = &options.repository_policy;
+    if stored_policy.0 != serde_json::to_string(&expected_policy.operation_state)?
+        || stored_policy.1 != serde_json::to_string(&expected_policy.canonical_repository)?
+        || stored_policy.2 != expected_policy.target_branch
+        || stored_policy.3 != expected_policy.integration_policy.to_string()
+        || stored_policy.4 != serde_json::to_string(&expected_policy.replication_policy)?
+    {
+        anyhow::bail!("repository is already reserved with a different explicit policy");
+    }
     let stored = transaction
         .query_row(
-            "SELECT owned_root_path,staging_root_path,rift_registry_path,target_branch,fetch_url,push_url,source_sha,policy_bytes,lifecycle_json,created_at FROM repository_provisioning_intents WHERE repo_key=?1",
+            "SELECT owned_root_path,staging_root_path,rift_registry_path,source_sha,policy_bytes,lifecycle_json,created_at FROM repository_provisioning_intents WHERE repo_key=?1",
             [repo_key.as_str()],
             |row| {
                 Ok((
@@ -762,12 +1017,9 @@ fn reserve_plan(
                     row.get::<_, Vec<u8>>(1)?,
                     row.get::<_, Vec<u8>>(2)?,
                     row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
-                    row.get::<_, Option<Vec<u8>>>(7)?,
-                    row.get::<_, String>(8)?,
-                    row.get::<_, String>(9)?,
                 ))
             },
         )
@@ -779,6 +1031,7 @@ fn reserve_plan(
         rift_database,
         target,
         remote,
+        canonical_repository,
         source_sha,
         policy,
         lifecycle,
@@ -804,15 +1057,13 @@ fn reserve_plan(
             path,
             path_from_bytes(stored.1),
             durable_rift_database,
+            options.repository_policy.target_branch.clone(),
+            remote,
+            options.repository_policy.canonical_repository.clone(),
             stored.3,
-            RemoteIdentity {
-                fetch_url: stored.4,
-                push_url: stored.5,
-            },
+            stored.4,
+            serde_json::from_str(&stored.5)?,
             stored.6,
-            stored.7,
-            serde_json::from_str(&stored.8)?,
-            stored.9,
         )
     } else {
         if !newly_reserved {
@@ -829,8 +1080,8 @@ fn reserve_plan(
         let lifecycle = ProvisioningLifecycle::Reserved;
         let created_at = chrono::Utc::now().to_rfc3339();
         transaction.execute(
-            "INSERT INTO repository_provisioning_intents(repo_key,bootstrap_path,owned_root_path,staging_root_path,rift_registry_path,target_branch,fetch_url,push_url,source_sha,policy_bytes,lifecycle_json,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)",
-            params![repo_key.as_str(),bootstrap_request.as_os_str().as_bytes(),path.as_os_str().as_bytes(),staging_path.as_os_str().as_bytes(),rift_database.as_os_str().as_bytes(),options.target,remote.fetch_url,remote.push_url,source_sha,policy,serde_json::to_string(&lifecycle)?,created_at],
+            "INSERT INTO repository_provisioning_intents(repo_key,bootstrap_path,owned_root_path,staging_root_path,rift_registry_path,source_sha,policy_bytes,lifecycle_json,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",
+            params![repo_key.as_str(),bootstrap_request.as_os_str().as_bytes(),path.as_os_str().as_bytes(),staging_path.as_os_str().as_bytes(),rift_database.as_os_str().as_bytes(),source_sha,policy,serde_json::to_string(&lifecycle)?,created_at],
         )?;
         (
             options.storage_root.clone(),
@@ -839,6 +1090,7 @@ fn reserve_plan(
             rift_database,
             options.target.clone(),
             remote,
+            options.repository_policy.canonical_repository.clone(),
             source_sha,
             policy,
             lifecycle,
@@ -861,6 +1113,7 @@ fn reserve_plan(
             staging_path,
             target,
             remote,
+            canonical_repository,
             rift_database,
             source_sha,
             policy,
@@ -947,13 +1200,13 @@ fn verify_completed_effects(
     match lifecycle {
         ProvisioningLifecycle::Reserved => {}
         ProvisioningLifecycle::StagingDirectory => verify_staging_directory(plan)?,
-        ProvisioningLifecycle::GitInitialized => verify_initialized_git(plan)?,
-        ProvisioningLifecycle::RemoteConfigured => {
+        ProvisioningLifecycle::GitInitialized(_) => verify_initialized_git(plan)?,
+        ProvisioningLifecycle::RemoteConfigured(_) => {
             verify_initialized_git(plan)?;
             verify_remote(&plan.staging_path, &plan.remote)?;
         }
-        ProvisioningLifecycle::TargetFetched => verify_fetched_target(plan)?,
-        ProvisioningLifecycle::TargetCheckedOut => {
+        ProvisioningLifecycle::TargetFetched(_) => verify_fetched_target(plan)?,
+        ProvisioningLifecycle::TargetCheckedOut(_) => {
             match (entry_exists(&plan.path)?, entry_exists(&plan.staging_path)?) {
                 (false, true) => verify_git_at(plan, &plan.staging_path, false)?,
                 (true, false) => verify_git_at(plan, &plan.path, false)?,
@@ -965,16 +1218,14 @@ fn verify_completed_effects(
                 }
             }
         }
-        ProvisioningLifecycle::RootPublished => verify_published_root(plan)?,
-        ProvisioningLifecycle::PolicyPublished { policy_sha256 } => {
+        ProvisioningLifecycle::RootPublished(_) => verify_published_root(plan)?,
+        ProvisioningLifecycle::PolicyPublished(state) => {
             verify_published_root(plan)?;
-            verify_published_policy(plan, policy_sha256.as_deref())?;
+            verify_published_policy(plan, state.policy_sha256.as_deref())?;
         }
-        ProvisioningLifecycle::RiftInitialized { policy_sha256 } => {
+        ProvisioningLifecycle::RiftInitialized(state) => {
             verify_published_root(plan)?;
-            verify_published_policy(plan, policy_sha256.as_deref())?;
-            read_rift_id(&plan.path)?;
-            verify_independent_rift_root(&plan.path, Some(&plan.rift_database))?;
+            verify_published_policy(plan, state.policy_sha256.as_deref())?;
         }
         ProvisioningLifecycle::RiftVerified(state) => {
             verify_rift_proof(plan, state)?;
@@ -1028,21 +1279,43 @@ fn verify_initialized_git(plan: &ProvisionPlan) -> Result<()> {
         0,
         "repository operation lock",
     )?;
-    if !git_text(&plan.staging_path, ["remote"])?.is_empty()
-        && git_text(&plan.staging_path, ["remote"])? != INTERNAL_REMOTE_NAME
-    {
+    let remotes = git_text(&plan.staging_path, ["remote"])?;
+    if !remotes.is_empty() && remotes != INTERNAL_REMOTE_NAME {
         anyhow::bail!("owned repository staging checkout has unexpected remotes");
     }
     Ok(())
 }
 
 fn verify_fetched_target(plan: &ProvisionPlan) -> Result<()> {
-    verify_remote(&plan.staging_path, &plan.remote)?;
-    if !git_object_exists(&plan.staging_path, &plan.source_sha)?
-        || git_text(
-            &plan.staging_path,
-            ["rev-parse", &format!("{}^{{commit}}", plan.source_sha)],
-        )? != plan.source_sha
+    let object = format!("{}^{{commit}}", plan.source_sha);
+    let commands = [
+        vec![
+            "config".into(),
+            "--name-only".into(),
+            "--get-regexp".into(),
+            r"^url\..*\.(insteadof|pushinsteadof)$".into(),
+        ],
+        vec!["remote".into()],
+        vec![
+            "config".into(),
+            "--get-all".into(),
+            "remote.iq-target.url".into(),
+        ],
+        vec![
+            "config".into(),
+            "--get-all".into(),
+            "remote.iq-target.pushurl".into(),
+        ],
+        vec!["cat-file".into(), "-e".into(), object.clone().into()],
+        vec!["rev-parse".into(), object.into()],
+    ];
+    let outputs = crate::git_command::read_outputs(&plan.staging_path, &commands)?;
+    require_no_url_rewrite_output(&outputs[0])?;
+    if output_text(&outputs[1], "inspect fetched repository remotes")? != INTERNAL_REMOTE_NAME
+        || output_text(&outputs[2], "inspect fetched repository URL")? != plan.remote.fetch_url
+        || output_text(&outputs[3], "inspect fetched repository push URL")? != plan.remote.push_url
+        || !outputs[4].status.success()
+        || output_text(&outputs[5], "resolve fetched target")? != plan.source_sha
     {
         anyhow::bail!("fetched target differs from durable provisioning intent");
     }
@@ -1097,6 +1370,40 @@ fn verify_rift_proof(plan: &ProvisionPlan, state: &RiftVerified) -> Result<()> {
     Ok(())
 }
 
+fn verify_completed_rift_initialization(plan: &ProvisionPlan) -> Result<()> {
+    let registry_identity = rift_registry_identity(Some(&plan.rift_database))?;
+    let registry = Connection::open_with_flags(
+        &registry_identity,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    crate::sqlite::configure_connection(&registry)?;
+    let registered: Option<(String, Option<String>)> = registry
+        .query_row(
+            "SELECT id,parent_id FROM rift WHERE path=?1",
+            [plan
+                .path
+                .to_str()
+                .context("owned repository root path is not UTF-8")?],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((registered_rift_id, parent_id)) = registered else {
+        anyhow::bail!("Rift registry does not contain the exact independent root transition");
+    };
+    if parent_id.is_some() {
+        anyhow::bail!("Rift registry transition is not an independent root");
+    }
+    if entry_exists(&plan.path.join(".rift"))? {
+        if read_rift_id(&plan.path)? != registered_rift_id {
+            anyhow::bail!("Rift marker conflicts with the exact registry transition");
+        }
+        verify_independent_rift_root(&plan.path, Some(&plan.rift_database))?;
+    }
+    let binding = crate::git_command::RepositoryBinding::capture(&plan.path)?;
+    crate::git_command::register_binding(&binding)?;
+    Ok(())
+}
+
 fn sync_plan_effects(plan: &ProvisionPlan) -> Result<()> {
     let active = if entry_exists(&plan.path)? {
         Some(plan.path.as_path())
@@ -1126,6 +1433,7 @@ fn owned_repository(plan: &ProvisionPlan, rift: RiftRootIdentity) -> OwnedReposi
         path: plan.path.clone(),
         rift,
         remote: plan.remote.clone(),
+        canonical_repository: plan.canonical_repository.clone(),
         target: plan.target.clone(),
         children: child_roots(plan),
         source_sha: plan.source_sha.clone(),
@@ -1148,34 +1456,49 @@ fn child_roots(plan: &ProvisionPlan) -> ChildWorkspaceRoots {
 }
 
 pub(crate) fn validate_provisioning_rows(connection: &Connection) -> Result<()> {
-    let mut requests = connection.prepare(
-        "SELECT request_path,target_branch,remote_name,storage_root_path,rift_registry_path,repo_key FROM repository_bootstrap_requests",
-    )?;
+    let legacy = table_has_column(connection, "repository_bootstrap_requests", "target_branch")?;
+    let request_query = if legacy {
+        "SELECT request_path,storage_root_path,rift_registry_path,repo_key,target_branch,remote_name FROM repository_bootstrap_requests"
+    } else {
+        "SELECT request_path,storage_root_path,rift_registry_path,repo_key,NULL,NULL FROM repository_bootstrap_requests"
+    };
+    let mut requests = connection.prepare(request_query)?;
     let request_rows = requests.query_map([], |row| {
         Ok((
             row.get::<_, Vec<u8>>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, Vec<u8>>(3)?,
-            row.get::<_, Vec<u8>>(4)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
             row.get::<_, Option<String>>(5)?,
         ))
     })?;
     for row in request_rows {
-        let (request, target, remote, storage, registry, repo_key) = row?;
+        let (request, storage, registry, repo_key, target, remote) = row?;
         if !path_from_bytes(request).is_absolute()
             || !path_from_bytes(storage).is_absolute()
             || !path_from_bytes(registry).is_absolute()
-            || remote.is_empty()
         {
             anyhow::bail!("repository bootstrap request authority is invalid");
         }
-        validate_target_branch(&target)?;
+        if legacy {
+            validate_target_branch(
+                target
+                    .as_deref()
+                    .context("legacy bootstrap target missing")?,
+            )?;
+            if remote.as_deref().is_none_or(str::is_empty) {
+                anyhow::bail!("legacy bootstrap remote name is empty");
+            }
+        }
         repo_key.map(RepoKey::from_stored).transpose()?;
     }
-    let mut statement = connection.prepare(
-        "SELECT repo_key,owned_root_path,staging_root_path,rift_registry_path,target_branch,source_sha,policy_bytes,lifecycle_json FROM repository_provisioning_intents",
-    )?;
+    let intent_query = if legacy {
+        "SELECT repo_key,owned_root_path,staging_root_path,rift_registry_path,source_sha,policy_bytes,lifecycle_json,target_branch,NULL FROM repository_provisioning_intents"
+    } else {
+        "SELECT intent.repo_key,intent.owned_root_path,intent.staging_root_path,intent.rift_registry_path,intent.source_sha,intent.policy_bytes,intent.lifecycle_json,NULL,policy.canonical_repository_json FROM repository_provisioning_intents intent JOIN repository_policies policy ON policy.repo_key=intent.repo_key"
+    };
+    let mut statement = connection.prepare(intent_query)?;
     let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -1183,13 +1506,24 @@ pub(crate) fn validate_provisioning_rows(connection: &Connection) -> Result<()> 
             row.get::<_, Vec<u8>>(2)?,
             row.get::<_, Vec<u8>>(3)?,
             row.get::<_, String>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, Option<Vec<u8>>>(6)?,
-            row.get::<_, String>(7)?,
+            row.get::<_, Option<Vec<u8>>>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<String>>(8)?,
         ))
     })?;
     for row in rows {
-        let (repo_key, root, staging, rift_database, target, source_sha, policy, lifecycle) = row?;
+        let (
+            repo_key,
+            root,
+            staging,
+            rift_database,
+            source_sha,
+            policy,
+            lifecycle,
+            target,
+            canonical_repository,
+        ) = row?;
         RepoKey::from_stored(repo_key)?;
         let root = path_from_bytes(root);
         let staging = path_from_bytes(staging);
@@ -1201,14 +1535,76 @@ pub(crate) fn validate_provisioning_rows(connection: &Connection) -> Result<()> 
         {
             anyhow::bail!("repository provisioning paths are not canonical planned paths");
         }
-        validate_target_branch(&target)?;
-        crate::control_domain::require_sha(&source_sha, "provisioning source SHA")?;
-        let lifecycle: ProvisioningLifecycle = serde_json::from_str(&lifecycle)?;
-        let persisted_digest = match &lifecycle {
-            ProvisioningLifecycle::PolicyPublished { policy_sha256 }
-            | ProvisioningLifecycle::RiftInitialized { policy_sha256 } => {
-                Some(policy_sha256.as_ref())
+        if let Some(target) = target {
+            validate_target_branch(&target)?;
+        }
+        let object_format = if let Some(repository) = canonical_repository {
+            serde_json::from_str::<crate::repository_policy::GitRepository>(&repository)?
+                .object_format()
+        } else {
+            crate::git_object::GitObjectFormat::Sha1
+        };
+        object_format.require_oid(&source_sha, "provisioning source SHA")?;
+        if legacy {
+            let lifecycle: Schema3ProvisioningLifecycle = serde_json::from_str(&lifecycle)?;
+            let persisted_digest = match &lifecycle {
+                Schema3ProvisioningLifecycle::PolicyPublished { policy_sha256 }
+                | Schema3ProvisioningLifecycle::RiftInitialized { policy_sha256 } => {
+                    Some(policy_sha256.as_ref())
+                }
+                Schema3ProvisioningLifecycle::RiftVerified(state)
+                | Schema3ProvisioningLifecycle::OwnerPublished(state)
+                | Schema3ProvisioningLifecycle::ChildRootsPublished(state) => {
+                    if !state.rift.registry_identity.is_absolute()
+                        || state.rift.registry_inode == 0
+                        || state.rift.generation != 0
+                    {
+                        anyhow::bail!("repository provisioning Rift authority is invalid");
+                    }
+                    Some(state.policy_sha256.as_ref())
+                }
+                _ => None,
+            };
+            if let Some(persisted_digest) = persisted_digest {
+                let actual_digest = policy
+                    .as_ref()
+                    .map(|bytes| format!("{:x}", Sha256::digest(bytes)));
+                if persisted_digest.map(String::as_str) != actual_digest.as_deref() {
+                    anyhow::bail!("repository provisioning policy digest is invalid");
+                }
             }
+            continue;
+        }
+        let lifecycle: ProvisioningLifecycle = serde_json::from_str(&lifecycle)?;
+        let expected_binding_path = match &lifecycle {
+            ProvisioningLifecycle::GitInitialized(state)
+            | ProvisioningLifecycle::RemoteConfigured(state)
+            | ProvisioningLifecycle::TargetFetched(state)
+            | ProvisioningLifecycle::TargetCheckedOut(state) => {
+                Some((&state.git_binding, staging.as_path()))
+            }
+            ProvisioningLifecycle::RootPublished(state) => {
+                Some((&state.git_binding, root.as_path()))
+            }
+            ProvisioningLifecycle::PolicyPublished(state)
+            | ProvisioningLifecycle::RiftInitialized(state) => {
+                Some((&state.git_binding, root.as_path()))
+            }
+            ProvisioningLifecycle::RiftVerified(state)
+            | ProvisioningLifecycle::OwnerPublished(state)
+            | ProvisioningLifecycle::ChildRootsPublished(state) => {
+                Some((&state.git_binding, root.as_path()))
+            }
+            ProvisioningLifecycle::Reserved | ProvisioningLifecycle::StagingDirectory => None,
+        };
+        if let Some((binding, expected_path)) = expected_binding_path {
+            if binding.top_level != expected_path || binding.object_format != object_format {
+                anyhow::bail!("repository provisioning Git binding is invalid for its phase");
+            }
+        }
+        let persisted_digest = match &lifecycle {
+            ProvisioningLifecycle::PolicyPublished(state)
+            | ProvisioningLifecycle::RiftInitialized(state) => Some(state.policy_sha256.as_ref()),
             ProvisioningLifecycle::RiftVerified(state)
             | ProvisioningLifecycle::OwnerPublished(state)
             | ProvisioningLifecycle::ChildRootsPublished(state) => {
@@ -1234,11 +1630,20 @@ pub(crate) fn validate_provisioning_rows(connection: &Connection) -> Result<()> 
     Ok(())
 }
 
+fn table_has_column(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(columns.iter().any(|candidate| candidate == column))
+}
+
 fn persist_ready(
     connection: &mut Connection,
     repository: &OwnedRepositoryRoot,
     created_at: &str,
 ) -> Result<()> {
+    let git_binding = crate::git_command::authorize_current(&repository.path)?;
     let transaction = connection.transaction()?;
     let timestamp = chrono::Utc::now().to_rfc3339();
     transaction.execute(
@@ -1246,8 +1651,8 @@ fn persist_ready(
         [repository.repo_key.as_str()],
     )?;
     transaction.execute(
-        "INSERT INTO registered_repositories(repo_key,owned_root_path,root_rift_id,registry_identity,registry_device,registry_inode,generation,remote_name,fetch_url,push_url,target_branch,source_sha,checkout_json,development_root_path,integration_root_path,provisioning_json,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,'iq-target',?8,?9,?10,?11,?12,?13,?14,'{\"state\":\"ready\"}',?15,?16)",
-        params![repository.repo_key.as_str(),repository.path.as_os_str().as_bytes(),repository.rift.rift_id,repository.rift.registry_identity.as_os_str().as_bytes(),repository.rift.registry_device,repository.rift.registry_inode,repository.rift.generation,repository.remote.fetch_url,repository.remote.push_url,repository.target,repository.source_sha,serde_json::to_string(&crate::sqlite::CheckoutReconciliationState::ready(&repository.source_sha)?)?,repository.children.development.as_os_str().as_bytes(),repository.children.integration.as_os_str().as_bytes(),created_at,timestamp],
+        "INSERT INTO registered_repositories(repo_key,owned_root_path,git_binding_json,root_rift_id,registry_identity,registry_device,registry_inode,generation,source_sha,checkout_json,development_root_path,integration_root_path,provisioning_json,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'{\"state\":\"ready\"}',?13,?14)",
+        params![repository.repo_key.as_str(),repository.path.as_os_str().as_bytes(),serde_json::to_string(&git_binding)?,repository.rift.rift_id,repository.rift.registry_identity.as_os_str().as_bytes(),repository.rift.registry_device,repository.rift.registry_inode,repository.rift.generation,repository.source_sha,serde_json::to_string(&crate::sqlite::CheckoutReconciliationState::ready(&repository.source_sha,git_binding.object_format)?)?,repository.children.development.as_os_str().as_bytes(),repository.children.integration.as_os_str().as_bytes(),created_at,timestamp],
     )?;
     for (kind, path) in [
         ("development", &repository.children.development),
@@ -1264,12 +1669,13 @@ fn persist_ready(
 
 fn find_registered(
     connection: &Connection,
-    remote: &RemoteIdentity,
+    policy: &crate::repository_policy::RepositoryPolicy,
 ) -> Result<Option<OwnedRepositoryRoot>> {
+    let ownership_key = policy.canonical_repository.canonical_ownership_key()?;
     connection
         .query_row(
-            "SELECT repo_key,owned_root_path,root_rift_id,registry_identity,registry_device,registry_inode,generation,fetch_url,push_url,target_branch,source_sha,development_root_path,integration_root_path FROM registered_repositories WHERE fetch_url=?1 AND push_url=?2",
-            params![remote.fetch_url,remote.push_url],
+            "SELECT repository.repo_key,repository.owned_root_path,repository.root_rift_id,repository.registry_identity,repository.registry_device,repository.registry_inode,repository.generation,policy.canonical_repository_json,policy.target_branch,repository.source_sha,repository.development_root_path,repository.integration_root_path FROM physical_repository_ownership ownership JOIN registered_repositories repository ON repository.repo_key=ownership.repo_key JOIN repository_policies policy ON policy.repo_key=repository.repo_key WHERE ownership.identity_key=?1 AND ownership.role='canonical'",
+            [ownership_key],
             map_owned_root,
         )
         .optional()
@@ -1278,17 +1684,29 @@ fn find_registered(
 
 fn find_remote_owner(
     connection: &Connection,
-    remote: &RemoteIdentity,
+    policy: &crate::repository_policy::RepositoryPolicy,
 ) -> Result<Option<(RepoKey, String)>> {
-    connection
+    let ownership_key = policy.canonical_repository.canonical_ownership_key()?;
+    let owner = connection
         .query_row(
-            "SELECT repo_key,target_branch FROM repository_remote_owners WHERE fetch_url=?1 AND push_url=?2",
-            params![remote.fetch_url, remote.push_url],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            "SELECT ownership.repo_key,policy.target_branch,ownership.role FROM physical_repository_ownership ownership JOIN repository_policies policy ON policy.repo_key=ownership.repo_key WHERE ownership.identity_key=?1",
+            [ownership_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
-        .optional()?
-        .map(|(repo_key, target)| Ok((RepoKey::from_stored(repo_key)?, target)))
-        .transpose()
+        .optional()?;
+    match owner {
+        Some((_, _, role)) if role != "canonical" => {
+            anyhow::bail!("canonical repository is already reserved as a replica")
+        }
+        Some((repo_key, target, _)) => Ok(Some((RepoKey::from_stored(repo_key)?, target))),
+        None => Ok(None),
+    }
 }
 
 fn find_registered_by_key(
@@ -1297,7 +1715,7 @@ fn find_registered_by_key(
 ) -> Result<Option<OwnedRepositoryRoot>> {
     connection
         .query_row(
-            "SELECT repo_key,owned_root_path,root_rift_id,registry_identity,registry_device,registry_inode,generation,fetch_url,push_url,target_branch,source_sha,development_root_path,integration_root_path FROM registered_repositories WHERE repo_key=?1",
+            "SELECT repository.repo_key,repository.owned_root_path,repository.root_rift_id,repository.registry_identity,repository.registry_device,repository.registry_inode,repository.generation,policy.canonical_repository_json,policy.target_branch,repository.source_sha,repository.development_root_path,repository.integration_root_path FROM registered_repositories repository JOIN repository_policies policy ON policy.repo_key=repository.repo_key WHERE repository.repo_key=?1",
             [repo_key.as_str()],
             map_owned_root,
         )
@@ -1306,7 +1724,10 @@ fn find_registered_by_key(
 }
 
 fn map_owned_root(row: &rusqlite::Row<'_>) -> rusqlite::Result<OwnedRepositoryRoot> {
-    let target: String = row.get(9)?;
+    let canonical: crate::repository_policy::GitRepository =
+        serde_json::from_str(&row.get::<_, String>(7)?)
+            .map_err(|error| sql_conversion_error(error.into()))?;
+    let target: String = row.get(8)?;
     Ok(OwnedRepositoryRoot {
         repo_key: RepoKey::from_stored(row.get::<_, String>(0)?).map_err(sql_conversion_error)?,
         path: path_from_bytes(row.get(1)?),
@@ -1318,16 +1739,17 @@ fn map_owned_root(row: &rusqlite::Row<'_>) -> rusqlite::Result<OwnedRepositoryRo
             generation: row.get(6)?,
         },
         remote: RemoteIdentity {
-            fetch_url: row.get(7)?,
-            push_url: row.get(8)?,
+            fetch_url: canonical.operational_fetch_url(),
+            push_url: canonical.operational_push_url(),
         },
+        canonical_repository: canonical,
         target: validate_target_branch(&target)
             .map(str::to_string)
             .map_err(sql_conversion_error)?,
-        source_sha: row.get(10)?,
+        source_sha: row.get(9)?,
         children: ChildWorkspaceRoots {
-            development: path_from_bytes(row.get(11)?),
-            integration: path_from_bytes(row.get(12)?),
+            development: path_from_bytes(row.get(10)?),
+            integration: path_from_bytes(row.get(11)?),
         },
     })
 }
@@ -1419,7 +1841,10 @@ fn initialize_git(plan: &ProvisionPlan) -> Result<()> {
     {
         anyhow::bail!("uninitialized owned repository staging directory is not empty");
     }
-    git(&plan.staging_path, ["init"], "initialize owned repository")?;
+    crate::git_command::init_repository(
+        &plan.staging_path,
+        plan.canonical_repository.object_format(),
+    )?;
     require_real_directory(&git_path, "owned repository Git directory")?;
     if !git_text(&plan.staging_path, ["remote"])?.is_empty() {
         anyhow::bail!("owned repository gained a remote before remote configuration");
@@ -1472,12 +1897,38 @@ fn configure_remote(plan: &ProvisionPlan) -> Result<()> {
     verify_remote(&plan.staging_path, &plan.remote)
 }
 
-fn fetch_target(plan: &ProvisionPlan) -> Result<()> {
+fn fetch_target(connection: &Connection, plan: &ProvisionPlan) -> Result<()> {
     verify_remote(&plan.staging_path, &plan.remote)?;
     if !git_object_exists(&plan.staging_path, &plan.source_sha)? {
-        git(
-            &plan.staging_path,
-            ["fetch", "--no-tags", INTERNAL_REMOTE_NAME, &plan.source_sha],
+        require_success(
+            crate::git_command::external_output(
+                &plan.staging_path,
+                [
+                    "fetch",
+                    "--no-tags",
+                    &plan.remote.fetch_url,
+                    &plan.source_sha,
+                ],
+                &plan.canonical_repository,
+                || {
+                    require_provisioning_phase(connection, &plan.repo_key, "remote_configured")?;
+                    let (revision, canonical): (i64, String) = connection.query_row(
+                        "SELECT revision,canonical_repository_json FROM repository_policies WHERE repo_key=?1",
+                        [plan.repo_key.as_str()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?;
+                    if revision != 1
+                        || serde_json::from_str::<crate::repository_policy::GitRepository>(
+                            &canonical,
+                        )? != plan.canonical_repository
+                    {
+                        anyhow::bail!(
+                            "repository provisioning policy changed before fetch release"
+                        );
+                    }
+                    verify_remote(&plan.staging_path, &plan.remote)
+                },
+            )?,
             "fetch exact target commit",
         )?;
     }
@@ -1536,6 +1987,7 @@ fn publish_root(plan: &ProvisionPlan) -> Result<()> {
         (true, true) => anyhow::bail!("owned repository root and staging root both exist"),
         (false, false) => anyhow::bail!("owned repository root publication lost both paths"),
     }
+    crate::git_command::authorize_current(&plan.path)?;
     verify_git_at(plan, &plan.path, false)
 }
 
@@ -1562,18 +2014,99 @@ fn verify_git_at(plan: &ProvisionPlan, path: &Path, require_exclusion: bool) -> 
     {
         anyhow::bail!("repository operation lock contains unexpected data");
     }
-    if git_text(path, ["rev-parse", "HEAD"])? != plan.source_sha {
+    let expected_tree = format!("{}^{{tree}}", plan.source_sha);
+    let commands = [
+        vec!["rev-parse".into(), "HEAD".into()],
+        vec!["rev-parse".into(), expected_tree.into()],
+        vec!["write-tree".into()],
+        vec![
+            "status".into(),
+            "--porcelain=v1".into(),
+            "--untracked-files=all".into(),
+        ],
+        vec!["symbolic-ref".into(), "--short".into(), "HEAD".into()],
+        vec![
+            "config".into(),
+            "--name-only".into(),
+            "--get-regexp".into(),
+            r"^url\..*\.(insteadof|pushinsteadof)$".into(),
+        ],
+        vec!["remote".into()],
+        vec![
+            "config".into(),
+            "--get-all".into(),
+            "remote.iq-target.url".into(),
+        ],
+        vec![
+            "config".into(),
+            "--get-all".into(),
+            "remote.iq-target.pushurl".into(),
+        ],
+        vec![
+            "ls-files".into(),
+            "--error-unmatch".into(),
+            POLICY_PATH.into(),
+        ],
+    ];
+    let outputs = crate::git_command::read_outputs(path, &commands)?;
+    let text = |index: usize, label: &str| -> Result<String> {
+        let output = &outputs[index];
+        if !output.status.success() {
+            anyhow::bail!(
+                "{label} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8(output.stdout.clone())?.trim().into())
+    };
+    if text(0, "inspect owned repository HEAD")? != plan.source_sha {
         anyhow::bail!("owned repository HEAD differs from provisioning intent");
     }
-    verify_exact_checkout(path, &plan.source_sha)?;
-    if git_text(path, ["symbolic-ref", "--short", "HEAD"])? != plan.target {
+    if text(2, "inspect owned repository index")?
+        != text(1, "inspect expected owned repository tree")?
+    {
+        anyhow::bail!("owned repository index differs from expected target tree");
+    }
+    if !text(3, "inspect owned repository worktree")?.is_empty() {
+        anyhow::bail!("owned repository worktree differs from expected target tree");
+    }
+    if text(4, "inspect owned repository branch")? != plan.target {
         anyhow::bail!("owned repository is not on its target branch");
     }
-    verify_remote(path, &plan.remote)?;
-    if require_exclusion && !read_exclude(path)?.lines().any(|line| line == POLICY_PATH) {
-        anyhow::bail!("owned repository does not exclude its local policy");
+    match outputs[5].status.code() {
+        Some(1) => {}
+        Some(0) => anyhow::bail!("owned repository contains forbidden URL rewrites"),
+        _ => anyhow::bail!(
+            "cannot inspect owned repository URL rewrites: {}",
+            String::from_utf8_lossy(&outputs[5].stderr).trim()
+        ),
     }
-    reject_tracked_policy(path)
+    if text(6, "inspect owned repository remotes")? != INTERNAL_REMOTE_NAME
+        || text(7, "inspect owned repository fetch URL")? != plan.remote.fetch_url
+        || text(8, "inspect owned repository push URL")? != plan.remote.push_url
+    {
+        anyhow::bail!("owned repository remote identity changed");
+    }
+    match outputs[9].status.code() {
+        Some(1) => {}
+        Some(0) => anyhow::bail!(
+            ".iq/config.json is local control-plane configuration and must not be tracked"
+        ),
+        _ => anyhow::bail!(
+            "cannot determine whether .iq/config.json is tracked: {}",
+            String::from_utf8_lossy(&outputs[9].stderr).trim()
+        ),
+    }
+    if require_exclusion {
+        let exclusions = read_exclude(path)?;
+        if [POLICY_PATH, ".rift"]
+            .iter()
+            .any(|required| !exclusions.lines().any(|line| line == *required))
+        {
+            anyhow::bail!("owned repository does not contain its required local exclusions");
+        }
+    }
+    Ok(())
 }
 
 fn ensure_operation_lock(path: &Path) -> Result<()> {
@@ -1621,12 +2154,22 @@ fn ensure_policy_exclusion(root: &Path) -> Result<()> {
         1024 * 1024,
         "Git exclude file",
     )?)?;
-    if !excludes.lines().any(|line| line == POLICY_PATH) {
-        let mut updated = excludes.into_bytes();
+    let mut updated = excludes.into_bytes();
+    let mut changed = false;
+    for required in [POLICY_PATH, ".rift"] {
+        if String::from_utf8_lossy(&updated)
+            .lines()
+            .any(|line| line == required)
+        {
+            continue;
+        }
         if !updated.is_empty() && !updated.ends_with(b"\n") {
             updated.push(b'\n');
         }
-        updated.extend_from_slice(format!("{POLICY_PATH}\n").as_bytes());
+        updated.extend_from_slice(format!("{required}\n").as_bytes());
+        changed = true;
+    }
+    if changed {
         replace_file_atomically(&info, OsStr::new("exclude"), &updated, "Git exclude file")?;
     }
     Ok(())
@@ -1644,7 +2187,11 @@ fn read_exclude(root: &Path) -> Result<String> {
     .context("Git exclude file is not UTF-8")
 }
 
-fn provision_rift(path: &Path, database: Option<&Path>) -> Result<()> {
+fn provision_rift(
+    path: &Path,
+    database: Option<&Path>,
+    authorize_start: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     let database_path = database
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("IQ_RIFT_DATABASE").map(PathBuf::from))
@@ -1669,6 +2216,7 @@ fn provision_rift(path: &Path, database: Option<&Path>) -> Result<()> {
             &database_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
+        crate::sqlite::configure_connection(&registry)?;
         let has_rift: bool = registry.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='rift')",
             [],
@@ -1713,6 +2261,7 @@ fn provision_rift(path: &Path, database: Option<&Path>) -> Result<()> {
                         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
                             | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
                     )?;
+                    crate::sqlite::configure_connection(&registry)?;
                     let has_rift: bool = registry.query_row(
                         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='rift')",
                         [],
@@ -1735,16 +2284,17 @@ fn provision_rift(path: &Path, database: Option<&Path>) -> Result<()> {
                 fs::remove_file(path.join(".rift"))?;
                 root.sync_all()?;
             }
-            let mut command = Command::new("rift");
+            let mut args = Vec::<OsString>::new();
             if let Some(database) = database {
-                command.args([
-                    "--database",
-                    database
-                        .to_str()
-                        .context("Rift database path is not UTF-8")?,
-                ]);
+                args.push("--database".into());
+                args.push(database.as_os_str().to_os_string());
             }
-            let output = command.args(["init", "--here"]).arg(path).output()?;
+            args.extend([
+                OsString::from("init"),
+                OsString::from("--here"),
+                path.as_os_str().to_os_string(),
+            ]);
+            let output = rift_output_authorized(args, authorize_start)?;
             require_success(output, "initialize independent Rift root")?;
             root = open_directory(path, "initialized owned repository root")?;
         }
@@ -1753,8 +2303,9 @@ fn provision_rift(path: &Path, database: Option<&Path>) -> Result<()> {
     let verified = Connection::open_with_flags(
         &database_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )?
-    .query_row(
+    )?;
+    crate::sqlite::configure_connection(&verified)?;
+    let verified = verified.query_row(
         "SELECT id,parent_id FROM rift WHERE path=?1",
         [path_text],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
@@ -1791,6 +2342,7 @@ fn verify_owned_root(
         staging_path: repository.path.with_file_name(".root.tmp"),
         target: repository.target.clone(),
         remote: repository.remote.clone(),
+        canonical_repository: repository.canonical_repository.clone(),
         rift_database: database
             .map(Path::to_path_buf)
             .unwrap_or_else(|| repository.rift.registry_identity.clone()),
@@ -1827,6 +2379,12 @@ pub(crate) fn verify_registered_repository(
     repository: &crate::sqlite::RegisteredRepository,
     database_id: &str,
 ) -> Result<()> {
+    if !matches!(
+        repository.policy.operation_state,
+        crate::repository_policy::OperationState::Disabled
+    ) {
+        repository.policy.canonical_repository.verify_local_bare()?;
+    }
     let target = validate_target_branch(&repository.target_branch)?.to_string();
     let head = git_text(&repository.owned_root_path, ["rev-parse", "HEAD"])?;
     let checkout_target = repository.checkout_reconciliation.target_sha();
@@ -1853,9 +2411,16 @@ pub(crate) fn verify_registered_repository(
                 .context("owned repository generation is negative")?,
         },
         remote: RemoteIdentity {
-            fetch_url: repository.remote.fetch_url.clone(),
-            push_url: repository.remote.push_url.clone(),
+            fetch_url: repository
+                .policy
+                .canonical_repository
+                .operational_fetch_url(),
+            push_url: repository
+                .policy
+                .canonical_repository
+                .operational_push_url(),
         },
+        canonical_repository: repository.policy.canonical_repository.clone(),
         target,
         children: ChildWorkspaceRoots {
             development: repository.development_root_path.clone(),
@@ -1994,10 +2559,7 @@ fn read_policy(path: &Path, label: &str) -> Result<Option<Vec<u8>>> {
 }
 
 fn reject_tracked_policy(path: &Path) -> Result<()> {
-    let status = Command::new("git")
-        .args(["ls-files", "--error-unmatch", POLICY_PATH])
-        .current_dir(path)
-        .output()?;
+    let status = crate::git_command::output(path, ["ls-files", "--error-unmatch", POLICY_PATH])?;
     if status.status.success() {
         anyhow::bail!(
             ".iq/config.json is local control-plane configuration and must not be tracked"
@@ -2115,61 +2677,135 @@ fn rift_registry_identity(explicit: Option<&Path>) -> Result<PathBuf> {
 }
 
 fn verify_remote(path: &Path, expected: &RemoteIdentity) -> Result<()> {
-    if git_text(path, ["remote"])? != INTERNAL_REMOTE_NAME
-        || git_text(path, ["remote", "get-url", "--all", INTERNAL_REMOTE_NAME])?
-            != expected.fetch_url
-        || git_text(
-            path,
-            ["remote", "get-url", "--push", "--all", INTERNAL_REMOTE_NAME],
-        )? != expected.push_url
+    let commands = [
+        vec![
+            "config".into(),
+            "--name-only".into(),
+            "--get-regexp".into(),
+            r"^url\..*\.(insteadof|pushinsteadof)$".into(),
+        ],
+        vec!["remote".into()],
+        vec![
+            "config".into(),
+            "--get-all".into(),
+            "remote.iq-target.url".into(),
+        ],
+        vec![
+            "config".into(),
+            "--get-all".into(),
+            "remote.iq-target.pushurl".into(),
+        ],
+    ];
+    let outputs = crate::git_command::read_outputs(path, &commands)?;
+    require_no_url_rewrite_output(&outputs[0])?;
+    if output_text(&outputs[1], "inspect owned repository remotes")? != INTERNAL_REMOTE_NAME
+        || output_text(&outputs[2], "inspect owned repository URL")? != expected.fetch_url
+        || output_text(&outputs[3], "inspect owned repository push URL")? != expected.push_url
     {
         anyhow::bail!("owned repository remote identity changed");
     }
     Ok(())
 }
 
-fn verify_exact_checkout(path: &Path, expected_sha: &str) -> Result<()> {
-    let expected_tree = git_text(path, ["rev-parse", &format!("{expected_sha}^{{tree}}")])?;
-    if git_text(path, ["write-tree"])? != expected_tree {
-        anyhow::bail!("owned repository index differs from expected target tree");
+fn output_text(output: &Output, label: &str) -> Result<String> {
+    if !output.status.success() {
+        anyhow::bail!(
+            "{label} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
-    let status = git_text(path, ["status", "--porcelain=v1", "--untracked-files=all"])?;
-    if !status.is_empty() {
-        anyhow::bail!("owned repository worktree differs from expected target tree");
+    Ok(String::from_utf8(output.stdout.clone())?.trim().into())
+}
+
+fn require_no_url_rewrite_output(output: &Output) -> Result<()> {
+    match output.status.code() {
+        Some(1) => Ok(()),
+        Some(0) => anyhow::bail!("owned repository contains forbidden URL rewrites"),
+        _ => anyhow::bail!(
+            "cannot inspect owned repository URL rewrites: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+}
+
+fn rift_output<const N: usize>(database: Option<&Path>, args: [&str; N]) -> Result<Output> {
+    let mut command_args = Vec::<OsString>::new();
+    if let Some(database) = database {
+        command_args.push("--database".into());
+        command_args.push(database.as_os_str().to_os_string());
+    }
+    command_args.extend(args.into_iter().map(OsString::from));
+    rift_output_authorized(command_args, || Ok(()))
+}
+
+fn rift_output_authorized(
+    args: Vec<OsString>,
+    authorize_start: impl FnOnce() -> Result<()>,
+) -> Result<Output> {
+    let authority = rift_executable_authority()?;
+    let outcome = crate::integrator::command_output_timeout_with_prepare(
+        crate::integrator::CommandProgram::Descriptor {
+            label: "rift",
+            authority: &authority,
+        },
+        args,
+        None,
+        std::time::Duration::from_secs(60),
+        |gate| {
+            authorize_start()?;
+            gate.write_all(b"run\n")?;
+            Ok(true)
+        },
+        || Ok(crate::sqlite::ExecutionAuthority::Active),
+        |command| {
+            crate::agent_config::harden_rift_environment(command);
+            Ok(())
+        },
+    )?;
+    match outcome {
+        crate::integrator::CommandOutputOutcome::Exited(output) => {
+            require_success(output, "run Rift command")
+        }
+        crate::integrator::CommandOutputOutcome::Cancelled => {
+            anyhow::bail!("Rift command lost execution authority")
+        }
+    }
+}
+
+fn require_provisioning_phase(
+    connection: &Connection,
+    repo_key: &RepoKey,
+    expected: &str,
+) -> Result<()> {
+    let phase: String = connection.query_row(
+        "SELECT json_extract(lifecycle_json,'$.state') FROM repository_provisioning_intents WHERE repo_key=?1",
+        [repo_key.as_str()],
+        |row| row.get(0),
+    )?;
+    if phase != expected {
+        anyhow::bail!("repository provisioning phase changed before Rift command release");
     }
     Ok(())
 }
 
-fn rift_output<const N: usize>(database: Option<&Path>, args: [&str; N]) -> Result<Output> {
-    let mut command = Command::new("rift");
-    if let Some(database) = database {
-        command.args([
-            "--database",
-            database
-                .to_str()
-                .context("Rift database path is not UTF-8")?,
-        ]);
-    }
-    require_success(command.args(args).output()?, "run Rift command")
+fn rift_executable_authority() -> Result<crate::agent_config::ExecutableAuthority> {
+    crate::agent_config::rift_executable_authority()
 }
 
-fn remote_identity(path: &Path, remote_name: &str) -> Result<RemoteIdentity> {
-    if remote_name.is_empty() {
-        anyhow::bail!("bootstrap remote name must not be empty");
-    }
-    let remote = crate::composition::resolve_remote_identity(path, remote_name)?;
-    Ok(RemoteIdentity {
-        fetch_url: remote.fetch_url,
-        push_url: remote.push_url,
-    })
-}
-
-fn remote_target_sha(fetch_url: &str, target: &str) -> Result<String> {
+fn remote_target_sha(
+    cwd: &Path,
+    repository: &crate::repository_policy::GitRepository,
+    target: &str,
+) -> Result<String> {
     let target_ref = target_ref(target)?;
+    let fetch_url = repository.operational_fetch_url();
     let output = require_success(
-        Command::new("git")
-            .args(["ls-remote", "--exit-code", fetch_url, &target_ref])
-            .output()?,
+        crate::git_command::external_output(
+            cwd,
+            ["ls-remote", "--exit-code", &fetch_url, &target_ref],
+            repository,
+            || Ok(()),
+        )?,
         "resolve remote target ref",
     )?;
     let text = String::from_utf8(output.stdout)?;
@@ -2181,7 +2817,9 @@ fn remote_target_sha(fetch_url: &str, target: &str) -> Result<String> {
     if fields.next() != Some(target_ref.as_str()) || fields.next().is_some() {
         anyhow::bail!("remote target ref did not resolve exactly once");
     }
-    crate::control_domain::require_sha(&sha, "remote target SHA")?;
+    repository
+        .object_format()
+        .require_oid(&sha, "remote target SHA")?;
     Ok(sha)
 }
 
@@ -2193,6 +2831,7 @@ fn canonical_git_root(path: &Path) -> Result<PathBuf> {
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         anyhow::bail!("bootstrap checkout must be a real directory");
     }
+    crate::git_command::authorize_current(&path)?;
     let root = PathBuf::from(git_text(&path, ["rev-parse", "--show-toplevel"])?).canonicalize()?;
     if root != path {
         anyhow::bail!("bootstrap checkout must be the Git root");
@@ -2201,17 +2840,13 @@ fn canonical_git_root(path: &Path) -> Result<PathBuf> {
 }
 
 fn git<const N: usize>(path: &Path, args: [&str; N], label: &str) -> Result<()> {
-    require_success(
-        Command::new("git").args(args).current_dir(path).output()?,
-        label,
-    )
-    .map(|_| ())
+    require_success(crate::git_command::output(path, args)?, label).map(|_| ())
 }
 
 fn git_text<const N: usize>(path: &Path, args: [&str; N]) -> Result<String> {
     Ok(String::from_utf8(
         require_success(
-            Command::new("git").args(args).current_dir(path).output()?,
+            crate::git_command::output(path, args)?,
             "inspect Git repository",
         )?
         .stdout,
@@ -2222,10 +2857,7 @@ fn git_text<const N: usize>(path: &Path, args: [&str; N]) -> Result<String> {
 
 fn git_object_exists(path: &Path, sha: &str) -> Result<bool> {
     let object = format!("{sha}^{{commit}}");
-    let output = Command::new("git")
-        .args(["cat-file", "-e", &object])
-        .current_dir(path)
-        .output()?;
+    let output = crate::git_command::output(path, ["cat-file", "-e", &object])?;
     match output.status.code() {
         Some(0) => Ok(true),
         Some(128) => Ok(false),

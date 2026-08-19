@@ -1,110 +1,133 @@
 # IQ
 
-IQ is a standalone durable Git integration coordinator. It serializes work for one physical target, uses a sandboxed local integration agent for every item, builds and validates the exact candidate, applies explicit signoff policy, lands with an exact lease, and reconciles all external effects from SQLite state.
+IQ is a durable Git integration coordinator. SQLite owns lifecycle state. One explicit repository policy owns Git authority.
 
-IQ owns one full checkout and independent Rift root for each registered remote. Development and integration Rifts are direct children of that root.
+## Repository Policy
 
-Registration persists the configured remote name and canonical fetch and push URL identities before the first fetch. Later registered operations reject any remote name, fetch URL, or push URL change before remote mutation.
+Repository policy stores five separate concepts:
 
-## Composition
+- operation state: `enabled`, `draining`, or `disabled`
+- canonical repository: a local bare Git path or an accessible Git repository
+- target branch: `main` or `master`
+- integration policy: `direct` or `merge_request_required`
+- replication policy: no replicas or an exact list of replica destinations
 
-`.iq/config.json` is optional local control-plane configuration in the owned root. It must not be tracked. When it is absent, IQ skips validation, requires no signoff, and integrates the exact candidate SHA. When it is present, it remains strict versioned JSON:
+The canonical target is the only source for new workspace bases and the only target that IQ can land. A bootstrap checkout, `origin`, a local branch, the IQ-owned root, and replicas are not authority. The owned root is only a canonical materialization and the independent Rift seed.
 
-```json
-{
-  "version": 2,
-  "integration": {
-    "validation": {"command": "task validate"},
-    "signoff": {"mode": "none"},
-    "agent": {"model": "openai/gpt-5.6-sol"}
-  },
-  "state_repository": {"kind": "local"}
-}
-```
+See [Repository Policy](docs/repository-policy.md) for strict JSON formats and state behavior.
 
-Required signoff is explicit:
+## Registration
 
-```json
-{
-  "version": 2,
-  "integration": {
-    "validation": {"command": "task validate"},
-    "signoff": {
-      "mode": "required",
-      "command": "./ci/iq-signoff",
-      "contexts": ["linux", "macos"]
-    }
-  },
-  "state_repository": {
-    "kind": "gitlab_issue",
-    "visibility": "full",
-    "repository": "group/project",
-    "allowed_responders": ["maintainer"]
-  }
-}
-```
-
-IQ rejects malformed, blank, unknown, unsupported, symlinked, or tracked policy. It does not infer commands from Cargo, Taskfile, Make, package managers, repository languages, or tools. The signoff command receives `IQ_SIGNOFF_SHA` and must print `{"sha":"<exact-sha>","contexts":{"<context>":"success"}}`.
-
-IQ copies optional untracked policy from the bootstrap checkout into the owned root during registration. It creates an authoritative policy snapshot only when a new attempt starts under the repository lease. It atomically stores the canonical snapshot and SHA-256 digest on that attempt. Resume, retry, and target movement keep the stored snapshot. A new attempt reads the owned-root file. Development and integration Rifts receive the file, but IQ trusts only the attempt snapshot. IQ rejects a tracked copy before landing.
-
-Registered repositories reject daemon validation commands and daemon signoff because owned-root policy is authoritative. `iq doctor` reports `owned_root` or `none` as the validation authority.
+Registration requires a bootstrap checkout, an owned storage root, and an explicit policy file. It does not derive authority from the bootstrap remote.
+Registration accepts only enabled policy. Use state-transition commands after registration; draining and disabled assignments are migration-only.
 
 ```sh
-iq repo init --path /path/to/repo --storage-root /path/to/reflink-storage --target main --remote origin
-iq repo list
-iq dev-workspace create --repo-key <repository-uuid> --name feature
+iq repo init \
+  --path /work/bootstrap \
+  --storage-root /var/lib/iq \
+  --policy /etc/iq/repository-policy.json
+```
+
+`.iq/config.json` remains optional, untracked validation and signoff configuration. It cannot define canonical repository, operation, integration, or replication policy.
+
+## Coding Workspaces
+
+Coding agents use only these workspace commands:
+
+```sh
+iq workspace create --repo-key <repository-uuid> --name feature
+iq workspace list --repo-key <repository-uuid>
+iq workspace status <workspace-id>
+iq workspace remove <workspace-id>
+```
+
+Create resolves the exact current canonical target, fails closed if it cannot resolve or fetch it, reconciles the owned root, creates a direct child Rift, and records the exact base SHA. Existing workspaces keep their recorded base.
+
+The retained internal integration Rift has separate operator commands:
+
+```sh
+iq integration status --repo-key <repository-uuid>
+iq integration reset --repo-key <repository-uuid> --system-config /etc/iq/system.yaml
+```
+
+The old `dev-workspace` command and the old `workspace status/reset` operator paths do not exist.
+
+## Admission
+
+Direct policy permits exact branch admission and immutable local workspace submission:
+
+```sh
+iq admit direct --repo-key <repository-uuid> --source agent/feature --head <full-sha>
 iq submit --workspace <workspace-id>
-iq integrate --system-config /etc/iq/system.yaml --next --repo-key <repository-uuid>
-iq cleanup --repo-key <repository-uuid> --system-config /etc/iq/system.yaml
 ```
 
-Normal cleanup preserves non-empty residue. If a terminal cleanup workspace's exact Rift is absent, `iq dev-workspace remove <workspace-id> --discard-residue` deletes only the residue at its exact IQ-owned path. It rejects symlinks, special entries, and `.git` or `.rift` markers at any depth.
+Direct landing uses compare-and-set against the exact validated canonical target. Direct canonical mutation can start CI or deployment, so deployment policy must enable it explicitly.
 
-Local submission refs under `refs/iq/submissions/` are immutable. Local items apply the exact persisted development-base-to-submission change as a one-parent candidate. Target movement creates a new candidate from that same change and invalidates validation and signoff evidence. Empty changes are blocked.
-
-Every PR/MR landing requires a passing post-signoff provider snapshot before target mutation. IQ fetches the final target and requires the snapshot to contain the queued head and that exact base. It then requests the provider merge and records integration only after the provider reports the exact landed commit.
-
-`--next` and `--resume` are mutually exclusive. Explicit resume accepts only the oldest active item for that repository queue.
-
-See [Composition Workspaces](docs/composition-workspaces.md) for the lifecycle and recovery contract.
-
-## Control Plane
-
-The daemon serves version 1 framed JSON only on the configured Unix socket. `inbox`, `show`, `answer`, and `watch` use this API. Local answers use `SO_PEERCRED`; callers cannot supply actor identity.
+Merge-request-required policy rejects both direct forms. The coding agent pushes its source branch, creates and describes the MR, then admits it:
 
 ```sh
-iq inbox --config /etc/iq/system.yaml
-iq show <item-id> --config /etc/iq/system.yaml
-iq answer --config /etc/iq/system.yaml --external-id <id> --request <id> --effort <id> --attempt <id> --cycle <id> --target-sha <sha> --source-sha <sha> --answer '<text>'
-iq watch --json --config /etc/iq/system.yaml --cursor 0
+iq admit mr https://github.com/owner/repository/pull/123 --repo-key <repository-uuid>
 ```
 
-System configuration selects the exact OpenCode executable, credential environment name, agent, default model, cycle timeout, process, memory, CPU, writable-byte, protocol, log, and API bounds. It does not require runtime command or path manifests. The automatic failed-cycle limit is always 10. Project policy can override only the model.
+IQ pins provider, canonical repository identity, target branch, MR identity, exact head, and exact current base. IQ queries and validates the admitted MR. IQ never creates an MR. A cross-repository MR fails. Source or target movement makes evidence stale and requires exact recomposition and validation.
 
-The Linux runner uses an unprivileged mount namespace, Bubblewrap, a user-systemd scope, and a size-bounded tmpfs overlay over the retained Rift. Normal runtime trees are read-only. The configured model credential is passed directly to OpenCode. Repository remote credentials are not deliberately mounted. IQ imports only a bounded staged patch whose paths and staged-tree digest match the typed result. Btrfs qgroups and persistent filesystem quotas are not required.
+Provider landing requires one provider operation that atomically pins both the admitted head and validated base. The current GitHub and GitLab CLI adapters cannot supply that guarantee, so IQ blocks before provider mutation.
 
-## Queue Commands
+No credentialed provider test project is available in this repository. A real-provider sandbox is required before an adapter can enable landing and prove atomic base/head pinning plus post-landing evidence.
+
+## Replication
+
+Canonical landing and replication are separate. A replica cannot change canonical truth or owned-root reconciliation. Failed replication does not roll back canonical state. It records exact durable debt:
 
 ```sh
-iq enqueue --repo-key <repository-uuid> --source feature --head <sha>
+iq replication status --repo-key <repository-uuid>
+iq replication retry <debt-id>
+```
+
+Each debt records the item's exact landed SHA, immutable physical destination identity, target, transactional destination sequence, expected destination SHA, compare-and-set operation, outcome, and failure. CLI retry and daemon recovery use this sequence, not timestamps, for FIFO. A completed later sequence first moves an older debt to durable supersession-cleanup-pending state. IQ then deletes the exact expected source pin and finalizes supersession, without a remote write. Restart resumes either cleanup boundary. A durable internal ref pins the source before debt becomes pending. The reconciler retains it through non-terminal and applied recovery, retries it after canonical advances, verifies the exact destination after push, and removes it only after application or safe supersession is durable.
+
+Never use `rsync`, `scp`, or manual filesystem copies to move data from a user checkout or IQ-owned root. Move Git objects and refs only through verified Git operations.
+
+## Operation State
+
+- `enabled` permits new authorized work.
+- `draining` contains an exact captured set of existing workspace, queue, and replication obligations. It rejects new work.
+- `disabled` rejects new mutation, integration, retry, landing, and replication. Reads, cancellation, and safe cleanup remain available.
+
+Policy authorization runs before operation arguments are validated.
+
+## Schema Migration
+
+Normal runtime accepts schema 4 only and rejects schema 3. Migration is explicit and offline:
+
+```sh
+iq migrate inspect-git-binding --path /var/lib/iq/repositories/<uuid>/root
+iq --queue-db /var/lib/iq/queues.db migrate schema3 \
+  --policy-inventory /etc/iq/schema3-policy-inventory.json
+```
+
+Version-2 inventory uses distinct ready-repository and interrupted-provisioning lifecycle variants. Each interrupted lifecycle is explicitly preserved or cancelled; migration never invents a ready root. The inventory contains generated live Git bindings for each lifecycle that has a repository, every active development Rift, and each supplied retained integration workspace. Before database path resolution or copying, migration verifies every canonical and replica provider or local-bare identity. It then takes the exclusive database authority lease, requires one policy assignment for every repository UUID, verifies every binding and expected HEAD/base before backup publication or primary mutation, validates exact schema 3, creates a durable backup, preserves queue/audit/evidence/event/notification/cleanup data, creates exact admissions, and validates all schema-4 authority before commit. Every active MR base comes from inventory. An active admission that is incompatible with the assigned integration policy must be explicitly cancelled. Failure leaves all schema-3 database-family files unchanged and usable. Migration and binding inspection dispatch before normal schema open. There is no runtime compatibility path.
+
+## Queue And Control Plane
+
+```sh
 iq list
 iq events <item-id>
-iq retry <item-id>
-iq requeue <item-id> --head <sha>
 iq cancel <item-id>
-iq daemon --config /path/to/iq.yaml --system-config /etc/iq/system.yaml
-iq doctor --config /path/to/iq.yaml --system-config /etc/iq/system.yaml
+iq integrate --system-config /etc/iq/system.yaml --next --repo-key <repository-uuid>
+iq cleanup --repo-key <repository-uuid> --system-config /etc/iq/system.yaml
+iq daemon --config /etc/iq/iq.yaml --system-config /etc/iq/system.yaml
 ```
 
-Queue state is host-local. IQ creates only the current schema. An incompatible existing database is rejected without mutation and must be removed before IQ is initialized again.
+Cancellation reports success only after IQ confirms that the exact prepared service and complete cgroup terminated. A failure keeps durable termination debt for retry by the command or daemon startup.
 
-The daemon, communication, forced-command, and config-reconciliation interfaces remain available. Repository operation leases and filesystem locks are scoped to one operation, so an idle daemon does not exclude composition commands.
+The daemon and CLI use shared validated database identity leases. Repository operation leases serialize mutation for one repository without holding an idle global exclusion.
 
 ## Development
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
 cargo test --locked
+cargo clippy --all-targets --all-features -- -D warnings
+RUSTFLAGS="-D warnings" cargo build --locked --release
 ```

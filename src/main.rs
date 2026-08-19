@@ -1,11 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use iq::composition::{RepositoryInitOptions, RepositoryManager};
-use iq::integrator::{
-    verify_rift_workspace_config_with_queue, workspace_status, IntegrationPolicy, Integrator,
-    IntegratorOptions, RepositoryOperationLease,
-};
-use iq::sqlite::{Attempt, EnqueueRequest, QueueItem, SqliteQueue, SqliteQueueReader};
+use iq::integrator::{IntegrationPolicy, Integrator, IntegratorOptions};
+use iq::sqlite::{Attempt, DirectAdmissionRequest, QueueItem, SqliteQueue, SqliteQueueReader};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -23,20 +20,26 @@ use uuid::Uuid;
 struct Cli {
     #[arg(long, global = true)]
     queue_db: Option<PathBuf>,
+    #[arg(long, global = true)]
+    rift_executable: Option<PathBuf>,
+    #[cfg(debug_assertions)]
+    #[arg(long, global = true, hide = true)]
+    test_github_executable: Option<PathBuf>,
+    #[cfg(debug_assertions)]
+    #[arg(long, global = true, hide = true)]
+    test_gitlab_executable: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Register and inspect explicit repository policy and owned materialization.
     Repo {
         #[command(subcommand)]
         command: RepoCommand,
     },
-    DevWorkspace {
-        #[command(subcommand)]
-        command: DevWorkspaceCommand,
-    },
+    /// Submit an immutable local workspace under direct integration policy.
     Submit {
         #[arg(long)]
         workspace: String,
@@ -56,17 +59,10 @@ enum Command {
         #[arg(long)]
         owner: Option<String>,
     },
-    Enqueue {
-        #[arg(long)]
-        repo_key: String,
-        #[arg(long)]
-        source: String,
-        #[arg(long)]
-        head: String,
-        #[arg(long)]
-        pr_url: Option<String>,
-        #[arg(long)]
-        producer: Option<String>,
+    /// Admit exact direct branches or coding-agent-owned merge requests.
+    Admit {
+        #[command(subcommand)]
+        command: AdmitCommand,
     },
     List,
     Inbox {
@@ -137,9 +133,25 @@ enum Command {
         #[arg(long, value_enum, default_value_t = EvidencePhaseArg::All)]
         phase: EvidencePhaseArg,
     },
+    /// Create and manage coding-agent Rift workspaces.
     Workspace {
         #[command(subcommand)]
         command: WorkspaceCommand,
+    },
+    /// Inspect or reset IQ's retained internal integration Rift.
+    Integration {
+        #[command(subcommand)]
+        command: IntegrationCommand,
+    },
+    /// Run an explicit offline state-schema migration.
+    Migrate {
+        #[command(subcommand)]
+        command: MigrationCommand,
+    },
+    /// Inspect or retry durable post-landing replication debt.
+    Replication {
+        #[command(subcommand)]
+        command: ReplicationCommand,
     },
     Daemon {
         #[arg(long)]
@@ -174,51 +186,80 @@ enum Command {
 
 #[derive(Args, Debug)]
 struct CleanupArgs {
-    #[arg(
-        long,
-        conflicts_with_all = ["repo_key", "system_config"]
-    )]
-    workspace: Option<String>,
-    #[arg(long, required_unless_present = "workspace")]
-    repo_key: Option<String>,
-    #[arg(long, required_unless_present = "workspace")]
-    system_config: Option<PathBuf>,
+    #[arg(long)]
+    repo_key: String,
+    #[arg(long)]
+    system_config: PathBuf,
 }
 
 #[derive(Subcommand, Debug)]
 enum RepoCommand {
+    /// Register from explicit canonical and operation policy; bootstrap remote is not authority.
     Init {
         #[arg(long, default_value = ".")]
         path: PathBuf,
         #[arg(long)]
         storage_root: PathBuf,
-        #[arg(long, default_value = "main")]
-        target: String,
-        #[arg(long, default_value = "origin")]
-        remote: String,
+        #[arg(long)]
+        policy: PathBuf,
     },
     List,
     Status {
         #[arg(long)]
         repo_key: String,
     },
+    /// Stop new work and atomically capture all current obligations.
+    Drain {
+        #[arg(long)]
+        repo_key: String,
+    },
+    /// Disable a drained repository after every captured obligation is clean.
+    Disable {
+        #[arg(long)]
+        repo_key: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
-enum DevWorkspaceCommand {
+enum AdmitCommand {
+    /// Admit one exact source branch and head under direct policy.
+    Direct {
+        #[arg(long)]
+        repo_key: String,
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        head: String,
+        #[arg(long)]
+        producer: Option<String>,
+    },
+    /// Admit one exact coding-agent-owned MR under merge-request-required policy.
+    Mr {
+        url: String,
+        #[arg(long)]
+        repo_key: String,
+        #[arg(long)]
+        producer: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum WorkspaceCommand {
+    /// Resolve the current canonical target and create a direct child Rift.
     Create {
         #[arg(long)]
         repo_key: String,
         #[arg(long)]
         name: String,
     },
+    /// List coding-agent workspaces.
     List {
         #[arg(long)]
         repo_key: Option<String>,
     },
-    Status {
-        id: String,
-    },
+    /// Inspect one coding-agent workspace.
+    Status { id: String },
+    /// Remove one coding-agent workspace through verified safe cleanup.
     Remove {
         id: String,
         /// Delete safe file residue after the exact Rift is absent.
@@ -272,15 +313,9 @@ struct RemoteCli {
 
 #[derive(Subcommand, Debug)]
 enum RemoteCommand {
-    Enqueue {
-        #[arg(long)]
-        source: String,
-        #[arg(long)]
-        head: String,
-        #[arg(long)]
-        pr_url: Option<String>,
-        #[arg(long)]
-        producer: Option<String>,
+    Admit {
+        #[command(subcommand)]
+        command: RemoteAdmitCommand,
     },
     List,
     Events {
@@ -300,11 +335,30 @@ enum RemoteCommand {
 }
 
 #[derive(Subcommand, Debug)]
-enum WorkspaceCommand {
+enum RemoteAdmitCommand {
+    Direct {
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        head: String,
+        #[arg(long)]
+        producer: Option<String>,
+    },
+    Mr {
+        url: String,
+        #[arg(long)]
+        producer: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum IntegrationCommand {
+    /// Inspect retained internal integration workspaces.
     Status {
         #[arg(long)]
         repo_key: String,
     },
+    /// Retry safe cleanup of retained internal integration workspaces.
     Reset {
         #[arg(long)]
         system_config: PathBuf,
@@ -313,6 +367,31 @@ enum WorkspaceCommand {
         #[arg(long)]
         owner: Option<String>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum MigrationCommand {
+    /// Inspect and verify one live repository for a schema-3 inventory binding.
+    InspectGitBinding {
+        #[arg(long)]
+        path: PathBuf,
+    },
+    /// Migrate exact schema 3 to schema 4 with a version-3 repository-policy inventory.
+    Schema3 {
+        #[arg(long)]
+        policy_inventory: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ReplicationCommand {
+    /// List precise replication outcomes and debt.
+    Status {
+        #[arg(long)]
+        repo_key: Option<String>,
+    },
+    /// Retry one exact failed replication obligation.
+    Retry { debt_id: String },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -338,28 +417,80 @@ struct EvidenceFile {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    iq::agent_config::validate_rift_executable_environment()?;
+    if let Some(path) = cli.rift_executable.as_deref() {
+        iq::agent_config::initialize_rift_executable_authority(path)?;
+    }
+    iq::providers::validate_executable_environment()?;
+    iq::git_command::initialize_executable_authority()?;
+    #[cfg(debug_assertions)]
+    let _github_executable = cli
+        .test_github_executable
+        .as_deref()
+        .map(|path| {
+            iq::providers::inject_test_provider_executable(
+                iq::repository_policy::Provider::Github,
+                path,
+            )
+        })
+        .transpose()?;
+    #[cfg(debug_assertions)]
+    let _gitlab_executable = cli
+        .test_gitlab_executable
+        .as_deref()
+        .map(|path| {
+            iq::providers::inject_test_provider_executable(
+                iq::repository_policy::Provider::Gitlab,
+                path,
+            )
+        })
+        .transpose()?;
+    if let Command::Migrate { command } = &cli.command {
+        let db_path = match cli.queue_db.as_ref() {
+            Some(path) => path.clone(),
+            None => SqliteQueue::default_db_path_without_open()?,
+        };
+        match command {
+            MigrationCommand::Schema3 { policy_inventory } => {
+                let inventory = iq::repository_policy::PolicyInventory::load(policy_inventory)?;
+                print_json(&SqliteQueue::migrate_schema3(&db_path, inventory)?)?;
+            }
+            MigrationCommand::InspectGitBinding { path } => {
+                print_json(&iq::git_command::RepositoryBinding::capture(path)?)?;
+            }
+        }
+        return Ok(());
+    }
+    if let Command::Repo {
+        command:
+            RepoCommand::Init {
+                path,
+                storage_root,
+                policy,
+            },
+    } = &cli.command
+    {
+        let options = RepositoryInitOptions {
+            storage_root: storage_root.clone(),
+            policy: load_repository_policy(policy)?,
+        }
+        .preflight(path)?;
+        let db_path = match cli.queue_db.as_ref() {
+            Some(path) => path.clone(),
+            None => SqliteQueue::default_db_path_without_open()?,
+        };
+        let manager = RepositoryManager::new(SqliteQueue::open(&db_path)?);
+        print_json(&manager.init_preflighted(options)?)?;
+        return Ok(());
+    }
     let db_path = match cli.queue_db {
         Some(path) => path,
         None => SqliteQueue::default_db_path()?,
     };
     match cli.command {
         Command::Repo { command } => match command {
-            RepoCommand::Init {
-                path,
-                storage_root,
-                target,
-                remote,
-            } => {
-                iq::repository::validate_target_branch(&target)?;
-                let manager = RepositoryManager::new(SqliteQueue::open(&db_path)?);
-                print_json(&manager.init(
-                    &path,
-                    RepositoryInitOptions {
-                        storage_root,
-                        target_branch: target,
-                        remote,
-                    },
-                )?)?
+            RepoCommand::Init { .. } => {
+                unreachable!("repository initialization returns after identity preflight")
             }
             RepoCommand::List => {
                 print_json(&RepositoryManager::new(SqliteQueue::open(&db_path)?).list()?)?
@@ -367,18 +498,24 @@ fn main() -> Result<()> {
             RepoCommand::Status { repo_key } => print_json(
                 &RepositoryManager::new(SqliteQueue::open(&db_path)?).status(&repo_key)?,
             )?,
+            RepoCommand::Drain { repo_key } => print_json(
+                &RepositoryManager::new(SqliteQueue::open(&db_path)?).begin_draining(&repo_key)?,
+            )?,
+            RepoCommand::Disable { repo_key } => print_json(
+                &RepositoryManager::new(SqliteQueue::open(&db_path)?).disable_drained(&repo_key)?,
+            )?,
         },
-        Command::DevWorkspace { command } => {
+        Command::Workspace { command } => {
             let manager = RepositoryManager::new(SqliteQueue::open(&db_path)?);
             match command {
-                DevWorkspaceCommand::Create { repo_key, name } => {
+                WorkspaceCommand::Create { repo_key, name } => {
                     print_json(&manager.create_workspace(&repo_key, &name)?)?
                 }
-                DevWorkspaceCommand::List { repo_key } => {
+                WorkspaceCommand::List { repo_key } => {
                     print_json(&manager.workspaces(repo_key.as_deref())?)?
                 }
-                DevWorkspaceCommand::Status { id } => print_json(&manager.workspace_status(&id)?)?,
-                DevWorkspaceCommand::Remove {
+                WorkspaceCommand::Status { id } => print_json(&manager.workspace_status(&id)?)?,
+                WorkspaceCommand::Remove {
                     id,
                     discard_residue,
                 } => {
@@ -400,19 +537,11 @@ fn main() -> Result<()> {
         }
         Command::Cleanup(CleanupArgs {
             repo_key,
-            workspace,
             system_config,
         }) => {
             let manager = RepositoryManager::new(SqliteQueue::open(&db_path)?);
-            if let Some(workspace) = workspace {
-                print_json(&manager.remove_workspace(&workspace)?)?;
-            } else {
-                let repo_key = repo_key.context("repository cleanup requires --repo-key")?;
-                let system_config =
-                    system_config.context("repository cleanup requires --system-config")?;
-                let system = iq::agent_config::SystemConfig::load(&system_config)?;
-                print_json(&manager.cleanup_repo_with_system(&repo_key, &system)?)?;
-            }
+            let system = iq::agent_config::SystemConfig::load(&system_config)?;
+            print_json(&manager.cleanup_repo_with_system(&repo_key, &system)?)?;
         }
         Command::Integrate {
             next: _,
@@ -432,22 +561,32 @@ fn main() -> Result<()> {
                 print_json(&integrator.run_once()?)?;
             }
         }
-        Command::Enqueue {
-            repo_key,
-            source,
-            head,
-            pr_url,
-            producer,
-        } => {
+        Command::Admit { command } => {
             let queue = SqliteQueue::open(&db_path)?;
-            let item = RepositoryManager::new(queue.clone()).enqueue_remote(EnqueueRequest {
-                repo_key,
-                source_branch: source,
-                current_head_sha: head,
-                pr_url,
-                producer_metadata: json!({ "producer": producer }),
-                state_repository: iq::control_domain::StateRepositorySnapshot::Local,
-            })?;
+            let manager = RepositoryManager::new(queue.clone());
+            let item = match command {
+                AdmitCommand::Direct {
+                    repo_key,
+                    source,
+                    head,
+                    producer,
+                } => manager.admit_direct(DirectAdmissionRequest {
+                    repo_key,
+                    source_branch: source,
+                    current_head_sha: head,
+                    producer_metadata: json!({ "producer": producer }),
+                    state_repository: iq::control_domain::StateRepositorySnapshot::Local,
+                })?,
+                AdmitCommand::Mr {
+                    url,
+                    repo_key,
+                    producer,
+                } => manager.admit_merge_request(
+                    &repo_key,
+                    &url,
+                    &json!({ "producer": producer }),
+                )?,
+            };
             iq::state_repository::reserve_full_issue(&queue.validated_control_store()?, &item.id)?;
             print_json(&item)?;
         }
@@ -525,14 +664,7 @@ fn main() -> Result<()> {
         }
         Command::Cancel { item } => {
             let queue = SqliteQueue::open(&db_path)?;
-            let store = queue.validated_control_store()?;
-            if let Some(effort) = store.effort_for_item(&item)? {
-                let cancelled = store.cancel(&effort.id, "local_cli", "operator_cancelled")?;
-                store.reconcile_cancelled_runner_terminations(false)?;
-                print_json(&cancelled)?;
-            } else {
-                print_json(&queue.transition_item(&item, iq::core::QueueStatus::Cancelled)?)?;
-            }
+            print_json(&RepositoryManager::new(queue).cancel_item(&item, "local_cli")?)?;
         }
         Command::Retry { item, config } => {
             let system = iq::agent_config::SystemConfig::load(&config)?;
@@ -575,21 +707,12 @@ fn main() -> Result<()> {
             let queued = queue.get_item(&item)?;
             print_json(&read_evidence(&queue, &queued, phase)?)?;
         }
-        Command::Workspace { command } => match command {
-            WorkspaceCommand::Status { repo_key } => {
-                let reader = SqliteQueueReader::open(&db_path)?;
-                let queue = SqliteQueue::open(&db_path)?;
-                let repository = queue.repository(&repo_key)?;
-                let _operation = RepositoryOperationLease::acquire(
-                    queue,
-                    &repository.owned_root_path,
-                    &repo_key,
-                    &format!("iq-workspace-status-{}", Uuid::new_v4()),
-                    30,
-                )?;
-                print_json(&workspace_status(&reader, &repo_key)?)?;
+        Command::Integration { command } => match command {
+            IntegrationCommand::Status { repo_key } => {
+                let manager = RepositoryManager::new(SqliteQueue::open(&db_path)?);
+                print_json(&manager.integration_status(&repo_key)?)?;
             }
-            WorkspaceCommand::Reset {
+            IntegrationCommand::Reset {
                 system_config,
                 repo_key,
                 owner,
@@ -602,6 +725,18 @@ fn main() -> Result<()> {
                 print_json(&integrator.reset_workspaces()?)?;
             }
         },
+        Command::Migrate { .. } => unreachable!("migration dispatch returns before schema open"),
+        Command::Replication { command } => {
+            let manager = RepositoryManager::new(SqliteQueue::open(&db_path)?);
+            match command {
+                ReplicationCommand::Status { repo_key } => {
+                    print_json(&manager.replication_debts(repo_key.as_deref())?)?;
+                }
+                ReplicationCommand::Retry { debt_id } => {
+                    print_json(&manager.retry_replication(&debt_id)?)?;
+                }
+            }
+        }
         Command::Daemon {
             config,
             system_config,
@@ -673,13 +808,6 @@ fn run_doctor(
     let mut results = Vec::new();
     for repo_key in config.repo_keys {
         let repository = queue.repository(&repo_key)?;
-        let operation = RepositoryOperationLease::acquire(
-            queue.clone(),
-            &repository.owned_root_path,
-            &repo_key,
-            &format!("iq-doctor-{}", Uuid::new_v4()),
-            30,
-        )?;
         let workspace_root = integrator_options_with_system_config(
             integrator_options_from_queue(
                 queue_db.to_path_buf(),
@@ -690,36 +818,8 @@ fn run_doctor(
             &system_config,
         )
         .workspace_root;
-        operation.ensure()?;
-        verify_rift_workspace_config_with_queue(
-            &queue,
-            &repository.owned_root_path,
-            &workspace_root,
-            &repo_key,
-            Some(&repository.registry_identity),
-        )?;
-        let output = operation.run_command(
-            "git",
-            [
-                "ls-remote",
-                "--heads",
-                repository.remote.name.as_str(),
-                &format!("refs/heads/{}", repository.target_branch),
-            ],
-            Some(&repository.owned_root_path),
-            std::time::Duration::from_secs(60),
-            "query repository target",
-        )?;
-        if output.stdout.is_empty() {
-            anyhow::bail!(
-                "cannot resolve {}/{} from {}",
-                repository.remote.name,
-                repository.target_branch,
-                repository.owned_root_path.display(),
-            );
-        }
-        operation.ensure()?;
-        let (policy, _, _) = iq::composition::load_local_policy(&repository.owned_root_path)?;
+        let policy = RepositoryManager::new(queue.clone())
+            .verify_runtime_repository(&repo_key, &workspace_root)?;
         let authority = if policy.policy == iq::composition::ValidationPolicy::None {
             "none"
         } else {
@@ -761,21 +861,27 @@ fn run_remote_exec(db_path: PathBuf, repo_key: String) -> Result<()> {
     let args = shell_words::split(&original).context("parse SSH_ORIGINAL_COMMAND")?;
     let command = RemoteCli::try_parse_from(args).context("parse permitted remote IQ command")?;
     match command.command {
-        RemoteCommand::Enqueue {
-            source,
-            head,
-            pr_url,
-            producer,
-        } => {
+        RemoteCommand::Admit { command } => {
             let queue = SqliteQueue::open(&db_path)?;
-            let item = RepositoryManager::new(queue.clone()).enqueue_remote(EnqueueRequest {
-                repo_key,
-                source_branch: source,
-                current_head_sha: head,
-                pr_url,
-                producer_metadata: json!({ "producer": producer }),
-                state_repository: iq::control_domain::StateRepositorySnapshot::Local,
-            })?;
+            let manager = RepositoryManager::new(queue.clone());
+            let item = match command {
+                RemoteAdmitCommand::Direct {
+                    source,
+                    head,
+                    producer,
+                } => manager.admit_direct(DirectAdmissionRequest {
+                    repo_key,
+                    source_branch: source,
+                    current_head_sha: head,
+                    producer_metadata: json!({ "producer": producer }),
+                    state_repository: iq::control_domain::StateRepositorySnapshot::Local,
+                })?,
+                RemoteAdmitCommand::Mr { url, producer } => manager.admit_merge_request(
+                    &repo_key,
+                    &url,
+                    &json!({ "producer": producer }),
+                )?,
+            };
             iq::state_repository::reserve_full_issue(&queue.validated_control_store()?, &item.id)?;
             print_json(&item)?;
         }
@@ -1092,6 +1198,14 @@ fn read_evidence_file(
 fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+fn load_repository_policy(path: &Path) -> Result<iq::repository_policy::RepositoryPolicy> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("read repository policy {}", path.display()))?;
+    serde_json::from_slice::<iq::repository_policy::RepositoryPolicy>(&bytes)
+        .with_context(|| format!("parse repository policy {}", path.display()))?
+        .validate()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1544,6 +1658,7 @@ fn publish_generation(
     ));
     std::fs::create_dir(&temporary)
         .with_context(|| format!("create generation directory {}", temporary.display()))?;
+    let temporary_identity = std::fs::symlink_metadata(&temporary)?;
     let result = (|| -> Result<()> {
         write_generation_file(&temporary.join("iq.yaml"), config)?;
         write_generation_file(&temporary.join("iq-manager-state.json"), manager_state)?;
@@ -1575,7 +1690,12 @@ fn publish_generation(
         Ok(())
     })();
     if result.is_err() {
-        let _ = std::fs::remove_dir_all(&temporary);
+        let _ = iq::secure_fs::remove_directory_with_identity(
+            &temporary,
+            temporary_identity.dev(),
+            temporary_identity.ino(),
+            "temporary generation",
+        );
     }
     result
 }
@@ -1785,7 +1905,7 @@ fn run_daemon_config(
     let config = read_daemon_config(config_path)?;
     let queue = SqliteQueue::open(&db_path)?;
     let control_store = queue.validated_control_store()?;
-    control_store.reconcile_cancelled_runner_terminations(true)?;
+    control_store.reconcile_cancelled_runner_terminations()?;
     let notifications = queue.notification_dispatcher(system_config.notifications.clone())?;
     notifications.configure()?;
     let (_daemon_lifetime, api) = iq::control_api::ControlApiServer::bind(

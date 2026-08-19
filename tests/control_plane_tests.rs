@@ -10,33 +10,37 @@ use iq::control_domain::{
     RunnerKind, RunnerSnapshot, SandboxIdentity, StateRepositorySnapshot,
 };
 use iq::control_store::ControlStore;
+use iq::git_object::GitObjectFormat;
 use iq::sqlite::SqliteQueue;
 use sha2::Digest;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::Command;
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
+mod support;
+use support::{direct_policy, Command, RepositoryFixture};
 
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+#[cfg(debug_assertions)]
 struct DatabaseSnapshotPause {
     ready: mpsc::SyncSender<()>,
     release: mpsc::Receiver<()>,
 }
 
+#[cfg(debug_assertions)]
 fn database_snapshot_pause() -> &'static Mutex<Option<DatabaseSnapshotPause>> {
     static PAUSE: OnceLock<Mutex<Option<DatabaseSnapshotPause>>> = OnceLock::new();
     PAUSE.get_or_init(|| Mutex::new(None))
 }
 
+#[cfg(debug_assertions)]
 fn pause_database_snapshot(_temporary: &Path) {
     let Some(pause) = database_snapshot_pause().lock().unwrap().take() else {
         return;
@@ -45,11 +49,13 @@ fn pause_database_snapshot(_temporary: &Path) {
     pause.release.recv().unwrap();
 }
 
+#[cfg(debug_assertions)]
 fn database_maintenance_blocked() -> &'static Mutex<Option<mpsc::SyncSender<()>>> {
     static BLOCKED: OnceLock<Mutex<Option<mpsc::SyncSender<()>>>> = OnceLock::new();
     BLOCKED.get_or_init(|| Mutex::new(None))
 }
 
+#[cfg(debug_assertions)]
 fn signal_database_maintenance_blocked(_database: &Path) {
     database_maintenance_blocked()
         .lock()
@@ -66,7 +72,7 @@ fn sha(byte: char) -> String {
 
 fn input() -> AgentInput {
     AgentInput {
-        version: 1,
+        version: 2,
         identity: ExactEffortIdentity {
             effort_id: "effort-1".into(),
             item_id: "item-1".into(),
@@ -79,6 +85,7 @@ fn input() -> AgentInput {
         repository: RepositoryIdentity {
             repo_key: "00000000-0000-4000-8000-000000000001".into(),
             target_branch: "main".into(),
+            object_format: GitObjectFormat::Sha1,
         },
         source: SourceVariant::RemoteBranch {
             branch: "feature".into(),
@@ -107,14 +114,14 @@ fn input() -> AgentInput {
 #[test]
 fn protocol_rejects_unknown_fields_and_identity_changes() {
     let input = input();
-    let unknown = br#"{"outcome":"resolved","version":1,"identity":{"effort_id":"effort-1","item_id":"item-1","attempt_id":"attempt-1","cycle_id":"cycle-1","target_sha":"1111111111111111111111111111111111111111","source_sha":"2222222222222222222222222222222222222222","candidate_sha":null},"staged_tree_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","changed_paths":[],"checks":[],"unknown":true}"#;
+    let unknown = br#"{"outcome":"resolved","version":2,"identity":{"effort_id":"effort-1","item_id":"item-1","attempt_id":"attempt-1","cycle_id":"cycle-1","target_sha":"1111111111111111111111111111111111111111","source_sha":"2222222222222222222222222222222222222222","candidate_sha":null},"staged_tree_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","changed_paths":[],"checks":[],"unknown":true}"#;
     assert!(parse_result(unknown, &input).is_err());
 
     let mut identity = serde_json::to_value(&input.identity).unwrap();
     identity["item_id"] = serde_json::Value::String("other".into());
     let wrong_identity = serde_json::json!({
         "outcome": "resolved",
-        "version": 1,
+        "version": 2,
         "identity": identity,
         "staged_tree_sha256": "a".repeat(64),
         "changed_paths": [],
@@ -124,7 +131,24 @@ fn protocol_rejects_unknown_fields_and_identity_changes() {
 }
 
 #[test]
-fn interrupted_protocol_cycle_delete_retries_exact_quarantine_only() {
+fn protocol_rejects_object_ids_from_a_different_repository_format() {
+    let mut input = input();
+    input.repository.object_format = GitObjectFormat::Sha256;
+    input.identity.target_sha = "1".repeat(64);
+    input.identity.source_sha = "2".repeat(64);
+    input.base_sha = "0".repeat(64);
+    input.source = SourceVariant::RemoteBranch {
+        branch: "feature".into(),
+        sha: "2".repeat(64),
+    };
+    input.validate().unwrap();
+
+    input.identity.target_sha = "1".repeat(40);
+    assert!(input.validate().is_err());
+}
+
+#[test]
+fn interrupted_protocol_cycle_delete_retries_exact_cycle_only() {
     let temp = tempdir().unwrap();
     let workspace = temp.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
@@ -140,18 +164,12 @@ fn interrupted_protocol_cycle_delete_retries_exact_quarantine_only() {
     std::fs::set_permissions(&unrelated, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     assert!(iq::agent_protocol::remove_protocol_cycle(&workspace, "cycle-1").is_err());
-    let quarantine = workspace.join(".iq-agent-protocol/.remove-cycle-1");
-    assert!(!protocol.exists());
-    assert!(quarantine.is_dir());
-    std::fs::set_permissions(
-        quarantine.join("blocked"),
-        std::fs::Permissions::from_mode(0o700),
-    )
-    .unwrap();
+    assert!(protocol.is_dir());
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     iq::agent_protocol::remove_protocol_cycle(&workspace, "cycle-1").unwrap();
     iq::agent_protocol::remove_protocol_cycle(&workspace, "cycle-1").unwrap();
-    assert!(!quarantine.exists());
+    assert!(!protocol.exists());
     assert!(unrelated.is_dir());
 }
 
@@ -202,6 +220,7 @@ fn terminal_cleanup_removes_exact_sandbox_when_original_rift_is_absent() {
     let unrelated = root.join(".iq-agent-sandbox-other-cycle");
     std::fs::create_dir_all(sandbox.join("export")).unwrap();
     std::fs::create_dir_all(unrelated.join("export")).unwrap();
+    iq::agent_runner::write_test_sandbox_ownership(&sandbox, "cycle-1").unwrap();
     let artifacts = iq::control_store::TerminalCycleArtifacts {
         item_id: "item-1".into(),
         cycle_id: "cycle-1".into(),
@@ -344,7 +363,7 @@ fn valid_resolved_result_parses_as_typed_variant() {
     let input = input();
     let result = serde_json::json!({
         "outcome": "resolved",
-        "version": 1,
+        "version": 2,
         "identity": input.identity,
         "staged_tree_sha256": "a".repeat(64),
         "changed_paths": [],
@@ -360,7 +379,10 @@ fn valid_resolved_result_parses_as_typed_variant() {
 fn unix_socket_api_enforces_private_modes_and_serves_durable_inbox() {
     let temp = tempdir().unwrap();
     let database = temp.path().join("queue.db");
-    let store = ControlStore::open_test_database(&database).unwrap();
+    let store = SqliteQueue::open(&database)
+        .unwrap()
+        .validated_control_store()
+        .unwrap();
     let socket = temp.path().join("control/control.sock");
     let config = iq::agent_config::ControlPlaneConfig {
         unix_socket: socket.clone(),
@@ -397,7 +419,10 @@ fn unix_socket_api_enforces_private_modes_and_serves_durable_inbox() {
 fn daemon_lifetime_fences_outlive_api_server_failure() {
     let temp = tempdir().unwrap();
     let database = temp.path().join("queue.db");
-    let store = ControlStore::open_test_database(&database).unwrap();
+    let store = SqliteQueue::open(&database)
+        .unwrap()
+        .validated_control_store()
+        .unwrap();
     let socket = temp.path().join("control/control.sock");
     let config = iq::agent_config::ControlPlaneConfig {
         unix_socket: socket,
@@ -512,7 +537,10 @@ fn first_control_lock_handoff_fences_exclusive_maintenance() {
 fn api_shutdown_closes_silent_and_watch_clients_and_joins_producer() {
     let temp = tempdir().unwrap();
     let database = temp.path().join("queue.db");
-    let store = ControlStore::open_test_database(&database).unwrap();
+    let store = SqliteQueue::open(&database)
+        .unwrap()
+        .validated_control_store()
+        .unwrap();
     let socket = temp.path().join("control/control.sock");
     let config = test_control_api_config(socket.clone(), 60, 2);
     let (_lifetime, server) = ControlApiServer::bind(config, store).unwrap();
@@ -542,7 +570,10 @@ fn api_shutdown_closes_silent_and_watch_clients_and_joins_producer() {
 fn api_worker_failure_shuts_down_and_joins_silent_worker() {
     let temp = tempdir().unwrap();
     let database = temp.path().join("queue.db");
-    let store = ControlStore::open_test_database(&database).unwrap();
+    let store = SqliteQueue::open(&database)
+        .unwrap()
+        .validated_control_store()
+        .unwrap();
     let socket = temp.path().join("control/control.sock");
     let config = test_control_api_config(socket.clone(), 60, 2);
     let (_lifetime, server) = ControlApiServer::bind(config, store).unwrap();
@@ -572,7 +603,10 @@ fn api_worker_failure_shuts_down_and_joins_silent_worker() {
 fn api_watch_producer_failure_shuts_down_and_joins_silent_worker() {
     let temp = tempdir().unwrap();
     let database = temp.path().join("queue.db");
-    let store = ControlStore::open_test_database(&database).unwrap();
+    let store = SqliteQueue::open(&database)
+        .unwrap()
+        .validated_control_store()
+        .unwrap();
     let socket = temp.path().join("control/control.sock");
     let config = test_control_api_config(socket.clone(), 60, 2);
     let (_lifetime, server) = ControlApiServer::bind(config, store).unwrap();
@@ -1009,11 +1043,30 @@ fn failed_landing_recomposition_preserves_one_recoverable_uncertain_state() {
         )
         .unwrap();
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    fixture
+        .store
+        .begin_target_move(&effort.id, &sha('5'))
+        .unwrap();
+    fixture
+        .store
+        .prepare_target_recomposition(&effort.id, &sha('5'))
+        .unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM private_ref_cleanup_debt", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
+    );
+    connection
+        .execute("DELETE FROM private_ref_cleanup_debt", [])
+        .unwrap();
     iq::control_store::set_recomposition_projection_failure_test_hook(&fixture.database, true);
 
     assert!(fixture
         .store
-        .recompose_after_target_move(
+        .complete_target_recomposition(
             &effort.id,
             &sha('5'),
             &serde_json::json!({"target_sha":sha('5')})
@@ -1023,9 +1076,9 @@ fn failed_landing_recomposition_preserves_one_recoverable_uncertain_state() {
     let effort_after_failure = fixture.store.effort_for_item("item-1").unwrap().unwrap();
     assert!(matches!(
         effort_after_failure.state,
-        IntegrationEffortState::LandingUncertain(ref landing)
-            if landing.candidate_sha == candidate_sha
-                && landing.expected_target_sha == sha('1')
+        IntegrationEffortState::TargetMovePending(ref pending)
+            if pending.target_sha == sha('5')
+                && pending.source_sha == sha('2')
     ));
     let (landing, target_sha, validated_sha): (String, Option<String>, Option<String>) = connection
         .query_row(
@@ -1036,18 +1089,22 @@ fn failed_landing_recomposition_preserves_one_recoverable_uncertain_state() {
         .unwrap();
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&landing).unwrap(),
-        serde_json::json!({
-            "state":"uncertain",
-            "candidate_sha":candidate_sha,
-            "expected_target_sha":sha('1')
-        })
+        serde_json::json!({"state":"ready"})
     );
-    assert_eq!(target_sha.as_deref(), None);
+    assert_eq!(target_sha.as_deref(), Some(sha('5').as_str()));
     assert_eq!(validated_sha.as_deref(), Some(candidate_sha.as_str()));
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM candidate_evidence", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
+    );
 
     fixture
         .store
-        .recompose_after_target_move(
+        .complete_target_recomposition(
             &effort.id,
             &sha('5'),
             &serde_json::json!({"target_sha":sha('5')}),
@@ -1075,114 +1132,646 @@ fn failed_landing_recomposition_preserves_one_recoverable_uncertain_state() {
 }
 
 #[test]
-fn effort_cancellation_restores_local_submission_workspace() {
-    let fixture = effort_fixture();
-    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
-    connection
-        .execute(
-            "INSERT INTO development_workspaces(id,repo_key,name,path,branch,base_sha,status,cleanup_json,created_at,updated_at) VALUES('workspace-1','00000000-0000-4000-8000-000000000001','test',X'04','iq-test',?1,'submitted','{\"state\":\"pending\"}','test','test')",
-            [sha('1')],
-        )
-        .unwrap();
-    connection
-        .execute(
-            "INSERT INTO local_submissions(id,queue_item_id,repo_key,workspace_id,base_sha,commit_sha,private_ref,staging_ref,state,created_at) VALUES('submission-1','item-1','00000000-0000-4000-8000-000000000001','workspace-1',?1,?2,'refs/iq/submissions/test','refs/iq/staging/test','creating','test')",
-            rusqlite::params![sha('1'),sha('2')],
-        )
-        .unwrap();
-    connection
-        .execute(
-            "UPDATE queue_items SET source_branch='refs/iq/submissions/test',source_ref='refs/iq/submissions/test',source_kind='local_submission',submission_id='submission-1',current_head_sha=?1,landing_policy='squash' WHERE id='item-1'",
-            [sha('2')],
-        )
-        .unwrap();
-    connection
-        .execute(
-            "UPDATE local_submissions SET state='queued' WHERE id='submission-1'",
-            [],
-        )
-        .unwrap();
-    drop(connection);
+fn released_landing_authority_rejects_every_destructive_runtime_transition() {
+    let fixture = released_landing_fixture();
+    let before = fixture.store.effort_for_item("item-1").unwrap().unwrap();
 
-    fixture
-        .store
-        .cancel(&fixture.effort_id, "test", "operator_cancelled")
-        .unwrap();
+    for error in [
+        fixture
+            .store
+            .cancel(&fixture.effort_id, "operator", "operator_cancelled")
+            .unwrap_err(),
+        fixture
+            .store
+            .begin_target_move(&fixture.effort_id, &sha('5'))
+            .unwrap_err(),
+        fixture
+            .store
+            .prepare_target_recomposition(&fixture.effort_id, &sha('5'))
+            .unwrap_err(),
+        fixture
+            .store
+            .reject_candidate(&fixture.effort_id, "candidate defect")
+            .unwrap_err(),
+    ] {
+        assert!(
+            format!("{error:#}").contains("landing authority"),
+            "{error:#}"
+        );
+    }
+    assert_eq!(
+        fixture.store.effort_for_item("item-1").unwrap().unwrap(),
+        before
+    );
+}
 
-    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
-    let submission: String = connection
-        .query_row(
-            "SELECT state FROM local_submissions WHERE id='submission-1'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let workspace: String = connection
-        .query_row(
-            "SELECT status FROM development_workspaces WHERE id='workspace-1'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let queue: String = connection
-        .query_row(
-            "SELECT status FROM queue_items WHERE id='item-1'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(submission, "cancelled");
-    assert_eq!(workspace, "active");
-    assert_eq!(queue, "cancelled");
+#[test]
+fn cancellation_detects_released_landing_authority_inside_valid_blocked_states() {
+    for blocker in ["infrastructure", "provider"] {
+        let fixture = released_landing_fixture();
+        match blocker {
+            "infrastructure" => fixture
+                .store
+                .block_infrastructure(
+                    &fixture.effort_id,
+                    iq::control_domain::InfrastructureBlocker {
+                        component: InfrastructureComponent::Filesystem,
+                        operation: "landing".into(),
+                        cause: InfrastructureCause::Interrupted {
+                            detail: "restart required".into(),
+                        },
+                    },
+                )
+                .unwrap(),
+            "provider" => fixture
+                .store
+                .block_provider(
+                    &fixture.effort_id,
+                    ProviderSignoffBlocker {
+                        gate: ProviderGateKind::Provider,
+                        repository: "org/repository".into(),
+                        context: "landing".into(),
+                        candidate_sha: sha('3'),
+                        status: ProviderGateStatus::Pending,
+                        evidence: "provider response is pending".into(),
+                    },
+                )
+                .unwrap(),
+            _ => unreachable!(),
+        }
+        let before = fixture.store.effort_for_item("item-1").unwrap().unwrap();
+
+        let error = fixture
+            .store
+            .cancel(&fixture.effort_id, "operator", "operator_cancelled")
+            .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("landing authority"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fixture.store.effort_for_item("item-1").unwrap().unwrap(),
+            before,
+            "cancellation changed {blocker} landing authority"
+        );
+    }
+}
+
+struct TestService {
+    wrapper: std::process::Child,
+    unit_name: String,
+    control_group: String,
+    pid: u32,
+    process_start_ticks: u64,
+}
+
+impl TestService {
+    #[allow(clippy::zombie_processes)]
+    fn start(cycle_id: &str, script: &str) -> Self {
+        let unit_name = iq::control_domain::systemd_unit_name(cycle_id).unwrap();
+        let mut wrapper = Command::new("/usr/bin/systemd-run")
+            .args([
+                "--user",
+                "--quiet",
+                "--collect",
+                "--wait",
+                "--pipe",
+                "--property=Type=exec",
+                &format!("--unit={unit_name}"),
+                "--",
+                "/bin/sh",
+                "-c",
+                script,
+            ])
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let output = Command::new("/usr/bin/systemctl")
+                .args([
+                    "--user",
+                    "show",
+                    &unit_name,
+                    "--property=LoadState,ActiveState,MainPID,ControlGroup",
+                    "--no-pager",
+                ])
+                .output()
+                .unwrap();
+            let properties = String::from_utf8(output.stdout).unwrap();
+            let control_group = properties
+                .lines()
+                .find_map(|line| line.strip_prefix("ControlGroup="))
+                .filter(|value| !value.is_empty());
+            if let (true, Some(control_group)) =
+                (properties.contains("ActiveState=active"), control_group)
+            {
+                let control_group = control_group.to_string();
+                let pid = properties
+                    .lines()
+                    .find_map(|line| line.strip_prefix("MainPID="))
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .filter(|pid| *pid != 0);
+                if let Some(pid) = pid {
+                    return Self {
+                        wrapper,
+                        unit_name,
+                        control_group,
+                        pid,
+                        process_start_ticks: iq::agent_runner::process_start_ticks(pid).unwrap(),
+                    };
+                }
+            }
+            if Instant::now() >= deadline {
+                let _ = Command::new("/usr/bin/systemctl")
+                    .args(["--user", "stop", &unit_name])
+                    .status();
+                let _ = wrapper.wait();
+                panic!("systemd service did not become active");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn wait(&mut self) {
+        self.wrapper.wait().unwrap();
+    }
+}
+
+impl Drop for TestService {
+    fn drop(&mut self) {
+        if self.wrapper.try_wait().ok().flatten().is_none() {
+            let _ = Command::new("/usr/bin/systemctl")
+                .args(["--user", "stop", &self.unit_name])
+                .status();
+        }
+        let _ = self.wrapper.wait();
+    }
 }
 
 #[test]
 fn cancelled_running_cycle_is_terminated_from_restart_debt() {
+    let cycle_id = format!("cancel-{}", uuid::Uuid::new_v4());
+    let mut service = TestService::start(&cycle_id, "exec /bin/sleep 30");
     let fixture = effort_fixture();
     let effort = fixture.store.effort_for_item("item-1").unwrap().unwrap();
-    let mut child = Command::new("sleep")
-        .arg("30")
-        .process_group(0)
-        .spawn()
-        .unwrap();
-    let pid = child.id();
-    let start = iq::agent_runner::process_start_ticks(pid).unwrap();
-    let group = unsafe { libc::getpgid(pid as i32) };
-    let mut running = running_cycle("cycle-restart-cancel", 1);
-    running.pid = pid;
-    running.process_start_ticks = start;
-    running.process_group_id = group;
+    let mut running = running_cycle(&cycle_id, 1);
+    running.pid = service.pid;
+    running.process_start_ticks = service.process_start_ticks;
+    running.control_group = service.control_group.clone();
     start_cycle(&fixture.store, &effort.id, &running);
 
     fixture
         .store
         .cancel(&effort.id, "test", "operator_cancelled")
         .unwrap();
-    assert!(child.try_wait().unwrap().is_none());
+    assert_eq!(
+        fixture
+            .store
+            .reconcile_cancelled_runner_terminations()
+            .unwrap(),
+        1
+    );
+    service.wait();
+    assert!(
+        !iq::agent_runner::exact_process_is_alive(service.pid, service.process_start_ticks)
+            .unwrap()
+    );
     let debt: i64 = rusqlite::Connection::open(&fixture.database)
         .unwrap()
         .query_row("SELECT COUNT(*) FROM runner_termination_debt", [], |row| {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(debt, 1);
+    assert_eq!(debt, 0);
+}
 
+#[test]
+fn cancelled_running_cycle_kills_descendant_in_a_different_process_group() {
+    let root = tempdir().unwrap();
+    let descendant_pid_path = root.path().join("descendant.pid");
+    let cycle_id = format!("cancel-{}", uuid::Uuid::new_v4());
+    let script = format!(
+        "setsid /bin/sleep 30 & printf '%s' \"$!\" > '{}'; exec /bin/sleep 30",
+        descendant_pid_path.display()
+    );
+    let mut service = TestService::start(&cycle_id, &script);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !descendant_pid_path.is_file() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let descendant_pid = std::fs::read_to_string(&descendant_pid_path)
+        .unwrap()
+        .parse::<u32>()
+        .unwrap();
+    let descendant_start = iq::agent_runner::process_start_ticks(descendant_pid).unwrap();
+    let fixture = effort_fixture();
+    let mut running = running_cycle(&cycle_id, 1);
+    running.pid = service.pid;
+    running.process_start_ticks = service.process_start_ticks;
+    running.control_group = service.control_group.clone();
+    start_cycle(&fixture.store, &fixture.effort_id, &running);
+    fixture
+        .store
+        .cancel(&fixture.effort_id, "test", "operator_cancelled")
+        .unwrap();
+
+    assert!(fixture
+        .store
+        .reconcile_cancelled_runner_termination(&fixture.effort_id)
+        .unwrap());
+    service.wait();
+    assert!(!iq::agent_runner::exact_process_is_alive(descendant_pid, descendant_start).unwrap());
+}
+
+#[test]
+fn cancel_cli_fails_explicitly_and_retains_unconfirmed_launch_termination_debt() {
+    let helper_root = tempdir().unwrap();
+    let systemctl = helper_root.path().join("systemctl");
+    let fail = helper_root.path().join("fail");
+    let stopped = helper_root.path().join("stopped");
+    std::fs::write(
+        &systemctl,
+        format!(
+            "#!/bin/sh\ncase \"$2\" in\nshow) if [ -f '{}' ]; then printf 'LoadState=not-found\\nMainPID=0\\n'; else printf 'LoadState=loaded\\nActiveState=active\\nMainPID=0\\n'; fi ;;\nstop) [ ! -f '{}' ] || exit 7; : > '{}' ;;\n*) exit 8 ;;\nesac\n",
+            stopped.display(),
+            fail.display(),
+            stopped.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(&fail, b"fail\n").unwrap();
+    let mut runner = runner_snapshot();
+    runner.sandbox.systemctl = iq::agent_config::executable_identity(&systemctl).unwrap();
+    let fixture = effort_fixture_with_repository_and_runner(StateRepositorySnapshot::Local, runner);
+    let running = running_cycle("cycle-cli-cancel", 1);
+    fixture
+        .store
+        .prepare_cycle_launch(&fixture.effort_id, &launching_cycle(&running))
+        .unwrap();
+    assert!(fixture
+        .store
+        .surrender_cycle_spawn_authority(
+            &fixture.effort_id,
+            &running.launch_operation_id,
+            &running.authority_lease_id,
+            &running.launcher,
+        )
+        .unwrap());
+
+    let failed = Command::new(env!("CARGO_BIN_EXE_iq"))
+        .arg("--queue-db")
+        .arg(&fixture.database)
+        .args(["cancel", "item-1"])
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains("stop prepared systemd unit failed"),
+        "{}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     assert_eq!(
-        fixture
-            .store
-            .reconcile_cancelled_runner_terminations(true)
+        connection
+            .query_row(
+                "SELECT status FROM queue_items WHERE id='item-1'",
+                [],
+                |row| { row.get::<_, String>(0) }
+            )
+            .unwrap(),
+        "cancelled"
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM runner_termination_debt", [], |row| {
+                row.get::<_, i64>(0)
+            })
             .unwrap(),
         1
     );
-    let _ = child.wait();
-    assert!(iq::agent_runner::process_start_ticks(pid).is_err());
-    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
-    let debt: i64 = connection
-        .query_row("SELECT COUNT(*) FROM runner_termination_debt", [], |row| {
-            row.get(0)
-        })
+
+    let early_acknowledgement = fixture
+        .store
+        .acknowledge_cycle_spawn_failed(
+            &fixture.effort_id,
+            &running.launch_operation_id,
+            &running.authority_lease_id,
+            &running.launcher,
+        )
+        .unwrap_err();
+    assert!(
+        format!("{early_acknowledgement:#}").contains("still active"),
+        "{early_acknowledgement:#}"
+    );
+    std::fs::remove_file(fail).unwrap();
+    let retried = Command::new(env!("CARGO_BIN_EXE_iq"))
+        .arg("--queue-db")
+        .arg(&fixture.database)
+        .args(["cancel", "item-1"])
+        .output()
         .unwrap();
-    assert_eq!(debt, 0);
+    assert!(!retried.status.success());
+    assert!(
+        String::from_utf8_lossy(&retried.stderr).contains("durable termination debt remains"),
+        "{}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
+    fixture
+        .store
+        .acknowledge_cycle_spawn_failed(
+            &fixture.effort_id,
+            &running.launch_operation_id,
+            &running.authority_lease_id,
+            &running.launcher,
+        )
+        .unwrap();
+    let completed = Command::new(env!("CARGO_BIN_EXE_iq"))
+        .arg("--queue-db")
+        .arg(&fixture.database)
+        .args(["cancel", "item-1"])
+        .output()
+        .unwrap();
+    assert!(
+        completed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM runner_termination_debt", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn cancellation_after_spawn_surrender_rejects_started_until_launcher_closes_authority() {
+    let fixture = effort_fixture();
+    let running = running_cycle("cycle-cancelled-before-start-record", 1);
+    fixture
+        .store
+        .prepare_cycle_launch(&fixture.effort_id, &launching_cycle(&running))
+        .unwrap();
+    assert!(fixture
+        .store
+        .surrender_cycle_spawn_authority(
+            &fixture.effort_id,
+            &running.launch_operation_id,
+            &running.authority_lease_id,
+            &running.launcher,
+        )
+        .unwrap());
+
+    fixture
+        .store
+        .cancel(&fixture.effort_id, "test", "operator_cancelled")
+        .unwrap();
+    assert!(!fixture
+        .store
+        .record_cycle_started(
+            &fixture.effort_id,
+            &running,
+            &running.authority_lease_id,
+            &running.launcher,
+        )
+        .unwrap());
+    assert!(!fixture
+        .store
+        .reconcile_cancelled_runner_termination(&fixture.effort_id)
+        .unwrap());
+    assert_eq!(
+        rusqlite::Connection::open(&fixture.database)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM runner_termination_debt", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
+    );
+
+    fixture
+        .store
+        .acknowledge_cycle_spawn_failed(
+            &fixture.effort_id,
+            &running.launch_operation_id,
+            &running.authority_lease_id,
+            &running.launcher,
+        )
+        .unwrap();
+    assert!(fixture
+        .store
+        .reconcile_cancelled_runner_termination(&fixture.effort_id)
+        .unwrap());
+    assert_eq!(
+        rusqlite::Connection::open(&fixture.database)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM runner_termination_debt", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn live_paused_launcher_retains_spawn_authority_until_exact_process_death() {
+    let fixture = effort_fixture();
+    let mut launcher = Command::new("sleep").arg("30").spawn().unwrap();
+    let mut running = running_cycle("cycle-launcher-liveness", 1);
+    running.launcher.pid = launcher.id();
+    running.launcher.process_start_ticks =
+        iq::agent_runner::process_start_ticks(launcher.id()).unwrap();
+    fixture
+        .store
+        .prepare_cycle_launch(&fixture.effort_id, &launching_cycle(&running))
+        .unwrap();
+    fixture
+        .store
+        .surrender_cycle_spawn_authority(
+            &fixture.effort_id,
+            &running.launch_operation_id,
+            &running.authority_lease_id,
+            &running.launcher,
+        )
+        .unwrap();
+    unsafe { libc::kill(launcher.id() as i32, libc::SIGSTOP) };
+
+    assert!(fixture
+        .store
+        .authorize_cycle_spawn(
+            &fixture.effort_id,
+            &running.launch_operation_id,
+            &running.authority_lease_id,
+            &running.launcher,
+        )
+        .unwrap());
+    assert!(fixture
+        .store
+        .reset_prepared_launch(&fixture.effort_id, &running.cycle_id)
+        .unwrap_err()
+        .to_string()
+        .contains("live launcher"));
+
+    unsafe {
+        libc::kill(launcher.id() as i32, libc::SIGCONT);
+        libc::kill(launcher.id() as i32, libc::SIGKILL);
+    }
+    launcher.wait().unwrap();
+    assert!(!fixture
+        .store
+        .authorize_cycle_spawn(
+            &fixture.effort_id,
+            &running.launch_operation_id,
+            &running.authority_lease_id,
+            &running.launcher,
+        )
+        .unwrap());
+    fixture
+        .store
+        .reset_prepared_launch(&fixture.effort_id, &running.cycle_id)
+        .unwrap();
+}
+
+#[test]
+fn spawn_authorization_rejects_stale_launcher_token_and_pid_reuse_identity() {
+    let fixture = effort_fixture();
+    let running = running_cycle("cycle-stale-launcher", 1);
+    fixture
+        .store
+        .prepare_cycle_launch(&fixture.effort_id, &launching_cycle(&running))
+        .unwrap();
+    fixture
+        .store
+        .surrender_cycle_spawn_authority(
+            &fixture.effort_id,
+            &running.launch_operation_id,
+            &running.authority_lease_id,
+            &running.launcher,
+        )
+        .unwrap();
+    let mut stale_token = running.launcher.clone();
+    stale_token.token = "launcher-stale-token".into();
+
+    assert!(fixture
+        .store
+        .authorize_cycle_spawn(
+            &fixture.effort_id,
+            &running.launch_operation_id,
+            &running.authority_lease_id,
+            &stale_token,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("differs from surrendered authority"));
+    assert!(!iq::agent_runner::exact_process_is_alive(
+        running.launcher.pid,
+        running.launcher.process_start_ticks + 1,
+    )
+    .unwrap());
+}
+
+#[test]
+fn cancellation_before_spawn_keeps_debt_while_exact_launcher_is_paused() {
+    let helper_root = tempdir().unwrap();
+    let systemctl = helper_root.path().join("systemctl");
+    let log = helper_root.path().join("systemctl.log");
+    std::fs::write(
+        &systemctl,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf 'LoadState=not-found\\nMainPID=0\\n'\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut runner = runner_snapshot();
+    runner.sandbox.systemctl = iq::agent_config::executable_identity(&systemctl).unwrap();
+    let fixture = effort_fixture_with_repository_and_runner(StateRepositorySnapshot::Local, runner);
+    let mut launcher = Command::new("sleep").arg("30").spawn().unwrap();
+    let mut running = running_cycle("cycle-close-race", 1);
+    running.launcher.pid = launcher.id();
+    running.launcher.process_start_ticks =
+        iq::agent_runner::process_start_ticks(launcher.id()).unwrap();
+    fixture
+        .store
+        .prepare_cycle_launch(&fixture.effort_id, &launching_cycle(&running))
+        .unwrap();
+    unsafe { libc::kill(launcher.id() as i32, libc::SIGSTOP) };
+    fixture
+        .store
+        .cancel(&fixture.effort_id, "test", "cancel-before-spawn")
+        .unwrap();
+
+    assert!(!fixture
+        .store
+        .reconcile_cancelled_runner_termination(&fixture.effort_id)
+        .unwrap());
+    assert_eq!(
+        rusqlite::Connection::open(&fixture.database)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM runner_termination_debt", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
+    );
+    unsafe {
+        libc::kill(launcher.id() as i32, libc::SIGCONT);
+        libc::kill(launcher.id() as i32, libc::SIGKILL);
+    }
+    launcher.wait().unwrap();
+    assert!(fixture
+        .store
+        .reconcile_cancelled_runner_termination(&fixture.effort_id)
+        .unwrap());
+    assert_eq!(
+        rusqlite::Connection::open(&fixture.database)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM runner_termination_debt", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+    assert!(std::fs::read_to_string(log).unwrap().contains(
+        "--user show --property=LoadState --property=ActiveState --property=MainPID --property=ControlGroup -- iq-agent-cycle-close-race.service"
+    ));
+}
+
+#[test]
+fn schema4_open_rejects_corrupt_termination_cycle_and_unit_pair() {
+    let fixture = effort_fixture();
+    let running = running_cycle("cycle-corrupt-debt", 1);
+    fixture
+        .store
+        .prepare_cycle_launch(&fixture.effort_id, &launching_cycle(&running))
+        .unwrap();
+    fixture
+        .store
+        .cancel(&fixture.effort_id, "test", "create-debt")
+        .unwrap();
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute(
+            "UPDATE runner_termination_debt SET authority_json=json_set(authority_json,'$.payload.unit_name','iq-agent-other-cycle.service') WHERE effort_id=?1",
+            [&fixture.effort_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = match iq::sqlite::SqliteQueue::open(&fixture.database) {
+        Ok(_) => panic!("corrupt termination authority opened successfully"),
+        Err(error) => error,
+    };
+    assert!(
+        format!("{error:#}").contains("exact cycle authority"),
+        "{error:#}"
+    );
 }
 
 #[test]
@@ -1197,7 +1786,8 @@ fn local_repository_creates_no_external_artifact() {
 }
 
 #[test]
-fn gitlab_issue_comments_get_one_durable_disposition_and_only_exact_authority_resumes() {
+// Controlled CLI scripts verify IQ's legacy state-repository contract, not provider service behavior.
+fn controlled_gitlab_cli_contract_records_one_disposition_and_exact_resume_authority() {
     let _guard = env_lock().lock().unwrap();
     let fixture = effort_fixture_with_repository(StateRepositorySnapshot::GitlabIssue(
         IssueRepositorySnapshot {
@@ -1276,12 +1866,15 @@ exit 0
     )
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::env::set_var("IQ_GITLAB_CLI", &fake);
+    let _provider_executable = iq::providers::inject_test_provider_executable(
+        iq::repository_policy::Provider::Gitlab,
+        &fake,
+    )
+    .unwrap();
 
     iq::state_repository::project_item(&fixture.store, "item-1").unwrap();
     let dispositions = iq::state_repository::ingest_answers(&fixture.store, "item-1").unwrap();
     let duplicate_poll = iq::state_repository::ingest_answers(&fixture.store, "item-1").unwrap();
-    std::env::remove_var("IQ_GITLAB_CLI");
 
     assert_eq!(
         dispositions,
@@ -1315,7 +1908,7 @@ exit 0
 }
 
 #[test]
-fn failed_terminal_issue_close_waits_for_due_retry_and_closes_same_issue() {
+fn controlled_gitlab_cli_contract_retries_terminal_issue_close() {
     let _guard = env_lock().lock().unwrap();
     let fixture = effort_fixture_with_repository(StateRepositorySnapshot::GitlabIssue(
         IssueRepositorySnapshot {
@@ -1345,7 +1938,11 @@ exit 0
     )
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::env::set_var("IQ_GITLAB_CLI", &fake);
+    let _provider_executable = iq::providers::inject_test_provider_executable(
+        iq::repository_policy::Provider::Gitlab,
+        &fake,
+    )
+    .unwrap();
 
     iq::state_repository::project_item(&fixture.store, "item-1").unwrap();
     fixture
@@ -1367,7 +1964,6 @@ exit 0
     std::fs::remove_file(fail_close).unwrap();
     assert_eq!(fixture.store.projection_items(10).unwrap(), vec!["item-1"]);
     iq::state_repository::project_item(&fixture.store, "item-1").unwrap();
-    std::env::remove_var("IQ_GITLAB_CLI");
 
     let artifact = fixture
         .store
@@ -1388,7 +1984,7 @@ exit 0
 }
 
 #[test]
-fn full_issue_is_reserved_once_at_enqueue_and_transferred_to_effort() {
+fn controlled_gitlab_cli_contract_reserves_full_issue_once() {
     let _guard = env_lock().lock().unwrap();
     let fixture = bare_store_fixture();
     let repository = StateRepositorySnapshot::GitlabIssue(IssueRepositorySnapshot {
@@ -1407,7 +2003,11 @@ fn full_issue_is_reserved_once_at_enqueue_and_transferred_to_effort() {
     )
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::env::set_var("IQ_GITLAB_CLI", &fake);
+    let _provider_executable = iq::providers::inject_test_provider_executable(
+        iq::repository_policy::Provider::Gitlab,
+        &fake,
+    )
+    .unwrap();
 
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection.execute(
@@ -1440,7 +2040,6 @@ fn full_issue_is_reserved_once_at_enqueue_and_transferred_to_effort() {
             state_repository: &repository,
         })
         .unwrap();
-    std::env::remove_var("IQ_GITLAB_CLI");
 
     assert!(fixture
         .store
@@ -1486,7 +2085,11 @@ fn reservation_outbox_recovers_pending_enqueue_once() {
     )
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::env::set_var("IQ_GITLAB_CLI", &fake);
+    let _provider_executable = iq::providers::inject_test_provider_executable(
+        iq::repository_policy::Provider::Gitlab,
+        &fake,
+    )
+    .unwrap();
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection.execute(
         "INSERT INTO item_state_repository_bindings(item_id,snapshot_json,provider,repository,visibility,reservation_state,created_at) VALUES('item-1',?1,'gitlab','group/project','full','pending','2026-01-01T00:00:00Z')",
@@ -1502,7 +2105,6 @@ fn reservation_outbox_recovers_pending_enqueue_once() {
         iq::state_repository::process_issue_reservation_outbox(&fixture.store, 10).unwrap(),
         0
     );
-    std::env::remove_var("IQ_GITLAB_CLI");
 
     assert_eq!(
         fixture
@@ -1573,29 +2175,23 @@ fn exhausted_projection_debt_creates_one_alert_and_one_delivery() {
 }
 
 #[test]
-fn minimal_issue_binding_creates_nothing_until_blocked_then_reuses_one_issue() {
+fn controlled_gitlab_cli_contract_reuses_minimal_blocked_issue() {
     let _guard = env_lock().lock().unwrap();
     let temp = tempdir().unwrap();
     let database = temp.path().join("queue.db");
-    let queue = iq::sqlite::SqliteQueue::open(&database).unwrap();
-    queue
-        .register_control_plane_fixture_repository(
-            "00000000-0000-4000-8000-000000000001",
-            "/repo",
-            "main",
-        )
-        .unwrap();
+    let fixture = RepositoryFixture::new(temp.path(), &database);
+    let head = fixture.create_branch("agent/minimal");
     let repository = StateRepositorySnapshot::GitlabIssue(IssueRepositorySnapshot {
         repository: "group/project".into(),
         visibility: IssueVisibility::Minimal,
         allowed_responders: vec!["maintainer".into()],
     });
-    let item = queue
-        .enqueue(iq::sqlite::EnqueueRequest {
-            repo_key: "00000000-0000-4000-8000-000000000001".into(),
+    let item = fixture
+        .manager
+        .admit_direct(iq::sqlite::DirectAdmissionRequest {
+            repo_key: fixture.repository.key.clone(),
             source_branch: "agent/minimal".into(),
-            current_head_sha: sha('2'),
-            pr_url: None,
+            current_head_sha: head,
             producer_metadata: serde_json::json!({"worker":"test"}),
             state_repository: repository.clone(),
         })
@@ -1609,7 +2205,7 @@ fn minimal_issue_binding_creates_nothing_until_blocked_then_reuses_one_issue() {
         .unwrap();
     connection
         .execute(
-            "UPDATE queue_items SET current_attempt_id='attempt-1' WHERE id=?1",
+            "UPDATE queue_items SET status='merging',current_attempt_id='attempt-1' WHERE id=?1",
             [&item.id],
         )
         .unwrap();
@@ -1644,7 +2240,11 @@ fn minimal_issue_binding_creates_nothing_until_blocked_then_reuses_one_issue() {
     )
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::env::set_var("IQ_GITLAB_CLI", &fake);
+    let _provider_executable = iq::providers::inject_test_provider_executable(
+        iq::repository_policy::Provider::Gitlab,
+        &fake,
+    )
+    .unwrap();
 
     iq::state_repository::project_item(&store, &item.id).unwrap();
     assert!(store.repository_artifact(&effort.id).unwrap().is_none());
@@ -1672,7 +2272,6 @@ fn minimal_issue_binding_creates_nothing_until_blocked_then_reuses_one_issue() {
         .unwrap();
     iq::state_repository::project_item(&store, &item.id).unwrap();
     start_cycle(&store, &effort.id, &running_cycle("cycle-1", 1));
-    std::env::remove_var("IQ_GITLAB_CLI");
 
     assert_eq!(
         store
@@ -2056,59 +2655,118 @@ fn unavailable_notification_backend_reports_degraded_health() {
 #[test]
 fn systemd_unit_lookup_distinguishes_loaded_missing_and_failed_queries() {
     let temp = tempdir().unwrap();
+    let publish_executable = |path: &Path, body: &str| {
+        let staged = path.with_extension("new");
+        std::fs::write(&staged, body).unwrap();
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(staged, path).unwrap();
+    };
     let loaded = temp.path().join("systemctl-loaded");
-    std::fs::write(
+    let arguments = temp.path().join("systemctl-arguments");
+    publish_executable(
         &loaded,
-        "#!/bin/sh\nprintf 'LoadState=loaded\\nMainPID=42\\n'\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&loaded, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert_eq!(
-        iq::agent_runner::systemd_unit_state(&loaded, "iq-agent-cycle-1").unwrap(),
-        iq::agent_runner::SystemdUnitState::Loaded { main_pid: Some(42) }
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$2\" = show ]; then printf 'LoadState=loaded\\nActiveState=active\\nMainPID=42\\n'; fi\n",
+            arguments.display()
+        ),
     );
+    let loaded_identity = iq::agent_config::executable_identity(&loaded).unwrap();
+    assert_eq!(
+        iq::agent_runner::systemd_unit_state(&loaded_identity, "iq-agent-cycle-1.service").unwrap(),
+        iq::agent_runner::SystemdUnitState::Active { main_pid: Some(42) }
+    );
+    iq::agent_runner::stop_systemd_unit(&loaded_identity, "iq-agent-cycle-1.service").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&arguments).unwrap(),
+        "--user show --property=LoadState --property=ActiveState --property=MainPID --property=ControlGroup -- iq-agent-cycle-1.service\n--user stop --no-block -- iq-agent-cycle-1.service\n"
+    );
+    let before = std::fs::read(&arguments).unwrap();
+    for unit in [
+        "iq-agent-cycle-*.service",
+        "iq-agent--cycle.service",
+        "unrelated.service",
+    ] {
+        assert!(iq::agent_runner::systemd_unit_state(&loaded_identity, unit).is_err());
+    }
+    assert_eq!(std::fs::read(&arguments).unwrap(), before);
 
     let missing = temp.path().join("systemctl-missing");
-    std::fs::write(
+    publish_executable(
         &missing,
         "#!/bin/sh\nprintf 'LoadState=not-found\\nMainPID=0\\n'\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&missing, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
+    let missing_identity = iq::agent_config::executable_identity(&missing).unwrap();
     assert_eq!(
-        iq::agent_runner::systemd_unit_state(&missing, "iq-agent-cycle-1").unwrap(),
+        iq::agent_runner::systemd_unit_state(&missing_identity, "iq-agent-cycle-1.service")
+            .unwrap(),
         iq::agent_runner::SystemdUnitState::Missing
     );
 
     let failed = temp.path().join("systemctl-failed");
-    std::fs::write(&failed, "#!/bin/sh\nprintf 'bus unavailable' >&2\nexit 1\n").unwrap();
-    std::fs::set_permissions(&failed, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let error = iq::agent_runner::systemd_unit_state(&failed, "iq-agent-cycle-1")
+    publish_executable(&failed, "#!/bin/sh\nprintf 'bus unavailable' >&2\nexit 1\n");
+    let failed_identity = iq::agent_config::executable_identity(&failed).unwrap();
+    let error = iq::agent_runner::systemd_unit_state(&failed_identity, "iq-agent-cycle-1.service")
         .unwrap_err()
         .to_string();
     assert!(error.contains("inspect prepared systemd unit failed"));
 }
 
 #[test]
-fn exact_process_termination_rejects_changed_process_group() {
-    let mut child = Command::new("sleep")
-        .arg("30")
-        .process_group(0)
-        .spawn()
-        .unwrap();
-    let pid = child.id();
-    let start_ticks = iq::agent_runner::process_start_ticks(pid).unwrap();
-    let process_group = unsafe { libc::getpgid(pid as i32) };
-    assert!(process_group > 0);
+fn executable_identity_rejects_content_and_inode_replacement() {
+    let temp = tempdir().unwrap();
+    let executable = temp.path().join("tool");
+    std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let identity = iq::agent_config::executable_identity(&executable).unwrap();
 
-    let error = iq::agent_runner::terminate_exact_process(pid, start_ticks, process_group + 1)
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("different process group"));
-    assert!(child.try_wait().unwrap().is_none());
+    std::fs::write(&executable, b"#!/bin/sh\nexit 1\n").unwrap();
+    let content_error = iq::agent_config::verify_executable(&identity).unwrap_err();
+    assert!(content_error
+        .to_string()
+        .contains("approved executable identity changed"));
 
-    iq::agent_runner::terminate_exact_process(pid, start_ticks, process_group).unwrap();
-    child.wait().unwrap();
+    let identity = iq::agent_config::executable_identity(&executable).unwrap();
+    let replacement = temp.path().join("replacement");
+    std::fs::write(&replacement, b"#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(replacement, &executable).unwrap();
+    let inode_error = iq::agent_config::verify_executable(&identity).unwrap_err();
+    assert!(inode_error
+        .to_string()
+        .contains("approved executable identity changed"));
+}
+
+#[test]
+fn sandbox_cleanup_rejects_replacement_and_symlink_roots() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join(".iq-agent-sandbox-cycle-replacement");
+    let export = root.join("export");
+    std::fs::create_dir_all(&export).unwrap();
+    iq::agent_runner::write_test_sandbox_ownership(&root, "cycle-replacement").unwrap();
+    let original = temp.path().join("original");
+    std::fs::rename(&root, &original).unwrap();
+    std::fs::create_dir_all(&export).unwrap();
+    std::fs::copy(
+        original.join(".iq-sandbox-owner.json"),
+        root.join(".iq-sandbox-owner.json"),
+    )
+    .unwrap();
+    std::fs::write(root.join("replacement-data"), b"keep\n").unwrap();
+
+    let replacement_error = iq::agent_runner::remove_sandbox_export(&export).unwrap_err();
+    assert!(replacement_error
+        .to_string()
+        .contains("ownership manifest differs"));
+    assert_eq!(
+        std::fs::read(root.join("replacement-data")).unwrap(),
+        b"keep\n"
+    );
+
+    std::fs::remove_dir_all(&root).unwrap();
+    std::os::unix::fs::symlink(&original, &root).unwrap();
+    let symlink_error = iq::agent_runner::remove_sandbox_export(&export).unwrap_err();
+    assert!(format!("{symlink_error:#}").contains("open sandbox root"));
+    assert!(original.join("export").is_dir());
 }
 
 #[test]
@@ -2119,15 +2777,10 @@ fn staged_result_import_reproduces_exact_tree_without_commit() {
     git(&retained, ["config", "user.name", "IQ Test"]);
     git(&retained, ["config", "user.email", "iq@example.test"]);
     git(&retained, ["config", "commit.gpgsign", "false"]);
-    let hooks = temp.path().join("hooks");
-    std::fs::create_dir(&hooks).unwrap();
-    git(
-        &retained,
-        ["config", "core.hooksPath", hooks.to_str().unwrap()],
-    );
     std::fs::write(retained.join("file.txt"), "base\n").unwrap();
     git(&retained, ["add", "file.txt"]);
     git(&retained, ["commit", "-m", "base"]);
+    iq::git_command::authorize_current(&retained).unwrap();
     let sandbox = temp.path().join("sandbox");
     git(
         temp.path(),
@@ -2177,18 +2830,25 @@ fn fake_opencode_runs_in_bounded_sandbox_and_exports_typed_result() {
     std::fs::write(retained.join("file.txt"), "base\n").unwrap();
     git(&retained, ["add", "file.txt"]);
     git(&retained, ["commit", "-m", "base"]);
+    iq::git_command::authorize_current(&retained).unwrap();
     let fake = temp.path().join("opencode");
     std::fs::write(
         &fake,
         r##"#!/bin/sh
 set -eu
+prompt=
+for argument in "$@"; do prompt=$argument; done
+version=$(expr "$prompt" : '.*protocol version \([0-9][0-9]*\) JSON')
+test -n "$version"
+test "$IQ_GIT_EXECUTABLE" = /iq-git
+test "$(command -v git)" = /iq-bin/git
 printf 'integrated\n' > file.txt
 git add file.txt
 tree=$(git write-tree)
 digest=$(printf '%s' "$tree" | sha256sum | cut -d' ' -f1)
 result=/iq-protocol/result.json
 cat > "$result.tmp" <<EOF
-{"outcome":"resolved","version":1,"identity":{"effort_id":"effort-1","item_id":"item-1","attempt_id":"attempt-1","cycle_id":"cycle-1","target_sha":"1111111111111111111111111111111111111111","source_sha":"2222222222222222222222222222222222222222","candidate_sha":null},"staged_tree_sha256":"$digest","changed_paths":[[{"hex":"66696c652e747874"}]],"checks":[]}
+    {"outcome":"resolved","version":$version,"identity":{"effort_id":"effort-1","item_id":"item-1","attempt_id":"attempt-1","cycle_id":"cycle-1","target_sha":"1111111111111111111111111111111111111111","source_sha":"2222222222222222222222222222222222222222","candidate_sha":null},"staged_tree_sha256":"$digest","changed_paths":[[{"hex":"66696c652e747874"}]],"checks":[]}
 EOF
 mv "$result.tmp" "$result"
 "##,
@@ -2217,7 +2877,31 @@ mv "$result.tmp" "$result"
         open_files: 128,
         credential_env: "IQ_TEST_MODEL_KEY".into(),
     };
+    let hostile_marker = temp.path().join("sandbox-helper-inherited-git-env");
+    let hostile_diff = temp.path().join("hostile-diff");
+    std::fs::write(
+        &hostile_diff,
+        format!("#!/bin/sh\n: > '{}'\n", hostile_marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hostile_diff, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let hostile_path = temp.path().join("hostile-path");
+    std::fs::create_dir(&hostile_path).unwrap();
+    let hostile_git_marker = temp.path().join("hostile-path-git-executed");
+    let hostile_git = hostile_path.join("git");
+    std::fs::write(
+        &hostile_git,
+        format!(
+            "#!/bin/sh\n: > '{}'\nexit 91\n",
+            hostile_git_marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hostile_git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let original_path = std::env::var_os("PATH");
     std::env::set_var("IQ_TEST_MODEL_KEY", "not-logged");
+    std::env::set_var("GIT_EXTERNAL_DIFF", &hostile_diff);
+    std::env::set_var("PATH", format!("{}:/usr/bin:/bin", hostile_path.display()));
     let outcome = iq::agent_runner::OpenCodeRunner::new(config, snapshot)
         .unwrap()
         .run(
@@ -2226,22 +2910,112 @@ mv "$result.tmp" "$result"
             &[],
             iq::agent_runner::RunnerLifecycle {
                 on_prepared: |_: &str, _: &Path| Ok(()),
-                on_started: |_: u32, _: u64, _: i32, _: &str, _: &Path| Ok(()),
+                on_spawn_surrender: || Ok(true),
+                recheck_spawn_authority: || Ok(true),
+                on_spawn_failed: || Ok(()),
+                on_started: |_: u32, _: u64, _: &str, _: &str, _: &Path| Ok(true),
                 on_writing: |_: &AtomicResultState| Ok(()),
                 authority_active: || Ok(true),
             },
         )
         .unwrap();
     std::env::remove_var("IQ_TEST_MODEL_KEY");
+    std::env::remove_var("GIT_EXTERNAL_DIFF");
+    match original_path {
+        Some(path) => std::env::set_var("PATH", path),
+        None => std::env::remove_var("PATH"),
+    }
     let iq::agent_runner::RunnerOutcome::Complete { result, log, .. } = outcome else {
         panic!("fake runner did not return a complete result: {outcome:?}")
     };
     assert!(matches!(*result, AgentResult::Resolved(_)));
     assert!(!String::from_utf8_lossy(&log).contains("not-logged"));
+    assert!(!hostile_marker.exists());
+    assert!(!hostile_git_marker.exists());
     assert_eq!(
         std::fs::read_to_string(retained.join("file.txt")).unwrap(),
         "base\n"
     );
+}
+
+#[test]
+fn failed_post_spawn_start_record_stops_service_and_closes_surrendered_authority() {
+    let _guard = env_lock().lock().unwrap();
+    let temp = tempdir().unwrap();
+    let retained = temp.path().join("retained");
+    git(temp.path(), ["init", retained.to_str().unwrap()]);
+    git(&retained, ["config", "user.name", "IQ Test"]);
+    git(&retained, ["config", "user.email", "iq@example.test"]);
+    git(&retained, ["config", "commit.gpgsign", "false"]);
+    std::fs::write(retained.join("file.txt"), "base\n").unwrap();
+    git(&retained, ["add", "file.txt"]);
+    git(&retained, ["commit", "-m", "base"]);
+    iq::git_command::authorize_current(&retained).unwrap();
+    let fake = temp.path().join("opencode");
+    std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let executable = iq::agent_config::executable_identity(&fake).unwrap();
+    let mut snapshot = runner_snapshot();
+    snapshot.executable = executable;
+    snapshot.bounds.max_processes = 16;
+    snapshot.bounds.memory_bytes = 256 * 1024 * 1024;
+    let config = iq::agent_config::IntegrationAgentConfig {
+        runner: RunnerKind::Opencode,
+        executable: fake,
+        agent: "iq-integration".into(),
+        model: "test/model".into(),
+        cycle_timeout_seconds: 30,
+        max_log_bytes: 4096,
+        max_result_bytes: 4096,
+        max_processes: 16,
+        memory_bytes: 256 * 1024 * 1024,
+        cpu_seconds: 30,
+        writable_bytes: 16 * 1024 * 1024,
+        open_files: 128,
+        credential_env: "IQ_TEST_MODEL_KEY".into(),
+    };
+    let spawn_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = spawn_failed.clone();
+    std::env::set_var("IQ_TEST_MODEL_KEY", "not-logged");
+
+    let error = iq::agent_runner::OpenCodeRunner::new(config, snapshot.clone())
+        .unwrap()
+        .run(
+            &retained,
+            &input(),
+            &[],
+            iq::agent_runner::RunnerLifecycle {
+                on_prepared: |_: &str, _: &Path| Ok(()),
+                on_spawn_surrender: || Ok(true),
+                recheck_spawn_authority: || Ok(true),
+                on_spawn_failed: move || {
+                    observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+                on_started: |_: u32, _: u64, _: &str, _: &str, _: &Path| {
+                    anyhow::bail!("injected start-record failure")
+                },
+                on_writing: |_: &AtomicResultState| Ok(()),
+                authority_active: || Ok(true),
+            },
+        )
+        .unwrap_err();
+    std::env::remove_var("IQ_TEST_MODEL_KEY");
+
+    assert!(format!("{error:#}").contains("injected start-record failure"));
+    assert!(
+        spawn_failed.load(std::sync::atomic::Ordering::SeqCst),
+        "{error:#}"
+    );
+    assert!(matches!(
+        iq::agent_runner::systemd_unit_state(
+            &snapshot.sandbox.systemctl,
+            "iq-agent-cycle-1.service"
+        )
+        .unwrap(),
+        iq::agent_runner::SystemdUnitState::Missing
+            | iq::agent_runner::SystemdUnitState::Inactive { .. }
+    ));
 }
 
 fn test_control_api_config(
@@ -2360,26 +3134,82 @@ struct EffortFixture {
 fn bare_store_fixture() -> EffortFixture {
     let temp = tempdir().unwrap();
     let database = temp.path().join("queue.db");
-    let store = ControlStore::open_test_database(&database).unwrap();
-    let queue = SqliteQueue::open(&database).unwrap();
-    queue
-        .register_control_plane_fixture_repository(
-            "00000000-0000-4000-8000-000000000001",
-            "/repo",
-            "main",
-        )
+    let repository_key = "00000000-0000-4000-8000-000000000001";
+    let reservation = temp.path().join("repositories").join(repository_key);
+    std::fs::create_dir_all(&reservation).unwrap();
+    let remote = reservation.join("root");
+    assert!(Command::new("/usr/bin/git")
+        .args([
+            "init",
+            "--bare",
+            "--object-format=sha1",
+            remote.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let policy = direct_policy(&remote);
+    let ownership_key = policy
+        .canonical_repository
+        .canonical_ownership_key()
         .unwrap();
-    drop(queue);
+    iq::sqlite::SqliteQueue::open(&database).unwrap();
+    let store = ControlStore::open(&database).unwrap();
     let connection = rusqlite::Connection::open(&database).unwrap();
     connection
         .execute(
-            "INSERT INTO queue_items(id,repo_key,source_branch,producer_metadata_json,validation_evidence_json,status,current_head_sha,current_attempt_id,source_kind,source_ref,landing_policy,created_at,updated_at) VALUES('item-1','00000000-0000-4000-8000-000000000001','agent/test','{}','[]','merging','111','attempt-1','remote_branch','agent/test','direct','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            "INSERT INTO repository_policies(repo_key,revision,operation_state_json,canonical_repository_json,canonical_ownership_key,target_branch,integration_policy,replication_policy_json,created_at,updated_at) VALUES(?1,1,?2,?3,?4,?5,?6,?7,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            rusqlite::params![repository_key,serde_json::to_string(&policy.operation_state).unwrap(),serde_json::to_string(&policy.canonical_repository).unwrap(),ownership_key,policy.target_branch,policy.integration_policy.to_string(),serde_json::to_string(&policy.replication_policy).unwrap()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO physical_repository_ownership(identity_key,repo_key,role,ordinal,repository_json,created_at) VALUES(?1,?2,'canonical',0,?3,'2026-01-01T00:00:00Z')",
+            rusqlite::params![ownership_key,repository_key,serde_json::to_string(&policy.canonical_repository).unwrap()],
+    )
+    .unwrap();
+    let development = reservation.join("development");
+    let integration = reservation.join("integration");
+    let registry = temp.path().join("rift.sqlite");
+    std::fs::create_dir(&development).unwrap();
+    std::fs::create_dir(&integration).unwrap();
+    std::fs::write(&registry, b"test registry\n").unwrap();
+    let registry_metadata = std::fs::metadata(&registry).unwrap();
+    let binding = iq::git_command::RepositoryBinding::capture(&remote).unwrap();
+    let mut connection = connection;
+    let transaction = connection.transaction().unwrap();
+    transaction
+        .execute(
+            "INSERT INTO registered_repositories(repo_key,owned_root_path,git_binding_json,root_rift_id,registry_identity,registry_device,registry_inode,generation,source_sha,checkout_json,development_root_path,integration_root_path,provisioning_json,created_at,updated_at) VALUES(?1,?2,?3,'ROOTRIFT000000000000000001',?4,?5,?6,0,?7,?8,?9,?10,'{\"state\":\"ready\"}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            rusqlite::params![repository_key,remote.as_os_str().as_encoded_bytes(),serde_json::to_string(&binding).unwrap(),registry.as_os_str().as_encoded_bytes(),registry_metadata.dev(),registry_metadata.ino(),sha('1'),serde_json::json!({"state":"ready","target_sha":sha('1')}).to_string(),development.as_os_str().as_encoded_bytes(),integration.as_os_str().as_encoded_bytes()],
+        )
+        .unwrap();
+    for (kind, root) in [("development", &development), ("integration", &integration)] {
+        transaction
+            .execute(
+                "INSERT INTO workspace_roots(repo_key,kind,root_path,source_path,source_rift_id,registry_identity,registry_device,registry_inode,generation) VALUES(?1,?2,?3,?4,'ROOTRIFT000000000000000001',?5,?6,?7,0)",
+                rusqlite::params![repository_key,kind,root.as_os_str().as_encoded_bytes(),remote.as_os_str().as_encoded_bytes(),registry.as_os_str().as_encoded_bytes(),registry_metadata.dev(),registry_metadata.ino()],
+            )
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+    drop(connection);
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "INSERT INTO queue_items(id,repo_key,producer_metadata_json,validation_evidence_json,status,current_attempt_id,created_at,updated_at) VALUES('item-1',?1,'{}','[]','merging','attempt-1','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            [repository_key],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO queue_admissions(item_id,kind,source_branch,head_sha,admitted_at) VALUES('item-1','direct','agent/test','1111111111111111111111111111111111111111','2026-01-01T00:00:00Z')",
             [],
         )
         .unwrap();
     connection
         .execute(
-            "INSERT INTO integration_attempts(id,item_id,attempt_number,source_head_sha,started_at) VALUES('attempt-1','item-1',1,'111','2026-01-01T00:00:00Z')",
+            "INSERT INTO integration_attempts(id,item_id,attempt_number,source_head_sha,started_at) VALUES('attempt-1','item-1',1,'1111111111111111111111111111111111111111','2026-01-01T00:00:00Z')",
             [],
         )
         .unwrap();
@@ -2392,25 +3222,111 @@ fn bare_store_fixture() -> EffortFixture {
     }
 }
 
+#[test]
+fn cancellation_winning_effort_creation_race_cannot_restore_merging() {
+    let fixture = bare_store_fixture();
+    let queue = iq::sqlite::SqliteQueue::open(&fixture.database).unwrap();
+    let mut cancellation = rusqlite::Connection::open(&fixture.database).unwrap();
+    let cancellation = cancellation
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    cancellation
+        .execute(
+            "UPDATE integration_attempts SET result='cancelled',finished_at='2026-01-01T00:00:01Z' WHERE id='attempt-1'",
+            [],
+        )
+        .unwrap();
+    cancellation
+        .execute(
+            "UPDATE queue_items SET status='cancelled' WHERE id='item-1'",
+            [],
+        )
+        .unwrap();
+    let workspace = iq::sqlite::WorkspaceIdentity {
+        path: fixture
+            .temp
+            .path()
+            .join("rift")
+            .to_string_lossy()
+            .to_string(),
+        rift_id: "rift-1".into(),
+        source_rift_id: "source-rift".into(),
+    };
+    let store = fixture.store.clone();
+    let creator = std::thread::spawn(move || {
+        store.create_effort(iq::control_store::NewEffort {
+            item_id: "item-1",
+            attempt_id: "attempt-1",
+            target_sha: &sha('1'),
+            source_sha: &sha('2'),
+            source_variant: "remote_branch",
+            landing_variant: "direct",
+            workspace: &workspace,
+            runner: &runner_snapshot(),
+            state_repository: &StateRepositorySnapshot::Local,
+        })
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(!creator.is_finished());
+    cancellation.commit().unwrap();
+
+    let error = creator.join().unwrap().unwrap_err();
+
+    assert!(matches!(
+        error.downcast_ref::<iq::control_store::EffortCreationError>(),
+        Some(iq::control_store::EffortCreationError::Cancelled { item_id }) if item_id == "item-1"
+    ));
+    assert_eq!(
+        queue.get_item("item-1").unwrap().status,
+        iq::core::QueueStatus::Cancelled
+    );
+    assert!(fixture.store.effort_for_item("item-1").unwrap().is_none());
+}
+
 fn effort_fixture() -> EffortFixture {
     effort_fixture_with_repository(StateRepositorySnapshot::Local)
 }
 
 fn effort_fixture_with_repository(state_repository: StateRepositorySnapshot) -> EffortFixture {
+    effort_fixture_with_repository_and_runner(state_repository, runner_snapshot())
+}
+
+fn effort_fixture_with_repository_and_runner(
+    state_repository: StateRepositorySnapshot,
+    runner: RunnerSnapshot,
+) -> EffortFixture {
     let fixture = bare_store_fixture();
     let temp = fixture.temp;
     let database = fixture.database;
     let store = fixture.store;
+    let workspace_path = temp.path().join("rift");
+    std::fs::create_dir(&workspace_path).unwrap();
+    assert!(Command::new("/usr/bin/git")
+        .args([
+            "init",
+            "--object-format=sha1",
+            workspace_path.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let binding = iq::git_command::authorize_current(&workspace_path).unwrap();
     let workspace = iq::sqlite::WorkspaceIdentity {
-        path: temp.path().join("rift").to_string_lossy().to_string(),
+        path: workspace_path.to_string_lossy().to_string(),
         rift_id: "rift-1".into(),
         source_rift_id: "source-rift".into(),
     };
-    rusqlite::Connection::open(&database)
-        .unwrap()
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
         .execute(
             "UPDATE queue_items SET integration_workspace_path=?1,integration_workspace_rift_id=?2,integration_workspace_source_rift_id=?3 WHERE id='item-1'",
             rusqlite::params![workspace.path,workspace.rift_id,workspace.source_rift_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO workspace_git_bindings(owner_kind,owner_id,top_level,binding_json,created_at) VALUES('integration','item-1',?1,?2,'2026-01-01T00:00:00Z')",
+            rusqlite::params![workspace_path.as_os_str().as_encoded_bytes(),serde_json::to_string(&binding).unwrap()],
         )
         .unwrap();
     let effort = store
@@ -2422,7 +3338,7 @@ fn effort_fixture_with_repository(state_repository: StateRepositorySnapshot) -> 
             source_variant: "remote_branch",
             landing_variant: "direct",
             workspace: &workspace,
-            runner: &runner_snapshot(),
+            runner: &runner,
             state_repository: &state_repository,
         })
         .unwrap();
@@ -2432,6 +3348,102 @@ fn effort_fixture_with_repository(state_repository: StateRepositorySnapshot) -> 
         store,
         effort_id: effort.id,
     }
+}
+
+fn released_landing_fixture() -> EffortFixture {
+    let fixture = effort_fixture();
+    let running = running_cycle("cycle-landing", 1);
+    start_cycle(&fixture.store, &fixture.effort_id, &running);
+    let intent = iq::control_store::CandidateIntent {
+        operation_id: "candidate-operation".into(),
+        cycle_id: running.cycle_id,
+        staged_tree_sha256: "a".repeat(64),
+        tree_sha: sha('4'),
+        parents: vec![sha('1'), sha('2')],
+        author_name: "IQ Test".into(),
+        author_email: "iq@example.test".into(),
+        author_timestamp: "2026-01-01T00:00:00Z".into(),
+        committer_name: "IQ Test".into(),
+        committer_email: "iq@example.test".into(),
+        committer_timestamp: "2026-01-01T00:00:00Z".into(),
+        message: "candidate".into(),
+        operation_ref: "refs/iq/candidate-operations/candidate-operation".into(),
+    };
+    fixture
+        .store
+        .accept_resolved_cycle(&fixture.effort_id, &intent)
+        .unwrap();
+    fixture
+        .store
+        .record_candidate(
+            &fixture.effort_id,
+            &iq::control_store::CandidateObservation {
+                operation_id: intent.operation_id.clone(),
+                candidate_sha: sha('3'),
+                tree_sha: intent.tree_sha,
+                parent_shas: intent.parents,
+                author_name: intent.author_name,
+                author_email: intent.author_email,
+                author_timestamp: intent.author_timestamp,
+                committer_name: intent.committer_name,
+                committer_email: intent.committer_email,
+                committer_timestamp: intent.committer_timestamp,
+                message: intent.message,
+                operation_ref: intent.operation_ref,
+            },
+        )
+        .unwrap();
+    fixture
+        .store
+        .start_validation(&fixture.effort_id, &"a".repeat(64))
+        .unwrap();
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute(
+            "UPDATE integration_attempts SET merge_commit_sha=?1,validated_commit_sha=?1 WHERE id='attempt-1'",
+            [sha('3')],
+        )
+        .unwrap();
+    drop(connection);
+    fixture
+        .store
+        .complete_validation(&fixture.effort_id, &sha('3'))
+        .unwrap();
+    fixture
+        .store
+        .begin_landing(
+            &fixture.effort_id,
+            &sha('1'),
+            "lease-1",
+            "command-1",
+            iq::control_domain::SignoffDisposition::NoValidation {
+                policy_digest: "a".repeat(64),
+            },
+        )
+        .unwrap();
+    let uncertain = iq::control_domain::IntegrationEffortState::LandingUncertain(
+        iq::control_domain::LandingUncertain {
+            candidate_sha: sha('3'),
+            expected_target_sha: sha('1'),
+            command_id: "command-1".into(),
+            evidence: "command_gate_released".into(),
+        },
+    );
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute(
+            "UPDATE integration_efforts SET state='landing_uncertain',state_json=?1,updated_at='2026-01-01T00:00:02Z' WHERE id=?2",
+            rusqlite::params![serde_json::to_string(&uncertain).unwrap(), fixture.effort_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE queue_items SET status='integrating',target_sha=?1,source_sha=?2,landing_state_json=json_object('state','uncertain','candidate_sha',?3,'expected_target_sha',?1),updated_at='2026-01-01T00:00:02Z' WHERE id='item-1'",
+            rusqlite::params![sha('1'), sha('2'), sha('3')],
+        )
+        .unwrap();
+    drop(connection);
+    fixture
 }
 
 fn runner_snapshot() -> RunnerSnapshot {
@@ -2457,25 +3469,35 @@ fn runner_snapshot() -> RunnerSnapshot {
         },
         sandbox: SandboxIdentity {
             implementation: "linux_userns_tmpfs_overlay_v1".into(),
-            bubblewrap: "/usr/bin/bwrap".into(),
-            unshare: "/usr/bin/unshare".into(),
-            systemd_run: "/usr/bin/systemd-run".into(),
-            systemctl: "/usr/bin/systemctl".into(),
+            bubblewrap: iq::agent_config::executable_identity(Path::new("/usr/bin/bwrap")).unwrap(),
+            unshare: iq::agent_config::executable_identity(Path::new("/usr/bin/unshare")).unwrap(),
+            systemd_run: iq::agent_config::executable_identity(Path::new("/usr/bin/systemd-run"))
+                .unwrap(),
+            systemctl: iq::agent_config::executable_identity(Path::new("/usr/bin/systemctl"))
+                .unwrap(),
         },
         credential_env: "IQ_TEST_MODEL_KEY".into(),
     }
 }
 
 fn running_cycle(id: &str, number: u8) -> AgentRunning {
+    let unit_name = format!("iq-agent-{id}.service");
     AgentRunning {
         launch_operation_id: format!("launch-{id}"),
-        unit_name: format!("iq-agent-{id}"),
+        unit_name: unit_name.clone(),
         cycle_id: id.into(),
         cycle_number: number,
         pid: 1,
         process_start_ticks: 1,
-        process_group_id: 1,
+        control_group: format!(
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/{unit_name}"
+        ),
         authority_lease_id: "lease".into(),
+        launcher: iq::control_domain::LauncherAuthority {
+            pid: std::process::id(),
+            process_start_ticks: iq::agent_runner::process_start_ticks(std::process::id()).unwrap(),
+            token: "00000000-0000-4000-8000-000000000001".into(),
+        },
         sandbox_id: "sandbox".into(),
         input_sha256: "a".repeat(64),
         result: AtomicResultState::Absent,
@@ -2490,9 +3512,11 @@ fn launching_cycle(running: &AgentRunning) -> iq::control_domain::AgentLaunching
         cycle_id: running.cycle_id.clone(),
         cycle_number: running.cycle_number,
         authority_lease_id: running.authority_lease_id.clone(),
+        launcher: running.launcher.clone(),
         input_sha256: running.input_sha256.clone(),
         protocol_directory: std::path::PathBuf::from("/test/protocol"),
         prepared_at: running.started_at.clone(),
+        spawn_authority: iq::control_domain::SpawnAuthority::Open,
     }
 }
 
@@ -2500,15 +3524,39 @@ fn start_cycle(store: &ControlStore, effort_id: &str, running: &AgentRunning) {
     store
         .prepare_cycle_launch(effort_id, &launching_cycle(running))
         .unwrap();
-    store.record_cycle_started(effort_id, running).unwrap();
+    assert!(store
+        .surrender_cycle_spawn_authority(
+            effort_id,
+            &running.launch_operation_id,
+            &running.authority_lease_id,
+            &running.launcher,
+        )
+        .unwrap());
+    assert!(store
+        .record_cycle_started(
+            effort_id,
+            running,
+            &running.authority_lease_id,
+            &running.launcher,
+        )
+        .unwrap());
 }
 
 fn git<const N: usize>(cwd: &Path, args: [&str; N]) {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .unwrap();
+    let mut command = Command::new("git");
+    if args.first() == Some(&"init")
+        && !args
+            .iter()
+            .any(|argument| argument.starts_with("--object-format="))
+    {
+        command
+            .arg("init")
+            .arg("--object-format=sha1")
+            .args(&args[1..]);
+    } else {
+        command.args(args);
+    }
+    let output = command.current_dir(cwd).output().unwrap();
     assert!(
         output.status.success(),
         "{}",

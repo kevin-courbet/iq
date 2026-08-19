@@ -5,8 +5,13 @@ pub mod composition;
 pub mod control_api;
 pub mod control_domain;
 pub mod control_store;
+pub mod git_command;
+pub mod git_object;
 pub mod notifications;
 pub mod repository;
+pub mod repository_policy;
+#[doc(hidden)]
+pub mod secure_fs;
 pub mod state_repository;
 
 pub mod core {
@@ -208,9 +213,11 @@ pub mod sqlite {
     };
     use serde::{Deserialize, Serialize};
     use serde_json::Value;
+    use sha2::{Digest, Sha256};
     use std::ffi::{OsStr, OsString};
     use std::fmt;
     use std::fs::{self, File, OpenOptions};
+    use std::io::{Read, Write};
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::path::{Path, PathBuf};
@@ -221,14 +228,154 @@ pub mod sqlite {
         BlockedPhase, BlockedReason, LandingPolicy, QueueSource, QueueStatus, StateMachine,
     };
 
+    pub(crate) fn configure_connection(connection: &Connection) -> Result<()> {
+        connection.pragma_update(None, "recursive_triggers", "ON")?;
+        let enabled: i64 =
+            connection.query_row("PRAGMA recursive_triggers", [], |row| row.get(0))?;
+        if enabled != 1 {
+            anyhow::bail!("SQLite recursive trigger enforcement is unavailable");
+        }
+        Ok(())
+    }
+
     #[derive(Clone, Debug)]
-    pub struct EnqueueRequest {
+    pub struct DirectAdmissionRequest {
         pub repo_key: String,
         pub source_branch: String,
         pub current_head_sha: String,
-        pub pr_url: Option<String>,
         pub producer_metadata: Value,
         pub state_repository: crate::control_domain::StateRepositorySnapshot,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct MergeRequestAdmission {
+        pub provider: crate::repository_policy::Provider,
+        pub provider_host: String,
+        pub repository: String,
+        pub repository_id: String,
+        pub target_branch: String,
+        pub identity: String,
+        pub url: String,
+        pub source_branch: String,
+        pub head_sha: String,
+        pub base_sha: Option<String>,
+        pub provider_merge_method: Option<crate::repository_policy::ProviderMergeMethod>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    pub enum QueueAdmission {
+        LocalSubmission {
+            source_branch: String,
+            head_sha: String,
+            source_ref: String,
+            submission_id: String,
+        },
+        Direct {
+            source_branch: String,
+            head_sha: String,
+        },
+        MergeRequest(MergeRequestAdmission),
+        HistoricalMergeRequest(MergeRequestAdmission),
+    }
+
+    pub(crate) struct ProviderLandingEvidence<'a> {
+        pub item_id: &'a str,
+        pub provider: crate::repository_policy::Provider,
+        pub provider_host: &'a str,
+        pub provider_repository: &'a str,
+        pub provider_repository_id: &'a str,
+        pub merge_request_identity: &'a str,
+        pub admitted_base_sha: &'a str,
+        pub admitted_head_sha: &'a str,
+        pub validated_target_sha: &'a str,
+        pub validated_candidate_sha: &'a str,
+        pub validated_tree_sha: &'a str,
+        pub landed_commit_sha: &'a str,
+        pub landed_tree_sha: &'a str,
+        pub first_parent_sha: &'a str,
+        pub history_contract: &'a str,
+        pub contains_admitted_head: bool,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct ReplicationDebt {
+        pub id: String,
+        pub item_id: String,
+        pub repo_key: String,
+        pub canonical_source_sha: String,
+        pub destination_key: String,
+        pub target_branch: String,
+        pub sequence: i64,
+        pub replica: crate::repository_policy::GitRepository,
+        pub expected_destination_sha: Option<String>,
+        pub operation: String,
+        pub outcome: String,
+        pub application_id: Option<String>,
+        pub failure: Option<String>,
+        pub superseded_by_id: Option<String>,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum PrivateRefKind {
+        RepositoryTarget,
+        Landing,
+    }
+
+    impl PrivateRefKind {
+        fn as_str(self) -> &'static str {
+            match self {
+                Self::RepositoryTarget => "repository_target",
+                Self::Landing => "landing",
+            }
+        }
+
+        fn parse(value: &str) -> Result<Self> {
+            match value {
+                "repository_target" => Ok(Self::RepositoryTarget),
+                "landing" => Ok(Self::Landing),
+                _ => anyhow::bail!("unknown private-ref cleanup kind {value}"),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct PrivateRefCleanupDebt {
+        pub repo_key: String,
+        pub kind: PrivateRefKind,
+        pub owner_id: String,
+        pub ref_name: String,
+        pub expected_sha: String,
+    }
+
+    impl QueueAdmission {
+        pub fn merge_request(&self) -> Option<&MergeRequestAdmission> {
+            match self {
+                Self::MergeRequest(admission) | Self::HistoricalMergeRequest(admission) => {
+                    Some(admission)
+                }
+                Self::LocalSubmission { .. } | Self::Direct { .. } => None,
+            }
+        }
+
+        pub fn source_branch(&self) -> &str {
+            match self {
+                Self::LocalSubmission { source_branch, .. }
+                | Self::Direct { source_branch, .. } => source_branch,
+                Self::MergeRequest(admission) | Self::HistoricalMergeRequest(admission) => {
+                    &admission.source_branch
+                }
+            }
+        }
+
+        pub fn head_sha(&self) -> &str {
+            match self {
+                Self::LocalSubmission { head_sha, .. } | Self::Direct { head_sha, .. } => head_sha,
+                Self::MergeRequest(admission) | Self::HistoricalMergeRequest(admission) => {
+                    &admission.head_sha
+                }
+            }
+        }
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -285,7 +432,7 @@ pub mod sqlite {
         pub source_branch: String,
         pub target_branch: String,
         pub current_head_sha: String,
-        pub pr_url: Option<String>,
+        pub admission: QueueAdmission,
         pub status: QueueStatus,
         pub blocked_phase: Option<BlockedPhase>,
         pub blocked_reason: Option<BlockedReason>,
@@ -321,13 +468,13 @@ pub mod sqlite {
         pub fn is_uncertain(&self) -> bool {
             matches!(self, Self::Uncertain { .. })
         }
-    }
 
-    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-    pub struct RegisteredRemote {
-        pub name: String,
-        pub fetch_url: String,
-        pub push_url: String,
+        pub fn contains_external_landing_authority(&self) -> bool {
+            match self {
+                Self::Uncertain { .. } | Self::Landed { .. } => true,
+                Self::Ready => false,
+            }
+        }
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -338,6 +485,11 @@ pub mod sqlite {
             old_attempt_id: String,
             old_workspace: WorkspaceIdentity,
         },
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct RegisteredRemote {
+        pub name: String,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -355,6 +507,8 @@ pub mod sqlite {
         pub integration_root_path: PathBuf,
         pub source_sha: String,
         pub checkout_reconciliation: CheckoutReconciliationState,
+        pub policy: crate::repository_policy::RepositoryPolicy,
+        pub policy_revision: i64,
         pub created_at: String,
         pub updated_at: String,
     }
@@ -512,21 +666,34 @@ pub mod sqlite {
     }
 
     impl CheckoutReconciliationState {
-        pub fn ready(target_sha: &str) -> Result<Self> {
-            Ok(Self::Ready(CheckoutTarget::new(target_sha)?))
+        pub fn ready(
+            target_sha: &str,
+            object_format: crate::git_object::GitObjectFormat,
+        ) -> Result<Self> {
+            Ok(Self::Ready(CheckoutTarget::new(target_sha, object_format)?))
         }
 
-        pub fn pending(target_sha: &str) -> Result<Self> {
-            Ok(Self::Pending(CheckoutTarget::new(target_sha)?))
+        pub fn pending(
+            target_sha: &str,
+            object_format: crate::git_object::GitObjectFormat,
+        ) -> Result<Self> {
+            Ok(Self::Pending(CheckoutTarget::new(
+                target_sha,
+                object_format,
+            )?))
         }
 
-        pub fn failed(target_sha: &str, message: &str) -> Result<Self> {
+        pub fn failed(
+            target_sha: &str,
+            object_format: crate::git_object::GitObjectFormat,
+            message: &str,
+        ) -> Result<Self> {
             let message = message.trim();
             if message.is_empty() {
                 anyhow::bail!("checkout reconciliation failure message must not be empty");
             }
             Ok(Self::Failed(CheckoutFailure {
-                target_sha: CheckoutTarget::new(target_sha)?.target_sha,
+                target_sha: CheckoutTarget::new(target_sha, object_format)?.target_sha,
                 message: message.to_string(),
             }))
         }
@@ -544,11 +711,23 @@ pub mod sqlite {
     }
 
     impl CheckoutTarget {
-        fn new(target_sha: &str) -> Result<Self> {
-            crate::control_domain::require_sha(target_sha, "checkout reconciliation target")?;
+        fn new(
+            target_sha: &str,
+            object_format: crate::git_object::GitObjectFormat,
+        ) -> Result<Self> {
+            object_format.require_oid(target_sha, "checkout reconciliation target")?;
             Ok(Self {
                 target_sha: target_sha.to_string(),
             })
+        }
+
+        fn from_serialized(target_sha: &str) -> Result<Self> {
+            let object_format = match target_sha.len() {
+                40 => crate::git_object::GitObjectFormat::Sha1,
+                64 => crate::git_object::GitObjectFormat::Sha256,
+                _ => anyhow::bail!("checkout reconciliation target must be a full Git object ID"),
+            };
+            Self::new(target_sha, object_format)
         }
     }
 
@@ -559,14 +738,25 @@ pub mod sqlite {
         {
             let raw = RawCheckoutReconciliationState::deserialize(deserializer)?;
             let checked = match raw {
-                RawCheckoutReconciliationState::Ready { target_sha } => Self::ready(&target_sha),
+                RawCheckoutReconciliationState::Ready { target_sha } => {
+                    CheckoutTarget::from_serialized(&target_sha).map(Self::Ready)
+                }
                 RawCheckoutReconciliationState::Pending { target_sha } => {
-                    Self::pending(&target_sha)
+                    CheckoutTarget::from_serialized(&target_sha).map(Self::Pending)
                 }
                 RawCheckoutReconciliationState::Failed {
                     target_sha,
                     message,
-                } => Self::failed(&target_sha, &message),
+                } => CheckoutTarget::from_serialized(&target_sha).and_then(|target| {
+                    let message = message.trim();
+                    if message.is_empty() {
+                        anyhow::bail!("checkout reconciliation failure message must not be empty")
+                    }
+                    Ok(Self::Failed(CheckoutFailure {
+                        target_sha: target.target_sha,
+                        message: message.to_string(),
+                    }))
+                }),
             };
             checked.map_err(serde::de::Error::custom)
         }
@@ -768,12 +958,25 @@ pub mod sqlite {
         Lost(String),
     }
 
-    enum MutationAuthority<'a> {
-        External,
+    pub(crate) enum ExecutionStartAuthority<'a> {
         RepositoryLease {
             repo_key: &'a str,
             owner_id: &'a str,
         },
+        ProviderVerified {
+            repo_key: &'a str,
+            owner_id: &'a str,
+            policy_revision: i64,
+            canonical: &'a crate::repository_policy::GitRepository,
+        },
+    }
+
+    enum MutationAuthority<'a> {
+        RepositoryLease {
+            repo_key: &'a str,
+            owner_id: &'a str,
+        },
+        Cancellation,
     }
 
     #[derive(Clone)]
@@ -784,6 +987,53 @@ pub mod sqlite {
     #[derive(Clone)]
     pub struct SqliteQueueReader {
         authority: crate::control_store::ValidatedDatabaseAuthority,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+    pub struct MigrationReport {
+        pub completion: MigrationCompletion,
+        pub database_id: String,
+        pub from_schema: u32,
+        pub to_schema: u32,
+        pub repositories: usize,
+        pub admissions: usize,
+        pub backup_path: PathBuf,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+    #[serde(tag = "state", rename_all = "snake_case")]
+    pub enum MigrationCompletion {
+        Complete,
+        PublishedButIncomplete {
+            remaining_runner_termination_debts: Option<usize>,
+            error: String,
+        },
+    }
+
+    fn reconcile_migrated_runner_termination_debt(path: &Path) -> MigrationCompletion {
+        let reconciliation = crate::control_store::ControlStore::open(path)
+            .and_then(|store| store.reconcile_cancelled_runner_terminations());
+        let remaining = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .and_then(|connection| {
+            connection.query_row("SELECT COUNT(*) FROM runner_termination_debt", [], |row| {
+                row.get::<_, usize>(0)
+            })
+        });
+        match (reconciliation, remaining) {
+            (Ok(_), Ok(0)) => MigrationCompletion::Complete,
+            (result, count) => MigrationCompletion::PublishedButIncomplete {
+                remaining_runner_termination_debts: count.ok(),
+                error: result
+                    .err()
+                    .map(|error| format!("{error:#}"))
+                    .unwrap_or_else(|| {
+                        "runner termination debt remains after reconciliation".into()
+                    }),
+            },
+        }
     }
 
     pub(crate) fn resolve_queue_database_path_without_creating(path: &Path) -> Result<PathBuf> {
@@ -803,10 +1053,12 @@ pub mod sqlite {
     }
 
     fn require_current_schema_version(version: Option<&str>) -> Result<()> {
-        if version == Some(crate::repository::SCHEMA_VERSION) {
-            Ok(())
-        } else {
-            incompatible_local_state()
+        match version {
+            Some(crate::repository::SCHEMA_VERSION) => Ok(()),
+            Some("3") => anyhow::bail!(
+                "IQ schema 3 requires explicit offline migration with `iq migrate schema3 --policy-inventory <path>`"
+            ),
+            _ => incompatible_local_state(),
         }
     }
 
@@ -819,6 +1071,19 @@ pub mod sqlite {
 
     #[cfg(not(debug_assertions))]
     fn stop_fresh_database_after(_boundary: &str) {}
+
+    #[cfg(debug_assertions)]
+    fn fail_schema3_publication_after(boundary: &str) -> Result<()> {
+        if std::env::var("IQ_TEST_SCHEMA3_FAIL_PUBLICATION_AFTER").as_deref() == Ok(boundary) {
+            anyhow::bail!("test failure after schema-3 publication boundary {boundary}");
+        }
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn fail_schema3_publication_after(_boundary: &str) -> Result<()> {
+        Ok(())
+    }
 
     #[cfg(debug_assertions)]
     fn wait_at_database_publish_barrier() -> Result<()> {
@@ -905,6 +1170,466 @@ pub mod sqlite {
         Ok(())
     }
 
+    fn exchange_database_files(first: &Path, second: &Path) -> Result<()> {
+        let first = std::ffi::CString::new(first.as_os_str().as_bytes())?;
+        let second = std::ffi::CString::new(second.as_os_str().as_bytes())?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let result = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                first.as_ptr(),
+                libc::AT_FDCWD,
+                second.as_ptr(),
+                libc::RENAME_EXCHANGE,
+            )
+        };
+        #[cfg(target_os = "macos")]
+        let result = unsafe {
+            libc::renameatx_np(
+                libc::AT_FDCWD,
+                first.as_ptr(),
+                libc::AT_FDCWD,
+                second.as_ptr(),
+                libc::RENAME_SWAP,
+            )
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+        anyhow::bail!("atomic database exchange is unsupported on this platform");
+        if result != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("atomically exchange database files");
+        }
+        Ok(())
+    }
+
+    struct PrivateDatabaseCandidate {
+        root: PathBuf,
+        path: PathBuf,
+        ownership: MigrationOwnershipManifest,
+        device: u64,
+        inode: u64,
+        cleanup_on_drop: bool,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct MigrationOwnershipManifest {
+        version: u32,
+        database_id: String,
+        source_digest: String,
+        operation_id: String,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum MigrationPublicationPhase {
+        Prepared,
+        Exchanged,
+        Validated,
+        Complete,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct MigrationPublicationState {
+        version: u32,
+        database_id: String,
+        source_digest: String,
+        operation_id: String,
+        source_members: Vec<Schema3BackupMember>,
+        candidate_root: PathBuf,
+        candidate_device: u64,
+        candidate_inode: u64,
+        phase: MigrationPublicationPhase,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Schema3BackupMember {
+        suffix: String,
+        length: u64,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        device: u64,
+        inode: u64,
+        modified_seconds: i64,
+        modified_nanoseconds: i64,
+        changed_seconds: i64,
+        changed_nanoseconds: i64,
+        sha256: String,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Schema3BackupManifest {
+        version: u32,
+        database_id: String,
+        source_digest: String,
+        operation_id: String,
+        members: Vec<Schema3BackupMember>,
+    }
+
+    struct PrivateBackupDirectory {
+        path: PathBuf,
+        ownership: MigrationOwnershipManifest,
+        device: u64,
+        inode: u64,
+    }
+
+    impl PrivateBackupDirectory {
+        fn new(database: &Path, manifest: &Schema3BackupManifest) -> Result<Self> {
+            use std::os::unix::fs::DirBuilderExt;
+
+            let file_name = database
+                .file_name()
+                .context("schema-3 database path has no file name")?;
+            let mut name = OsString::from(".");
+            name.push(file_name);
+            name.push(format!(".schema3-backup-{}.tmp", Uuid::new_v4()));
+            let path = database.with_file_name(name);
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .with_context(|| format!("create private schema-3 backup {}", path.display()))?;
+            let metadata = fs::symlink_metadata(&path)?;
+            let ownership = MigrationOwnershipManifest {
+                version: 1,
+                database_id: manifest.database_id.clone(),
+                source_digest: manifest.source_digest.clone(),
+                operation_id: manifest.operation_id.clone(),
+            };
+            write_migration_ownership_manifest(&path, &ownership)?;
+            Ok(Self {
+                path,
+                ownership,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+    }
+
+    impl Drop for PrivateBackupDirectory {
+        fn drop(&mut self) {
+            remove_owned_migration_directory(&self.path, &self.ownership, self.device, self.inode);
+        }
+    }
+
+    impl PrivateDatabaseCandidate {
+        fn new(
+            path: &Path,
+            database_id: &str,
+            source_digest: &str,
+            operation_id: &str,
+        ) -> Result<Self> {
+            use std::os::unix::fs::DirBuilderExt;
+
+            let name = path
+                .file_name()
+                .context("queue database path has no file name")?;
+            let mut legacy_name = OsString::from(".");
+            legacy_name.push(name);
+            legacy_name.push(".schema3-migration-candidate");
+            let legacy = path.with_file_name(legacy_name);
+            if legacy.exists() {
+                anyhow::bail!(
+                    "unowned fixed-name schema-3 migration candidate exists: {}",
+                    legacy.display()
+                );
+            }
+            let mut candidate_name = OsString::from(".");
+            candidate_name.push(name);
+            candidate_name.push(format!(".schema3-migration-{operation_id}.tmp"));
+            let root = path.with_file_name(candidate_name);
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&root)
+                .with_context(|| {
+                    format!("create private schema-3 migration root {}", root.display())
+                })?;
+            let metadata = fs::symlink_metadata(&root)?;
+            let ownership = MigrationOwnershipManifest {
+                version: 1,
+                database_id: database_id.to_string(),
+                source_digest: source_digest.to_string(),
+                operation_id: operation_id.to_string(),
+            };
+            write_migration_ownership_manifest(&root, &ownership)?;
+            Ok(Self {
+                path: root.join("database"),
+                root,
+                ownership,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                cleanup_on_drop: true,
+            })
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn preserve_for_recovery(&mut self) {
+            self.cleanup_on_drop = false;
+        }
+
+        fn remove(mut self) {
+            remove_owned_migration_directory(&self.root, &self.ownership, self.device, self.inode);
+            self.cleanup_on_drop = false;
+        }
+    }
+
+    impl Drop for PrivateDatabaseCandidate {
+        fn drop(&mut self) {
+            if self.cleanup_on_drop {
+                remove_owned_migration_directory(
+                    &self.root,
+                    &self.ownership,
+                    self.device,
+                    self.inode,
+                );
+            }
+        }
+    }
+
+    fn migration_publication_state_path(database: &Path) -> Result<PathBuf> {
+        let mut name = database
+            .file_name()
+            .context("queue database path has no file name")?
+            .to_os_string();
+        name.push(".schema3-publication-state.json");
+        Ok(database.with_file_name(name))
+    }
+
+    fn write_migration_publication_state(
+        database: &Path,
+        state: &MigrationPublicationState,
+    ) -> Result<()> {
+        let path = migration_publication_state_path(database)?;
+        if path.exists() {
+            let existing = read_migration_publication_state(database)?
+                .context("migration publication state disappeared")?;
+            if existing.operation_id != state.operation_id
+                || existing.database_id != state.database_id
+                || existing.source_digest != state.source_digest
+            {
+                anyhow::bail!("migration publication state belongs to another operation");
+            }
+        }
+        let mut temporary_name = path
+            .file_name()
+            .context("migration publication state has no file name")?
+            .to_os_string();
+        temporary_name.push(format!(".{}.tmp", Uuid::new_v4()));
+        let temporary = path.with_file_name(temporary_name);
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&temporary)?;
+        serde_json::to_writer(&mut file, state)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temporary, &path)?;
+        File::open(path.parent().context("migration state has no parent")?)?.sync_all()?;
+        Ok(())
+    }
+
+    fn read_migration_publication_state(
+        database: &Path,
+    ) -> Result<Option<MigrationPublicationState>> {
+        let path = migration_publication_state_path(database)?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("inspect migration publication state"),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 1024 * 1024
+        {
+            anyhow::bail!("migration publication state is not a bounded regular file");
+        }
+        let state: MigrationPublicationState = serde_json::from_slice(&fs::read(&path)?)?;
+        if state.version != 1
+            || Uuid::parse_str(&state.operation_id)
+                .map_or(true, |id| id.to_string() != state.operation_id)
+        {
+            anyhow::bail!("migration publication state identity is invalid");
+        }
+        let name = database
+            .file_name()
+            .context("queue database path has no file name")?;
+        let mut expected_name = OsString::from(".");
+        expected_name.push(name);
+        expected_name.push(format!(".schema3-migration-{}.tmp", state.operation_id));
+        if state.candidate_root != database.with_file_name(expected_name) {
+            anyhow::bail!("migration publication state has an invalid candidate root");
+        }
+        Ok(Some(state))
+    }
+
+    fn same_schema3_bytes(
+        actual: &[Schema3BackupMember],
+        expected: &[Schema3BackupMember],
+    ) -> bool {
+        actual
+            .iter()
+            .map(|member| (&member.suffix, member.length, &member.sha256))
+            .eq(expected
+                .iter()
+                .map(|member| (&member.suffix, member.length, &member.sha256)))
+    }
+
+    fn remove_migration_publication_state(database: &Path) -> Result<()> {
+        let path = migration_publication_state_path(database)?;
+        fs::remove_file(&path)?;
+        File::open(path.parent().context("migration state has no parent")?)?.sync_all()?;
+        Ok(())
+    }
+
+    fn recover_schema3_publication(database: &Path) -> Result<()> {
+        let Some(mut state) = read_migration_publication_state(database)? else {
+            return Ok(());
+        };
+        validate_schema3_backup(database, &state.database_id, Some(&state.source_digest))
+            .context("migration publication recovery has no exact schema-3 backup")?;
+        let candidate_path = state.candidate_root.join("database");
+        let candidate_source = if candidate_path.exists() {
+            let ownership = read_migration_ownership_manifest(&state.candidate_root)?;
+            let metadata = fs::symlink_metadata(&state.candidate_root)?;
+            if ownership.operation_id != state.operation_id
+                || ownership.database_id != state.database_id
+                || ownership.source_digest != state.source_digest
+                || (metadata.dev(), metadata.ino())
+                    != (state.candidate_device, state.candidate_inode)
+            {
+                anyhow::bail!("migration publication candidate lost recovery authority");
+            }
+            let members = schema3_source_family(&candidate_path)?;
+            Some((
+                ownership,
+                same_schema3_bytes(&members, &state.source_members),
+            ))
+        } else {
+            None
+        };
+        let published = open_immutable_database(database)
+            .and_then(|connection| validate_existing_schema_identity(&connection));
+        if matches!(published, Ok(ref id) if id == &state.database_id) {
+            if let Some((ownership, exact_source)) = &candidate_source {
+                if !*exact_source {
+                    anyhow::bail!("exchanged schema-3 source bytes differ from publication state");
+                }
+                let source = open_immutable_database(&candidate_path)?;
+                if validate_schema3_identity(&source)? != state.database_id {
+                    anyhow::bail!("exchanged schema-3 source has a different database identity");
+                }
+                remove_owned_migration_directory(
+                    &state.candidate_root,
+                    ownership,
+                    state.candidate_device,
+                    state.candidate_inode,
+                );
+            }
+            state.phase = MigrationPublicationPhase::Complete;
+            write_migration_publication_state(database, &state)?;
+            sync_database_file_and_parent(database)?;
+            return Ok(());
+        }
+        let source = open_immutable_database(database)
+            .and_then(|connection| validate_schema3_identity(&connection));
+        if matches!(source, Ok(ref id) if id == &state.database_id) {
+            if let Some((ownership, _)) = &candidate_source {
+                remove_owned_migration_directory(
+                    &state.candidate_root,
+                    ownership,
+                    state.candidate_device,
+                    state.candidate_inode,
+                );
+            }
+            remove_migration_publication_state(database)?;
+            return Ok(());
+        }
+        let Some((ownership, true)) = candidate_source else {
+            anyhow::bail!("migration publication cannot restore exact schema-3 source bytes");
+        };
+        exchange_database_files(&candidate_path, database)?;
+        sync_database_file_and_parent(database)?;
+        let restored = open_immutable_database(database)?;
+        if validate_schema3_identity(&restored)? != state.database_id
+            || !same_schema3_bytes(&schema3_source_family(database)?, &state.source_members)
+        {
+            anyhow::bail!("migration publication rollback did not restore exact schema-3 source");
+        }
+        drop(restored);
+        remove_owned_migration_directory(
+            &state.candidate_root,
+            &ownership,
+            state.candidate_device,
+            state.candidate_inode,
+        );
+        remove_migration_publication_state(database)
+    }
+
+    fn write_migration_ownership_manifest(
+        root: &Path,
+        ownership: &MigrationOwnershipManifest,
+    ) -> Result<()> {
+        let path = root.join("ownership.json");
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)?;
+        serde_json::to_writer(&mut file, ownership)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        File::open(root)?.sync_all()?;
+        Ok(())
+    }
+
+    fn read_migration_ownership_manifest(root: &Path) -> Result<MigrationOwnershipManifest> {
+        let path = root.join("ownership.json");
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 4096 {
+            anyhow::bail!("migration ownership manifest is not a bounded regular file");
+        }
+        let manifest: MigrationOwnershipManifest = serde_json::from_slice(&fs::read(path)?)?;
+        if manifest.version != 1
+            || Uuid::parse_str(&manifest.operation_id).map_or(true, |operation| {
+                operation.to_string() != manifest.operation_id
+            })
+        {
+            anyhow::bail!("migration ownership manifest identity is invalid");
+        }
+        Ok(manifest)
+    }
+
+    fn remove_owned_migration_directory(
+        root: &Path,
+        ownership: &MigrationOwnershipManifest,
+        device: u64,
+        inode: u64,
+    ) {
+        let Ok(directory) = crate::secure_fs::DirectoryHandle::open(root, "migration artifact")
+        else {
+            return;
+        };
+        let metadata = match directory.directory().metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => return,
+        };
+        let manifest = directory
+            .open_file(OsStr::new("ownership.json"), "migration ownership manifest")
+            .and_then(|file| serde_json::from_reader(file).context("parse migration ownership"));
+        if (metadata.dev(), metadata.ino()) == (device, inode)
+            && manifest.is_ok_and(|actual: MigrationOwnershipManifest| actual == *ownership)
+        {
+            let _ = directory.remove("migration artifact");
+        }
+    }
+
     fn sync_database_file_and_parent(path: &Path) -> Result<()> {
         let file = OpenOptions::new()
             .read(true)
@@ -927,6 +1652,7 @@ pub mod sqlite {
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
+        configure_connection(&connection)?;
         let version: Option<String> = connection
             .query_row(
                 "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
@@ -967,6 +1693,7 @@ pub mod sqlite {
                 &temporary,
                 OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
             )?;
+            configure_connection(&connection)?;
             connection.pragma_update(None, "foreign_keys", "ON")?;
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1027,6 +1754,12 @@ pub mod sqlite {
         const AUTHORITY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
 
         pub fn default_db_path() -> Result<PathBuf> {
+            let database = Self::default_db_path_without_open()?;
+            Self::open(&database)?;
+            Ok(database)
+        }
+
+        pub fn default_db_path_without_open() -> Result<PathBuf> {
             let iq_directory = if cfg!(target_os = "macos") {
                 let home = std::env::var_os("HOME").context("HOME is required for IQ state")?;
                 PathBuf::from(home).join("Library/Application Support/IQ/IntegrationQueues")
@@ -1048,9 +1781,1195 @@ pub mod sqlite {
             fs::create_dir_all(&iq_directory)
                 .with_context(|| format!("create IQ state directory {}", iq_directory.display()))?;
             require_real_directory(&iq_directory, "IQ state directory")?;
-            let database = iq_directory.join("queues.db");
-            Self::open(&database)?;
-            Ok(database)
+            Ok(iq_directory.join("queues.db"))
+        }
+
+        pub fn migrate_schema3(
+            path: &Path,
+            inventory: crate::repository_policy::PolicyInventory,
+        ) -> Result<MigrationReport> {
+            #[derive(Clone)]
+            enum AdmissionPlan {
+                Local {
+                    item_id: String,
+                    kind: &'static str,
+                    source_branch: String,
+                    head_sha: String,
+                    source_ref: Option<String>,
+                    submission_id: Option<String>,
+                    admitted_at: String,
+                },
+                MergeRequest {
+                    item_id: String,
+                    kind: &'static str,
+                    source_branch: String,
+                    head_sha: String,
+                    provider: crate::repository_policy::Provider,
+                    provider_host: String,
+                    provider_repository: String,
+                    provider_repository_id: String,
+                    target_branch: String,
+                    base_sha: Option<String>,
+                    provider_merge_method: Option<crate::repository_policy::ProviderMergeMethod>,
+                    identity: String,
+                    url: String,
+                    admitted_at: String,
+                },
+            }
+
+            let inventory = inventory.validate()?;
+            for assignment in &inventory.repositories {
+                assignment
+                    .policy
+                    .clone()
+                    .verify_effect_identities()
+                    .with_context(|| {
+                        format!(
+                            "verify schema-3 migration repository identities for {}",
+                            assignment.repo_key
+                        )
+                    })?;
+            }
+            let path = resolve_queue_database_path_without_creating(path)?;
+            let metadata = fs::symlink_metadata(&path)
+                .with_context(|| format!("inspect schema-3 queue database {}", path.display()))?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                anyhow::bail!("migration source must be a regular queue database");
+            }
+            let exclusive = crate::control_store::DatabaseProcessLease::acquire_exclusive(&path)
+                .context("take exclusive offline migration authority")?;
+            recover_schema3_publication(&path)?;
+            for suffix in ["-journal", "-wal", "-shm"] {
+                let mut sidecar = path.as_os_str().to_os_string();
+                sidecar.push(suffix);
+                if PathBuf::from(sidecar).exists() {
+                    anyhow::bail!(
+                        "schema-3 migration requires a closed database with no sidecar files"
+                    );
+                }
+            }
+            let migration_source_members = schema3_source_family(&path)?;
+            let migration_source_digest = schema3_source_digest(&migration_source_members)?;
+            let source = open_immutable_database(&path)?;
+            source.pragma_update(None, "foreign_keys", "ON")?;
+            let stored_version: String = source.query_row(
+                "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
+                [],
+                |row| row.get(0),
+            )?;
+            if stored_version == crate::repository::SCHEMA_VERSION {
+                let database_id = validate_existing_schema_identity(&source)?;
+                let backup_path = validate_schema3_backup(&path, &database_id, None)
+                    .context("published migration has no valid durable schema-3 backup")?;
+                let repositories: usize =
+                    source.query_row("SELECT COUNT(*) FROM repository_policies", [], |row| {
+                        row.get(0)
+                    })?;
+                let admissions: usize =
+                    source.query_row("SELECT COUNT(*) FROM queue_admissions", [], |row| {
+                        row.get(0)
+                    })?;
+                drop(source);
+                sync_database_file_and_parent(&path)?;
+                drop(exclusive);
+                return Ok(MigrationReport {
+                    completion: reconcile_migrated_runner_termination_debt(&path),
+                    database_id,
+                    from_schema: 3,
+                    to_schema: 4,
+                    repositories,
+                    admissions,
+                    backup_path,
+                });
+            }
+            crate::control_store::validate_schema3_systemd_authority(&source)?;
+            let database_id = validate_schema3_identity(&source)?;
+            drop(source);
+            let operation_id = Uuid::new_v4().to_string();
+            let mut candidate = PrivateDatabaseCandidate::new(
+                &path,
+                &database_id,
+                &migration_source_digest,
+                &operation_id,
+            )?;
+            copy_database_file(&path, candidate.path())?;
+            let source_after_copy = schema3_source_family(&path)?;
+            if source_after_copy != migration_source_members {
+                anyhow::bail!(
+                    "schema-3 source family changed after candidate copy: expected {migration_source_members:?}, observed {source_after_copy:?}"
+                );
+            }
+            let connection = Connection::open_with_flags(
+                candidate.path(),
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?;
+            configure_connection(&connection)?;
+            connection.pragma_update(None, "foreign_keys", "ON")?;
+            let candidate_database_id = validate_schema3_identity(&connection)?;
+            if candidate_database_id != database_id {
+                anyhow::bail!("schema-3 migration candidate changed database identity");
+            }
+
+            let stored_keys = {
+                let mut statement = connection
+                    .prepare("SELECT repo_key FROM repository_remote_owners ORDER BY repo_key")?;
+                let keys = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                keys
+            };
+            let mut inventory_keys = inventory
+                .repositories
+                .iter()
+                .map(|assignment| assignment.repo_key.clone())
+                .collect::<Vec<_>>();
+            inventory_keys.sort();
+            if stored_keys != inventory_keys {
+                anyhow::bail!(
+                    "policy inventory must assign every schema-3 repository UUID exactly once"
+                );
+            }
+            let inventory_formats = inventory
+                .repositories
+                .iter()
+                .map(|assignment| {
+                    (
+                        assignment.repo_key.clone(),
+                        assignment.policy.canonical_repository.object_format(),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>();
+            validate_stored_object_ids(&connection, &inventory_formats, true)
+                .context("validate schema-3 Git object IDs against policy inventory")?;
+
+            let mut policies = std::collections::BTreeMap::new();
+            let mut ready_repository_keys = std::collections::BTreeSet::new();
+            let mut preserved_provisioning_keys = std::collections::BTreeSet::new();
+            let mut cancelled_provisioning_keys = std::collections::BTreeSet::new();
+            let mut schema4_repository_bindings = std::collections::BTreeMap::new();
+            let mut schema4_provisioning_lifecycles = std::collections::BTreeMap::new();
+            let mut schema4_workspace_bindings = std::collections::BTreeMap::new();
+            let mut schema4_development_bindings = std::collections::BTreeMap::new();
+            let mut dispositions = std::collections::BTreeMap::new();
+            for assignment in inventory.repositories {
+                let registered = connection
+                    .query_row(
+                        "SELECT owned_root_path,source_sha FROM registered_repositories WHERE repo_key=?1",
+                        [&assignment.repo_key],
+                        |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()?;
+                let intent = connection
+                    .query_row(
+                        "SELECT owned_root_path,staging_root_path,source_sha,json_extract(lifecycle_json,'$.state'),lifecycle_json FROM repository_provisioning_intents WHERE repo_key=?1",
+                        [&assignment.repo_key],
+                        |row| {
+                            Ok((
+                                row.get::<_, Vec<u8>>(0)?,
+                                row.get::<_, Vec<u8>>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(4)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                match (&assignment.repository, registered, intent) {
+                    (
+                        crate::repository_policy::MigrationRepositoryState::Ready { .. },
+                        Some((owned_root, source_sha)),
+                        None,
+                    ) => {
+                        let binding = assignment
+                            .repository
+                            .git_binding()
+                            .context("validated ready repository has no Git binding")?;
+                        let owned_root = PathBuf::from(OsString::from_vec(owned_root));
+                        if binding.top_level != owned_root {
+                            anyhow::bail!(
+                                "schema-3 repository {} Git binding top-level differs from stored owned root",
+                                assignment.repo_key
+                            );
+                        }
+                        binding.verify_head(&source_sha).with_context(|| {
+                            format!(
+                                "verify schema-3 repository {} live Git binding and HEAD",
+                                assignment.repo_key
+                            )
+                        })?;
+                        schema4_repository_bindings.insert(
+                            assignment.repo_key.clone(),
+                            serde_json::to_string(binding)?,
+                        );
+                        ready_repository_keys.insert(assignment.repo_key.clone());
+                    }
+                    (state, None, Some((owned_root, staging_root, source_sha, lifecycle, lifecycle_json)))
+                        if state.lifecycle() == Some(lifecycle.as_str()) =>
+                    {
+                        if let Some(binding) = state.git_binding() {
+                            let owned_root = PathBuf::from(OsString::from_vec(owned_root));
+                            let staging_root = PathBuf::from(OsString::from_vec(staging_root));
+                            let expected_path = if state.uses_staging_repository() {
+                                &staging_root
+                            } else if matches!(
+                                state,
+                                crate::repository_policy::MigrationRepositoryState::TargetCheckedOut { .. }
+                            ) {
+                                if binding.top_level == staging_root {
+                                    &staging_root
+                                } else {
+                                    &owned_root
+                                }
+                            } else {
+                                &owned_root
+                            };
+                            if binding.top_level != *expected_path {
+                                anyhow::bail!(
+                                    "schema-3 repository {} provisioning Git binding has the wrong lifecycle path",
+                                    assignment.repo_key
+                                );
+                            }
+                            if state.requires_checked_out_head() {
+                                binding.verify_head(&source_sha)?;
+                            } else if state.requires_source_commit() {
+                                binding.verify_commit(&source_sha)?;
+                            } else {
+                                binding.verify()?;
+                            }
+                        }
+                        let mut lifecycle_value: serde_json::Value =
+                            serde_json::from_str(&lifecycle_json)?;
+                        if let Some(binding) = state.git_binding() {
+                            lifecycle_value
+                                .as_object_mut()
+                                .context("schema-3 provisioning lifecycle is not an object")?
+                                .entry("identity")
+                                .or_insert_with(|| serde_json::json!({}))
+                                .as_object_mut()
+                                .context("schema-3 provisioning lifecycle identity is not an object")?
+                                .insert(
+                                    "git_binding".into(),
+                                    serde_json::to_value(binding)?,
+                                );
+                        }
+                        schema4_provisioning_lifecycles.insert(
+                            assignment.repo_key.clone(),
+                            serde_json::to_string(&lifecycle_value)?,
+                        );
+                        match state.disposition().context(
+                            "validated interrupted provisioning state has no disposition",
+                        )? {
+                            crate::repository_policy::InterruptedProvisioningDisposition::Preserve => {
+                                preserved_provisioning_keys.insert(assignment.repo_key.clone());
+                            }
+                            crate::repository_policy::InterruptedProvisioningDisposition::Cancel => {
+                                cancelled_provisioning_keys.insert(assignment.repo_key.clone());
+                            }
+                        }
+                    }
+                    (crate::repository_policy::MigrationRepositoryState::Ready { .. }, _, _) => {
+                        anyhow::bail!(
+                            "schema-3 repository {} inventory says ready but durable state is not ready",
+                            assignment.repo_key
+                        )
+                    }
+                    (state, _, _) => anyhow::bail!(
+                        "schema-3 repository {} provisioning inventory state {} differs from durable lifecycle",
+                        assignment.repo_key,
+                        state.lifecycle().unwrap_or("ready")
+                    ),
+                }
+                let mut stored_development = std::collections::BTreeMap::new();
+                {
+                    let mut statement = connection.prepare(
+                        "SELECT id,path,rift_id,source_rift_id,base_sha FROM development_workspaces WHERE repo_key=?1 AND rift_id IS NOT NULL AND status!='removed' ORDER BY id",
+                    )?;
+                    let rows = statement.query_map([&assignment.repo_key], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    })?;
+                    for row in rows {
+                        let (id, path, rift_id, source_rift_id, base_sha) = row?;
+                        stored_development.insert(
+                            id,
+                            (
+                                PathBuf::from(OsString::from_vec(path)),
+                                rift_id,
+                                source_rift_id,
+                                base_sha,
+                            ),
+                        );
+                    }
+                }
+                for workspace in assignment.development_workspaces {
+                    let stored = stored_development
+                        .remove(&workspace.workspace_id)
+                        .with_context(|| {
+                            format!(
+                                "migration development workspace {} is not active in schema 3",
+                                workspace.workspace_id
+                            )
+                        })?;
+                    if Path::new(&workspace.path) != stored.0
+                        || workspace.rift_id != stored.1
+                        || workspace.source_rift_id != stored.2
+                        || workspace.base_sha != stored.3
+                    {
+                        anyhow::bail!(
+                            "migration development workspace {} differs from durable identity",
+                            workspace.workspace_id
+                        );
+                    }
+                    let binding = workspace
+                        .git_binding
+                        .as_ref()
+                        .context("validated development workspace has no Git binding")?;
+                    binding.verify_base(&workspace.base_sha).with_context(|| {
+                        format!(
+                            "verify schema-3 development workspace {} live Git binding and base",
+                            workspace.workspace_id
+                        )
+                    })?;
+                    schema4_development_bindings.insert(
+                        workspace.workspace_id,
+                        (workspace.path, serde_json::to_string(binding)?),
+                    );
+                }
+                if !stored_development.is_empty() {
+                    anyhow::bail!(
+                        "migration inventory omits active schema-3 development workspace(s) for repository {}",
+                        assignment.repo_key
+                    );
+                }
+                assignment.policy.canonical_repository.verify_local_bare()?;
+                let owner: (String, String, String) = connection.query_row(
+                    "SELECT fetch_url,push_url,target_branch FROM repository_remote_owners WHERE repo_key=?1",
+                    [&assignment.repo_key],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+                if !legacy_transport_matches(
+                    &owner.0,
+                    &assignment.policy.canonical_repository,
+                    true,
+                ) || !legacy_transport_matches(
+                    &owner.1,
+                    &assignment.policy.canonical_repository,
+                    false,
+                ) || owner.2 != assignment.policy.target_branch
+                {
+                    anyhow::bail!(
+                        "schema-3 repository {} transport differs from its explicit canonical policy",
+                        assignment.repo_key
+                    );
+                }
+                for disposition in assignment.item_dispositions {
+                    if let Some(workspace) = &disposition.workspace_identity {
+                        let binding = workspace
+                            .git_binding
+                            .as_ref()
+                            .context("validated migration workspace has no Git binding")?;
+                        binding.verify().with_context(|| {
+                            format!(
+                                "verify schema-3 item {} live workspace Git binding",
+                                disposition.item_id
+                            )
+                        })?;
+                        schema4_workspace_bindings.insert(
+                            disposition.item_id.clone(),
+                            (workspace.path.clone(), serde_json::to_string(binding)?),
+                        );
+                    }
+                    let stored_repo_key = connection
+                        .query_row(
+                            "SELECT repo_key FROM queue_items WHERE id=?1",
+                            [&disposition.item_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?;
+                    match stored_repo_key.as_deref() {
+                        Some(stored) if stored == assignment.repo_key => {}
+                        Some(_) => anyhow::bail!(
+                            "schema-3 item {} disposition is assigned to the wrong repository",
+                            disposition.item_id
+                        ),
+                        None => anyhow::bail!(
+                            "migration inventory contains a disposition for no stored item"
+                        ),
+                    }
+                    dispositions.insert(disposition.item_id.clone(), disposition);
+                }
+                policies.insert(assignment.repo_key, assignment.policy);
+            }
+
+            let mut admissions = Vec::new();
+            let mut cancelled_incompatible_items = std::collections::BTreeSet::new();
+            let mut consumed_dispositions = std::collections::BTreeSet::new();
+            let mut effort_workspace_repairs = std::collections::BTreeMap::new();
+            let mut effort_runner_repairs = std::collections::BTreeMap::new();
+            let mut effort_runners = std::collections::BTreeMap::new();
+            {
+                let mut statement = connection.prepare(
+                    "SELECT item_id,workspace_json,runner_snapshot_json FROM integration_efforts ORDER BY item_id",
+                )?;
+                let rows = statement.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (item_id, stored_workspace, stored_runner) = row?;
+                    let stored = serde_json::from_str::<WorkspaceIdentity>(&stored_workspace)
+                        .and_then(|workspace| {
+                            validate_migration_workspace_identity(&workspace)
+                                .map(|()| workspace)
+                                .map_err(|error| {
+                                    serde_json::Error::io(std::io::Error::other(error))
+                                })
+                        });
+                    let disposition = dispositions.get(&item_id);
+                    let supplied =
+                        disposition.and_then(|disposition| disposition.workspace_identity.as_ref());
+                    match (stored, supplied) {
+                        (Ok(stored), Some(supplied))
+                            if stored.path != supplied.path
+                                || stored.rift_id != supplied.rift_id
+                                || stored.source_rift_id != supplied.source_rift_id =>
+                        {
+                            anyhow::bail!(
+                                "schema-3 item {item_id} migration workspace identity contradicts durable identity"
+                            );
+                        }
+                        (Ok(_), _) => {}
+                        (Err(_), Some(supplied)) => {
+                            effort_workspace_repairs.insert(
+                                item_id.clone(),
+                                WorkspaceIdentity {
+                                    path: supplied.path.clone(),
+                                    rift_id: supplied.rift_id.clone(),
+                                    source_rift_id: supplied.source_rift_id.clone(),
+                                },
+                            );
+                        }
+                        (Err(_), None) => anyhow::bail!(
+                            "schema-3 item {item_id} requires explicit workspace_identity in migration inventory"
+                        ),
+                    }
+                    let stored = serde_json::from_str::<crate::control_domain::RunnerSnapshot>(
+                        &stored_runner,
+                    )
+                    .and_then(|runner| {
+                        runner
+                            .validate()
+                            .map_err(|error| serde_json::Error::io(std::io::Error::other(error)))
+                    });
+                    let supplied =
+                        disposition.and_then(|disposition| disposition.runner_snapshot.as_ref());
+                    let runner = match (stored, supplied) {
+                        (Ok(stored), Some(supplied)) if &stored != supplied => anyhow::bail!(
+                            "schema-3 item {item_id} migration runner snapshot contradicts durable snapshot"
+                        ),
+                        (Ok(stored), _) => stored,
+                        (Err(_), Some(supplied)) => {
+                            effort_runner_repairs.insert(item_id.clone(), supplied.clone());
+                            supplied.clone()
+                        }
+                        (Err(_), None) => anyhow::bail!(
+                            "schema-3 item {item_id} requires explicit runner_snapshot in migration inventory"
+                        ),
+                    };
+                    effort_runners.insert(item_id, runner);
+                }
+            }
+            let mut migration_termination_authorities = std::collections::BTreeMap::new();
+            {
+                let mut statement = connection.prepare(
+                    "SELECT effort.item_id,effort.state,effort.state_json,debt.authority_json
+                     FROM integration_efforts effort
+                     LEFT JOIN runner_termination_debt debt ON debt.effort_id=effort.id
+                     WHERE effort.state IN ('agent_launching','agent_running') OR debt.effort_id IS NOT NULL
+                     ORDER BY effort.item_id",
+                )?;
+                let rows = statement.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (item_id, state, state_json, debt_json) = row?;
+                    let disposition = dispositions.get(&item_id).with_context(|| {
+                        format!(
+                            "schema-3 runner authority for item {item_id} requires an explicit migration disposition"
+                        )
+                    })?;
+                    if matches!(state.as_str(), "agent_launching" | "agent_running")
+                        && disposition.disposition
+                            != crate::repository_policy::IncompatibleItemDisposition::Cancel
+                    {
+                        anyhow::bail!(
+                            "schema-3 active runner item {item_id} must be explicitly cancelled"
+                        );
+                    }
+                    let authority = disposition
+                        .runner_termination_authority
+                        .as_ref()
+                        .with_context(|| {
+                            format!(
+                                "schema-3 runner item {item_id} requires explicit termination authority"
+                            )
+                        })?;
+                    let stored: serde_json::Value =
+                        serde_json::from_str(debt_json.as_deref().unwrap_or(&state_json))?;
+                    let payload = stored
+                        .get("payload")
+                        .context("schema-3 runner authority has no payload")?;
+                    let stored_authority_state =
+                        stored.get("state").and_then(serde_json::Value::as_str);
+                    if payload.get("cycle_id").and_then(serde_json::Value::as_str)
+                        != Some(authority.cycle_id.as_str())
+                        || payload.get("unit_name").and_then(serde_json::Value::as_str)
+                            != Some(authority.unit_name.as_str())
+                    {
+                        anyhow::bail!(
+                            "schema-3 runner item {item_id} termination authority contradicts durable unit identity"
+                        );
+                    }
+                    if (state == "agent_running" || stored_authority_state == Some("running"))
+                        && (payload.get("pid").and_then(serde_json::Value::as_u64)
+                            != Some(u64::from(authority.pid))
+                            || payload
+                                .get("process_start_ticks")
+                                .and_then(serde_json::Value::as_u64)
+                                != Some(authority.process_start_ticks))
+                    {
+                        anyhow::bail!(
+                            "schema-3 runner item {item_id} termination authority contradicts durable process identity"
+                        );
+                    }
+                    let runner = effort_runners
+                        .get(&item_id)
+                        .context("schema-3 runner item has no validated runner snapshot")?;
+                    crate::agent_runner::verify_live_legacy_runner_scope_authority(
+                        &runner.sandbox.systemctl,
+                        authority,
+                    )
+                    .with_context(|| {
+                        format!("verify schema-3 runner termination authority for item {item_id}")
+                    })?;
+                    migration_termination_authorities.insert(item_id, authority.clone());
+                }
+            }
+            for (item_id, disposition) in &dispositions {
+                if disposition.runner_termination_authority.is_some()
+                    && !migration_termination_authorities.contains_key(item_id)
+                {
+                    anyhow::bail!(
+                        "migration inventory contains runner termination authority for item without runner debt"
+                    );
+                }
+            }
+            {
+                let mut statement = connection.prepare(
+                    "SELECT item.id,item.repo_key,item.status,item.source_kind,item.source_branch,item.current_head_sha,item.pr_url,item.landing_policy,item.source_ref,item.submission_id,item.created_at,repository.target_branch,item.landing_state_json
+                     FROM queue_items item
+                     JOIN registered_repositories repository ON repository.repo_key=item.repo_key
+                     ORDER BY item.created_at,item.id",
+                )?;
+                let rows = statement.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, String>(11)?,
+                        row.get::<_, String>(12)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (
+                        item_id,
+                        repo_key,
+                        status,
+                        source_kind,
+                        source_branch,
+                        head_sha,
+                        pr_url,
+                        landing_policy,
+                        source_ref,
+                        submission_id,
+                        admitted_at,
+                        legacy_target,
+                        landing_state,
+                    ) = row?;
+                    let terminal = matches!(status.as_str(), "integrated" | "cancelled");
+                    let policy = policies
+                        .get(&repo_key)
+                        .context("migration item repository has no policy")?;
+                    policy
+                        .canonical_repository
+                        .object_format()
+                        .require_oid(&head_sha, "schema-3 queue head SHA")?;
+                    let disposition = dispositions.get(&item_id);
+                    let compatible = match (
+                        source_kind.as_str(),
+                        landing_policy.as_str(),
+                        pr_url.as_deref(),
+                    ) {
+                        ("local_submission", "squash", None) => {
+                            let source_ref = source_ref
+                                .context("legacy local submission has no exact source ref")?;
+                            let submission_id = submission_id
+                                .context("legacy local submission has no submission identity")?;
+                            admissions.push(AdmissionPlan::Local {
+                                item_id: item_id.clone(),
+                                kind: "local_submission",
+                                source_branch,
+                                head_sha,
+                                source_ref: Some(source_ref),
+                                submission_id: Some(submission_id),
+                                admitted_at,
+                            });
+                            policy.integration_policy
+                                == crate::repository_policy::IntegrationPolicy::Direct
+                        }
+                        ("remote_branch", "direct", None) => {
+                            admissions.push(AdmissionPlan::Local {
+                                item_id: item_id.clone(),
+                                kind: "direct",
+                                source_branch,
+                                head_sha,
+                                source_ref: None,
+                                submission_id: None,
+                                admitted_at,
+                            });
+                            policy.integration_policy
+                                == crate::repository_policy::IntegrationPolicy::Direct
+                        }
+                        ("remote_branch", "provider", Some(url)) => {
+                            let locator = crate::providers::merge_request_locator(url)?;
+                            let provider_policy = policy.canonical_repository.provider();
+                            let (provider_repository, admitted_base) = if terminal {
+                                let historical = disposition.with_context(|| {
+                                    format!(
+                                        "historical schema-3 MR item {item_id} requires explicit provider identity and admitted base inventory"
+                                    )
+                                })?;
+                                let provider_repository = historical
+                                    .provider_repository
+                                    .clone()
+                                    .with_context(|| {
+                                        format!(
+                                            "historical schema-3 MR item {item_id} requires complete provider_repository in migration inventory"
+                                        )
+                                    })?;
+                                let admitted_base = historical
+                                    .admitted_base_sha
+                                    .clone()
+                                    .with_context(|| {
+                                        format!(
+                                            "historical schema-3 MR item {item_id} requires admitted_base_sha in migration inventory"
+                                        )
+                                    })?;
+                                (provider_repository, Some(admitted_base))
+                            } else {
+                                let provider_repository = match (
+                                    provider_policy,
+                                    disposition.and_then(|value| value.provider_repository.as_ref()),
+                                ) {
+                                    (Some(configured), Some(supplied)) if configured != supplied => {
+                                        anyhow::bail!(
+                                            "active schema-3 MR item {item_id} provider inventory contradicts canonical provider identity"
+                                        )
+                                    }
+                                    (Some(configured), _) => configured.clone(),
+                                    (None, Some(supplied)) => supplied.clone(),
+                                    (None, None) => anyhow::bail!(
+                                        "incompatible active schema-3 MR item {item_id} requires complete provider_repository inventory for cancellation"
+                                    ),
+                                };
+                                let admitted_base = disposition
+                                    .and_then(|value| value.admitted_base_sha.clone());
+                                (provider_repository, admitted_base)
+                            };
+                            if locator.provider != provider_repository.provider
+                                || locator.host != provider_repository.host
+                                || locator.repository != provider_repository.repository
+                            {
+                                anyhow::bail!(
+                                    "schema-3 MR item {item_id} URL differs from explicit provider repository inventory"
+                                );
+                            }
+                            if !terminal && admitted_base.is_none() {
+                                anyhow::bail!(
+                                    "active schema-3 MR item {item_id} requires admitted_base_sha in migration inventory"
+                                );
+                            }
+                            let provider_merge_method =
+                                disposition.and_then(|value| value.provider_merge_method);
+                            if !terminal
+                                && serde_json::from_str::<LandingState>(&landing_state)?
+                                    .is_uncertain()
+                                && provider_merge_method.is_none()
+                            {
+                                anyhow::bail!(
+                                    "migrated uncertain provider item {item_id} requires provider_merge_method in migration inventory"
+                                );
+                            }
+                            let exact_source_ref = match provider_repository.provider {
+                                crate::repository_policy::Provider::Github => {
+                                    format!("refs/pull/{}/head", locator.identity)
+                                }
+                                crate::repository_policy::Provider::Gitlab => {
+                                    format!("refs/merge-requests/{}/head", locator.identity)
+                                }
+                            };
+                            let source_ref_matches = source_branch == exact_source_ref;
+                            let belongs_to_canonical = provider_policy
+                                .is_some_and(|configured| configured == &provider_repository);
+                            admissions.push(AdmissionPlan::MergeRequest {
+                                item_id: item_id.clone(),
+                                kind: if terminal {
+                                    "historical_merge_request"
+                                } else {
+                                    "merge_request"
+                                },
+                                source_branch: exact_source_ref,
+                                head_sha,
+                                provider: provider_repository.provider,
+                                provider_host: provider_repository.host,
+                                provider_repository: provider_repository.repository,
+                                provider_repository_id: provider_repository.repository_id,
+                                target_branch: legacy_target,
+                                base_sha: admitted_base,
+                                provider_merge_method,
+                                identity: locator.identity,
+                                url: url.to_string(),
+                                admitted_at,
+                            });
+                            policy.integration_policy
+                                == crate::repository_policy::IntegrationPolicy::MergeRequestRequired
+                                && belongs_to_canonical
+                                && source_ref_matches
+                        }
+                        _ => anyhow::bail!(
+                            "schema-3 item {item_id} has an invalid explicit source/landing/URL combination"
+                        ),
+                    };
+                    if !terminal {
+                        match disposition.map(|value| value.disposition) {
+                            Some(
+                                crate::repository_policy::IncompatibleItemDisposition::Cancel,
+                            ) => {
+                                cancelled_incompatible_items.insert(item_id.clone());
+                            }
+                            Some(
+                                crate::repository_policy::IncompatibleItemDisposition::Continue,
+                            ) if !compatible => anyhow::bail!(
+                                "incompatible active schema-3 item {item_id} must be explicitly cancelled"
+                            ),
+                            None if !compatible => anyhow::bail!(
+                                "active schema-3 item {item_id} is incompatible with new policy and requires explicit disposition"
+                            ),
+                            Some(
+                                crate::repository_policy::IncompatibleItemDisposition::Continue,
+                            )
+                            | None => {}
+                        }
+                    }
+                    if disposition.is_some() {
+                        consumed_dispositions.insert(item_id.clone());
+                    }
+                    if !terminal
+                        && matches!(
+                            policy.operation_state,
+                            crate::repository_policy::OperationState::Disabled
+                        )
+                    {
+                        anyhow::bail!(
+                            "disabled migration policy cannot contain active item {item_id}"
+                        );
+                    }
+                }
+            }
+            if consumed_dispositions.len() != dispositions.len() {
+                anyhow::bail!("migration inventory contains a disposition for no stored item");
+            }
+
+            for (repo_key, policy) in &mut policies {
+                if matches!(
+                    policy.operation_state,
+                    crate::repository_policy::OperationState::Draining { .. }
+                ) {
+                    let mut obligations = std::collections::BTreeSet::new();
+                    {
+                        let mut statement = connection.prepare(
+                            "SELECT id FROM development_workspaces WHERE repo_key=?1 AND status!='removed'",
+                        )?;
+                        for id in statement.query_map([repo_key], |row| row.get::<_, String>(0))? {
+                            obligations.insert(crate::repository_policy::Obligation::Workspace {
+                                id: id?,
+                            });
+                        }
+                    }
+                    {
+                        let mut statement = connection.prepare(
+                            "SELECT id FROM queue_items WHERE repo_key=?1 AND status NOT IN ('integrated','cancelled')",
+                        )?;
+                        for id in statement.query_map([repo_key], |row| row.get::<_, String>(0))? {
+                            obligations.insert(crate::repository_policy::Obligation::QueueItem {
+                                id: id?,
+                            });
+                        }
+                    }
+                    obligations.retain(|obligation| {
+                        !matches!(
+                            obligation,
+                            crate::repository_policy::Obligation::QueueItem { id }
+                                if cancelled_incompatible_items.contains(id)
+                        )
+                    });
+                    policy.operation_state =
+                        crate::repository_policy::OperationState::Draining { obligations };
+                }
+            }
+
+            let backup_path = create_schema3_backup(
+                &path,
+                &database_id,
+                &migration_source_members,
+                &migration_source_digest,
+                &operation_id,
+            )?;
+            #[cfg(debug_assertions)]
+            if std::env::var_os("IQ_TEST_SCHEMA3_STOP_AFTER_BACKUP_PUBLICATION").is_some() {
+                std::process::exit(94);
+            }
+            drop(connection);
+            let mut connection = Connection::open_with_flags(
+                candidate.path(),
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?;
+            configure_connection(&connection)?;
+            let journal_mode: String =
+                connection.query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))?;
+            if journal_mode != "delete" {
+                anyhow::bail!("migration candidate could not enter single-file journal mode");
+            }
+            connection.pragma_update(None, "foreign_keys", "ON")?;
+            connection.pragma_update(None, "foreign_keys", "OFF")?;
+            connection.pragma_update(None, "legacy_alter_table", "ON")?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+            transaction.execute_batch(REPOSITORY_POLICY_TABLE_SCHEMA)?;
+            let timestamp = now();
+            for (repo_key, policy) in &policies {
+                if cancelled_provisioning_keys.contains(repo_key) {
+                    continue;
+                }
+                transaction.execute(
+                    "INSERT INTO repository_policies(repo_key,revision,operation_state_json,canonical_repository_json,canonical_ownership_key,target_branch,integration_policy,replication_policy_json,created_at,updated_at) VALUES(?1,1,?2,?3,?4,?5,?6,?7,?8,?8)",
+                    params![repo_key,serde_json::to_string(&policy.operation_state)?,serde_json::to_string(&policy.canonical_repository)?,policy.canonical_repository.canonical_ownership_key()?,policy.target_branch,policy.integration_policy.to_string(),serde_json::to_string(&policy.replication_policy)?,timestamp],
+                )?;
+            }
+            crate::control_store::upgrade_schema3_control_identity(&transaction)?;
+            transaction.execute_batch(
+                "DROP VIEW queue_items_runtime;
+                 DROP TRIGGER IF EXISTS queue_items_local_source_insert;
+                 DROP TRIGGER IF EXISTS queue_items_local_source_update;
+                 DROP TRIGGER IF EXISTS queue_items_landing_state_insert;
+                 DROP TRIGGER IF EXISTS queue_items_landing_state_update;
+                 DROP TRIGGER IF EXISTS queue_items_workspace_state_insert;
+                 DROP TRIGGER IF EXISTS queue_items_workspace_state_update;
+                 DROP TRIGGER IF EXISTS registered_repository_path_identity_insert;
+                 DROP TRIGGER IF EXISTS registered_repository_excludes_provisioning_intent;
+                 DROP TRIGGER IF EXISTS repository_provisioning_intent_excludes_ready;
+                 DROP TRIGGER IF EXISTS repository_remote_owner_identity_immutable;
+                 DROP TRIGGER IF EXISTS registered_repository_identity_immutable;
+                 DROP TRIGGER IF EXISTS registered_repository_exact_provisioning_insert;
+                 DROP TRIGGER IF EXISTS registered_repository_checkout_insert;
+                 DROP TRIGGER IF EXISTS registered_repository_checkout_update;
+                 DROP TRIGGER IF EXISTS registered_repository_delete_guard;
+                 DROP TRIGGER IF EXISTS workspace_root_exact_identity_insert;
+                 DROP TRIGGER IF EXISTS workspace_root_exact_identity_update;
+                 DROP TRIGGER IF EXISTS workspace_root_delete_guard;
+                 DROP TRIGGER IF EXISTS local_submission_identity_immutable;
+                 ALTER TABLE queue_items RENAME TO queue_items_schema3;
+                 ALTER TABLE registered_repositories RENAME TO registered_repositories_schema3;
+                 ALTER TABLE repository_provisioning_intents RENAME TO repository_provisioning_intents_schema3;
+                 ALTER TABLE repository_bootstrap_requests RENAME TO repository_bootstrap_requests_schema3;
+                 ALTER TABLE repository_remote_owners RENAME TO repository_remote_owners_schema3;",
+            )?;
+            transaction.execute_batch(SCHEMA4)?;
+            transaction.execute_batch(COMPOSITION_SCHEMA4)?;
+            transaction.execute_batch(
+                "INSERT INTO queue_items(id,repo_key,producer_metadata_json,validation_evidence_json,status,current_attempt_id,blocked_phase,blocked_reason,blocked_message,retry_after,prompt_id,conflict_json,integration_workspace_path,integration_workspace_rift_id,integration_workspace_source_rift_id,integration_workspace_cleaned_at,target_sha,source_sha,landed_commit_sha,landing_state_json,replacement_json,created_at,updated_at)
+                 SELECT id,repo_key,producer_metadata_json,validation_evidence_json,status,current_attempt_id,blocked_phase,blocked_reason,blocked_message,retry_after,prompt_id,conflict_json,integration_workspace_path,integration_workspace_rift_id,integration_workspace_source_rift_id,integration_workspace_cleaned_at,target_sha,source_sha,landed_commit_sha,landing_state_json,replacement_json,created_at,updated_at FROM queue_items_schema3;
+                 INSERT INTO repository_bootstrap_requests(request_path,storage_root_path,rift_registry_path,repo_key,created_at,updated_at)
+                 SELECT request_path,storage_root_path,rift_registry_path,NULL,created_at,updated_at FROM repository_bootstrap_requests_schema3 WHERE repo_key IS NULL;",
+            )?;
+            for repo_key in &ready_repository_keys {
+                transaction.execute(
+                    "INSERT INTO registered_repositories(repo_key,owned_root_path,git_binding_json,root_rift_id,registry_identity,registry_device,registry_inode,generation,source_sha,checkout_json,development_root_path,development_kind,integration_root_path,integration_kind,provisioning_json,created_at,updated_at) SELECT repo_key,owned_root_path,'{}',root_rift_id,registry_identity,registry_device,registry_inode,generation,source_sha,checkout_json,development_root_path,development_kind,integration_root_path,integration_kind,provisioning_json,created_at,updated_at FROM registered_repositories_schema3 WHERE repo_key=?1",
+                    [repo_key],
+                )?;
+                transaction.execute(
+                    "INSERT INTO repository_bootstrap_requests(request_path,storage_root_path,rift_registry_path,repo_key,created_at,updated_at) SELECT request_path,storage_root_path,rift_registry_path,repo_key,created_at,updated_at FROM repository_bootstrap_requests_schema3 WHERE repo_key=?1",
+                    [repo_key],
+                )?;
+            }
+            for repo_key in &preserved_provisioning_keys {
+                transaction.execute(
+                    "INSERT INTO repository_provisioning_intents(repo_key,bootstrap_path,owned_root_path,staging_root_path,rift_registry_path,source_sha,policy_bytes,lifecycle_json,created_at,updated_at) SELECT repo_key,bootstrap_path,owned_root_path,staging_root_path,rift_registry_path,source_sha,policy_bytes,lifecycle_json,created_at,updated_at FROM repository_provisioning_intents_schema3 WHERE repo_key=?1",
+                    [repo_key],
+                )?;
+                transaction.execute(
+                    "INSERT INTO repository_bootstrap_requests(request_path,storage_root_path,rift_registry_path,repo_key,created_at,updated_at) SELECT request_path,storage_root_path,rift_registry_path,repo_key,created_at,updated_at FROM repository_bootstrap_requests_schema3 WHERE repo_key=?1",
+                    [repo_key],
+                )?;
+                let lifecycle = schema4_provisioning_lifecycles
+                    .get(repo_key)
+                    .context("preserved provisioning lifecycle has no verified schema-4 state")?;
+                transaction.execute(
+                    "UPDATE repository_provisioning_intents SET lifecycle_json=?1 WHERE repo_key=?2",
+                    params![lifecycle, repo_key],
+                )?;
+            }
+            transaction.execute_batch(
+                "DROP TABLE queue_items_schema3;
+                 DROP TABLE registered_repositories_schema3;
+                 DROP TABLE repository_provisioning_intents_schema3;
+                 DROP TABLE repository_bootstrap_requests_schema3;
+                 DROP TABLE repository_remote_owners_schema3;",
+            )?;
+            for (repo_key, binding) in &schema4_repository_bindings {
+                let changed = transaction.execute(
+                    "UPDATE registered_repositories SET git_binding_json=?1 WHERE repo_key=?2",
+                    params![binding, repo_key],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("migration repository Git binding authority changed");
+                }
+            }
+            transaction.execute_batch(REPOSITORY_POLICY_SCHEMA)?;
+            reserve_all_policy_physical_ownership(&transaction)?;
+            for admission in &admissions {
+                match admission {
+                    AdmissionPlan::Local {
+                        item_id,
+                        kind,
+                        source_branch,
+                        head_sha,
+                        source_ref,
+                        submission_id,
+                        admitted_at,
+                    } => {
+                        transaction.execute(
+                            "INSERT INTO queue_admissions(item_id,kind,source_branch,head_sha,source_ref,submission_id,admitted_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                            params![item_id,kind,source_branch,head_sha,source_ref,submission_id,admitted_at],
+                        )?;
+                    }
+                    AdmissionPlan::MergeRequest {
+                        item_id,
+                        kind,
+                        source_branch,
+                        head_sha,
+                        provider,
+                        provider_host,
+                        provider_repository,
+                        provider_repository_id,
+                        target_branch,
+                        base_sha,
+                        provider_merge_method,
+                        identity,
+                        url,
+                        admitted_at,
+                    } => {
+                        transaction.execute(
+                            "INSERT INTO queue_admissions(item_id,kind,source_branch,head_sha,provider,provider_host,provider_repository,provider_repository_id,target_branch,base_sha,provider_merge_method,merge_request_identity,merge_request_url,admitted_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                            params![item_id,kind,source_branch,head_sha,provider.to_string(),provider_host,provider_repository,provider_repository_id,target_branch,base_sha,provider_merge_method.map(|method| match method { crate::repository_policy::ProviderMergeMethod::Merge => "merge", crate::repository_policy::ProviderMergeMethod::Squash => "squash" }),identity,url,admitted_at],
+                        )?;
+                    }
+                }
+            }
+            for (item_id, workspace) in &effort_workspace_repairs {
+                let changed = transaction.execute(
+                    "UPDATE integration_efforts SET workspace_json=?1,updated_at=?2 WHERE item_id=?3",
+                    params![serde_json::to_string(workspace)?,timestamp,item_id],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("migration effort workspace authority changed");
+                }
+                let queue_changed = transaction.execute(
+                    "UPDATE queue_items SET integration_workspace_path=?1,integration_workspace_rift_id=?2,integration_workspace_source_rift_id=?3,updated_at=?4 WHERE id=?5 AND integration_workspace_path IS NULL AND integration_workspace_rift_id IS NULL AND integration_workspace_source_rift_id IS NULL AND integration_workspace_cleaned_at IS NULL",
+                    params![workspace.path,workspace.rift_id,workspace.source_rift_id,timestamp,item_id],
+                )?;
+                if queue_changed != 1 {
+                    anyhow::bail!(
+                        "migration queue workspace authority contradicts explicit inventory"
+                    );
+                }
+            }
+            for (item_id, (path, binding)) in &schema4_workspace_bindings {
+                let changed = transaction.execute(
+                    "INSERT INTO workspace_git_bindings(owner_kind,owner_id,top_level,binding_json,created_at) SELECT 'integration',?1,CAST(?2 AS BLOB),?3,?4 WHERE EXISTS(SELECT 1 FROM queue_items WHERE id=?1 AND integration_workspace_path=?2 AND integration_workspace_rift_id IS NOT NULL)",
+                    params![item_id,path,binding,timestamp],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("migration workspace Git binding differs from queue authority");
+                }
+            }
+            for (workspace_id, (path, binding)) in &schema4_development_bindings {
+                let changed = transaction.execute(
+                    "INSERT INTO workspace_git_bindings(owner_kind,owner_id,top_level,binding_json,created_at) SELECT 'development',?1,CAST(?2 AS BLOB),?3,?4 WHERE EXISTS(SELECT 1 FROM development_workspaces WHERE id=?1 AND CAST(path AS TEXT)=?2 AND rift_id IS NOT NULL AND status!='removed')",
+                    params![workspace_id,path,binding,timestamp],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!(
+                        "migration development workspace Git binding differs from workspace authority"
+                    );
+                }
+            }
+            for (item_id, runner) in &effort_runner_repairs {
+                let changed = transaction.execute(
+                    "UPDATE integration_efforts SET runner_snapshot_json=?1,updated_at=?2 WHERE item_id=?3",
+                    params![serde_json::to_string(runner)?,timestamp,item_id],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("migration effort runner authority changed");
+                }
+            }
+            transaction.execute_batch(LANDING_STATE_TRIGGERS)?;
+            transaction.execute_batch(WORKSPACE_STATE_TRIGGERS)?;
+            crate::control_store::install_control_schema(&transaction)?;
+            for (item_id, authority) in &migration_termination_authorities {
+                transaction.execute(
+                    "UPDATE runner_termination_debt
+                     SET authority_json=?1
+                     WHERE effort_id=(SELECT id FROM integration_efforts WHERE item_id=?2)",
+                    params![
+                        serde_json::to_string(&serde_json::json!({
+                            "state": "legacy_scope",
+                            "payload": authority,
+                        }))?,
+                        item_id,
+                    ],
+                )?;
+            }
+            for item_id in &cancelled_incompatible_items {
+                crate::control_store::cancel_item_for_migration(
+                    &transaction,
+                    item_id,
+                    migration_termination_authorities.get(item_id),
+                )?;
+            }
+            transaction.execute_batch(REGISTERED_REPOSITORY_TRIGGERS4)?;
+            transaction.execute(
+                "UPDATE queue_metadata SET value=?1 WHERE key='workspace_schema_version' AND value='3'",
+                [crate::repository::SCHEMA_VERSION],
+            )?;
+            validate_schema_objects(&transaction)?;
+            validate_schema4_contents(&transaction)?;
+            validate_registered_repository_rows(&transaction)?;
+            crate::repository::validate_provisioning_rows(&transaction)?;
+            crate::control_store::validate_control_contents(&transaction)?;
+            #[cfg(debug_assertions)]
+            if std::env::var_os("IQ_TEST_SCHEMA3_FAIL_BEFORE_COMMIT").is_some() {
+                anyhow::bail!("test interruption before schema-3 migration commit");
+            }
+            let integrity: String =
+                transaction.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+            let foreign_key_errors: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check",
+                [],
+                |row| row.get(0),
+            )?;
+            if integrity != "ok" || foreign_key_errors != 0 {
+                anyhow::bail!("migrated schema/content invariant validation failed");
+            }
+            transaction.commit()?;
+            connection.pragma_update(None, "legacy_alter_table", "OFF")?;
+            connection.pragma_update(None, "foreign_keys", "ON")?;
+            let validated_database_id = validate_existing_schema_identity(&connection)?;
+            if validated_database_id != database_id {
+                anyhow::bail!(
+                    "migration candidate changed database identity; preserve backup {backup_path:?}"
+                );
+            }
+            drop(connection);
+            sync_database_file_and_parent(candidate.path())?;
+            let mut publication = MigrationPublicationState {
+                version: 1,
+                database_id: database_id.clone(),
+                source_digest: migration_source_digest.clone(),
+                operation_id: operation_id.clone(),
+                source_members: migration_source_members.clone(),
+                candidate_root: candidate.root.clone(),
+                candidate_device: candidate.device,
+                candidate_inode: candidate.inode,
+                phase: MigrationPublicationPhase::Prepared,
+            };
+            write_migration_publication_state(&path, &publication)?;
+            #[cfg(debug_assertions)]
+            if std::env::var_os("IQ_TEST_SCHEMA3_STOP_BEFORE_PUBLICATION").is_some() {
+                std::process::exit(92);
+            }
+            exchange_database_files(candidate.path(), &path)?;
+            candidate.preserve_for_recovery();
+            fail_schema3_publication_after("exchange")?;
+            #[cfg(debug_assertions)]
+            if std::env::var_os("IQ_TEST_SCHEMA3_STOP_AFTER_PUBLICATION").is_some() {
+                std::process::exit(93);
+            }
+            sync_database_file_and_parent(&path)?;
+            fail_schema3_publication_after("primary_sync")?;
+            sync_database_file_and_parent(candidate.path())?;
+            publication.phase = MigrationPublicationPhase::Exchanged;
+            write_migration_publication_state(&path, &publication)?;
+            fail_schema3_publication_after("exchanged_state")?;
+            sync_database_file_and_parent(&backup_path)?;
+            let published = Connection::open_with_flags(
+                &path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?;
+            configure_connection(&published)?;
+            if validate_existing_schema_identity(&published)? != database_id {
+                anyhow::bail!("published schema-4 database identity is invalid");
+            }
+            drop(published);
+            fail_schema3_publication_after("validation")?;
+            publication.phase = MigrationPublicationPhase::Validated;
+            write_migration_publication_state(&path, &publication)?;
+            candidate.remove();
+            fail_schema3_publication_after("candidate_cleanup")?;
+            publication.phase = MigrationPublicationPhase::Complete;
+            write_migration_publication_state(&path, &publication)?;
+            File::open(path.parent().context("queue database path has no parent")?)?.sync_all()?;
+            drop(exclusive);
+            Ok(MigrationReport {
+                completion: reconcile_migrated_runner_termination_debt(&path),
+                database_id,
+                from_schema: 3,
+                to_schema: 4,
+                repositories: stored_keys.len(),
+                admissions: admissions.len(),
+                backup_path,
+            })
         }
 
         pub fn open(path: &Path) -> Result<Self> {
@@ -1128,6 +3047,7 @@ pub mod sqlite {
                 OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
             )
             .with_context(|| format!("open queue db {}", path.display()))?;
+            configure_connection(&conn)?;
             conn.busy_timeout(Self::OPEN_BUSY_TIMEOUT)?;
             conn.pragma_update(None, "foreign_keys", "ON")?;
             source.verify_authoritative(&path)?;
@@ -1185,35 +3105,60 @@ pub mod sqlite {
             self.reader().connect(SqliteQueueReader::BUSY_TIMEOUT)
         }
 
+        pub fn purge_terminal_item(&self, item_id: &str) -> Result<()> {
+            crate::control_domain::require_exact_text(item_id, "queue item identity")?;
+            let mut connection = self.connect()?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute(
+                "INSERT INTO queue_item_purge_authority(item_id,authorized_at) VALUES(?1,?2)",
+                params![item_id, now()],
+            )?;
+            let deleted = transaction.execute("DELETE FROM queue_items WHERE id=?1", [item_id])?;
+            if deleted != 1 {
+                anyhow::bail!("terminal queue-item purge lost exact item authority");
+            }
+            transaction.commit()?;
+            Ok(())
+        }
+
         pub(crate) fn reader(&self) -> SqliteQueueReader {
             SqliteQueueReader {
                 authority: self.authority.clone(),
             }
         }
 
-        pub fn enqueue(&self, request: EnqueueRequest) -> Result<QueueItem> {
+        pub(crate) fn admit_direct(&self, request: DirectAdmissionRequest) -> Result<QueueItem> {
             let state_repository = request.state_repository.clone().validate()?;
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let registered: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM registered_repositories WHERE repo_key=?1)",
+            let policy: Option<(String, String, String)> = tx.query_row(
+                "SELECT policy.operation_state_json,policy.integration_policy,policy.canonical_repository_json FROM registered_repositories repository JOIN repository_policies policy ON policy.repo_key=repository.repo_key WHERE repository.repo_key=?1",
                 [&request.repo_key],
-                |row| row.get(0),
-            )?;
-            if !registered {
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            ).optional()?;
+            let Some((operation_state, integration_policy, canonical_repository)) = policy else {
                 anyhow::bail!("cannot enqueue for unknown repository {}", request.repo_key);
+            };
+            serde_json::from_str::<crate::repository_policy::GitRepository>(&canonical_repository)?
+                .object_format()
+                .require_oid(&request.current_head_sha, "direct admission head")?;
+            serde_json::from_str::<crate::repository_policy::OperationState>(&operation_state)?
+                .require_new_work()?;
+            if integration_policy != "direct" {
+                anyhow::bail!("repository policy rejects direct admission");
             }
             let now = now();
-            let existing: Option<(String, String, Option<String>)> = tx
+            let existing: Option<(String, String)> = tx
                 .query_row(
-                    "SELECT id,current_head_sha,pr_url FROM queue_items WHERE repo_key=?1 AND source_branch=?2 AND status NOT IN ('integrated','cancelled')",
+                    "SELECT item.id,admission.head_sha FROM queue_items item JOIN queue_admissions admission ON admission.item_id=item.id WHERE item.repo_key=?1 AND admission.source_branch=?2 AND item.status NOT IN ('integrated','cancelled')",
                     params![request.repo_key, request.source_branch],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
 
-            let item_id = if let Some((id, current_head_sha, pr_url)) = existing {
-                if current_head_sha != request.current_head_sha || pr_url != request.pr_url {
+            let item_id = if let Some((id, current_head_sha)) = existing {
+                if current_head_sha != request.current_head_sha {
                     anyhow::bail!(
                         "active queue item {id} already tracks {current_head_sha}; update blocked agent work through requeue instead of enqueue"
                     );
@@ -1232,28 +3177,126 @@ pub mod sqlite {
             } else {
                 let id = Uuid::new_v4().to_string();
                 tx.execute(
-                    "INSERT INTO queue_items (id,repo_key,source_branch,pr_url,producer_metadata_json,validation_evidence_json,status,current_head_sha,source_kind,source_ref,landing_policy,created_at,updated_at)
-                     VALUES (?1,?2,?3,?4,?5,'{}','ready',?6,'remote_branch',?3,?8,?7,?7)",
+                    "INSERT INTO queue_items (id,repo_key,producer_metadata_json,validation_evidence_json,status,created_at,updated_at)
+                     VALUES (?1,?2,?3,'{}','ready',?4,?4)",
                     params![
                         id,
                         request.repo_key,
-                        request.source_branch,
-                        request.pr_url,
                         request.producer_metadata.to_string(),
-                        request.current_head_sha,
                         now,
-                        if request.pr_url.is_some() {
-                            "provider"
-                        } else {
-                            "direct"
-                        },
                     ],
+                )?;
+                tx.execute(
+                    "INSERT INTO queue_admissions(item_id,kind,source_branch,head_sha,admitted_at) VALUES(?1,'direct',?2,?3,?4)",
+                    params![id,request.source_branch,request.current_head_sha,now],
                 )?;
                 Self::record_event_tx(&tx, &id, "item_enqueued", "item enqueued")?;
                 insert_state_repository_binding(&tx, &id, &state_repository, &now)?;
                 id
             };
             tx.commit()?;
+            self.get_item(&item_id)
+        }
+
+        pub(crate) fn admit_merge_request(
+            &self,
+            repo_key: &str,
+            admission: &MergeRequestAdmission,
+            producer_metadata: &Value,
+            state_repository: &crate::control_domain::StateRepositorySnapshot,
+        ) -> Result<QueueItem> {
+            let state_repository = state_repository.clone().validate()?;
+            let source_ref = match admission.provider {
+                crate::repository_policy::Provider::Github => {
+                    format!("refs/pull/{}/head", admission.identity)
+                }
+                crate::repository_policy::Provider::Gitlab => {
+                    format!("refs/merge-requests/{}/head", admission.identity)
+                }
+            };
+            if source_ref != admission.source_branch {
+                anyhow::bail!("merge-request source ref differs from exact provider identity");
+            }
+            let mut connection = self.connect()?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let stored_policy: (String, String, String) = transaction.query_row(
+                "SELECT operation_state_json,integration_policy,canonical_repository_json FROM repository_policies WHERE repo_key=?1 AND EXISTS(SELECT 1 FROM registered_repositories WHERE repo_key=?1)",
+                [repo_key],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            )?;
+            serde_json::from_str::<crate::repository_policy::OperationState>(&stored_policy.0)?
+                .require_new_work()?;
+            if stored_policy.1 != "merge_request_required" {
+                anyhow::bail!("repository policy rejects merge-request admission");
+            }
+            let canonical: crate::repository_policy::GitRepository =
+                serde_json::from_str(&stored_policy.2)?;
+            canonical
+                .object_format()
+                .require_oid(&admission.head_sha, "admitted MR head SHA")?;
+            canonical.object_format().require_oid(
+                admission
+                    .base_sha
+                    .as_deref()
+                    .context("merge-request admission requires exact admitted base SHA")?,
+                "admitted MR base SHA",
+            )?;
+            let configured = canonical
+                .provider()
+                .context("merge-request policy has no canonical provider identity")?;
+            if configured.provider != admission.provider
+                || configured.host != admission.provider_host
+                || configured.repository != admission.repository
+                || configured.repository_id != admission.repository_id
+            {
+                anyhow::bail!("merge request does not belong to canonical provider repository");
+            }
+            let existing: Option<String> = transaction
+                .query_row(
+                    "SELECT item.id FROM queue_items item JOIN queue_admissions admission ON admission.item_id=item.id WHERE item.repo_key=?1 AND admission.kind='merge_request' AND admission.provider=?2 AND admission.provider_repository=?3 AND admission.merge_request_identity=?4 AND item.status NOT IN ('integrated','cancelled')",
+                    params![repo_key,admission.provider.to_string(),admission.repository,admission.identity],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(item_id) = existing {
+                let stored: (String, Option<String>, String) = transaction.query_row(
+                    "SELECT head_sha,base_sha,merge_request_url FROM queue_admissions WHERE item_id=?1",
+                    [&item_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+                if stored
+                    != (
+                        admission.head_sha.clone(),
+                        admission.base_sha.clone(),
+                        admission.url.clone(),
+                    )
+                {
+                    anyhow::bail!(
+                        "active merge-request admission has different immutable identity"
+                    );
+                }
+                transaction.commit()?;
+                return self.get_item(&item_id);
+            }
+            let item_id = Uuid::new_v4().to_string();
+            let timestamp = now();
+            transaction.execute(
+                "INSERT INTO queue_items(id,repo_key,producer_metadata_json,validation_evidence_json,status,created_at,updated_at) VALUES(?1,?2,?3,'{}','ready',?4,?4)",
+                params![item_id,repo_key,producer_metadata.to_string(),timestamp],
+            )?;
+            transaction.execute(
+                "INSERT INTO queue_admissions(item_id,kind,source_branch,head_sha,provider,provider_host,provider_repository,provider_repository_id,target_branch,base_sha,merge_request_identity,merge_request_url,admitted_at) VALUES(?1,'merge_request',?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                params![item_id,source_ref,admission.head_sha,admission.provider.to_string(),admission.provider_host,admission.repository,admission.repository_id,admission.target_branch,admission.base_sha,admission.identity,admission.url,timestamp],
+            )?;
+            Self::record_event_tx(
+                &transaction,
+                &item_id,
+                "merge_request_admitted",
+                "coding-agent merge request admitted with exact head",
+            )?;
+            insert_state_repository_binding(&transaction, &item_id, &state_repository, &timestamp)?;
+            transaction.commit()?;
             self.get_item(&item_id)
         }
 
@@ -1299,36 +3342,6 @@ pub mod sqlite {
             .with_context(|| format!("read oldest active item for repo queue {repo_key}"))
         }
 
-        pub fn claim_next_ready(&self, repo_key: &str) -> Result<Option<(QueueItem, Attempt)>> {
-            let registered: bool = self.connect_read_only()?.query_row(
-                "SELECT EXISTS(SELECT 1 FROM registered_repositories WHERE repo_key=?1)",
-                [repo_key],
-                |row| row.get(0),
-            )?;
-            if registered {
-                anyhow::bail!(
-                    "registered repository attempts require an owned policy claim under the repository lease"
-                );
-            }
-            anyhow::bail!("queue repository is not registered")
-        }
-
-        #[doc(hidden)]
-        pub fn claim_next_ready_control_fixture(
-            &self,
-            repo_key: &str,
-        ) -> Result<Option<(QueueItem, Attempt)>> {
-            let (snapshot, digest) = crate::composition::no_validation_policy_snapshot()?;
-            self.claim_next_ready_with_authority(
-                repo_key,
-                MutationAuthority::External,
-                AttemptPolicy::Snapshot {
-                    snapshot_json: &snapshot,
-                    digest: &digest,
-                },
-            )
-        }
-
         pub(crate) fn claim_next_ready_owned(
             &self,
             repo_key: &str,
@@ -1362,6 +3375,13 @@ pub mod sqlite {
                 return Ok(None);
             };
             Self::require_mutation_authority(&tx, &item.repo_key, authority)?;
+            Self::require_obligation_tx(
+                &tx,
+                &item.repo_key,
+                &crate::repository_policy::Obligation::QueueItem {
+                    id: item.id.clone(),
+                },
+            )?;
             if item.status != QueueStatus::Ready {
                 tx.commit()?;
                 return Ok(None);
@@ -1415,10 +3435,6 @@ pub mod sqlite {
             .with_context(|| format!("read next resumable active item for repo queue {repo_key}"))
         }
 
-        pub fn transition_item(&self, item_id: &str, target: QueueStatus) -> Result<QueueItem> {
-            self.transition_item_with_authority(item_id, target, MutationAuthority::External)
-        }
-
         pub(crate) fn transition_item_owned(
             &self,
             item_id: &str,
@@ -1430,6 +3446,14 @@ pub mod sqlite {
                 item_id,
                 target,
                 MutationAuthority::RepositoryLease { repo_key, owner_id },
+            )
+        }
+
+        pub(crate) fn cancel_item_without_effort(&self, item_id: &str) -> Result<QueueItem> {
+            self.transition_item_with_authority(
+                item_id,
+                QueueStatus::Cancelled,
+                MutationAuthority::Cancellation,
             )
         }
 
@@ -1458,13 +3482,29 @@ pub mod sqlite {
             if effort_owned {
                 anyhow::bail!("queue lifecycle is read-only after integration effort creation");
             }
+            if matches!(&authority, MutationAuthority::Cancellation)
+                && target != QueueStatus::Cancelled
+            {
+                anyhow::bail!("cancellation authority can only cancel a queue item");
+            }
             Self::require_mutation_authority(&tx, &item.repo_key, authority)?;
+            if target != QueueStatus::Cancelled {
+                Self::require_obligation_tx(
+                    &tx,
+                    &item.repo_key,
+                    &crate::repository_policy::Obligation::QueueItem {
+                        id: item.id.clone(),
+                    },
+                )?;
+            }
             StateMachine
                 .transition(item.status, target)
                 .map_err(anyhow::Error::msg)?;
-            if target == QueueStatus::Cancelled && item.landing.is_uncertain() {
+            if target == QueueStatus::Cancelled
+                && item.landing.contains_external_landing_authority()
+            {
                 anyhow::bail!(
-                    "item {item_id} has an uncertain landing outcome and cannot be cancelled"
+                    "item {item_id} has external landing authority and cannot be cancelled"
                 );
             }
             if target == QueueStatus::Cancelled {
@@ -1555,7 +3595,12 @@ pub mod sqlite {
                 anyhow::bail!("repository mutation authority does not match queue item");
             }
             let authorized: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM repo_leases WHERE repo_key=?1 AND owner_id=?2 AND expires_at>?3)",
+                "SELECT EXISTS(SELECT 1 FROM repo_leases WHERE repo_key=?1 AND owner_id=?2 AND expires_at>?3)
+                   AND NOT EXISTS(
+                     SELECT 1 FROM physical_repository_ownership ownership
+                     LEFT JOIN physical_repository_leases lease ON lease.identity_key=ownership.identity_key
+                     WHERE ownership.repo_key=?1 AND (lease.owner_id IS NOT ?2 OR lease.expires_at<=?3)
+                   )",
                 params![repo_key, owner_id, now()],
                 |row| row.get(0),
             )?;
@@ -1565,48 +3610,246 @@ pub mod sqlite {
             Ok(())
         }
 
+        fn require_new_work_tx(tx: &rusqlite::Transaction<'_>, repo_key: &str) -> Result<()> {
+            let state: String = tx.query_row(
+                "SELECT operation_state_json FROM repository_policies WHERE repo_key=?1",
+                [repo_key],
+                |row| row.get(0),
+            )?;
+            serde_json::from_str::<crate::repository_policy::OperationState>(&state)?
+                .require_new_work()
+        }
+
+        fn require_obligation_tx(
+            tx: &rusqlite::Transaction<'_>,
+            repo_key: &str,
+            obligation: &crate::repository_policy::Obligation,
+        ) -> Result<()> {
+            let state: String = tx.query_row(
+                "SELECT operation_state_json FROM repository_policies WHERE repo_key=?1",
+                [repo_key],
+                |row| row.get(0),
+            )?;
+            serde_json::from_str::<crate::repository_policy::OperationState>(&state)?
+                .require_obligation(obligation)
+        }
+
         pub(crate) fn authorize_execution_start(
             &self,
             item_id: &str,
             attempt_id: &str,
             expected_status: QueueStatus,
-            release_gate: impl FnOnce() -> Result<()>,
+            authority: ExecutionStartAuthority<'_>,
+            release_gate: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<()>,
         ) -> Result<bool> {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let (status, current_attempt_id): (String, Option<String>) = required_row(
-                tx.query_row(
-                    "SELECT status,current_attempt_id FROM queue_items WHERE id=?1",
-                    params![item_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                ),
-                "queue item",
-                item_id,
-            )?;
+            let (status, current_attempt_id, item_repo_key): (String, Option<String>, String) =
+                required_row(
+                    tx.query_row(
+                        "SELECT status,current_attempt_id,repo_key FROM queue_items WHERE id=?1",
+                        params![item_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    ),
+                    "queue item",
+                    item_id,
+                )?;
             let authorized = status == expected_status.to_string()
                 && current_attempt_id.as_deref() == Some(attempt_id);
             if authorized {
-                release_gate()?;
+                let (repo_key, owner_id, expected_policy) = match authority {
+                    ExecutionStartAuthority::RepositoryLease { repo_key, owner_id } => {
+                        (repo_key, owner_id, None)
+                    }
+                    ExecutionStartAuthority::ProviderVerified {
+                        repo_key,
+                        owner_id,
+                        policy_revision,
+                        canonical,
+                    } => (repo_key, owner_id, Some((policy_revision, canonical))),
+                };
+                Self::require_mutation_authority(
+                    &tx,
+                    &item_repo_key,
+                    MutationAuthority::RepositoryLease { repo_key, owner_id },
+                )?;
+                let (revision, operation_state, canonical): (i64, String, String) = tx.query_row(
+                    "SELECT policy.revision,policy.operation_state_json,policy.canonical_repository_json FROM queue_items item JOIN repository_policies policy ON policy.repo_key=item.repo_key WHERE item.id=?1",
+                    [item_id],
+                    |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+                )?;
+                serde_json::from_str::<crate::repository_policy::OperationState>(&operation_state)?
+                    .require_obligation(&crate::repository_policy::Obligation::QueueItem {
+                        id: item_id.to_string(),
+                    })?;
+                let canonical =
+                    serde_json::from_str::<crate::repository_policy::GitRepository>(&canonical)?;
+                canonical.verify_local_bare()?;
+                if let Some((expected_revision, expected_canonical)) = expected_policy {
+                    if revision != expected_revision || &canonical != expected_canonical {
+                        anyhow::bail!(
+                            "repository policy changed after provider identity verification"
+                        );
+                    }
+                }
+                release_gate(&tx)?;
             }
             tx.commit()?;
             Ok(authorized)
         }
 
-        pub fn block_item(
+        pub(crate) fn authorize_new_work(&self, repo_key: &str) -> Result<()> {
+            let connection = self.connect_read_only()?;
+            let (operation, canonical): (String, String) = connection.query_row(
+                "SELECT operation_state_json,canonical_repository_json FROM repository_policies WHERE repo_key=?1",
+                [repo_key],
+                |row| Ok((row.get(0)?,row.get(1)?)),
+            )?;
+            serde_json::from_str::<crate::repository_policy::OperationState>(&operation)?
+                .require_new_work()?;
+            serde_json::from_str::<crate::repository_policy::GitRepository>(&canonical)?
+                .verify_local_bare()
+        }
+
+        pub(crate) fn authorize_obligation(
             &self,
-            item_id: &str,
-            phase: BlockedPhase,
-            reason: BlockedReason,
-            message: &str,
-        ) -> Result<String> {
-            self.block_item_from_status(
-                item_id,
-                phase.into(),
-                phase,
-                reason,
-                message,
-                MutationAuthority::External,
-            )
+            repo_key: &str,
+            obligation: &crate::repository_policy::Obligation,
+        ) -> Result<()> {
+            let connection = self.connect_read_only()?;
+            let (operation, canonical): (String, String) = connection.query_row(
+                "SELECT operation_state_json,canonical_repository_json FROM repository_policies WHERE repo_key=?1",
+                [repo_key],
+                |row| Ok((row.get(0)?,row.get(1)?)),
+            )?;
+            serde_json::from_str::<crate::repository_policy::OperationState>(&operation)?
+                .require_obligation(obligation)?;
+            serde_json::from_str::<crate::repository_policy::GitRepository>(&canonical)?
+                .verify_local_bare()
+        }
+
+        pub(crate) fn authorize_replication(
+            &self,
+            repo_key: &str,
+            debt_id: &str,
+            owner_id: &str,
+        ) -> Result<()> {
+            let connection = self.connect_read_only()?;
+            Self::validate_replication_binding(&connection, repo_key, debt_id, Some(owner_id))?;
+            let (state, item_id, canonical): (String, String, String) = connection.query_row(
+                "SELECT policy.operation_state_json,debt.item_id,policy.canonical_repository_json FROM replication_debt debt JOIN repository_policies policy ON policy.repo_key=debt.repo_key WHERE debt.id=?1 AND debt.repo_key=?2",
+                params![debt_id,repo_key],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            )?;
+            let state: crate::repository_policy::OperationState = serde_json::from_str(&state)?;
+            if let crate::repository_policy::OperationState::Draining { obligations } = &state {
+                if obligations
+                    .contains(&crate::repository_policy::Obligation::QueueItem { id: item_id })
+                {
+                    return serde_json::from_str::<crate::repository_policy::GitRepository>(
+                        &canonical,
+                    )?
+                    .verify_local_bare();
+                }
+            }
+            state.require_obligation(&crate::repository_policy::Obligation::Replication {
+                id: debt_id.to_string(),
+            })?;
+            serde_json::from_str::<crate::repository_policy::GitRepository>(&canonical)?
+                .verify_local_bare()
+        }
+
+        pub(crate) fn authorize_replication_command(
+            &self,
+            repo_key: &str,
+            debt_id: &str,
+            owner_id: &str,
+            args: &[OsString],
+        ) -> Result<ReplicationDebt> {
+            self.authorize_replication(repo_key, debt_id, owner_id)?;
+            let debt = self.replication_debt(debt_id)?;
+            if debt.operation == "pin_source" {
+                let object = OsString::from(format!("{}^{{commit}}", debt.canonical_source_sha));
+                let preserved_ref = OsString::from(format!("refs/iq/replication/{debt_id}"));
+                let zero = OsString::from(debt.replica.object_format().zero_oid());
+                let verify = [OsString::from("cat-file"), OsString::from("-e"), object];
+                let publish = [
+                    OsString::from("update-ref"),
+                    preserved_ref.clone(),
+                    OsString::from(&debt.canonical_source_sha),
+                    zero,
+                ];
+                let confirm = [
+                    OsString::from("update-ref"),
+                    preserved_ref,
+                    OsString::from(&debt.canonical_source_sha),
+                    OsString::from(&debt.canonical_source_sha),
+                ];
+                if args != verify && args != publish && args != confirm {
+                    anyhow::bail!(
+                        "pin_source permits only exact source verification and pin publication"
+                    );
+                }
+            }
+            Ok(debt)
+        }
+
+        fn validate_replication_binding(
+            connection: &Connection,
+            repo_key: &str,
+            debt_id: &str,
+            lease_owner: Option<&str>,
+        ) -> Result<ReplicationDebt> {
+            let debt = required_row(
+                connection.query_row(
+                    "SELECT id,item_id,repo_key,canonical_source_sha,destination_key,target_branch,sequence,replica_json,expected_destination_sha,operation,outcome,application_id,failure,superseded_by_id FROM replication_debt WHERE id=?1 AND repo_key=?2",
+                    params![debt_id, repo_key],
+                    map_replication_debt,
+                ),
+                "replication debt",
+                debt_id,
+            )?;
+            let (target_branch, replication_policy, landed_sha): (String, String, String) =
+                connection.query_row(
+                    "SELECT policy.target_branch,policy.replication_policy_json,item.landed_commit_sha FROM repository_policies policy JOIN queue_items item ON item.repo_key=policy.repo_key JOIN replication_debt debt ON debt.item_id=item.id AND debt.repo_key=item.repo_key WHERE policy.repo_key=?1 AND debt.id=?2 AND item.status='integrated'",
+                    params![repo_key, debt_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+            let policy: crate::repository_policy::ReplicationPolicy =
+                serde_json::from_str(&replication_policy)?;
+            let configured = match policy {
+                crate::repository_policy::ReplicationPolicy::Replicate { targets } => targets,
+                crate::repository_policy::ReplicationPolicy::None => {
+                    anyhow::bail!("replication debt has no immutable policy replica")
+                }
+            };
+            if debt.target_branch != target_branch
+                || debt.canonical_source_sha != landed_sha
+                || debt.destination_key != debt.replica.destination_identity_key()?
+                || !configured.iter().any(|replica| replica == &debt.replica)
+            {
+                anyhow::bail!("replication debt differs from immutable policy or landed item");
+            }
+            let repository_json = serde_json::to_string(&debt.replica)?;
+            let ownership_matches: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM physical_repository_ownership WHERE identity_key=?1 AND repo_key=?2 AND role='replica' AND repository_json=?3)",
+                params![debt.destination_key, repo_key, repository_json],
+                |row| row.get(0),
+            )?;
+            if !ownership_matches {
+                anyhow::bail!("replication debt has no exact global destination ownership");
+            }
+            if let Some(owner_id) = lease_owner {
+                let lease_matches: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM physical_repository_leases WHERE identity_key=?1 AND repo_key=?2 AND owner_id=?3 AND expires_at>?4)",
+                    params![debt.destination_key, repo_key, owner_id, now()],
+                    |row| row.get(0),
+                )?;
+                if !lease_matches {
+                    anyhow::bail!("replication destination physical lease is not active");
+                }
+            }
+            Ok(debt)
         }
 
         pub(crate) fn block_item_owned(
@@ -1712,102 +3955,6 @@ pub mod sqlite {
             Ok(prompt_id.unwrap_or_default())
         }
 
-        pub fn requeue_agent_fix(&self, item_id: &str, new_head: &str) -> Result<QueueItem> {
-            let mut conn = self.connect()?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let item = required_row(
-                tx.query_row(
-                    "SELECT * FROM queue_items_runtime WHERE id=?1",
-                    params![item_id],
-                    map_item,
-                ),
-                "queue item",
-                item_id,
-            )?;
-            let effort_owned: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM integration_efforts WHERE item_id=?1)",
-                params![item_id],
-                |row| row.get(0),
-            )?;
-            if effort_owned {
-                anyhow::bail!("queue lifecycle is read-only after integration effort creation");
-            }
-            if item.status != QueueStatus::Blocked
-                || item.blocked_reason != Some(BlockedReason::NeedsAgentFix)
-            {
-                anyhow::bail!("item {item_id} is not blocked for agent fix")
-            }
-            if !matches!(item.source, QueueSource::RemoteBranch { .. }) {
-                anyhow::bail!(
-                    "local submissions are immutable; use submit --replace for an agent fix"
-                );
-            }
-            tx.execute(
-                "UPDATE prompts SET status='superseded' WHERE item_id=?1 AND status='open'",
-                params![item_id],
-            )?;
-            tx.execute(
-                r#"UPDATE queue_items SET status='ready',current_head_sha=?1,landing_state_json='{"state":"ready"}',blocked_phase=NULL,blocked_reason=NULL,blocked_message=NULL,prompt_id=NULL,updated_at=?2 WHERE id=?3"#,
-                params![new_head, now(), item_id],
-            )?;
-            Self::record_event_tx(&tx, item_id, "agent_requeued", "agent fix marked ready")?;
-            tx.commit()?;
-            self.get_item(item_id)
-        }
-
-        pub fn update_current_head(&self, item_id: &str, new_head: &str) -> Result<QueueItem> {
-            let mut conn = self.connect()?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let changed = tx.execute(
-                "UPDATE queue_items SET current_head_sha=?1,updated_at=?2 WHERE id=?3 AND source_kind='remote_branch'",
-                params![new_head, now(), item_id],
-            )?;
-            if changed != 1 {
-                anyhow::bail!("only a remote branch queue source can update its current head");
-            }
-            Self::record_event_tx(
-                &tx,
-                item_id,
-                "source_head_updated",
-                &format!("source head updated to {new_head}"),
-            )?;
-            tx.commit()?;
-            self.get_item(item_id)
-        }
-
-        pub fn acquire_repo_lease(
-            &self,
-            repo_key: &str,
-            owner_id: &str,
-            ttl_seconds: i64,
-        ) -> Result<bool> {
-            let mut conn = self.connect()?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let current: Option<(String, String)> = tx
-                .query_row(
-                    "SELECT owner_id,expires_at FROM repo_leases WHERE repo_key=?1",
-                    params![repo_key],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            let now = now();
-            let expires_at = (Utc::now() + Duration::seconds(ttl_seconds)).to_rfc3339();
-            let can_acquire = match current {
-                None => true,
-                Some((owner, _expires)) if owner == owner_id => true,
-                Some((_owner, expires)) => expires <= now,
-            };
-            if can_acquire {
-                tx.execute(
-                    "INSERT INTO repo_leases (repo_key,owner_id,heartbeat_at,expires_at) VALUES (?1,?2,?3,?4)
-                     ON CONFLICT(repo_key) DO UPDATE SET owner_id=excluded.owner_id,heartbeat_at=excluded.heartbeat_at,expires_at=excluded.expires_at",
-                    params![repo_key, owner_id, now, expires_at],
-                )?;
-            }
-            tx.commit()?;
-            Ok(can_acquire)
-        }
-
         pub(crate) fn acquire_repo_operation_lease(
             &self,
             repo_key: &str,
@@ -1817,14 +3964,39 @@ pub mod sqlite {
             target: &str,
         ) -> Result<()> {
             self.validate_repository_binding(repo_key, repository, target)?;
-            let conn = self.connect()?;
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let heartbeat_at = now();
             let expires_at = (Utc::now() + Duration::seconds(ttl_seconds)).to_rfc3339();
-            conn.execute(
+            let identities = {
+                let mut statement = tx.prepare(
+                    "SELECT identity_key FROM physical_repository_ownership WHERE repo_key=?1 ORDER BY identity_key",
+                )?;
+                let identities = statement
+                    .query_map([repo_key], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                identities
+            };
+            if identities.is_empty() {
+                anyhow::bail!("repository has no physical ownership authority");
+            }
+            for identity in identities {
+                let changed = tx.execute(
+                    "INSERT INTO physical_repository_leases(identity_key,repo_key,owner_id,heartbeat_at,expires_at) VALUES(?1,?2,?3,?4,?5)
+                     ON CONFLICT(identity_key) DO UPDATE SET repo_key=excluded.repo_key,owner_id=excluded.owner_id,heartbeat_at=excluded.heartbeat_at,expires_at=excluded.expires_at
+                     WHERE physical_repository_leases.expires_at<=excluded.heartbeat_at OR physical_repository_leases.repo_key=excluded.repo_key",
+                    params![identity, repo_key, owner_id, heartbeat_at, expires_at],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("physical repository has an active operation");
+                }
+            }
+            tx.execute(
                 "INSERT INTO repo_leases (repo_key,owner_id,heartbeat_at,expires_at) VALUES (?1,?2,?3,?4)
                  ON CONFLICT(repo_key) DO UPDATE SET owner_id=excluded.owner_id,heartbeat_at=excluded.heartbeat_at,expires_at=excluded.expires_at",
                 params![repo_key, owner_id, heartbeat_at, expires_at],
             )?;
+            tx.commit()?;
             Ok(())
         }
 
@@ -1838,7 +4010,7 @@ pub mod sqlite {
             let invalid: i64 = conn.query_row(
                 "SELECT
                    (SELECT CASE WHEN COUNT(*)=1 THEN 0 ELSE 1 END FROM registered_repositories WHERE repo_key=?1) +
-                   (SELECT COUNT(*) FROM registered_repositories WHERE repo_key=?1 AND (owned_root_path!=?2 OR target_branch!=?3)) +
+                   (SELECT COUNT(*) FROM registered_repositories repository JOIN repository_policies policy ON policy.repo_key=repository.repo_key WHERE repository.repo_key=?1 AND (repository.owned_root_path!=?2 OR policy.target_branch!=?3)) +
                    (SELECT COUNT(*) FROM registered_repositories WHERE repo_key!=?1 AND owned_root_path=?2)",
                 params![repo_key,path_bytes(repository),target],
                 |row| row.get(0),
@@ -1851,7 +4023,7 @@ pub mod sqlite {
             Ok(())
         }
 
-        pub fn heartbeat_repo_lease(
+        pub(crate) fn heartbeat_repo_lease(
             &self,
             repo_key: &str,
             owner_id: &str,
@@ -1860,15 +4032,28 @@ pub mod sqlite {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let current_time = now();
+            let expires_at = (Utc::now() + Duration::seconds(ttl_seconds)).to_rfc3339();
+            let physical_changed = tx.execute(
+                "UPDATE physical_repository_leases SET heartbeat_at=?1,expires_at=?2 WHERE repo_key=?3 AND owner_id=?4 AND expires_at>?1",
+                params![current_time, expires_at, repo_key, owner_id],
+            )?;
+            let physical_expected: usize = tx.query_row(
+                "SELECT COUNT(*) FROM physical_repository_ownership WHERE repo_key=?1",
+                [repo_key],
+                |row| row.get(0),
+            )?;
+            if physical_changed != physical_expected || physical_expected == 0 {
+                return Ok(false);
+            }
             let changed = tx.execute(
                 "UPDATE repo_leases SET heartbeat_at=?1,expires_at=?2 WHERE repo_key=?3 AND owner_id=?4 AND expires_at>?1",
-                params![current_time, (Utc::now() + Duration::seconds(ttl_seconds)).to_rfc3339(), repo_key, owner_id],
+                params![current_time, expires_at, repo_key, owner_id],
             )?;
             tx.commit()?;
             Ok(changed == 1)
         }
 
-        pub fn ensure_repo_lease_owner(
+        pub(crate) fn ensure_repo_lease_owner(
             &self,
             repo_key: &str,
             owner_id: &str,
@@ -1877,15 +4062,22 @@ pub mod sqlite {
             self.heartbeat_repo_lease(repo_key, owner_id, ttl_seconds)
         }
 
-        pub fn release_repo_lease(&self, repo_key: &str, owner_id: &str) -> Result<bool> {
-            let conn = self.connect()?;
-            Ok(conn.execute(
+        pub(crate) fn release_repo_lease(&self, repo_key: &str, owner_id: &str) -> Result<bool> {
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
+                "DELETE FROM physical_repository_leases WHERE repo_key=?1 AND owner_id=?2",
+                params![repo_key, owner_id],
+            )?;
+            let released = tx.execute(
                 "DELETE FROM repo_leases WHERE repo_key=?1 AND owner_id=?2",
                 params![repo_key, owner_id],
-            )? == 1)
+            )? == 1;
+            tx.commit()?;
+            Ok(released)
         }
 
-        pub fn register_workspace_root(
+        pub(crate) fn register_workspace_root(
             &self,
             repo_key: &str,
             source_path: &Path,
@@ -2046,8 +4238,15 @@ pub mod sqlite {
         pub(crate) fn begin_development_workspace_generation(
             &self,
             repo_key: &str,
+            workspace_id: &str,
         ) -> Result<WorkspaceGenerationState> {
-            let state = self.begin_workspace_generation_for_kind(repo_key, "development")?;
+            let state = self.begin_workspace_generation_for_kind(
+                repo_key,
+                "development",
+                Some(&crate::repository_policy::Obligation::Workspace {
+                    id: workspace_id.to_string(),
+                }),
+            )?;
             stop_workspace_generation_after("development_recorded");
             Ok(state)
         }
@@ -2056,9 +4255,13 @@ pub mod sqlite {
             &self,
             repo_key: &str,
             kind: &str,
+            obligation: Option<&crate::repository_policy::Obligation>,
         ) -> Result<WorkspaceGenerationState> {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(obligation) = obligation {
+                Self::require_obligation_tx(&tx, repo_key, obligation)?;
+            }
             let changed = tx.execute(
                 "UPDATE workspace_roots SET pending_generation=generation+1 WHERE repo_key=?1 AND kind=?2 AND pending_generation IS NULL",
                 params![repo_key, kind],
@@ -2093,14 +4296,16 @@ pub mod sqlite {
             let WorkspaceGenerationState::Pending { current, pending } = expected else {
                 anyhow::bail!("workspace generation completion requires pending authority");
             };
-            let conn = self.connect()?;
-            let changed = conn.execute(
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx.execute(
                 "UPDATE workspace_roots SET generation=?1,pending_generation=NULL WHERE repo_key=?2 AND kind=?3 AND generation=?4 AND pending_generation=?1",
                 params![pending,repo_key,kind,current],
             )?;
             if changed != 1 {
                 anyhow::bail!("pending workspace generation authority changed before completion");
             }
+            tx.commit()?;
             Ok(pending)
         }
 
@@ -2114,7 +4319,7 @@ pub mod sqlite {
             .context("read queue database identity")
         }
 
-        pub fn provision_repository(
+        pub(crate) fn provision_repository(
             &self,
             options: &crate::repository::ProvisionOptions,
         ) -> Result<crate::repository::OwnedRepositoryRoot> {
@@ -2192,53 +4397,6 @@ pub mod sqlite {
             Ok(repository)
         }
 
-        #[doc(hidden)]
-        pub fn register_control_plane_fixture_repository(
-            &self,
-            repo_key: &str,
-            repository_path: &str,
-            target: &str,
-        ) -> Result<()> {
-            crate::repository::validate_target_branch(target)?;
-            let mut connection = self.connect()?;
-            let transaction =
-                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let digest = format!(
-                "{:016x}",
-                repo_key.as_bytes().iter().fold(0_u64, |value, byte| value
-                    .wrapping_mul(131)
-                    .wrapping_add(u64::from(*byte)))
-            );
-            let requested = Path::new(repository_path);
-            let reservation = requested
-                .parent()
-                .unwrap_or(Path::new("/"))
-                .join("repositories")
-                .join(repo_key);
-            let repository = reservation.join("root");
-            let development = reservation.join("development");
-            let integration = reservation.join("integration");
-            let root_rift_id = format!("0000000000{digest}");
-            let fetch_url = format!("file:///control-fixture/{digest}");
-            let timestamp = now();
-            transaction.execute(
-                "INSERT INTO repository_remote_owners(repo_key,fetch_url,push_url,target_branch,created_at) VALUES(?1,?2,?2,?3,?4)",
-                params![repo_key,fetch_url,target,timestamp],
-            )?;
-            transaction.execute(
-                "INSERT INTO registered_repositories(repo_key,owned_root_path,root_rift_id,registry_identity,registry_device,registry_inode,generation,remote_name,fetch_url,push_url,target_branch,source_sha,checkout_json,development_root_path,integration_root_path,provisioning_json,created_at,updated_at) VALUES(?1,?2,?3,X'2F7265676973747279',1,1,0,'iq-target',?4,?4,?5,?6,json_object('state','ready','target_sha',?6),?7,?8,'{\"state\":\"ready\"}',?9,?9)",
-                params![repo_key,path_bytes(&repository),root_rift_id,fetch_url,target,"0".repeat(40),path_bytes(&development),path_bytes(&integration),timestamp],
-            )?;
-            for (kind, root) in [("development", development), ("integration", integration)] {
-                transaction.execute(
-                    "INSERT INTO workspace_roots(repo_key,kind,root_path,source_path,source_rift_id,registry_identity,registry_device,registry_inode,generation) VALUES(?1,?2,?3,?4,?5,X'2F7265676973747279',1,1,0)",
-                    params![repo_key,kind,path_bytes(&root),path_bytes(&repository),root_rift_id],
-                )?;
-            }
-            transaction.commit()?;
-            Ok(())
-        }
-
         pub fn path(&self) -> &Path {
             self.authority.path()
         }
@@ -2260,7 +4418,7 @@ pub mod sqlite {
             )
         }
 
-        pub fn record_workspace_gc_debt(&self, registry_identity: &str) -> Result<()> {
+        pub(crate) fn record_workspace_gc_debt(&self, registry_identity: &str) -> Result<()> {
             let conn = self.connect()?;
             conn.execute(
                 "INSERT OR IGNORE INTO workspace_gc_debt (registry_identity,created_at) VALUES (?1,?2)",
@@ -2278,7 +4436,7 @@ pub mod sqlite {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let live: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM integration_cycles cycle JOIN integration_efforts effort ON effort.id=cycle.effort_id JOIN queue_items item ON item.id=effort.item_id WHERE item.repo_key=?1 AND cycle.id=?2 AND cycle.status IN ('starting','running')) OR EXISTS(SELECT 1 FROM integration_efforts effort JOIN queue_items item ON item.id=effort.item_id WHERE item.repo_key=?1 AND effort.state IN ('agent_launching','agent_running') AND json_extract(effort.state_json,'$.payload.cycle_id')=?2)",
+                "SELECT EXISTS(SELECT 1 FROM integration_cycles cycle JOIN integration_efforts effort ON effort.id=cycle.effort_id JOIN queue_items item ON item.id=effort.item_id WHERE item.repo_key=?1 AND cycle.id=?2 AND cycle.status IN ('starting','running')) OR EXISTS(SELECT 1 FROM integration_efforts effort JOIN queue_items item ON item.id=effort.item_id WHERE item.repo_key=?1 AND effort.state IN ('agent_launching','agent_running') AND json_extract(effort.state_json,'$.payload.cycle_id')=?2) OR EXISTS(SELECT 1 FROM runner_termination_debt debt JOIN integration_efforts effort ON effort.id=debt.effort_id JOIN queue_items item ON item.id=effort.item_id WHERE item.repo_key=?1 AND json_extract(debt.authority_json,'$.payload.cycle_id')=?2)",
                 params![repo_key,cycle_id],
                 |row| row.get(0),
             )?;
@@ -2322,7 +4480,7 @@ pub mod sqlite {
             Ok(DeletedCycleSandboxRepair::Authorized)
         }
 
-        pub fn clear_workspace_gc_debt(&self, registry_identity: &str) -> Result<()> {
+        pub(crate) fn clear_workspace_gc_debt(&self, registry_identity: &str) -> Result<()> {
             let conn = self.connect()?;
             conn.execute(
                 "DELETE FROM workspace_gc_debt WHERE registry_identity=?1",
@@ -2341,7 +4499,12 @@ pub mod sqlite {
             .context("read workspace garbage-collection debt")
         }
 
-        pub fn record_event(&self, item_id: &str, event_type: &str, message: &str) -> Result<()> {
+        pub(crate) fn record_event(
+            &self,
+            item_id: &str,
+            event_type: &str,
+            message: &str,
+        ) -> Result<()> {
             let conn = self.connect()?;
             self.record_event_with_conn(&conn, item_id, event_type, message)
         }
@@ -2406,24 +4569,6 @@ pub mod sqlite {
 
         pub fn get_attempt(&self, attempt_id: &str) -> Result<Attempt> {
             self.reader().get_attempt(attempt_id)
-        }
-
-        pub fn update_attempt_base(&self, attempt_id: &str, target_base_sha: &str) -> Result<()> {
-            let conn = self.connect()?;
-            conn.execute(
-                "UPDATE integration_attempts SET target_base_sha=?1 WHERE id=?2",
-                params![target_base_sha, attempt_id],
-            )?;
-            Ok(())
-        }
-
-        pub fn update_attempt_merge(&self, attempt_id: &str, merge_commit_sha: &str) -> Result<()> {
-            let conn = self.connect()?;
-            conn.execute(
-                "UPDATE integration_attempts SET merge_commit_sha=?1 WHERE id=?2",
-                params![merge_commit_sha, attempt_id],
-            )?;
-            Ok(())
         }
 
         pub(crate) fn record_attempt_validation(
@@ -2495,12 +4640,10 @@ pub mod sqlite {
             invocation_number: i64,
             validated_commit_sha: &str,
         ) -> Result<()> {
-            crate::control_domain::require_sha(
-                validated_commit_sha,
-                "validated invocation candidate SHA",
-            )?;
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            attempt_object_format(&tx, attempt_id)?
+                .require_oid(validated_commit_sha, "validated invocation candidate SHA")?;
             let invocation_changed = tx.execute(
                 "UPDATE validation_invocations SET validated_commit_sha=?1
                  WHERE attempt_id=?2 AND invocation_number=?3 AND candidate_sha=?1
@@ -2665,7 +4808,11 @@ pub mod sqlite {
             Ok(())
         }
 
-        pub fn update_attempt_signoff(&self, attempt_id: &str, evidence: &Value) -> Result<()> {
+        pub(crate) fn update_attempt_signoff(
+            &self,
+            attempt_id: &str,
+            evidence: &Value,
+        ) -> Result<()> {
             let conn = self.connect()?;
             let changed = conn.execute(
                 "UPDATE integration_attempts SET signoff_evidence_json=?1 WHERE id=?2",
@@ -2677,7 +4824,7 @@ pub mod sqlite {
             Ok(())
         }
 
-        pub fn set_workspace_intent(&self, item_id: &str, path: &str) -> Result<()> {
+        pub(crate) fn set_workspace_intent(&self, item_id: &str, path: &str) -> Result<()> {
             let conn = self.connect()?;
             let changed = conn.execute(
                 "UPDATE queue_items SET integration_workspace_path=?1,integration_workspace_rift_id=NULL,integration_workspace_source_rift_id=NULL,integration_workspace_cleaned_at=NULL,updated_at=?2 WHERE id=?3 AND status='merging'",
@@ -2726,15 +4873,16 @@ pub mod sqlite {
             })
         }
 
-        pub fn set_workspace_identity(
+        pub(crate) fn set_workspace_identity(
             &self,
             item_id: &str,
             path: &str,
             rift_id: &str,
             source_rift_id: &str,
         ) -> Result<()> {
-            let conn = self.connect()?;
-            let changed = conn.execute(
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx.execute(
                 "UPDATE queue_items SET integration_workspace_rift_id=?1,integration_workspace_source_rift_id=?2,updated_at=?3 WHERE id=?4 AND status='merging' AND integration_workspace_path=?5",
                 params![rift_id, source_rift_id, now(), item_id, path],
             )?;
@@ -2743,10 +4891,17 @@ pub mod sqlite {
                     "item {item_id} workspace intent changed before Rift identity was persisted"
                 );
             }
+            let repo_key: String = tx.query_row(
+                "SELECT repo_key FROM queue_items WHERE id=?1",
+                [item_id],
+                |row| row.get(0),
+            )?;
+            insert_workspace_git_binding(&tx, &repo_key, "integration", item_id, Path::new(path))?;
+            tx.commit()?;
             Ok(())
         }
 
-        pub fn mark_workspace_cleaned(&self, item_id: &str) -> Result<()> {
+        pub(crate) fn mark_workspace_cleaned(&self, item_id: &str) -> Result<()> {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let changed = tx.execute(
@@ -2754,6 +4909,10 @@ pub mod sqlite {
                 params![now(), item_id],
             )?;
             if changed == 1 {
+                tx.execute(
+                    "DELETE FROM workspace_git_bindings WHERE owner_kind='integration' AND owner_id=?1",
+                    [item_id],
+                )?;
                 Self::record_event_tx(
                     &tx,
                     item_id,
@@ -2783,6 +4942,20 @@ pub mod sqlite {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let current_time = now();
+            let physical_changed = tx.execute(
+                "UPDATE physical_repository_leases SET heartbeat_at=?1,expires_at=?2 WHERE repo_key=?3 AND owner_id=?4 AND expires_at>?1",
+                params![current_time, (Utc::now() + Duration::seconds(30)).to_rfc3339(), repo_key, owner_id],
+            )?;
+            let physical_expected: usize = tx.query_row(
+                "SELECT COUNT(*) FROM physical_repository_ownership WHERE repo_key=?1",
+                [repo_key],
+                |row| row.get(0),
+            )?;
+            if physical_changed != physical_expected || physical_expected == 0 {
+                anyhow::bail!(
+                    "repo queue {repo_key} physical composition lease is not owned by {owner_id}"
+                );
+            }
             let changed = tx.execute(
                 "UPDATE repo_leases SET heartbeat_at=?1,expires_at=?2 WHERE repo_key=?3 AND owner_id=?4 AND expires_at>?1",
                 params![current_time, (Utc::now() + Duration::seconds(30)).to_rfc3339(), repo_key, owner_id],
@@ -2831,19 +5004,132 @@ pub mod sqlite {
             Ok(repositories)
         }
 
+        pub(crate) fn begin_repository_draining(
+            &self,
+            repo_key: &str,
+            owner_id: &str,
+        ) -> Result<RegisteredRepository> {
+            self.composition_transaction(repo_key, owner_id, |transaction| {
+                let (revision, state): (i64, String) = transaction.query_row(
+                    "SELECT revision,operation_state_json FROM repository_policies WHERE repo_key=?1",
+                    [repo_key],
+                    |row| Ok((row.get(0)?,row.get(1)?)),
+                )?;
+                if serde_json::from_str::<crate::repository_policy::OperationState>(&state)?
+                    != crate::repository_policy::OperationState::Enabled
+                {
+                    anyhow::bail!("only an enabled repository can enter draining");
+                }
+                let creating_submissions: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM local_submissions WHERE repo_key=?1 AND state='creating')",
+                    [repo_key],
+                    |row| row.get(0),
+                )?;
+                if creating_submissions {
+                    anyhow::bail!("repository has an incomplete local submission intent");
+                }
+                let mut obligations = std::collections::BTreeSet::new();
+                let mut workspaces = transaction.prepare(
+                    "SELECT id FROM development_workspaces WHERE repo_key=?1 AND status!='removed'",
+                )?;
+                for id in workspaces.query_map([repo_key], |row| row.get::<_, String>(0))? {
+                    obligations.insert(crate::repository_policy::Obligation::Workspace { id: id? });
+                }
+                let mut items = transaction.prepare(
+                    "SELECT id FROM queue_items WHERE repo_key=?1 AND status NOT IN ('integrated','cancelled')",
+                )?;
+                for id in items.query_map([repo_key], |row| row.get::<_, String>(0))? {
+                    obligations.insert(crate::repository_policy::Obligation::QueueItem { id: id? });
+                }
+                let mut debts = transaction.prepare(
+                    "SELECT id FROM replication_debt WHERE repo_key=?1 AND outcome NOT IN ('succeeded','superseded')",
+                )?;
+                for id in debts.query_map([repo_key], |row| row.get::<_, String>(0))? {
+                    obligations.insert(crate::repository_policy::Obligation::Replication { id: id? });
+                }
+                let state = crate::repository_policy::OperationState::Draining { obligations };
+                let changed = transaction.execute(
+                    "UPDATE repository_policies SET revision=revision+1,operation_state_json=?1,updated_at=?2 WHERE repo_key=?3 AND revision=?4",
+                    params![serde_json::to_string(&state)?,now(),repo_key,revision],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("repository policy changed during draining transition");
+                }
+                Ok(())
+            })?;
+            self.repository(repo_key)
+        }
+
+        pub(crate) fn disable_drained_repository(
+            &self,
+            repo_key: &str,
+            owner_id: &str,
+        ) -> Result<RegisteredRepository> {
+            self.composition_transaction(repo_key, owner_id, |transaction| {
+                let (revision, state): (i64, String) = transaction.query_row(
+                    "SELECT revision,operation_state_json FROM repository_policies WHERE repo_key=?1",
+                    [repo_key],
+                    |row| Ok((row.get(0)?,row.get(1)?)),
+                )?;
+                let crate::repository_policy::OperationState::Draining { obligations } =
+                    serde_json::from_str(&state)?
+                else {
+                    anyhow::bail!("only a draining repository can be disabled");
+                };
+                for obligation in obligations {
+                    let complete = match obligation {
+                        crate::repository_policy::Obligation::Workspace { id } => transaction
+                            .query_row(
+                                "SELECT status='removed' FROM development_workspaces WHERE id=?1 AND repo_key=?2",
+                                params![id,repo_key],
+                                |row| row.get::<_, bool>(0),
+                            )
+                            .optional()?
+                            .unwrap_or(false),
+                        crate::repository_policy::Obligation::QueueItem { id } => transaction
+                            .query_row(
+                                "SELECT status IN ('integrated','cancelled') AND (integration_workspace_path IS NULL OR integration_workspace_cleaned_at IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM terminal_workspace_cleanup_debt debt WHERE debt.item_id=queue_items.id AND debt.state!='complete') AND NOT EXISTS(SELECT 1 FROM replication_debt debt WHERE debt.item_id=queue_items.id AND debt.outcome NOT IN ('succeeded','superseded')) FROM queue_items WHERE id=?1 AND repo_key=?2",
+                                params![id,repo_key],
+                                |row| row.get::<_, bool>(0),
+                            )
+                            .optional()?
+                            .unwrap_or(false),
+                        crate::repository_policy::Obligation::Replication { id } => transaction
+                            .query_row(
+                                "SELECT outcome IN ('succeeded','superseded') FROM replication_debt WHERE id=?1 AND repo_key=?2",
+                                params![id,repo_key],
+                                |row| row.get::<_, bool>(0),
+                            )
+                            .optional()?
+                            .unwrap_or(false),
+                    };
+                    if !complete {
+                        anyhow::bail!("captured draining obligation is not terminal and clean");
+                    }
+                }
+                let changed = transaction.execute(
+                    "UPDATE repository_policies SET revision=revision+1,operation_state_json='{\"state\":\"disabled\"}',updated_at=?1 WHERE repo_key=?2 AND revision=?3",
+                    params![now(),repo_key,revision],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("repository policy changed during disable transition");
+                }
+                Ok(())
+            })?;
+            self.repository(repo_key)
+        }
+
         pub(crate) fn registered_remote_identity(
             &self,
             repo_key: &str,
         ) -> Result<Option<(PathBuf, String, RegisteredRemote)>> {
             let conn = self.connect_read_only()?;
-            conn.query_row("SELECT owned_root_path,target_branch,remote_name,fetch_url,push_url FROM registered_repositories WHERE repo_key=?1", params![repo_key], |row| {
+            conn.query_row("SELECT repository.owned_root_path,policy.target_branch FROM registered_repositories repository JOIN repository_policies policy ON policy.repo_key=repository.repo_key WHERE repository.repo_key=?1", params![repo_key], |row| {
                 Ok((
                     row_path(row, "owned_root_path")?,
                     row.get("target_branch")?,
                     RegisteredRemote {
-                        name: row.get("remote_name")?,
-                        fetch_url: row.get("fetch_url")?,
-                        push_url: row.get("push_url")?,
+                        name: crate::repository::INTERNAL_REMOTE_NAME.into(),
                     },
                 ))
             })
@@ -2851,7 +5137,7 @@ pub mod sqlite {
             .map_err(Into::into)
         }
 
-        pub fn update_checkout_reconciliation(
+        pub(crate) fn update_checkout_reconciliation(
             &self,
             repo_key: &str,
             owner_id: &str,
@@ -2870,8 +5156,495 @@ pub mod sqlite {
                     )?,
                 };
                 if changed != 1 { anyhow::bail!("registered repository disappeared"); }
+                if matches!(state, CheckoutReconciliationState::Ready(_)) {
+                    let ref_name = format!(
+                        "refs/iq/repository-targets/{repo_key}/{}",
+                        state.target_sha()
+                    );
+                    let inserted = tx.execute(
+                        "INSERT INTO private_ref_cleanup_debt(repo_key,kind,owner_id,ref_name,expected_sha,created_at,updated_at) VALUES(?1,'repository_target',?2,?3,?2,?4,?4) ON CONFLICT(repo_key,ref_name) DO NOTHING",
+                        params![repo_key,state.target_sha(),ref_name,now()],
+                    )?;
+                    if inserted == 0 {
+                        let stored: (String,String,String) = tx.query_row(
+                            "SELECT kind,owner_id,expected_sha FROM private_ref_cleanup_debt WHERE repo_key=?1 AND ref_name=?2",
+                            params![repo_key,ref_name],
+                            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+                        )?;
+                        if stored != ("repository_target".into(),state.target_sha().into(),state.target_sha().into()) {
+                            anyhow::bail!("repository-target cleanup debt differs from checkout authority");
+                        }
+                    }
+                }
                 Ok(())
             })
+        }
+
+        pub(crate) fn record_provider_landing_guarantee(
+            &self,
+            repo_key: &str,
+            owner_id: &str,
+            evidence: &ProviderLandingEvidence<'_>,
+        ) -> Result<()> {
+            self.composition_transaction(repo_key, owner_id, |transaction| {
+                let changed = transaction.execute(
+                    "INSERT INTO provider_landing_guarantees(item_id,provider,provider_host,provider_repository,provider_repository_id,merge_request_identity,admitted_base_sha,admitted_head_sha,validated_target_sha,validated_candidate_sha,validated_tree_sha,landed_commit_sha,landed_tree_sha,first_parent_sha,history_contract,contains_admitted_head,verified_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17) ON CONFLICT(item_id) DO NOTHING",
+                    params![evidence.item_id,evidence.provider.to_string(),evidence.provider_host,evidence.provider_repository,evidence.provider_repository_id,evidence.merge_request_identity,evidence.admitted_base_sha,evidence.admitted_head_sha,evidence.validated_target_sha,evidence.validated_candidate_sha,evidence.validated_tree_sha,evidence.landed_commit_sha,evidence.landed_tree_sha,evidence.first_parent_sha,evidence.history_contract,evidence.contains_admitted_head,now()],
+                )?;
+                if changed == 0 {
+                    let stored: Vec<String> = transaction.query_row(
+                        "SELECT provider,provider_host,provider_repository,provider_repository_id,merge_request_identity,admitted_base_sha,admitted_head_sha,validated_target_sha,validated_candidate_sha,validated_tree_sha,landed_commit_sha,landed_tree_sha,first_parent_sha,history_contract,CAST(contains_admitted_head AS TEXT) FROM provider_landing_guarantees WHERE item_id=?1",
+                        [evidence.item_id],
+                        |row| (0..15).map(|column| row.get(column)).collect(),
+                    )?;
+                    let expected = vec![
+                        evidence.provider.to_string(),evidence.provider_host.to_string(),evidence.provider_repository.to_string(),evidence.provider_repository_id.to_string(),evidence.merge_request_identity.to_string(),evidence.admitted_base_sha.to_string(),evidence.admitted_head_sha.to_string(),evidence.validated_target_sha.to_string(),evidence.validated_candidate_sha.to_string(),evidence.validated_tree_sha.to_string(),evidence.landed_commit_sha.to_string(),evidence.landed_tree_sha.to_string(),evidence.first_parent_sha.to_string(),evidence.history_contract.to_string(),i64::from(evidence.contains_admitted_head).to_string(),
+                    ];
+                    if stored != expected {
+                        anyhow::bail!("provider landing guarantee differs from durable evidence");
+                    }
+                }
+                Ok(())
+            })
+        }
+
+        pub(crate) fn private_ref_cleanup_debts(
+            &self,
+            repo_key: &str,
+        ) -> Result<Vec<PrivateRefCleanupDebt>> {
+            let connection = self.connect_read_only()?;
+            let mut statement = connection.prepare(
+                "SELECT repo_key,kind,owner_id,ref_name,expected_sha FROM private_ref_cleanup_debt WHERE repo_key=?1 ORDER BY created_at,ref_name",
+            )?;
+            let debts = statement
+                .query_map([repo_key], |row| {
+                    let kind: String = row.get(1)?;
+                    Ok(PrivateRefCleanupDebt {
+                        repo_key: row.get(0)?,
+                        kind: PrivateRefKind::parse(&kind)
+                            .map_err(|error| map_parse_error(error.to_string()))?,
+                        owner_id: row.get(2)?,
+                        ref_name: row.get(3)?,
+                        expected_sha: row.get(4)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(anyhow::Error::from)?;
+            Ok(debts)
+        }
+
+        pub(crate) fn private_ref_authority(
+            &self,
+            repo_key: &str,
+            kind: PrivateRefKind,
+            ref_owner_id: &str,
+            observed_sha: &str,
+        ) -> Result<(bool, String)> {
+            let connection = self.connect_read_only()?;
+            let object_format = repository_object_format(&connection, repo_key)?;
+            object_format.require_oid(observed_sha, "private ref object ID")?;
+            match kind {
+                PrivateRefKind::RepositoryTarget => {
+                    object_format.require_oid(ref_owner_id, "repository-target owner")?;
+                    if ref_owner_id != observed_sha {
+                        anyhow::bail!("repository-target ref drifted from its encoded object ID");
+                    }
+                    let checkout: CheckoutReconciliationState =
+                        serde_json::from_str(&connection.query_row(
+                            "SELECT checkout_json FROM registered_repositories WHERE repo_key=?1",
+                            [repo_key],
+                            |row| row.get::<_, String>(0),
+                        )?)?;
+                    let required = !matches!(checkout, CheckoutReconciliationState::Ready(_))
+                        && checkout.target_sha() == ref_owner_id;
+                    Ok((required, ref_owner_id.to_string()))
+                }
+                PrivateRefKind::Landing => {
+                    let cleanup_authority = connection
+                        .query_row(
+                            "SELECT expected_sha FROM private_ref_cleanup_debt WHERE repo_key=?1 AND kind='landing' AND owner_id=?2 AND ref_name=?3",
+                            params![repo_key,ref_owner_id,format!("refs/iq/landings/{ref_owner_id}")],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?;
+                    if let Some(expected) = cleanup_authority.as_deref() {
+                        object_format.require_oid(expected, "landing cleanup candidate")?;
+                        if expected != observed_sha {
+                            anyhow::bail!("landing ref drifted from cleanup debt authority");
+                        }
+                    }
+                    let authority = connection
+                        .query_row(
+                            "SELECT item.status,item.landing_state_json,attempt.merge_commit_sha,effort.state_json,EXISTS(SELECT 1 FROM replication_debt debt WHERE debt.item_id=item.id AND debt.operation='pin_source' AND debt.outcome NOT IN ('succeeded','superseded')) FROM integration_attempts attempt JOIN queue_items item ON item.id=attempt.item_id LEFT JOIN integration_efforts effort ON effort.item_id=item.id WHERE attempt.id=?1 AND item.repo_key=?2",
+                            params![ref_owner_id,repo_key],
+                            |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, Option<String>>(2)?,row.get::<_, Option<String>>(3)?,row.get::<_, bool>(4)?)),
+                        )
+                        .optional()?;
+                    let Some((
+                        status,
+                        landing_state,
+                        attempt_candidate,
+                        effort_state,
+                        replication_pin_pending,
+                    )) = authority
+                    else {
+                        return Ok((
+                            false,
+                            cleanup_authority.unwrap_or_else(|| observed_sha.to_string()),
+                        ));
+                    };
+                    let landing_state: LandingState = serde_json::from_str(&landing_state)?;
+                    let state = effort_state
+                        .as_deref()
+                        .map(serde_json::from_str::<crate::control_domain::IntegrationEffortState>)
+                        .transpose()?;
+                    let expected = state
+                        .as_ref()
+                        .and_then(crate::control_domain::IntegrationEffortState::candidate_sha)
+                        .map(str::to_string)
+                        .or(attempt_candidate)
+                        .context("landing ref has no durable candidate authority")?;
+                    object_format.require_oid(&expected, "landing ref candidate")?;
+                    if cleanup_authority
+                        .as_deref()
+                        .is_some_and(|cleanup_expected| cleanup_expected != expected)
+                    {
+                        anyhow::bail!("landing cleanup debt differs from current authority");
+                    }
+                    let required = if cleanup_authority.is_some() {
+                        landing_state.is_uncertain() || replication_pin_pending
+                    } else {
+                        !matches!(status.as_str(), "integrated" | "cancelled")
+                            || landing_state.is_uncertain()
+                            || replication_pin_pending
+                    };
+                    Ok((required, expected))
+                }
+            }
+        }
+
+        pub(crate) fn schedule_private_ref_cleanup(
+            &self,
+            repo_key: &str,
+            lease_owner_id: &str,
+            kind: PrivateRefKind,
+            ref_owner_id: &str,
+            ref_name: &str,
+            expected_sha: &str,
+        ) -> Result<()> {
+            self.composition_transaction(repo_key, lease_owner_id, |transaction| {
+                repository_object_format(transaction, repo_key)?
+                    .require_oid(expected_sha, "private-ref cleanup object ID")?;
+                let expected_ref = match kind {
+                    PrivateRefKind::RepositoryTarget => {
+                        format!("refs/iq/repository-targets/{repo_key}/{expected_sha}")
+                    }
+                    PrivateRefKind::Landing => format!("refs/iq/landings/{ref_owner_id}"),
+                };
+                if ref_name != expected_ref {
+                    anyhow::bail!("private-ref cleanup identity is not canonical");
+                }
+                let inserted = transaction.execute(
+                    "INSERT INTO private_ref_cleanup_debt(repo_key,kind,owner_id,ref_name,expected_sha,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?6) ON CONFLICT(repo_key,ref_name) DO NOTHING",
+                    params![repo_key,kind.as_str(),ref_owner_id,ref_name,expected_sha,now()],
+                )?;
+                if inserted == 0 {
+                    let stored: (String,String,String) = transaction.query_row(
+                        "SELECT kind,owner_id,expected_sha FROM private_ref_cleanup_debt WHERE repo_key=?1 AND ref_name=?2",
+                        params![repo_key,ref_name],
+                        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+                    )?;
+                    if stored != (kind.as_str().to_string(),ref_owner_id.to_string(),expected_sha.to_string()) {
+                        anyhow::bail!("private-ref cleanup debt differs from exact authority");
+                    }
+                }
+                Ok(())
+            })
+        }
+
+        pub(crate) fn complete_private_ref_cleanup(
+            &self,
+            repo_key: &str,
+            lease_owner_id: &str,
+            debt: &PrivateRefCleanupDebt,
+        ) -> Result<()> {
+            self.composition_transaction(repo_key, lease_owner_id, |transaction| {
+                let changed = transaction.execute(
+                    "DELETE FROM private_ref_cleanup_debt WHERE repo_key=?1 AND kind=?2 AND owner_id=?3 AND ref_name=?4 AND expected_sha=?5",
+                    params![repo_key,debt.kind.as_str(),debt.owner_id,debt.ref_name,debt.expected_sha],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("private-ref cleanup debt authority changed during finalization");
+                }
+                Ok(())
+            })
+        }
+
+        pub(crate) fn finish_replication_debt(
+            &self,
+            repo_key: &str,
+            owner_id: &str,
+            debt_id: &str,
+            result: std::result::Result<(), &str>,
+        ) -> Result<ReplicationDebt> {
+            self.composition_transaction(repo_key, owner_id, |transaction| {
+                Self::require_replication_tx(transaction, repo_key, debt_id)?;
+                let (outcome, failure) = match result {
+                    Ok(()) => ("applied", None),
+                    Err(message) if !message.trim().is_empty() => ("failed", Some(message)),
+                    Err(_) => anyhow::bail!("replication failure must not be empty"),
+                };
+                let changed = transaction.execute(
+                    "UPDATE replication_debt SET outcome=?1,application_id=NULL,failure=?2,updated_at=?3 WHERE id=?4 AND repo_key=?5 AND outcome IN ('pinning','pending','applying','uncertain','failed')",
+                    params![outcome,failure,now(),debt_id,repo_key],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("replication debt authority changed");
+                }
+                Ok(())
+            })?;
+            self.replication_debt(debt_id)
+        }
+
+        pub(crate) fn complete_replication_source_pin(
+            &self,
+            repo_key: &str,
+            owner_id: &str,
+            debt_id: &str,
+        ) -> Result<ReplicationDebt> {
+            self.composition_transaction(repo_key, owner_id, |transaction| {
+                Self::require_replication_tx(transaction, repo_key, debt_id)?;
+                let changed = transaction.execute(
+                    "UPDATE replication_debt SET operation='resolve_destination',outcome='pending',failure=NULL,updated_at=?1 WHERE id=?2 AND repo_key=?3 AND operation='pin_source' AND outcome IN ('pinning','failed')",
+                    params![now(),debt_id,repo_key],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("replication source pin authority changed");
+                }
+                Ok(())
+            })?;
+            self.replication_debt(debt_id)
+        }
+
+        pub(crate) fn complete_replication_source_cleanup(
+            &self,
+            repo_key: &str,
+            owner_id: &str,
+            debt_id: &str,
+        ) -> Result<ReplicationDebt> {
+            self.composition_transaction(repo_key, owner_id, |transaction| {
+                Self::require_replication_tx(transaction, repo_key, debt_id)?;
+                let changed = transaction.execute(
+                    "UPDATE replication_debt SET outcome='succeeded',updated_at=?1 WHERE id=?2 AND repo_key=?3 AND outcome='applied'",
+                    params![now(),debt_id,repo_key],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("replication source cleanup authority changed");
+                }
+                Ok(())
+            })?;
+            self.replication_debt(debt_id)
+        }
+
+        pub(crate) fn begin_replication_application(
+            &self,
+            repo_key: &str,
+            owner_id: &str,
+            debt_id: &str,
+            expected_destination_sha: &str,
+        ) -> Result<ReplicationDebt> {
+            self.composition_transaction(repo_key, owner_id, |transaction| {
+                repository_object_format(transaction, repo_key)?.require_oid(
+                    expected_destination_sha,
+                    "replication expected destination SHA",
+                )?;
+                Self::require_replication_tx(transaction, repo_key, debt_id)?;
+                let application_id = Uuid::new_v4().to_string();
+                let changed = transaction.execute(
+                    "UPDATE replication_debt SET expected_destination_sha=?1,operation='advance_exact_target',outcome='applying',application_id=?2,failure=NULL,updated_at=?3 WHERE id=?4 AND repo_key=?5 AND outcome IN ('pending','failed')",
+                    params![expected_destination_sha,application_id,now(),debt_id,repo_key],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("replication debt cannot begin an application");
+                }
+                Ok(())
+            })?;
+            self.replication_debt(debt_id)
+        }
+
+        pub(crate) fn resume_replication_application(
+            &self,
+            repo_key: &str,
+            owner_id: &str,
+            debt_id: &str,
+        ) -> Result<ReplicationDebt> {
+            self.composition_transaction(repo_key, owner_id, |transaction| {
+                Self::require_replication_tx(transaction, repo_key, debt_id)?;
+                let changed = transaction.execute(
+                    "UPDATE replication_debt SET outcome='applying',failure=NULL,updated_at=?1 WHERE id=?2 AND repo_key=?3 AND outcome='uncertain' AND application_id IS NOT NULL AND expected_destination_sha IS NOT NULL",
+                    params![now(),debt_id,repo_key],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("uncertain replication application cannot resume");
+                }
+                Ok(())
+            })?;
+            self.replication_debt(debt_id)
+        }
+
+        pub(crate) fn mark_replication_uncertain(
+            &self,
+            repo_key: &str,
+            owner_id: &str,
+            debt_id: &str,
+            failure: &str,
+        ) -> Result<ReplicationDebt> {
+            if failure.trim().is_empty() {
+                anyhow::bail!("replication uncertainty evidence must not be empty");
+            }
+            self.composition_transaction(repo_key, owner_id, |transaction| {
+                Self::require_replication_tx(transaction, repo_key, debt_id)?;
+                let changed = transaction.execute(
+                    "UPDATE replication_debt SET outcome='uncertain',failure=?1,updated_at=?2 WHERE id=?3 AND repo_key=?4 AND outcome IN ('applying','uncertain') AND application_id IS NOT NULL",
+                    params![failure,now(),debt_id,repo_key],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("replication application is not in flight");
+                }
+                Ok(())
+            })?;
+            self.replication_debt(debt_id)
+        }
+
+        fn require_replication_tx(
+            transaction: &rusqlite::Transaction<'_>,
+            repo_key: &str,
+            debt_id: &str,
+        ) -> Result<()> {
+            Self::validate_replication_binding(transaction, repo_key, debt_id, None)?;
+            let (state, item_id): (String, String) = transaction.query_row(
+                "SELECT policy.operation_state_json,debt.item_id FROM replication_debt debt JOIN repository_policies policy ON policy.repo_key=debt.repo_key WHERE debt.id=?1 AND debt.repo_key=?2",
+                params![debt_id,repo_key],
+                |row| Ok((row.get(0)?,row.get(1)?)),
+            )?;
+            let state: crate::repository_policy::OperationState = serde_json::from_str(&state)?;
+            match &state {
+                crate::repository_policy::OperationState::Draining { obligations }
+                    if obligations.contains(&crate::repository_policy::Obligation::QueueItem {
+                        id: item_id,
+                    }) =>
+                {
+                    Ok(())
+                }
+                _ => state.require_obligation(&crate::repository_policy::Obligation::Replication {
+                    id: debt_id.to_string(),
+                }),
+            }
+        }
+
+        pub fn replication_debts(&self, repo_key: Option<&str>) -> Result<Vec<ReplicationDebt>> {
+            let connection = self.connect_read_only()?;
+            let mut statement = if repo_key.is_some() {
+                connection.prepare("SELECT id,item_id,repo_key,canonical_source_sha,destination_key,target_branch,sequence,replica_json,expected_destination_sha,operation,outcome,application_id,failure,superseded_by_id FROM replication_debt WHERE repo_key=?1 ORDER BY destination_key,target_branch,sequence")?
+            } else {
+                connection.prepare("SELECT id,item_id,repo_key,canonical_source_sha,destination_key,target_branch,sequence,replica_json,expected_destination_sha,operation,outcome,application_id,failure,superseded_by_id FROM replication_debt ORDER BY destination_key,target_branch,sequence")?
+            };
+            let map = |row: &Row<'_>| map_replication_debt(row);
+            if let Some(repo_key) = repo_key {
+                statement
+                    .query_map([repo_key], map)?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(Into::into)
+            } else {
+                statement
+                    .query_map([], map)?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(Into::into)
+            }
+        }
+
+        pub fn replication_debt(&self, debt_id: &str) -> Result<ReplicationDebt> {
+            let connection = self.connect_read_only()?;
+            required_row(
+                connection.query_row(
+                    "SELECT id,item_id,repo_key,canonical_source_sha,destination_key,target_branch,sequence,replica_json,expected_destination_sha,operation,outcome,application_id,failure,superseded_by_id FROM replication_debt WHERE id=?1",
+                    [debt_id],
+                    map_replication_debt,
+                ),
+                "replication debt",
+                debt_id,
+            )
+        }
+
+        pub(crate) fn older_unfinished_replication(
+            &self,
+            debt: &ReplicationDebt,
+        ) -> Result<Option<ReplicationDebt>> {
+            let connection = self.connect_read_only()?;
+            connection
+                .query_row(
+                    "SELECT id,item_id,repo_key,canonical_source_sha,destination_key,target_branch,sequence,replica_json,expected_destination_sha,operation,outcome,application_id,failure,superseded_by_id FROM replication_debt WHERE destination_key=?1 AND target_branch=?2 AND sequence<?3 AND outcome NOT IN ('succeeded','superseded') ORDER BY sequence LIMIT 1",
+                    params![debt.destination_key,debt.target_branch,debt.sequence],
+                    map_replication_debt,
+                )
+                .optional()
+                .map_err(Into::into)
+        }
+
+        pub(crate) fn newer_completed_replication(
+            &self,
+            debt: &ReplicationDebt,
+        ) -> Result<Option<ReplicationDebt>> {
+            let connection = self.connect_read_only()?;
+            connection
+                .query_row(
+                    "SELECT id,item_id,repo_key,canonical_source_sha,destination_key,target_branch,sequence,replica_json,expected_destination_sha,operation,outcome,application_id,failure,superseded_by_id FROM replication_debt WHERE destination_key=?1 AND target_branch=?2 AND sequence>?3 AND outcome IN ('succeeded','superseded') ORDER BY sequence DESC LIMIT 1",
+                    params![debt.destination_key,debt.target_branch,debt.sequence],
+                    map_replication_debt,
+                )
+                .optional()
+                .map_err(Into::into)
+        }
+
+        pub(crate) fn begin_replication_supersession(
+            &self,
+            repo_key: &str,
+            owner_id: &str,
+            debt_id: &str,
+            newer_id: &str,
+        ) -> Result<ReplicationDebt> {
+            self.composition_transaction(repo_key, owner_id, |transaction| {
+                Self::require_replication_tx(transaction, repo_key, debt_id)?;
+                let changed = transaction.execute(
+                    "UPDATE replication_debt AS older SET outcome='superseded_cleanup_pending',application_id=NULL,failure=NULL,superseded_by_id=?1,updated_at=?2 WHERE older.id=?3 AND older.repo_key=?4 AND older.outcome NOT IN ('succeeded','superseded','superseded_cleanup_pending') AND EXISTS(SELECT 1 FROM replication_debt newer WHERE newer.id=?1 AND newer.destination_key=older.destination_key AND newer.target_branch=older.target_branch AND newer.sequence>older.sequence AND newer.outcome IN ('succeeded','superseded'))",
+                    params![newer_id,now(),debt_id,repo_key],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("replication debt cannot begin supersession cleanup");
+                }
+                Ok(())
+            })?;
+            self.replication_debt(debt_id)
+        }
+
+        pub(crate) fn complete_replication_supersession(
+            &self,
+            repo_key: &str,
+            owner_id: &str,
+            debt_id: &str,
+        ) -> Result<ReplicationDebt> {
+            self.composition_transaction(repo_key, owner_id, |transaction| {
+                Self::require_replication_tx(transaction, repo_key, debt_id)?;
+                let changed = transaction.execute(
+                    "UPDATE replication_debt SET outcome='superseded',updated_at=?1 WHERE id=?2 AND repo_key=?3 AND outcome='superseded_cleanup_pending' AND superseded_by_id IS NOT NULL",
+                    params![now(),debt_id,repo_key],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("replication supersession cleanup authority changed");
+                }
+                Ok(())
+            })?;
+            self.replication_debt(debt_id)
         }
 
         pub(crate) fn begin_initial_target_fetch(
@@ -2882,8 +5655,9 @@ pub mod sqlite {
             attempt_id: &str,
             target_sha: &str,
         ) -> Result<()> {
-            crate::control_domain::require_sha(target_sha, "observed target SHA")?;
             self.composition_transaction(repo_key, owner_id, |tx| {
+                repository_object_format(tx, repo_key)?
+                    .require_oid(target_sha, "observed target SHA")?;
                 let attempt_changed = tx.execute(
                     "UPDATE integration_attempts SET target_base_sha=?1 WHERE id=?2 AND item_id=?3 AND target_base_sha IS NULL",
                     params![target_sha,attempt_id,item_id],
@@ -2901,31 +5675,16 @@ pub mod sqlite {
                         anyhow::bail!("integration attempt target authority changed before fetch");
                     }
                 }
-                let checkout = CheckoutReconciliationState::pending(target_sha)?;
+                let checkout = CheckoutReconciliationState::pending(
+                    target_sha,
+                    repository_object_format(tx, repo_key)?,
+                )?;
                 let repository_changed = tx.execute(
                     "UPDATE registered_repositories SET checkout_json=?1,updated_at=?2 WHERE repo_key=?3",
                     params![serde_json::to_string(&checkout)?,now(),repo_key],
                 )?;
                 if repository_changed != 1 {
                     anyhow::bail!("registered repository disappeared before target fetch");
-                }
-                Ok(())
-            })
-        }
-
-        pub fn refresh_registered_target(
-            &self,
-            repo_key: &str,
-            owner_id: &str,
-            target_sha: &str,
-        ) -> Result<()> {
-            self.composition_transaction(repo_key, owner_id, |tx| {
-                let changed = tx.execute(
-                    "UPDATE registered_repositories SET checkout_json=?1,updated_at=?2 WHERE repo_key=?3",
-                    params![serde_json::to_string(&CheckoutReconciliationState::pending(target_sha)?)?,now(),repo_key],
-                )?;
-                if changed != 1 {
-                    anyhow::bail!("registered repository disappeared during target refresh");
                 }
                 Ok(())
             })
@@ -2969,12 +5728,15 @@ pub mod sqlite {
             }
         }
 
-        pub fn save_development_workspace(
+        pub(crate) fn save_development_workspace(
             &self,
             owner_id: &str,
             workspace: &DevelopmentWorkspace,
         ) -> Result<()> {
             self.composition_transaction(&workspace.repo_key, owner_id, |tx| {
+                Self::require_new_work_tx(tx, &workspace.repo_key)?;
+                repository_object_format(tx, &workspace.repo_key)?
+                    .require_oid(&workspace.base_sha, "development workspace base")?;
                 tx.execute(
                     "INSERT INTO development_workspaces (id,repo_key,name,path,rift_id,source_rift_id,branch,base_sha,status,cleanup_json,created_at,updated_at) VALUES (?1,?2,?3,?4,NULL,NULL,?5,?6,?7,?8,?9,?9)",
                     params![workspace.id,workspace.repo_key,workspace.name,path_bytes(&workspace.path),workspace.branch,workspace.base_sha,workspace.status.to_string(),serde_json::to_string(&workspace.cleanup)?,workspace.created_at],
@@ -2983,7 +5745,7 @@ pub mod sqlite {
             })
         }
 
-        pub fn set_development_workspace_identity(
+        pub(crate) fn set_development_workspace_identity(
             &self,
             repo_key: &str,
             owner_id: &str,
@@ -2991,17 +5753,29 @@ pub mod sqlite {
             identity: &WorkspaceIdentity,
         ) -> Result<DevelopmentWorkspace> {
             self.composition_transaction(repo_key, owner_id, |tx| {
+                Self::require_obligation_tx(
+                    tx,
+                    repo_key,
+                    &crate::repository_policy::Obligation::Workspace { id: id.to_string() },
+                )?;
                 let changed = tx.execute(
                     "UPDATE development_workspaces SET rift_id=?1,source_rift_id=?2,status='active',updated_at=?3 WHERE id=?4 AND repo_key=?5 AND status='creating' AND path=?6",
                     params![identity.rift_id,identity.source_rift_id,now(),id,repo_key,path_bytes(Path::new(&identity.path))],
                 )?;
                 if changed != 1 { anyhow::bail!("development workspace creation intent changed"); }
+                insert_workspace_git_binding(
+                    tx,
+                    repo_key,
+                    "development",
+                    id,
+                    Path::new(&identity.path),
+                )?;
                 Ok(())
             })?;
             self.workspace(id)
         }
 
-        pub fn update_development_workspace_cleanup(
+        pub(crate) fn update_development_workspace_cleanup(
             &self,
             repo_key: &str,
             owner_id: &str,
@@ -3015,12 +5789,18 @@ pub mod sqlite {
                     params![status.to_string(),serde_json::to_string(cleanup)?,now(),id,repo_key],
                 )?;
                 if changed != 1 { anyhow::bail!("development workspace disappeared"); }
+                if status == DevelopmentWorkspaceStatus::Removed {
+                    tx.execute(
+                        "DELETE FROM workspace_git_bindings WHERE owner_kind='development' AND owner_id=?1",
+                        [id],
+                    )?;
+                }
                 Ok(())
             })?;
             self.workspace(id)
         }
 
-        pub fn complete_development_workspace_cleanup(
+        pub(crate) fn complete_development_workspace_cleanup(
             &self,
             repo_key: &str,
             owner_id: &str,
@@ -3036,6 +5816,10 @@ pub mod sqlite {
                     anyhow::bail!("development workspace cleanup authority changed");
                 }
                 tx.execute(
+                    "DELETE FROM workspace_git_bindings WHERE owner_kind='development' AND owner_id=?1",
+                    [id],
+                )?;
+                tx.execute(
                     "DELETE FROM workspace_gc_debt WHERE registry_identity=?1",
                     params![registry_identity],
                 )?;
@@ -3044,7 +5828,7 @@ pub mod sqlite {
             self.workspace(id)
         }
 
-        pub fn begin_local_submission(
+        pub(crate) fn begin_local_submission(
             &self,
             repo_key: &str,
             owner_id: &str,
@@ -3054,9 +5838,20 @@ pub mod sqlite {
         ) -> Result<LocalSubmission> {
             let mut submission_id = None;
             self.composition_transaction(repo_key, owner_id, |tx| {
+                let object_format = repository_object_format(tx, repo_key)?;
+                object_format.require_oid(commit_sha, "local submission commit")?;
+                Self::require_obligation_tx(
+                    tx,
+                    repo_key,
+                    &crate::repository_policy::Obligation::Workspace {
+                        id: workspace_id.to_string(),
+                    },
+                )?;
                 let existing = tx
                     .query_row(
-                        "SELECT * FROM local_submissions WHERE workspace_id=?1 AND state='creating'",
+                        &format!(
+                            "{LOCAL_SUBMISSION_SELECT} WHERE submission.workspace_id=?1 AND submission.state='creating'"
+                        ),
                         params![workspace_id],
                         map_local_submission,
                     )
@@ -3073,6 +5868,7 @@ pub mod sqlite {
                     submission_id = Some(existing.id);
                     return Ok(());
                 }
+                Self::require_new_work_tx(tx, repo_key)?;
                 let workspace = required_row(
                     tx.query_row(
                         "SELECT * FROM development_workspaces WHERE id=?1",
@@ -3090,6 +5886,7 @@ pub mod sqlite {
                 if workspace.repo_key != repo_key || workspace.status != expected_status {
                     anyhow::bail!("development workspace is not in the required submission state");
                 }
+                object_format.require_oid(&workspace.base_sha, "local submission base")?;
                 if let Some(item_id) = replaces_item_id {
                     let item = required_row(
                         tx.query_row(
@@ -3120,9 +5917,7 @@ pub mod sqlite {
                     }
                 }
                 let id = Uuid::new_v4().to_string();
-                let item_id = replaces_item_id
-                    .map(str::to_string)
-                    .unwrap_or_else(|| Uuid::new_v4().to_string());
+                let item_id = Uuid::new_v4().to_string();
                 let private_ref = format!("refs/iq/submissions/{id}");
                 let staging_ref = format!("refs/iq/staging/{id}");
                 tx.execute(
@@ -3139,7 +5934,7 @@ pub mod sqlite {
             )
         }
 
-        pub fn finalize_local_submission(
+        pub(crate) fn finalize_local_submission(
             &self,
             repo_key: &str,
             owner_id: &str,
@@ -3152,7 +5947,7 @@ pub mod sqlite {
             self.composition_transaction(repo_key, owner_id, |tx| {
                 let submission = required_row(
                     tx.query_row(
-                        "SELECT * FROM local_submissions WHERE id=?1",
+                        &format!("{LOCAL_SUBMISSION_SELECT} WHERE submission.id=?1"),
                         params![submission_id],
                         map_local_submission,
                     ),
@@ -3164,6 +5959,13 @@ pub mod sqlite {
                 {
                     anyhow::bail!("local submission is not an exact creation intent");
                 }
+                Self::require_obligation_tx(
+                    tx,
+                    repo_key,
+                    &crate::repository_policy::Obligation::Workspace {
+                        id: submission.workspace_id.clone(),
+                    },
+                )?;
                 let _ = required_row(
                     tx.query_row(
                         &format!(
@@ -3176,88 +5978,40 @@ pub mod sqlite {
                     repo_key,
                 )?;
                 let timestamp = now();
-                if let Some(item_id) = submission.replaces_item_id.as_deref() {
-                    let item = required_row(
-                        tx.query_row(
-                            "SELECT * FROM queue_items_runtime WHERE id=?1",
-                            params![item_id],
-                            map_item,
-                        ),
-                        "queue item",
-                        item_id,
+                if let Some(replaced_item_id) = submission.replaces_item_id.as_deref() {
+                    let replaced_status: String = tx.query_row(
+                        "SELECT status FROM queue_items WHERE id=?1 AND repo_key=?2",
+                        params![replaced_item_id, repo_key],
+                        |row| row.get(0),
                     )?;
-                    let old_submission_id = match &item.source {
-                        QueueSource::LocalSubmission { submission_id, .. } => submission_id,
-                        QueueSource::RemoteBranch { .. } => {
-                            anyhow::bail!("replacement item is not a local submission")
-                        }
-                    };
-                    if item.repo_key != repo_key
-                        || item.status != QueueStatus::Blocked
-                        || item.blocked_reason != Some(BlockedReason::NeedsAgentFix)
-                    {
-                        anyhow::bail!("local replacement target changed before finalization");
+                    if replaced_status != "cancelled" {
+                        anyhow::bail!("superseded queue item is not cancelled");
                     }
-                    let old_attempt_id = item
-                        .current_attempt_id
-                        .as_deref()
-                        .context("replacement target has no active integration attempt")?;
-                    let replacement = match &item.workspace {
-                        WorkspaceState::Retained { identity } => ReplacementState::CleanupPending {
-                            old_attempt_id: old_attempt_id.to_string(),
-                            old_workspace: identity.clone(),
-                        },
-                        WorkspaceState::CreationIntent { .. } => anyhow::bail!("replacement cannot discard an incomplete integration workspace"),
-                        _ => ReplacementState::None,
-                    };
-                    let (status, current_attempt, workspace_path, workspace_rift, workspace_source, replacement_json) = match &replacement {
-                        ReplacementState::None => ("ready", None, None, None, None, None),
-                        ReplacementState::CleanupPending { .. } => (
-                            "blocked",
-                            item.current_attempt_id.as_deref(),
-                            item.workspace.path(),
-                            item.workspace.identity().map(|identity| identity.rift_id.as_str()),
-                            item.workspace.identity().map(|identity| identity.source_rift_id.as_str()),
-                            Some(serde_json::to_string(&replacement)?),
-                        ),
-                    };
-                    let changed = tx.execute(
-                        r#"UPDATE queue_items SET source_branch=?1,source_ref=?1,submission_id=?2,current_head_sha=?3,status=?4,current_attempt_id=?5,integration_workspace_path=?6,integration_workspace_rift_id=?7,integration_workspace_source_rift_id=?8,replacement_json=?9,conflict_json=NULL,target_sha=NULL,source_sha=NULL,validation_evidence_json='{}',updated_at=?10 WHERE id=?11 AND repo_key=?12 AND status='blocked'"#,
-                        params![submission.private_ref,submission.id,submission.commit_sha,status,current_attempt,workspace_path,workspace_rift,workspace_source,replacement_json,timestamp,item_id,repo_key],
-                    )?;
-                    if changed != 1 { anyhow::bail!("local replacement state changed concurrently"); }
-                    let changed = tx.execute(
-                        "UPDATE local_submissions SET state='replaced' WHERE id=?1 AND state='queued'",
-                        params![old_submission_id],
-                    )?;
-                    if changed != 1 { anyhow::bail!("old local submission is not queued"); }
-                    if matches!(replacement, ReplacementState::None) {
-                        let changed = tx.execute(
-                            "UPDATE integration_attempts SET result='superseded',finished_at=?1 WHERE id=?2 AND item_id=?3 AND finished_at IS NULL AND result IS NULL",
-                            params![timestamp,old_attempt_id,item_id],
-                        )?;
-                        if changed != 1 { anyhow::bail!("old integration attempt cannot be superseded"); }
-                    }
-                    tx.execute("UPDATE prompts SET status='superseded' WHERE item_id=?1 AND status='open'",params![item_id])?;
-                    Self::record_event_tx(tx,item_id,"local_submission_replaced",if matches!(replacement, ReplacementState::None) { "immutable local submission replaced" } else { "immutable local submission replaced; old integration Rift cleanup is pending" })?;
-                } else {
                     tx.execute(
-                        "INSERT INTO queue_items (id,repo_key,source_branch,pr_url,producer_metadata_json,validation_evidence_json,status,current_head_sha,source_kind,source_ref,submission_id,landing_policy,created_at,updated_at) VALUES (?1,?2,?3,NULL,?4,'{}','ready',?5,'local_submission',?3,?6,'squash',?7,?7)",
-                        params![submission.queue_item_id,repo_key,submission.private_ref,producer_metadata.to_string(),submission.commit_sha,submission.id,timestamp],
-                    )?;
-                    let changed = tx.execute(
-                        "UPDATE development_workspaces SET status='submitted',updated_at=?1 WHERE id=?2 AND repo_key=?3 AND status='active'",
-                        params![timestamp,submission.workspace_id,repo_key],
-                    )?;
-                    if changed != 1 { anyhow::bail!("development workspace is not active"); }
-                    Self::record_event_tx(tx,&submission.queue_item_id,"item_enqueued","immutable local submission enqueued")?;
-                    insert_state_repository_binding(
-                        tx,
-                        &submission.queue_item_id,
-                        &state_repository,
-                        &timestamp,
+                        "UPDATE local_submissions SET state='replaced' WHERE queue_item_id=?1 AND state='cancelled'",
+                        [replaced_item_id],
                     )?;
                 }
+                tx.execute(
+                    "INSERT INTO queue_items (id,repo_key,producer_metadata_json,validation_evidence_json,status,created_at,updated_at) VALUES (?1,?2,?3,'{}','ready',?4,?4)",
+                    params![submission.queue_item_id,repo_key,producer_metadata.to_string(),timestamp],
+                )?;
+                tx.execute(
+                    "INSERT INTO queue_admissions(item_id,kind,source_branch,head_sha,source_ref,submission_id,admitted_at) VALUES(?1,'local_submission',?2,?3,?2,?4,?5)",
+                    params![submission.queue_item_id,submission.private_ref,submission.commit_sha,submission.id,timestamp],
+                )?;
+                let changed = tx.execute(
+                    "UPDATE development_workspaces SET status='submitted',updated_at=?1 WHERE id=?2 AND repo_key=?3 AND status='active'",
+                    params![timestamp,submission.workspace_id,repo_key],
+                )?;
+                if changed != 1 { anyhow::bail!("development workspace is not active"); }
+                Self::record_event_tx(tx,&submission.queue_item_id,"item_enqueued","immutable local submission enqueued")?;
+                insert_state_repository_binding(
+                    tx,
+                    &submission.queue_item_id,
+                    &state_repository,
+                    &timestamp,
+                )?;
                 let changed = tx.execute(
                     "UPDATE local_submissions SET state='queued' WHERE id=?1 AND state='creating'",
                     params![submission.id],
@@ -3274,7 +6028,7 @@ pub mod sqlite {
             ))
         }
 
-        pub fn finish_replacement_cleanup(
+        pub(crate) fn finish_replacement_cleanup(
             &self,
             repo_key: &str,
             owner_id: &str,
@@ -3352,7 +6106,7 @@ pub mod sqlite {
             let conn = self.connect_read_only()?;
             required_row(
                 conn.query_row(
-                    "SELECT * FROM local_submissions WHERE id=?1",
+                    &format!("{LOCAL_SUBMISSION_SELECT} WHERE submission.id=?1"),
                     params![id],
                     map_local_submission,
                 ),
@@ -3367,7 +6121,9 @@ pub mod sqlite {
         ) -> Result<Option<LocalSubmission>> {
             let conn = self.connect_read_only()?;
             conn.query_row(
-                "SELECT * FROM local_submissions WHERE workspace_id=?1 AND state='creating'",
+                &format!(
+                    "{LOCAL_SUBMISSION_SELECT} WHERE submission.workspace_id=?1 AND submission.state='creating'"
+                ),
                 params![workspace_id],
                 map_local_submission,
             )
@@ -3378,36 +6134,58 @@ pub mod sqlite {
         pub fn integrated_submission_sha(&self, workspace_id: &str) -> Result<Option<String>> {
             let conn = self.connect_read_only()?;
             conn.query_row(
-                "SELECT ls.commit_sha FROM local_submissions ls JOIN queue_items qi ON qi.submission_id=ls.id WHERE ls.workspace_id=?1 AND qi.status='integrated' ORDER BY ls.created_at DESC LIMIT 1",
+                "SELECT submission.commit_sha,policy.canonical_repository_json FROM local_submissions submission JOIN queue_admissions admission ON admission.submission_id=submission.id JOIN queue_items item ON item.id=admission.item_id JOIN repository_policies policy ON policy.repo_key=submission.repo_key WHERE submission.workspace_id=?1 AND item.status='integrated' ORDER BY submission.created_at DESC LIMIT 1",
                 params![workspace_id],
-                |row| row.get(0),
+                |row| {
+                    let commit_sha: String = row.get(0)?;
+                    let repository: String = row.get(1)?;
+                    let object_format = serde_json::from_str::<
+                        crate::repository_policy::GitRepository,
+                    >(&repository)
+                    .map_err(|error| map_json_error("canonical_repository_json", error))?
+                    .object_format();
+                    object_format
+                        .require_oid(&commit_sha, "integrated local submission commit")
+                        .map_err(|error| map_parse_error(format!("{error:#}")))?;
+                    Ok(commit_sha)
+                },
             )
             .optional()
             .map_err(Into::into)
         }
 
-        pub fn set_conflict_metadata(
+        pub(crate) fn set_conflict_metadata(
             &self,
             item_id: &str,
+            attempt_id: &str,
             conflict_json: &Value,
             target_sha: &str,
             source_sha: &str,
-        ) -> Result<()> {
-            let conn = self.connect()?;
-            conn.execute(
-                "UPDATE queue_items SET conflict_json=?1,target_sha=?2,source_sha=?3,updated_at=?4 WHERE id=?5",
-                params![conflict_json.to_string(), target_sha, source_sha, now(), item_id],
+        ) -> Result<QueueItem> {
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx.execute(
+                "UPDATE queue_items SET conflict_json=?1,target_sha=?2,source_sha=?3,updated_at=?4 WHERE id=?5 AND status='merging' AND current_attempt_id=?6",
+                params![conflict_json.to_string(), target_sha, source_sha, now(), item_id, attempt_id],
             )?;
-            Ok(())
-        }
-
-        pub fn clear_conflict_metadata(&self, item_id: &str) -> Result<()> {
-            let conn = self.connect()?;
-            conn.execute(
-                "UPDATE queue_items SET conflict_json=NULL,target_sha=NULL,source_sha=NULL,updated_at=?1 WHERE id=?2",
-                params![now(), item_id],
-            )?;
-            Ok(())
+            if changed != 1 {
+                let item = required_row(
+                    tx.query_row(
+                        "SELECT * FROM queue_items_runtime WHERE id=?1",
+                        [item_id],
+                        map_item,
+                    ),
+                    "queue item",
+                    item_id,
+                )?;
+                if item.status == QueueStatus::Cancelled {
+                    tx.commit()?;
+                    return Ok(item);
+                }
+                anyhow::bail!("conflict metadata lost exact merging attempt authority");
+            }
+            tx.commit()?;
+            self.get_item(item_id)
         }
 
         pub fn get_prompt(&self, prompt_id: &str) -> Result<Prompt> {
@@ -3516,6 +6294,7 @@ pub mod sqlite {
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
             )
             .with_context(|| format!("open existing queue db {}", path.display()))?;
+            configure_connection(&conn)?;
             conn.busy_timeout(Self::BUSY_TIMEOUT)?;
             conn.pragma_update(None, "query_only", "ON")?;
             source.verify_authoritative(&path)?;
@@ -3707,6 +6486,20 @@ pub mod sqlite {
                     "repo queue {repo_key} lease cannot cover the next command authority check"
                 )));
             }
+            let physical_invalid: bool = conn.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM physical_repository_ownership ownership
+                   LEFT JOIN physical_repository_leases lease ON lease.identity_key=ownership.identity_key
+                   WHERE ownership.repo_key=?1 AND (lease.owner_id IS NOT ?2 OR lease.expires_at<=?3)
+                 )",
+                params![repo_key, owner_id, (Utc::now() + Self::COMMAND_AUTHORITY_RESERVE).to_rfc3339()],
+                |row| row.get(0),
+            )?;
+            if physical_invalid {
+                return Ok(ExecutionAuthority::Lost(format!(
+                    "repo queue {repo_key} physical lease is not owned by {owner_id}"
+                )));
+            }
             match QueueStatus::from_str(&status) {
                 Ok(QueueStatus::Cancelled) => Ok(ExecutionAuthority::Cancelled),
                 Ok(_) => Ok(ExecutionAuthority::Active),
@@ -3751,6 +6544,20 @@ pub mod sqlite {
             if lease_expires <= Utc::now() + Self::COMMAND_AUTHORITY_RESERVE {
                 return Ok(ExecutionAuthority::Lost(format!(
                     "repo queue {repo_key} lease cannot cover the next command authority check"
+                )));
+            }
+            let physical_invalid: bool = conn.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM physical_repository_ownership ownership
+                   LEFT JOIN physical_repository_leases lease ON lease.identity_key=ownership.identity_key
+                   WHERE ownership.repo_key=?1 AND (lease.owner_id IS NOT ?2 OR lease.expires_at<=?3)
+                 )",
+                params![repo_key, owner_id, (Utc::now() + Self::COMMAND_AUTHORITY_RESERVE).to_rfc3339()],
+                |row| row.get(0),
+            )?;
+            if physical_invalid {
+                return Ok(ExecutionAuthority::Lost(format!(
+                    "repo queue {repo_key} physical lease is not owned by {owner_id}"
                 )));
             }
             Ok(ExecutionAuthority::Active)
@@ -3843,20 +6650,71 @@ pub mod sqlite {
         path.as_os_str().as_bytes().to_vec()
     }
 
+    fn insert_workspace_git_binding(
+        transaction: &rusqlite::Transaction<'_>,
+        repo_key: &str,
+        owner_kind: &str,
+        owner_id: &str,
+        path: &Path,
+    ) -> Result<()> {
+        let binding = crate::git_command::expected_binding(path)?;
+        binding.verify()?;
+        if binding.object_format != repository_object_format(transaction, repo_key)? {
+            anyhow::bail!("workspace Git object format differs from repository policy");
+        }
+        transaction.execute(
+            "INSERT INTO workspace_git_bindings(owner_kind,owner_id,top_level,binding_json,created_at) VALUES(?1,?2,?3,?4,?5)",
+            params![owner_kind,owner_id,path_bytes(path),serde_json::to_string(&binding)?,now()],
+        )?;
+        Ok(())
+    }
+
     fn row_path(row: &Row<'_>, column: &str) -> rusqlite::Result<PathBuf> {
         let bytes: Vec<u8> = row.get(column)?;
         Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
     }
 
+    fn repository_object_format(
+        connection: &Connection,
+        repo_key: &str,
+    ) -> Result<crate::git_object::GitObjectFormat> {
+        let repository: String = connection.query_row(
+            "SELECT canonical_repository_json FROM repository_policies WHERE repo_key=?1",
+            [repo_key],
+            |row| row.get(0),
+        )?;
+        Ok(
+            serde_json::from_str::<crate::repository_policy::GitRepository>(&repository)?
+                .object_format(),
+        )
+    }
+
+    fn attempt_object_format(
+        connection: &Connection,
+        attempt_id: &str,
+    ) -> Result<crate::git_object::GitObjectFormat> {
+        let repository: String = connection.query_row(
+            "SELECT policy.canonical_repository_json FROM integration_attempts attempt JOIN queue_items item ON item.id=attempt.item_id JOIN repository_policies policy ON policy.repo_key=item.repo_key WHERE attempt.id=?1",
+            [attempt_id],
+            |row| row.get(0),
+        )?;
+        Ok(
+            serde_json::from_str::<crate::repository_policy::GitRepository>(&repository)?
+                .object_format(),
+        )
+    }
+
     const REGISTERED_REPOSITORY_SELECT: &str = "SELECT repository.* FROM (
         SELECT registered.repo_key,registered.owned_root_path,registered.root_rift_id,
-               registered.registry_identity,registered.registry_device,registered.registry_inode,
-               registered.generation,registered.target_branch,registered.development_root_path,
+                registered.git_binding_json,registered.registry_identity,registered.registry_device,registered.registry_inode,
+               registered.generation,policy.target_branch,registered.development_root_path,
                registered.integration_root_path,registered.source_sha,
                registered.checkout_json AS checkout_reconciliation_json,
-               registered.created_at,registered.updated_at,registered.remote_name,
-               registered.fetch_url,registered.push_url
+               registered.created_at,registered.updated_at,policy.revision AS policy_revision,
+               policy.operation_state_json,policy.canonical_repository_json,
+               policy.integration_policy,policy.replication_policy_json
         FROM registered_repositories registered
+        JOIN repository_policies policy ON policy.repo_key=registered.repo_key
         JOIN workspace_roots development
           ON development.repo_key=registered.repo_key
          AND development.kind='development'
@@ -3878,13 +6736,55 @@ pub mod sqlite {
     ) repository";
 
     fn map_repository(row: &Row<'_>) -> rusqlite::Result<RegisteredRepository> {
+        let binding: crate::git_command::RepositoryBinding =
+            serde_json::from_str(&row.get::<_, String>("git_binding_json")?)
+                .map_err(|error| map_json_error("git_binding_json", error))?;
+        crate::git_command::register_binding(&binding).map_err(|error| {
+            map_parse_error(format!("invalid Git repository binding: {error:#}"))
+        })?;
         let checkout_reconciliation: CheckoutReconciliationState =
             serde_json::from_str(&row.get::<_, String>("checkout_reconciliation_json")?)
                 .map_err(|error| map_json_error("checkout_reconciliation_json", error))?;
         let checkout_target = checkout_reconciliation.target_sha();
-        require_persisted_sha(checkout_target, "registered checkout target")?;
         let source_sha: String = row.get("source_sha")?;
-        require_persisted_sha(&source_sha, "registered checkout source")?;
+        let policy = crate::repository_policy::RepositoryPolicy {
+            operation_state: serde_json::from_str(&row.get::<_, String>("operation_state_json")?)
+                .map_err(|error| map_json_error("operation_state_json", error))?,
+            canonical_repository: serde_json::from_str(
+                &row.get::<_, String>("canonical_repository_json")?,
+            )
+            .map_err(|error| map_json_error("canonical_repository_json", error))?,
+            target_branch: row.get("target_branch")?,
+            integration_policy: match row.get::<_, String>("integration_policy")?.as_str() {
+                "direct" => crate::repository_policy::IntegrationPolicy::Direct,
+                "merge_request_required" => {
+                    crate::repository_policy::IntegrationPolicy::MergeRequestRequired
+                }
+                _ => {
+                    return Err(map_parse_error(
+                        "invalid repository integration policy".into(),
+                    ))
+                }
+            },
+            replication_policy: serde_json::from_str(
+                &row.get::<_, String>("replication_policy_json")?,
+            )
+            .map_err(|error| map_json_error("replication_policy_json", error))?,
+        }
+        .validate()
+        .map_err(|error| map_parse_error(format!("invalid repository policy: {error:#}")))?;
+        let object_format = policy.canonical_repository.object_format();
+        object_format
+            .require_oid(checkout_target, "registered checkout target")
+            .map_err(|error| map_parse_error(format!("{error:#}")))?;
+        object_format
+            .require_oid(&source_sha, "registered checkout source")
+            .map_err(|error| map_parse_error(format!("{error:#}")))?;
+        if binding.object_format != object_format {
+            return Err(map_parse_error(
+                "registered Git binding object format differs from policy".into(),
+            ));
+        }
         Ok(RegisteredRepository {
             key: row.get("repo_key")?,
             owned_root_path: row_path(row, "owned_root_path")?,
@@ -3895,14 +6795,14 @@ pub mod sqlite {
             generation: row.get("generation")?,
             target_branch: row.get("target_branch")?,
             remote: RegisteredRemote {
-                name: row.get("remote_name")?,
-                fetch_url: row.get("fetch_url")?,
-                push_url: row.get("push_url")?,
+                name: crate::repository::INTERNAL_REMOTE_NAME.into(),
             },
             development_root_path: row_path(row, "development_root_path")?,
             integration_root_path: row_path(row, "integration_root_path")?,
             source_sha,
             checkout_reconciliation,
+            policy,
+            policy_revision: row.get("policy_revision")?,
             created_at: row.get("created_at")?,
             updated_at: row.get("updated_at")?,
         })
@@ -3941,11 +6841,25 @@ pub mod sqlite {
         })
     }
 
+    const LOCAL_SUBMISSION_SELECT: &str = "SELECT submission.*,policy.canonical_repository_json
+        AS canonical_repository_json FROM local_submissions submission
+        JOIN repository_policies policy ON policy.repo_key=submission.repo_key";
+
     fn map_local_submission(row: &Row<'_>) -> rusqlite::Result<LocalSubmission> {
         let base_sha: String = row.get("base_sha")?;
         let commit_sha: String = row.get("commit_sha")?;
-        require_persisted_sha(&base_sha, "local submission base")?;
-        require_persisted_sha(&commit_sha, "local submission commit")?;
+        let repository: crate::repository_policy::GitRepository =
+            serde_json::from_str(&row.get::<_, String>("canonical_repository_json")?)
+                .map_err(|error| map_json_error("canonical_repository_json", error))?;
+        repository
+            .object_format()
+            .require_oid(&base_sha, "local submission base")
+            .and_then(|()| {
+                repository
+                    .object_format()
+                    .require_oid(&commit_sha, "local submission commit")
+            })
+            .map_err(|error| map_parse_error(format!("{error:#}")))?;
         Ok(LocalSubmission {
             id: row.get("id")?,
             queue_item_id: row.get("queue_item_id")?,
@@ -3962,12 +6876,24 @@ pub mod sqlite {
         })
     }
 
-    fn require_persisted_sha(value: &str, label: &str) -> rusqlite::Result<()> {
-        if matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            Ok(())
-        } else {
-            Err(map_parse_error(format!("invalid {label} SHA")))
-        }
+    fn map_replication_debt(row: &Row<'_>) -> rusqlite::Result<ReplicationDebt> {
+        Ok(ReplicationDebt {
+            id: row.get(0)?,
+            item_id: row.get(1)?,
+            repo_key: row.get(2)?,
+            canonical_source_sha: row.get(3)?,
+            destination_key: row.get(4)?,
+            target_branch: row.get(5)?,
+            sequence: row.get(6)?,
+            replica: serde_json::from_str(&row.get::<_, String>(7)?)
+                .map_err(|error| map_json_error("replica_json", error))?,
+            expected_destination_sha: row.get(8)?,
+            operation: row.get(9)?,
+            outcome: row.get(10)?,
+            application_id: row.get(11)?,
+            failure: row.get(12)?,
+            superseded_by_id: row.get(13)?,
+        })
     }
 
     fn required_row<T>(result: rusqlite::Result<T>, entity: &str, id: &str) -> Result<T> {
@@ -4026,14 +6952,89 @@ pub mod sqlite {
         if let Some(prompt_id) = prompt_id {
             validation_evidence["prompt_id"] = Value::String(prompt_id);
         }
+        let admission = match row.get::<_, String>("admission_kind")?.as_str() {
+            "local_submission" => QueueAdmission::LocalSubmission {
+                source_branch: row.get("admission_source_branch")?,
+                head_sha: row.get("admission_head_sha")?,
+                source_ref: row.get("admission_source_ref")?,
+                submission_id: row.get("admission_submission_id")?,
+            },
+            "direct" => QueueAdmission::Direct {
+                source_branch: row.get("admission_source_branch")?,
+                head_sha: row.get("admission_head_sha")?,
+            },
+            "merge_request" | "historical_merge_request" => {
+                let admission = MergeRequestAdmission {
+                    provider: match row.get::<_, String>("admission_provider")?.as_str() {
+                        "github" => crate::repository_policy::Provider::Github,
+                        "gitlab" => crate::repository_policy::Provider::Gitlab,
+                        _ => return Err(map_parse_error("invalid admitted provider".into())),
+                    },
+                    provider_host: row.get("admission_provider_host")?,
+                    repository: row.get("admission_provider_repository")?,
+                    repository_id: row.get("admission_provider_repository_id")?,
+                    target_branch: row.get("admission_target_branch")?,
+                    identity: row.get("admission_merge_request_identity")?,
+                    url: row.get("admission_merge_request_url")?,
+                    source_branch: row.get("admission_source_branch")?,
+                    head_sha: row.get("admission_head_sha")?,
+                    base_sha: row.get("admission_base_sha")?,
+                    provider_merge_method: row
+                        .get::<_, Option<String>>("admission_provider_merge_method")?
+                        .map(|method| match method.as_str() {
+                            "merge" => Ok(crate::repository_policy::ProviderMergeMethod::Merge),
+                            "squash" => Ok(crate::repository_policy::ProviderMergeMethod::Squash),
+                            _ => Err(map_parse_error(
+                                "invalid admitted provider merge method".into(),
+                            )),
+                        })
+                        .transpose()?,
+                };
+                if row.get::<_, String>("admission_kind")? == "merge_request" {
+                    QueueAdmission::MergeRequest(admission)
+                } else {
+                    QueueAdmission::HistoricalMergeRequest(admission)
+                }
+            }
+            _ => return Err(map_parse_error("invalid queue admission kind".into())),
+        };
+        let source_branch = admission.source_branch().to_string();
+        let current_head_sha = admission.head_sha().to_string();
+        let (source, landing_policy) = match &admission {
+            QueueAdmission::LocalSubmission {
+                submission_id,
+                head_sha,
+                ..
+            } => (
+                QueueSource::LocalSubmission {
+                    submission_id: submission_id.clone(),
+                    commit_sha: head_sha.clone(),
+                },
+                LandingPolicy::Squash,
+            ),
+            QueueAdmission::Direct { source_branch, .. } => (
+                QueueSource::RemoteBranch {
+                    branch: source_branch.clone(),
+                },
+                LandingPolicy::Direct,
+            ),
+            QueueAdmission::MergeRequest(value) | QueueAdmission::HistoricalMergeRequest(value) => {
+                (
+                    QueueSource::RemoteBranch {
+                        branch: value.source_branch.clone(),
+                    },
+                    LandingPolicy::Provider,
+                )
+            }
+        };
         Ok(QueueItem {
             id: row.get("id")?,
             repo_key: row.get("repo_key")?,
             owned_root_path: row.get("owned_root_path")?,
-            source_branch: row.get("source_branch")?,
+            source_branch,
             target_branch: row.get("target_branch")?,
-            current_head_sha: row.get("current_head_sha")?,
-            pr_url: row.get("pr_url")?,
+            current_head_sha,
+            admission,
             status: QueueStatus::from_str(&status).map_err(map_parse_error)?,
             blocked_phase: blocked_phase
                 .as_deref()
@@ -4055,18 +7056,8 @@ pub mod sqlite {
             validation_evidence,
             landing: serde_json::from_str(&row.get::<_, String>("landing_state_json")?)
                 .map_err(|error| map_json_error("landing_state_json", error))?,
-            source: match row.get::<_, String>("source_kind")?.as_str() {
-                "remote_branch" => QueueSource::RemoteBranch {
-                    branch: row.get("source_ref")?,
-                },
-                "local_submission" => QueueSource::LocalSubmission {
-                    submission_id: row.get("submission_id")?,
-                    commit_sha: row.get("current_head_sha")?,
-                },
-                value => return Err(map_parse_error(format!("unknown queue source: {value}"))),
-            },
-            landing_policy: LandingPolicy::from_str(&row.get::<_, String>("landing_policy")?)
-                .map_err(map_parse_error)?,
+            source,
+            landing_policy,
             replacement: row
                 .get::<_, Option<String>>("replacement_json")?
                 .map(|value| {
@@ -4189,18 +7180,1035 @@ pub mod sqlite {
             "CREATE TABLE IF NOT EXISTS iq_sqlite_sequence_init(id INTEGER PRIMARY KEY AUTOINCREMENT);
              DROP TABLE iq_sqlite_sequence_init;",
         )?;
+        connection.execute_batch(SCHEMA4)?;
+        connection.execute_batch(REPOSITORY_POLICY_SCHEMA)?;
+        reserve_all_policy_physical_ownership(connection)?;
+        connection.execute_batch(COMPOSITION_SCHEMA4)?;
+        connection.execute_batch(LANDING_STATE_TRIGGERS)?;
+        connection.execute_batch(WORKSPACE_STATE_TRIGGERS)?;
+        crate::control_store::install_control_schema(connection)?;
+        connection.execute_batch(REGISTERED_REPOSITORY_TRIGGERS4)?;
+        #[cfg(debug_assertions)]
+        if std::env::var_os("IQ_TEST_SCHEMA_STOP_AFTER_OBJECTS").is_some() {
+            std::process::exit(86);
+        }
+        Ok(())
+    }
+
+    fn install_schema3_objects(connection: &Connection) -> Result<()> {
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS iq_sqlite_sequence_init(id INTEGER PRIMARY KEY AUTOINCREMENT);
+             DROP TABLE iq_sqlite_sequence_init;",
+        )?;
         connection.execute_batch(SCHEMA)?;
         connection.execute_batch(COMPOSITION_SCHEMA)?;
         connection.execute_batch(QUEUE_SOURCE_TRIGGERS)?;
         connection.execute_batch(LANDING_STATE_TRIGGERS)?;
         connection.execute_batch(WORKSPACE_STATE_TRIGGERS)?;
-        crate::control_store::install_control_schema(connection)?;
+        crate::control_store::install_schema3_control_identity(connection)?;
+        install_schema3_landing_projection(connection)?;
         connection.execute_batch(REGISTERED_REPOSITORY_TRIGGERS)?;
         #[cfg(debug_assertions)]
         if std::env::var_os("IQ_TEST_SCHEMA_STOP_AFTER_OBJECTS").is_some() {
             std::process::exit(86);
         }
         Ok(())
+    }
+
+    fn install_schema3_landing_projection(connection: &Connection) -> Result<()> {
+        let current: String = connection.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='queue_effort_projection_guard'",
+            [],
+            |row| row.get(0),
+        )?;
+        let legacy = current
+            .replacen(
+                "WHEN effort.state='landing_uncertain' THEN",
+                "WHEN effort.state IN ('landing','landing_uncertain') THEN",
+                1,
+            )
+            .replacen(
+                "AND json_extract(effort.state_json,'$.payload.resume.state')='landing_uncertain' THEN",
+                "AND json_extract(effort.state_json,'$.payload.resume.state') IN ('landing','landing_uncertain') THEN",
+                1,
+            );
+        if legacy == current {
+            anyhow::bail!("schema-3 landing projection template did not change");
+        }
+        connection.execute_batch("DROP TRIGGER queue_effort_projection_guard")?;
+        connection.execute_batch(&legacy)?;
+        Ok(())
+    }
+
+    pub(crate) fn reserve_policy_physical_ownership(
+        connection: &Connection,
+        repo_key: &str,
+        policy: &crate::repository_policy::RepositoryPolicy,
+    ) -> Result<()> {
+        for (repository, role, ordinal) in policy.physical_repositories() {
+            let identity_key = repository.physical_identity_key()?;
+            let repository_json = serde_json::to_string(repository)?;
+            let existing = connection
+                .query_row(
+                    "SELECT repo_key,role,ordinal,repository_json FROM physical_repository_ownership WHERE identity_key=?1",
+                    [&identity_key],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, usize>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            match existing {
+                Some(existing)
+                    if existing
+                        == (
+                            repo_key.to_string(),
+                            role.to_string(),
+                            ordinal,
+                            repository_json.clone(),
+                        ) => {}
+                Some((owner, owner_role, _, _)) => anyhow::bail!(
+                    "physical repository is already reserved as {owner_role} by repository {owner}"
+                ),
+                None => {
+                    connection.execute(
+                        "INSERT INTO physical_repository_ownership(identity_key,repo_key,role,ordinal,repository_json,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+                        params![identity_key, repo_key, role, ordinal, repository_json, now()],
+                    )?;
+                }
+            }
+        }
+        let expected = policy.physical_repositories().len();
+        let actual: usize = connection.query_row(
+            "SELECT COUNT(*) FROM physical_repository_ownership WHERE repo_key=?1",
+            [repo_key],
+            |row| row.get(0),
+        )?;
+        if actual != expected {
+            anyhow::bail!("repository physical ownership inventory differs from policy");
+        }
+        Ok(())
+    }
+
+    fn reserve_all_policy_physical_ownership(connection: &Connection) -> Result<()> {
+        let mut statement = connection.prepare(
+            "SELECT repo_key,operation_state_json,canonical_repository_json,target_branch,integration_policy,replication_policy_json FROM repository_policies ORDER BY repo_key",
+        )?;
+        let policies = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        for (repo_key, operation, canonical, target, integration, replication) in policies {
+            let policy = crate::repository_policy::RepositoryPolicy {
+                operation_state: serde_json::from_str(&operation)?,
+                canonical_repository: serde_json::from_str(&canonical)?,
+                target_branch: target,
+                integration_policy: match integration.as_str() {
+                    "direct" => crate::repository_policy::IntegrationPolicy::Direct,
+                    "merge_request_required" => {
+                        crate::repository_policy::IntegrationPolicy::MergeRequestRequired
+                    }
+                    _ => anyhow::bail!("stored repository integration policy is invalid"),
+                },
+                replication_policy: serde_json::from_str(&replication)?,
+            }
+            .validate()?;
+            reserve_policy_physical_ownership(connection, &repo_key, &policy)?;
+        }
+        Ok(())
+    }
+
+    fn legacy_transport_matches(
+        legacy: &str,
+        repository: &crate::repository_policy::GitRepository,
+        fetch: bool,
+    ) -> bool {
+        match repository {
+            crate::repository_policy::GitRepository::Accessible {
+                fetch_url,
+                push_url,
+                ..
+            } => legacy == if fetch { fetch_url } else { push_url },
+            crate::repository_policy::GitRepository::LocalBare { path, .. } => {
+                let mut expected = b"file://".to_vec();
+                expected.extend_from_slice(path.as_os_str().as_bytes());
+                legacy.as_bytes() == path.as_os_str().as_bytes() || legacy.as_bytes() == expected
+            }
+        }
+    }
+
+    fn validate_migration_workspace_identity(workspace: &WorkspaceIdentity) -> Result<()> {
+        if !Path::new(&workspace.path).is_absolute() {
+            anyhow::bail!("migration workspace path must be absolute");
+        }
+        crate::control_domain::require_exact_text(
+            &workspace.rift_id,
+            "migration workspace Rift ID",
+        )?;
+        crate::control_domain::require_exact_text(
+            &workspace.source_rift_id,
+            "migration workspace source Rift ID",
+        )?;
+        Ok(())
+    }
+
+    fn create_schema3_backup(
+        path: &Path,
+        database_id: &str,
+        members: &[Schema3BackupMember],
+        source_digest: &str,
+        operation_id: &str,
+    ) -> Result<PathBuf> {
+        if schema3_source_family(path)? != members
+            || schema3_source_digest(members)? != source_digest
+        {
+            anyhow::bail!("schema-3 source family changed before backup publication");
+        }
+        let root = schema3_backup_root(path)?;
+        let manifest = Schema3BackupManifest {
+            version: 2,
+            database_id: database_id.to_string(),
+            source_digest: source_digest.to_string(),
+            operation_id: operation_id.to_string(),
+            members: members.to_vec(),
+        };
+        if root.exists() {
+            let existing = validate_schema3_backup_root(&root, database_id, None)
+                .context("pre-existing schema-3 backup authority is not owned by IQ")?;
+            let existing_manifest: Schema3BackupManifest =
+                serde_json::from_slice(&fs::read(root.join("manifest.json"))?)?;
+            if existing_manifest.source_digest == source_digest {
+                return Ok(existing);
+            }
+        }
+
+        let temporary = PrivateBackupDirectory::new(path, &manifest)?;
+        for member in members {
+            copy_database_file(
+                &database_family_member(path, &member.suffix),
+                &backup_family_member(&temporary.path, &member.suffix)?,
+            )?;
+        }
+        let copied = backup_family_members(&temporary.path, members)?;
+        if copied
+            .iter()
+            .map(|member| (&member.suffix, member.length, &member.sha256))
+            .ne(members
+                .iter()
+                .map(|member| (&member.suffix, member.length, &member.sha256)))
+        {
+            anyhow::bail!("private schema-3 backup differs from exact source bytes");
+        }
+        let backup_database = backup_family_member(&temporary.path, "")?;
+        let backup = open_immutable_database(&backup_database)?;
+        if validate_schema3_identity(&backup)? != database_id {
+            anyhow::bail!("private schema-3 backup changed database identity");
+        }
+        drop(backup);
+        let manifest_path = temporary.path.join("manifest.json");
+        let mut manifest_file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&manifest_path)?;
+        serde_json::to_writer(&mut manifest_file, &manifest)?;
+        manifest_file.write_all(b"\n")?;
+        manifest_file.sync_all()?;
+        File::open(&temporary.path)?.sync_all()?;
+
+        let stale = if root.exists() {
+            let mut name = root
+                .file_name()
+                .context("schema-3 backup root has no file name")?
+                .to_os_string();
+            name.push(format!(".stale-{}", Uuid::new_v4()));
+            let stale = root.with_file_name(name);
+            fs::rename(&root, &stale).context("quarantine stale schema-3 backup")?;
+            File::open(root.parent().context("schema-3 backup has no parent")?)?.sync_all()?;
+            Some(stale)
+        } else {
+            None
+        };
+        if let Err(error) = publish_database_noreplace(&temporary.path, &root) {
+            if let Some(stale) = &stale {
+                if !root.exists() {
+                    let _ = fs::rename(stale, &root);
+                }
+            }
+            return Err(error).context("publish exact schema-3 backup authority");
+        }
+        File::open(root.parent().context("schema-3 backup has no parent")?)?.sync_all()?;
+        let published =
+            validate_schema3_backup_root(&root, database_id, Some(&manifest.source_digest))?;
+        if let Some(stale) = stale {
+            let stale_directory =
+                crate::secure_fs::DirectoryHandle::open(&stale, "stale schema-3 backup authority")?;
+            let stale_identity = stale_directory.directory().metadata()?;
+            validate_schema3_backup_root(&stale, database_id, None)
+                .context("quarantined schema-3 backup lost ownership proof")?;
+            let live_identity = fs::symlink_metadata(&stale)?;
+            if (stale_identity.dev(), stale_identity.ino())
+                != (live_identity.dev(), live_identity.ino())
+            {
+                anyhow::bail!("quarantined schema-3 backup changed during validation");
+            }
+            stale_directory.remove("stale schema-3 backup authority")?;
+        }
+        Ok(published)
+    }
+
+    fn schema3_backup_root(path: &Path) -> Result<PathBuf> {
+        let file_name = path
+            .file_name()
+            .context("schema-3 database path has no file name")?;
+        let mut backup_name = file_name.to_os_string();
+        backup_name.push(".schema3-backup-authority");
+        Ok(path.with_file_name(backup_name))
+    }
+
+    fn validate_schema3_backup(
+        source_path: &Path,
+        database_id: &str,
+        expected_source_digest: Option<&str>,
+    ) -> Result<PathBuf> {
+        let root = schema3_backup_root(source_path)?;
+        validate_schema3_backup_root(&root, database_id, expected_source_digest)
+    }
+
+    fn validate_schema3_backup_root(
+        root: &Path,
+        database_id: &str,
+        expected_source_digest: Option<&str>,
+    ) -> Result<PathBuf> {
+        let metadata = fs::symlink_metadata(root)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            anyhow::bail!("schema-3 backup authority is not a real directory");
+        }
+        let manifest_path = root.join("manifest.json");
+        let manifest_metadata = fs::symlink_metadata(&manifest_path)?;
+        if manifest_metadata.file_type().is_symlink()
+            || !manifest_metadata.is_file()
+            || manifest_metadata.len() > 64 * 1024
+        {
+            anyhow::bail!("schema-3 backup manifest is invalid");
+        }
+        let manifest: Schema3BackupManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+        if manifest.version != 2
+            || manifest.database_id != database_id
+            || Uuid::parse_str(&manifest.operation_id).map_or(true, |operation| {
+                operation.to_string() != manifest.operation_id
+            })
+        {
+            anyhow::bail!("schema-3 backup manifest identity is invalid");
+        }
+        let ownership = read_migration_ownership_manifest(root)?;
+        if ownership
+            != (MigrationOwnershipManifest {
+                version: 1,
+                database_id: manifest.database_id.clone(),
+                source_digest: manifest.source_digest.clone(),
+                operation_id: manifest.operation_id.clone(),
+            })
+        {
+            anyhow::bail!("schema-3 backup ownership manifest is inconsistent");
+        }
+        if expected_source_digest.is_some_and(|expected| expected != manifest.source_digest) {
+            anyhow::bail!("schema-3 backup source digest is stale");
+        }
+        if schema3_source_digest(&manifest.members)? != manifest.source_digest {
+            anyhow::bail!("schema-3 backup manifest digest is inconsistent");
+        }
+        let copied = backup_family_members(root, &manifest.members)?;
+        if copied
+            .iter()
+            .map(|member| (&member.suffix, member.length, &member.sha256))
+            .ne(manifest
+                .members
+                .iter()
+                .map(|member| (&member.suffix, member.length, &member.sha256)))
+        {
+            anyhow::bail!("schema-3 backup bytes differ from its source digest");
+        }
+        let expected_names = manifest
+            .members
+            .iter()
+            .map(|member| {
+                backup_family_member(root, &member.suffix).map(|path| {
+                    path.file_name()
+                        .expect("backup family member has a file name")
+                        .to_os_string()
+                })
+            })
+            .chain([
+                Ok(OsString::from("manifest.json")),
+                Ok(OsString::from("ownership.json")),
+            ])
+            .collect::<Result<std::collections::BTreeSet<_>>>()?;
+        let actual_names = fs::read_dir(root)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<std::result::Result<std::collections::BTreeSet<_>, _>>()?;
+        if actual_names != expected_names {
+            anyhow::bail!("schema-3 backup family contains unexpected members");
+        }
+        let database = backup_family_member(root, "")?;
+        let connection = open_immutable_database(&database)?;
+        if validate_schema3_identity(&connection)? != database_id {
+            anyhow::bail!("schema-3 backup database identity is inconsistent");
+        }
+        drop(connection);
+        sync_database_file_and_parent(&database)?;
+        Ok(database)
+    }
+
+    fn schema3_source_family(path: &Path) -> Result<Vec<Schema3BackupMember>> {
+        let mut members = ["", "-journal", "-wal", "-shm"]
+            .into_iter()
+            .filter_map(|suffix| {
+                let member = database_family_member(path, suffix);
+                match fs::symlink_metadata(&member) {
+                    Ok(_) => Some(backup_member_identity(&member, suffix)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => Some(Err(error.into())),
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        members.sort_by(|left, right| left.suffix.cmp(&right.suffix));
+        if members
+            .first()
+            .is_none_or(|member| !member.suffix.is_empty())
+        {
+            anyhow::bail!("schema-3 source family has no primary database");
+        }
+        Ok(members)
+    }
+
+    fn backup_family_members(
+        root: &Path,
+        expected: &[Schema3BackupMember],
+    ) -> Result<Vec<Schema3BackupMember>> {
+        expected
+            .iter()
+            .map(|member| {
+                backup_member_identity(&backup_family_member(root, &member.suffix)?, &member.suffix)
+            })
+            .collect()
+    }
+
+    fn backup_member_identity(path: &Path, suffix: &str) -> Result<Schema3BackupMember> {
+        if !matches!(suffix, "" | "-journal" | "-wal" | "-shm") {
+            anyhow::bail!("schema-3 backup manifest has an invalid family suffix");
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        let before = file.metadata()?;
+        if !before.is_file() {
+            anyhow::bail!("schema-3 database family member is not a regular file");
+        }
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        let after = file.metadata()?;
+        if (
+            before.dev(),
+            before.ino(),
+            before.len(),
+            before.mtime(),
+            before.mtime_nsec(),
+        ) != (
+            after.dev(),
+            after.ino(),
+            after.len(),
+            after.mtime(),
+            after.mtime_nsec(),
+        ) || (before.ctime(), before.ctime_nsec()) != (after.ctime(), after.ctime_nsec())
+        {
+            anyhow::bail!("schema-3 database family changed while computing its digest");
+        }
+        Ok(Schema3BackupMember {
+            suffix: suffix.to_string(),
+            length: before.len(),
+            mode: before.mode(),
+            uid: before.uid(),
+            gid: before.gid(),
+            device: before.dev(),
+            inode: before.ino(),
+            modified_seconds: before.mtime(),
+            modified_nanoseconds: before.mtime_nsec(),
+            changed_seconds: before.ctime(),
+            changed_nanoseconds: before.ctime_nsec(),
+            sha256: format!("{:x}", digest.finalize()),
+        })
+    }
+
+    fn schema3_source_digest(members: &[Schema3BackupMember]) -> Result<String> {
+        if members.is_empty()
+            || members
+                .windows(2)
+                .any(|pair| pair[0].suffix >= pair[1].suffix)
+        {
+            anyhow::bail!("schema-3 source family manifest is not canonical");
+        }
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(members)?)
+        ))
+    }
+
+    fn database_family_member(path: &Path, suffix: &str) -> PathBuf {
+        let mut member = path.as_os_str().to_os_string();
+        member.push(suffix);
+        PathBuf::from(member)
+    }
+
+    fn backup_family_member(root: &Path, suffix: &str) -> Result<PathBuf> {
+        if !matches!(suffix, "" | "-journal" | "-wal" | "-shm") {
+            anyhow::bail!("schema-3 backup manifest has an invalid family suffix");
+        }
+        Ok(root.join(format!("database{suffix}")))
+    }
+
+    fn open_immutable_database(path: &Path) -> Result<Connection> {
+        let mut uri = String::from("file:");
+        for byte in path.as_os_str().as_bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                    uri.push(*byte as char)
+                }
+                _ => uri.push_str(&format!("%{byte:02X}")),
+            }
+        }
+        uri.push_str("?immutable=1");
+        let connection = Connection::open_with_flags(
+            uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW
+                | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .context("open immutable schema-3 backup")?;
+        configure_connection(&connection)?;
+        Ok(connection)
+    }
+
+    fn copy_database_file(source_path: &Path, destination_path: &Path) -> Result<()> {
+        let mut source = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOATIME)
+            .open(source_path)?;
+        let source_metadata = source.metadata()?;
+        let mut destination = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(destination_path)
+            .with_context(|| format!("create database copy {}", destination_path.display()))?;
+        std::io::copy(&mut source, &mut destination)?;
+        destination.sync_all()?;
+        let after = source.metadata()?;
+        if !source_metadata.is_file()
+            || source_metadata.len() != destination.metadata()?.len()
+            || (source_metadata.dev(), source_metadata.ino()) != (after.dev(), after.ino())
+            || source_metadata.len() != after.len()
+            || source_metadata.mtime() != after.mtime()
+            || source_metadata.mtime_nsec() != after.mtime_nsec()
+        {
+            anyhow::bail!("database changed while creating private copy");
+        }
+        Ok(())
+    }
+
+    fn validate_stored_object_ids(
+        connection: &Connection,
+        object_formats: &std::collections::BTreeMap<String, crate::git_object::GitObjectFormat>,
+        has_legacy_queue_head: bool,
+    ) -> Result<()> {
+        let queue_head = if has_legacy_queue_head {
+            "UNION ALL SELECT repo_key,'queue head',current_head_sha FROM queue_items"
+        } else {
+            ""
+        };
+        let oid_query = format!(
+            "SELECT repo_key,label,oid FROM (
+             SELECT repo_key,'registered repository source' AS label,source_sha AS oid FROM registered_repositories
+             UNION ALL SELECT repo_key,'provisioning source',source_sha FROM repository_provisioning_intents
+             UNION ALL SELECT repo_key,'development workspace base',base_sha FROM development_workspaces
+             UNION ALL SELECT repo_key,'local submission base',base_sha FROM local_submissions
+             UNION ALL SELECT repo_key,'local submission commit',commit_sha FROM local_submissions
+             {queue_head}
+             UNION ALL SELECT repo_key,'queue target',target_sha FROM queue_items
+             UNION ALL SELECT repo_key,'queue source',source_sha FROM queue_items
+             UNION ALL SELECT repo_key,'queue landed commit',landed_commit_sha FROM queue_items
+             UNION ALL SELECT item.repo_key,'attempt source head',attempt.source_head_sha FROM integration_attempts attempt JOIN queue_items item ON item.id=attempt.item_id
+             UNION ALL SELECT item.repo_key,'attempt target base',attempt.target_base_sha FROM integration_attempts attempt JOIN queue_items item ON item.id=attempt.item_id
+             UNION ALL SELECT item.repo_key,'attempt merge commit',attempt.merge_commit_sha FROM integration_attempts attempt JOIN queue_items item ON item.id=attempt.item_id
+             UNION ALL SELECT item.repo_key,'attempt validated commit',attempt.validated_commit_sha FROM integration_attempts attempt JOIN queue_items item ON item.id=attempt.item_id
+             UNION ALL SELECT item.repo_key,'attempt landed commit',attempt.landed_commit_sha FROM integration_attempts attempt JOIN queue_items item ON item.id=attempt.item_id
+             UNION ALL SELECT item.repo_key,'validation target base',invocation.target_base_sha FROM validation_invocations invocation JOIN integration_attempts attempt ON attempt.id=invocation.attempt_id JOIN queue_items item ON item.id=attempt.item_id
+             UNION ALL SELECT item.repo_key,'validation candidate',invocation.candidate_sha FROM validation_invocations invocation JOIN integration_attempts attempt ON attempt.id=invocation.attempt_id JOIN queue_items item ON item.id=attempt.item_id
+             UNION ALL SELECT item.repo_key,'validation result',invocation.validated_commit_sha FROM validation_invocations invocation JOIN integration_attempts attempt ON attempt.id=invocation.attempt_id JOIN queue_items item ON item.id=attempt.item_id
+             UNION ALL SELECT item.repo_key,'effort target',effort.target_sha FROM integration_efforts effort JOIN queue_items item ON item.id=effort.item_id
+             UNION ALL SELECT item.repo_key,'effort source',effort.source_sha FROM integration_efforts effort JOIN queue_items item ON item.id=effort.item_id
+             UNION ALL SELECT item.repo_key,'candidate evidence',evidence.candidate_sha FROM candidate_evidence evidence JOIN integration_efforts effort ON effort.id=evidence.effort_id JOIN queue_items item ON item.id=effort.item_id
+             ) WHERE oid IS NOT NULL"
+        );
+        let mut statement = connection.prepare(&oid_query)?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (repo_key, label, oid) = row?;
+            object_formats
+                .get(&repo_key)
+                .with_context(|| format!("stored {label} has no repository object-format policy"))?
+                .require_oid(&oid, &label)?;
+        }
+
+        let mut checkouts = connection.prepare(
+            "SELECT repo_key,checkout_json FROM registered_repositories ORDER BY repo_key",
+        )?;
+        for row in checkouts.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (repo_key, checkout) = row?;
+            let checkout: CheckoutReconciliationState = serde_json::from_str(&checkout)?;
+            object_formats
+                .get(&repo_key)
+                .context("registered checkout has no repository object-format policy")?
+                .require_oid(checkout.target_sha(), "registered checkout target")?;
+        }
+
+        let mut item_states = connection
+            .prepare("SELECT repo_key,landing_state_json FROM queue_items ORDER BY id")?;
+        for row in item_states.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (repo_key, state) = row?;
+            let object_format = object_formats
+                .get(&repo_key)
+                .context("queue landing state has no repository object-format policy")?;
+            match serde_json::from_str::<LandingState>(&state)? {
+                LandingState::Ready => {}
+                LandingState::Uncertain {
+                    candidate_sha,
+                    expected_target_sha,
+                } => {
+                    object_format.require_oid(&candidate_sha, "uncertain queue candidate")?;
+                    object_format.require_oid(&expected_target_sha, "uncertain queue target")?;
+                }
+                LandingState::Landed {
+                    candidate_sha,
+                    commit_sha,
+                } => {
+                    object_format.require_oid(&candidate_sha, "landed queue candidate")?;
+                    object_format.require_oid(&commit_sha, "landed queue commit")?;
+                }
+            }
+        }
+
+        let mut attempts = connection.prepare(
+            "SELECT item.repo_key,attempt.moved_base_json FROM integration_attempts attempt JOIN queue_items item ON item.id=attempt.item_id ORDER BY attempt.id",
+        )?;
+        for row in attempts.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (repo_key, moved_base) = row?;
+            let object_format = object_formats
+                .get(&repo_key)
+                .context("moved-base state has no repository object-format policy")?;
+            match serde_json::from_str::<MovedBaseState>(&moved_base)? {
+                MovedBaseState::None => {}
+                MovedBaseState::Pending {
+                    target_sha,
+                    source_sha,
+                } => {
+                    object_format.require_oid(&target_sha, "moved-base target")?;
+                    object_format.require_oid(&source_sha, "moved-base source")?;
+                }
+                MovedBaseState::Applied {
+                    target_sha,
+                    source_sha,
+                    candidate_sha,
+                } => {
+                    object_format.require_oid(&target_sha, "applied moved-base target")?;
+                    object_format.require_oid(&source_sha, "applied moved-base source")?;
+                    object_format.require_oid(&candidate_sha, "applied moved-base candidate")?;
+                }
+            }
+        }
+
+        let mut efforts = connection.prepare(
+            "SELECT item.repo_key,effort.state,effort.state_json FROM integration_efforts effort JOIN queue_items item ON item.id=effort.item_id ORDER BY effort.id",
+        )?;
+        for row in efforts.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            let (repo_key, state_name, state) = row?;
+            if has_legacy_queue_head
+                && matches!(state_name.as_str(), "agent_launching" | "agent_running")
+            {
+                continue;
+            }
+            serde_json::from_str::<crate::control_domain::IntegrationEffortState>(&state)?
+                .validate_object_ids(
+                    *object_formats
+                        .get(&repo_key)
+                        .context("effort state has no repository object-format policy")?,
+                )?;
+        }
+        Ok(())
+    }
+
+    fn validate_schema4_contents(connection: &Connection) -> Result<()> {
+        let invalid: i64 = connection.query_row(
+            "SELECT
+             (SELECT COUNT(*) FROM registered_repositories repository LEFT JOIN repository_policies policy ON policy.repo_key=repository.repo_key WHERE policy.repo_key IS NULL)+
+             (SELECT COUNT(*) FROM repository_provisioning_intents intent LEFT JOIN repository_policies policy ON policy.repo_key=intent.repo_key WHERE policy.repo_key IS NULL)+
+             (SELECT COUNT(*) FROM repository_policies policy LEFT JOIN registered_repositories repository ON repository.repo_key=policy.repo_key LEFT JOIN repository_provisioning_intents intent ON intent.repo_key=policy.repo_key WHERE (repository.repo_key IS NULL AND intent.repo_key IS NULL) OR (repository.repo_key IS NOT NULL AND intent.repo_key IS NOT NULL))+
+             (SELECT COUNT(*) FROM queue_items item LEFT JOIN queue_admissions admission ON admission.item_id=item.id WHERE admission.item_id IS NULL)+
+             (SELECT COUNT(*) FROM queue_admissions admission LEFT JOIN queue_items item ON item.id=admission.item_id WHERE item.id IS NULL)+
+             (SELECT COUNT(*) FROM queue_admissions admission JOIN queue_items item ON item.id=admission.item_id WHERE admission.kind='historical_merge_request' AND item.status NOT IN ('integrated','cancelled'))",
+            [],
+            |row| row.get(0),
+        )?;
+        if invalid != 0 {
+            anyhow::bail!("schema-4 authority content is inconsistent");
+        }
+        let invalid_supersession: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM replication_debt older LEFT JOIN replication_debt newer ON newer.id=older.superseded_by_id WHERE older.outcome IN ('superseded_cleanup_pending','superseded') AND (newer.id IS NULL OR newer.destination_key!=older.destination_key OR newer.target_branch!=older.target_branch OR newer.sequence<=older.sequence OR newer.outcome NOT IN ('succeeded','superseded'))",
+            [],
+            |row| row.get(0),
+        )?;
+        if invalid_supersession != 0 {
+            anyhow::bail!("replication supersession authority is inconsistent");
+        }
+        let object_formats = {
+            let mut statement = connection.prepare(
+                "SELECT repo_key,canonical_repository_json FROM repository_policies ORDER BY repo_key",
+            )?;
+            let formats = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .map(|row| {
+                    let (repo_key, repository) = row?;
+                    Ok((
+                        repo_key,
+                        serde_json::from_str::<crate::repository_policy::GitRepository>(
+                            &repository,
+                        )?
+                        .object_format(),
+                    ))
+                })
+                .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+            formats
+        };
+        validate_stored_object_ids(connection, &object_formats, false)?;
+        let mut schema4_oids = connection.prepare(
+            "SELECT repo_key,label,oid FROM (
+             SELECT item.repo_key,'admission head' AS label,admission.head_sha AS oid FROM queue_admissions admission JOIN queue_items item ON item.id=admission.item_id
+             UNION ALL SELECT item.repo_key,'admission base',admission.base_sha FROM queue_admissions admission JOIN queue_items item ON item.id=admission.item_id
+             UNION ALL SELECT item.repo_key,'provider admitted base',guarantee.admitted_base_sha FROM provider_landing_guarantees guarantee JOIN queue_items item ON item.id=guarantee.item_id
+             UNION ALL SELECT item.repo_key,'provider admitted head',guarantee.admitted_head_sha FROM provider_landing_guarantees guarantee JOIN queue_items item ON item.id=guarantee.item_id
+             UNION ALL SELECT item.repo_key,'provider validated target',guarantee.validated_target_sha FROM provider_landing_guarantees guarantee JOIN queue_items item ON item.id=guarantee.item_id
+             UNION ALL SELECT item.repo_key,'provider validated candidate',guarantee.validated_candidate_sha FROM provider_landing_guarantees guarantee JOIN queue_items item ON item.id=guarantee.item_id
+             UNION ALL SELECT item.repo_key,'provider validated tree',guarantee.validated_tree_sha FROM provider_landing_guarantees guarantee JOIN queue_items item ON item.id=guarantee.item_id
+             UNION ALL SELECT item.repo_key,'provider landed commit',guarantee.landed_commit_sha FROM provider_landing_guarantees guarantee JOIN queue_items item ON item.id=guarantee.item_id
+             UNION ALL SELECT item.repo_key,'provider landed tree',guarantee.landed_tree_sha FROM provider_landing_guarantees guarantee JOIN queue_items item ON item.id=guarantee.item_id
+             UNION ALL SELECT item.repo_key,'provider first parent',guarantee.first_parent_sha FROM provider_landing_guarantees guarantee JOIN queue_items item ON item.id=guarantee.item_id
+              UNION ALL SELECT debt.repo_key,'replication canonical source',debt.canonical_source_sha FROM replication_debt debt
+              UNION ALL SELECT debt.repo_key,'replication expected destination',debt.expected_destination_sha FROM replication_debt debt
+              UNION ALL SELECT debt.repo_key,'private-ref cleanup object',debt.expected_sha FROM private_ref_cleanup_debt debt
+              ) WHERE oid IS NOT NULL",
+        )?;
+        for row in schema4_oids.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            let (repo_key, label, oid) = row?;
+            object_formats
+                .get(&repo_key)
+                .with_context(|| format!("stored {label} has no repository object-format policy"))?
+                .require_oid(&oid, &label)?;
+        }
+        let mut private_refs = connection.prepare(
+            "SELECT repo_key,kind,owner_id,ref_name,expected_sha FROM private_ref_cleanup_debt ORDER BY repo_key,ref_name",
+        )?;
+        for row in private_refs.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })? {
+            let (repo_key, kind, owner_id, ref_name, expected_sha) = row?;
+            let expected_ref = match kind.as_str() {
+                "repository_target" if owner_id == expected_sha => {
+                    format!("refs/iq/repository-targets/{repo_key}/{expected_sha}")
+                }
+                "landing" if !owner_id.is_empty() && !owner_id.contains('/') => {
+                    format!("refs/iq/landings/{owner_id}")
+                }
+                _ => anyhow::bail!("private-ref cleanup identity is inconsistent"),
+            };
+            if ref_name != expected_ref {
+                anyhow::bail!("private-ref cleanup name differs from durable identity");
+            }
+        }
+        let mut repository_bindings = connection.prepare(
+            "SELECT repository.owned_root_path,repository.git_binding_json,policy.canonical_repository_json FROM registered_repositories repository JOIN repository_policies policy ON policy.repo_key=repository.repo_key ORDER BY repository.repo_key",
+        )?;
+        for binding in repository_bindings.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            let (path, binding, repository) = binding?;
+            let path = PathBuf::from(OsString::from_vec(path));
+            let binding: crate::git_command::RepositoryBinding = serde_json::from_str(&binding)?;
+            let object_format =
+                serde_json::from_str::<crate::repository_policy::GitRepository>(&repository)?
+                    .object_format();
+            if binding.top_level != path || binding.object_format != object_format {
+                anyhow::bail!(
+                    "registered repository Git binding differs from path or object format authority"
+                );
+            }
+            crate::git_command::register_binding(&binding)?;
+        }
+        let invalid_workspace_bindings: i64 = connection.query_row(
+            "SELECT
+             (SELECT COUNT(*) FROM development_workspaces workspace LEFT JOIN workspace_git_bindings binding ON binding.owner_kind='development' AND binding.owner_id=workspace.id WHERE workspace.rift_id IS NOT NULL AND workspace.status!='removed' AND (binding.owner_id IS NULL OR binding.top_level!=workspace.path))+
+             (SELECT COUNT(*) FROM queue_items item LEFT JOIN workspace_git_bindings binding ON binding.owner_kind='integration' AND binding.owner_id=item.id WHERE item.integration_workspace_rift_id IS NOT NULL AND (binding.owner_id IS NULL OR binding.top_level!=CAST(item.integration_workspace_path AS BLOB)))+
+             (SELECT COUNT(*) FROM workspace_git_bindings binding LEFT JOIN development_workspaces workspace ON binding.owner_kind='development' AND workspace.id=binding.owner_id LEFT JOIN queue_items item ON binding.owner_kind='integration' AND item.id=binding.owner_id WHERE (binding.owner_kind='development' AND (workspace.id IS NULL OR workspace.rift_id IS NULL OR workspace.status='removed')) OR (binding.owner_kind='integration' AND (item.id IS NULL OR item.integration_workspace_rift_id IS NULL)))",
+            [],
+            |row| row.get(0),
+        )?;
+        if invalid_workspace_bindings != 0 {
+            anyhow::bail!("workspace Git binding ownership is inconsistent");
+        }
+        let mut workspace_bindings = connection.prepare(
+            "SELECT binding.top_level,binding.binding_json,policy.canonical_repository_json,workspace.base_sha,item.target_sha,item.source_sha,item.landed_commit_sha FROM workspace_git_bindings binding LEFT JOIN development_workspaces workspace ON binding.owner_kind='development' AND workspace.id=binding.owner_id LEFT JOIN queue_items item ON binding.owner_kind='integration' AND item.id=binding.owner_id JOIN repository_policies policy ON policy.repo_key=COALESCE(workspace.repo_key,item.repo_key) ORDER BY binding.owner_kind,binding.owner_id",
+        )?;
+        for binding in workspace_bindings.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })? {
+            let (path, binding, repository, base, target, source, landed) = binding?;
+            let path = PathBuf::from(OsString::from_vec(path));
+            let binding: crate::git_command::RepositoryBinding = serde_json::from_str(&binding)?;
+            let object_format =
+                serde_json::from_str::<crate::repository_policy::GitRepository>(&repository)?
+                    .object_format();
+            if binding.top_level != path || binding.object_format != object_format {
+                anyhow::bail!("workspace Git binding differs from path or object format authority");
+            }
+            for (value, label) in [
+                (base, "development workspace base"),
+                (target, "integration workspace target"),
+                (source, "integration workspace source"),
+                (landed, "integration workspace landed commit"),
+            ] {
+                if let Some(value) = value {
+                    object_format.require_oid(&value, label)?;
+                }
+            }
+            crate::git_command::register_binding(&binding)?;
+        }
+        let mut statement = connection.prepare(
+            "SELECT repo_key,operation_state_json,canonical_repository_json,canonical_ownership_key,target_branch,integration_policy,replication_policy_json FROM repository_policies",
+        )?;
+        let policies = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?;
+        for policy in policies {
+            let (repo_key, operation, canonical, ownership_key, target, integration, replication) =
+                policy?;
+            let policy = crate::repository_policy::RepositoryPolicy {
+                operation_state: serde_json::from_str(&operation)?,
+                canonical_repository: serde_json::from_str(&canonical)?,
+                target_branch: target,
+                integration_policy: match integration.as_str() {
+                    "direct" => crate::repository_policy::IntegrationPolicy::Direct,
+                    "merge_request_required" => {
+                        crate::repository_policy::IntegrationPolicy::MergeRequestRequired
+                    }
+                    _ => anyhow::bail!("stored repository integration policy is invalid"),
+                },
+                replication_policy: serde_json::from_str(&replication)?,
+            }
+            .validate()?;
+            if policy.canonical_repository.canonical_ownership_key()? != ownership_key {
+                anyhow::bail!("stored canonical repository ownership key is inconsistent");
+            }
+            if matches!(
+                policy.operation_state,
+                crate::repository_policy::OperationState::Disabled
+            ) {
+                let active: i64 = connection.query_row(
+                    "SELECT
+                     (SELECT COUNT(*) FROM queue_items WHERE repo_key=?1 AND status NOT IN ('integrated','cancelled'))+
+                     (SELECT COUNT(*) FROM development_workspaces WHERE repo_key=?1 AND status!='removed')+
+                     (SELECT COUNT(*) FROM replication_debt WHERE repo_key=?1 AND outcome NOT IN ('succeeded','superseded'))",
+                    [&repo_key],
+                    |row| row.get(0),
+                )?;
+                if active != 0 {
+                    anyhow::bail!("disabled repository retains nonterminal obligations");
+                }
+            }
+        }
+        let mut debts = connection.prepare(
+             "SELECT id,repo_key,destination_key,replica_json,operation,outcome FROM replication_debt ORDER BY id",
+        )?;
+        for debt in debts.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })? {
+            let (id, repo_key, destination_key, replica, operation, outcome) = debt?;
+            let replica: crate::repository_policy::GitRepository = serde_json::from_str(&replica)?;
+            if replica.clone().validate("stored replica")? != replica
+                || replica.destination_identity_key()? != destination_key
+            {
+                anyhow::bail!("replication debt {id} destination identity is inconsistent");
+            }
+            let validated =
+                SqliteQueue::validate_replication_binding(connection, &repo_key, &id, None)?;
+            if operation != "pin_source"
+                && !matches!(
+                    outcome.as_str(),
+                    "succeeded" | "superseded" | "superseded_cleanup_pending" | "applied"
+                )
+            {
+                let owned_root: Vec<u8> = connection.query_row(
+                    "SELECT owned_root_path FROM registered_repositories WHERE repo_key=?1",
+                    [&repo_key],
+                    |row| row.get(0),
+                )?;
+                let owned_root = PathBuf::from(OsString::from_vec(owned_root));
+                let preserved_ref = format!("refs/iq/replication/{id}");
+                let preserved = crate::git_command::output(
+                    &owned_root,
+                    ["rev-parse", "--verify", preserved_ref.as_str()],
+                )?;
+                if !preserved.status.success()
+                    || String::from_utf8(preserved.stdout)?.trim() != validated.canonical_source_sha
+                {
+                    anyhow::bail!("replication debt {id} source pin is missing or inconsistent");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_schema3_identity(connection: &Connection) -> Result<String> {
+        let expected = Connection::open_in_memory()?;
+        configure_connection(&expected)?;
+        expected.pragma_update(None, "foreign_keys", "ON")?;
+        install_schema3_objects(&expected)?;
+        let expected_objects = schema_objects(&expected)?;
+        let actual_objects = schema_objects(connection)?;
+        if expected_objects != actual_objects {
+            let differences = expected_objects
+                .keys()
+                .chain(actual_objects.keys())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .filter(|key| expected_objects.get(*key) != actual_objects.get(*key))
+                .map(|(object_type, name)| format!("{object_type}:{name}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "migration source is not the exact IQ schema 3; differing objects: {differences}"
+            );
+        }
+        let version: String = connection.query_row(
+            "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        if version != "3" {
+            anyhow::bail!("migration source schema must be 3");
+        }
+        let database_id: String = connection.query_row(
+            "SELECT value FROM queue_metadata WHERE key='database_id'",
+            [],
+            |row| row.get(0),
+        )?;
+        if database_id.is_empty() {
+            anyhow::bail!("migration source database ID must not be empty");
+        }
+        let integrity: String =
+            connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        let foreign_keys: i64 =
+            connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })?;
+        if integrity != "ok" || foreign_keys != 0 {
+            anyhow::bail!("migration source integrity validation failed");
+        }
+        validate_registered_repository_rows(connection)?;
+        crate::repository::validate_provisioning_rows(connection)?;
+        crate::control_store::validate_control_contents(connection)?;
+        Ok(database_id)
     }
 
     pub fn validate_existing_schema_identity(connection: &Connection) -> Result<String> {
@@ -4235,49 +8243,12 @@ pub mod sqlite {
         if foreign_keys != 0 || foreign_keys_enabled != 1 {
             return incompatible_local_state();
         }
-        let invalid: i64 = connection.query_row(
-            "SELECT
-             (SELECT COUNT(*) FROM registered_repositories WHERE target_branch NOT IN ('main','master') OR remote_name!='iq-target')+
-             (SELECT COUNT(*) FROM queue_items item LEFT JOIN registered_repositories repository ON repository.repo_key=item.repo_key WHERE repository.repo_key IS NULL)+
-             (SELECT COUNT(*) FROM registered_repositories repository WHERE
-                (SELECT COUNT(*) FROM workspace_roots root WHERE root.repo_key=repository.repo_key AND root.kind IN ('development','integration'))!=2)+
-             (SELECT COUNT(*) FROM registered_repositories repository
-                LEFT JOIN workspace_roots development ON development.repo_key=repository.repo_key AND development.kind='development'
-                LEFT JOIN workspace_roots integration ON integration.repo_key=repository.repo_key AND integration.kind='integration'
-                WHERE development.repo_key IS NULL OR integration.repo_key IS NULL
-                   OR development.root_path!=repository.development_root_path
-                   OR integration.root_path!=repository.integration_root_path
-                   OR development.source_path!=repository.owned_root_path
-                   OR integration.source_path!=repository.owned_root_path
-                   OR development.source_rift_id!=repository.root_rift_id
-                   OR integration.source_rift_id!=repository.root_rift_id
-                   OR development.registry_identity!=repository.registry_identity
-                   OR integration.registry_identity!=repository.registry_identity
-                   OR development.registry_device!=repository.registry_device
-                   OR integration.registry_device!=repository.registry_device
-                   OR development.registry_inode!=repository.registry_inode
-                   OR integration.registry_inode!=repository.registry_inode)+
-             (SELECT COUNT(*) FROM registered_repositories repository
-                LEFT JOIN repository_remote_owners owner ON owner.repo_key=repository.repo_key
-                WHERE owner.repo_key IS NULL OR owner.fetch_url!=repository.fetch_url
-                   OR owner.push_url!=repository.push_url OR owner.target_branch!=repository.target_branch)+
-             (SELECT COUNT(*) FROM repository_provisioning_intents intent
-                LEFT JOIN repository_remote_owners owner ON owner.repo_key=intent.repo_key
-                WHERE owner.repo_key IS NULL OR owner.fetch_url!=intent.fetch_url
-                   OR owner.push_url!=intent.push_url OR owner.target_branch!=intent.target_branch)+
-             (SELECT COUNT(*) FROM repository_remote_owners owner
-                LEFT JOIN registered_repositories repository ON repository.repo_key=owner.repo_key
-                LEFT JOIN repository_provisioning_intents intent ON intent.repo_key=owner.repo_key
-                WHERE (repository.repo_key IS NULL AND intent.repo_key IS NULL)
-                   OR (repository.repo_key IS NOT NULL AND intent.repo_key IS NOT NULL))", [], |row| row.get(0))?;
-        if invalid != 0 {
-            return incompatible_local_state();
-        }
-        let mut repository_keys = connection.prepare(
-            "SELECT repo_key FROM repository_remote_owners
-             UNION ALL SELECT repo_key FROM registered_repositories
-             UNION ALL SELECT repo_key FROM repository_provisioning_intents",
-        )?;
+        validate_schema4_contents(connection).map_err(|error| {
+            anyhow::anyhow!(
+                "IQ local state is incompatible; schema-4 content is invalid: {error:#}"
+            )
+        })?;
+        let mut repository_keys = connection.prepare("SELECT repo_key FROM repository_policies")?;
         let repository_keys = repository_keys
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -4287,17 +8258,64 @@ pub mod sqlite {
         {
             return incompatible_local_state();
         }
-        validate_registered_repository_rows(connection).or_else(|_| incompatible_local_state())?;
-        crate::repository::validate_provisioning_rows(connection)
-            .or_else(|_| incompatible_local_state())?;
-        crate::control_store::validate_control_contents(connection)
-            .or_else(|_| incompatible_local_state())?;
+        validate_registered_repository_rows(connection).map_err(|error| {
+            anyhow::anyhow!(
+                "IQ local state is incompatible; registered repository authority is invalid: {error:#}"
+            )
+        })?;
+        crate::repository::validate_provisioning_rows(connection).map_err(|error| {
+            anyhow::anyhow!(
+                "IQ local state is incompatible; provisioning authority is invalid: {error:#}"
+            )
+        })?;
+        crate::control_store::validate_control_contents(connection).map_err(|error| {
+            anyhow::anyhow!(
+                "IQ local state is incompatible; control authority is invalid: {error:#}"
+            )
+        })?;
         Ok(database_id)
     }
 
     fn validate_registered_repository_rows(connection: &Connection) -> Result<()> {
+        let has_policy: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='repository_policies')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_policy {
+            let mut statement = connection.prepare(
+                "SELECT repo_key,target_branch,remote_name,fetch_url,push_url,source_sha,checkout_json FROM registered_repositories",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })?;
+            for row in rows {
+                let (key, target, remote, fetch, push, source, checkout) = row?;
+                crate::repository::RepoKey::from_stored(key)?;
+                crate::repository::validate_target_branch(&target)?;
+                crate::git_object::GitObjectFormat::Sha1
+                    .require_oid(&source, "legacy registered source SHA")?;
+                if remote != crate::repository::INTERNAL_REMOTE_NAME
+                    || fetch.is_empty()
+                    || push.is_empty()
+                    || !serde_json::from_str::<CheckoutReconciliationState>(&checkout)?
+                        .is_ready_for(&source)
+                {
+                    anyhow::bail!("legacy registered repository authority is invalid");
+                }
+            }
+            return Ok(());
+        }
         let mut statement = connection.prepare(
-            "SELECT repo_key,owned_root_path,root_rift_id,registry_identity,generation,target_branch,source_sha,checkout_json,development_root_path,integration_root_path,remote_name,fetch_url,push_url FROM registered_repositories",
+            "SELECT repository.repo_key,repository.owned_root_path,repository.root_rift_id,repository.registry_identity,repository.generation,policy.target_branch,repository.source_sha,repository.checkout_json,repository.development_root_path,repository.integration_root_path,policy.canonical_repository_json FROM registered_repositories repository JOIN repository_policies policy ON policy.repo_key=repository.repo_key",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -4312,8 +8330,6 @@ pub mod sqlite {
                 row.get::<_, Vec<u8>>(8)?,
                 row.get::<_, Vec<u8>>(9)?,
                 row.get::<_, String>(10)?,
-                row.get::<_, String>(11)?,
-                row.get::<_, String>(12)?,
             ))
         })?;
         for row in rows {
@@ -4328,9 +8344,7 @@ pub mod sqlite {
                 checkout,
                 development,
                 integration,
-                remote_name,
-                fetch_url,
-                push_url,
+                canonical_repository,
             ) = row?;
             let owned_root = PathBuf::from(OsString::from_vec(owned_root));
             let development = PathBuf::from(OsString::from_vec(development));
@@ -4352,15 +8366,17 @@ pub mod sqlite {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric())
                 || generation < 0
-                || remote_name != crate::repository::INTERNAL_REMOTE_NAME
-                || fetch_url.is_empty()
-                || push_url.is_empty()
             {
                 anyhow::bail!("registered repository structural authority is invalid");
             }
             crate::repository::validate_target_branch(&target)?;
-            crate::control_domain::require_sha(&source_sha, "registered source SHA")?;
+            let object_format = serde_json::from_str::<crate::repository_policy::GitRepository>(
+                &canonical_repository,
+            )?
+            .object_format();
+            object_format.require_oid(&source_sha, "registered source SHA")?;
             let checkout: CheckoutReconciliationState = serde_json::from_str(&checkout)?;
+            object_format.require_oid(checkout.target_sha(), "registered checkout target")?;
             if matches!(checkout, CheckoutReconciliationState::Ready(_))
                 && !checkout.is_ready_for(&source_sha)
             {
@@ -4372,47 +8388,43 @@ pub mod sqlite {
 
     pub(crate) fn validate_schema_objects(connection: &Connection) -> Result<()> {
         let expected = Connection::open_in_memory()?;
+        configure_connection(&expected)?;
         expected.pragma_update(None, "foreign_keys", "ON")?;
         install_schema(&expected)?;
         let expected_objects = schema_objects(&expected)?;
         let actual_objects = schema_objects(connection)?;
         if actual_objects != expected_objects {
-            if let Some((_identity, _)) = expected_objects
+            if let Some((identity, _)) = expected_objects
                 .iter()
                 .find(|(identity, _)| !actual_objects.contains_key(*identity))
             {
-                return incompatible_local_state();
+                anyhow::bail!(
+                    "IQ local state is incompatible; missing schema object {} {}",
+                    identity.0,
+                    identity.1
+                );
             }
-            if let Some((_identity, _)) = actual_objects
+            if let Some((identity, _)) = actual_objects
                 .iter()
                 .find(|(identity, _)| !expected_objects.contains_key(*identity))
             {
-                return incompatible_local_state();
+                anyhow::bail!(
+                    "IQ local state is incompatible; unexpected schema object {} {}",
+                    identity.0,
+                    identity.1
+                );
             }
             let identity = expected_objects
                 .keys()
                 .find(|identity| actual_objects.get(*identity) != expected_objects.get(*identity))
                 .context("schema object maps differ without an identifiable object")?;
-            let _ = identity;
-            return incompatible_local_state();
+            anyhow::bail!(
+                "IQ local state is incompatible; schema object {} {} differs",
+                identity.0,
+                identity.1
+            );
         }
         Ok(())
-    }
-
-    #[doc(hidden)]
-    pub fn initialize_test_schema(connection: &Connection) -> Result<()> {
-        let transaction = connection.unchecked_transaction()?;
-        install_schema(&transaction)?;
-        transaction.execute(
-            "INSERT INTO queue_metadata(key,value) VALUES('workspace_schema_version',?1)",
-            [crate::repository::SCHEMA_VERSION],
-        )?;
-        transaction.execute(
-            "INSERT INTO queue_metadata(key,value) VALUES('database_id','fixture')",
-            [],
-        )?;
-        transaction.commit()?;
-        validate_schema_objects(connection)
     }
 
     fn incompatible_local_state<T>() -> Result<T> {
@@ -4676,6 +8688,135 @@ CREATE TABLE IF NOT EXISTS workspace_gc_debt (
 );
 "#;
 
+    const SCHEMA4: &str = r#"
+CREATE TABLE IF NOT EXISTS queue_items (
+  id TEXT PRIMARY KEY,
+  repo_key TEXT NOT NULL REFERENCES registered_repositories(repo_key),
+  producer_metadata_json TEXT NOT NULL,
+  validation_evidence_json TEXT NOT NULL,
+  status TEXT NOT NULL,
+  current_attempt_id TEXT,
+  blocked_phase TEXT,
+  blocked_reason TEXT,
+  blocked_message TEXT,
+  retry_after TEXT,
+  prompt_id TEXT,
+  conflict_json TEXT,
+  integration_workspace_path TEXT,
+  integration_workspace_rift_id TEXT,
+  integration_workspace_source_rift_id TEXT,
+  integration_workspace_cleaned_at TEXT,
+  target_sha TEXT,
+  source_sha TEXT,
+  landed_commit_sha TEXT,
+  landing_state_json TEXT NOT NULL DEFAULT '{"state":"ready"}',
+  replacement_json TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS integration_attempts (
+  id TEXT PRIMARY KEY,
+  item_id TEXT NOT NULL REFERENCES queue_items(id) ON DELETE CASCADE,
+  attempt_number INTEGER NOT NULL,
+  source_head_sha TEXT NOT NULL,
+  target_base_sha TEXT,
+  merge_commit_sha TEXT,
+  validated_commit_sha TEXT,
+  landed_commit_sha TEXT,
+  validation_command TEXT,
+  validation_exit_code INTEGER,
+  validation_log_path TEXT,
+  policy_snapshot_json TEXT,
+  policy_digest TEXT,
+  signoff_evidence_json TEXT,
+  moved_base_json TEXT NOT NULL DEFAULT '{"state":"none"}',
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  result TEXT,
+  UNIQUE(item_id, attempt_number)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS integration_attempt_item_identity ON integration_attempts(id,item_id);
+
+CREATE TABLE IF NOT EXISTS validation_invocations (
+  attempt_id TEXT NOT NULL REFERENCES integration_attempts(id) ON DELETE CASCADE,
+  invocation_number INTEGER NOT NULL CHECK(invocation_number>0),
+  target_base_sha TEXT NOT NULL CHECK(length(target_base_sha) IN (40,64) AND target_base_sha NOT GLOB '*[^0-9A-Fa-f]*'),
+  candidate_sha TEXT NOT NULL CHECK(length(candidate_sha) IN (40,64) AND candidate_sha NOT GLOB '*[^0-9A-Fa-f]*'),
+  command TEXT NOT NULL CHECK(command!=''),
+  exit_code INTEGER NOT NULL,
+  log_path TEXT NOT NULL CHECK(log_path!=''),
+  validated_commit_sha TEXT CHECK(validated_commit_sha IS NULL OR validated_commit_sha=candidate_sha),
+  invalidated_at TEXT,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(attempt_id,invocation_number)
+);
+
+CREATE TABLE IF NOT EXISTS queue_events (
+  id TEXT PRIMARY KEY,
+  item_id TEXT NOT NULL REFERENCES queue_items(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL,
+  message TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS prompts (
+  id TEXT PRIMARY KEY,
+  item_id TEXT NOT NULL REFERENCES queue_items(id) ON DELETE CASCADE,
+  attempt_id TEXT,
+  blocked_phase TEXT NOT NULL,
+  status TEXT NOT NULL,
+  question TEXT NOT NULL,
+  options_json TEXT,
+  allow_freeform INTEGER NOT NULL DEFAULT 1,
+  created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  answer TEXT,
+  answered_by TEXT,
+  answered_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS repo_leases (
+  repo_key TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  heartbeat_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS physical_repository_leases (
+  identity_key TEXT PRIMARY KEY REFERENCES physical_repository_ownership(identity_key),
+  repo_key TEXT NOT NULL REFERENCES repository_policies(repo_key),
+  owner_id TEXT NOT NULL,
+  heartbeat_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS queue_metadata (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS workspace_roots (
+  repo_key TEXT NOT NULL REFERENCES registered_repositories(repo_key) DEFERRABLE INITIALLY DEFERRED,
+  kind TEXT NOT NULL CHECK(kind IN ('development','integration')),
+  root_path BLOB NOT NULL UNIQUE,
+  source_path BLOB NOT NULL,
+  source_rift_id TEXT NOT NULL CHECK(source_rift_id!=''),
+  registry_identity BLOB NOT NULL,
+  registry_device INTEGER NOT NULL CHECK(registry_device>=0),
+  registry_inode INTEGER NOT NULL CHECK(registry_inode>0),
+  generation INTEGER NOT NULL CHECK(generation>=0),
+  pending_generation INTEGER CHECK(pending_generation IS NULL OR pending_generation=generation+1),
+  PRIMARY KEY(repo_key,kind),
+  UNIQUE(repo_key,kind,root_path,source_path,source_rift_id,registry_identity,registry_device,registry_inode)
+);
+
+CREATE TABLE IF NOT EXISTS workspace_gc_debt (
+  registry_identity TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL
+);
+"#;
+
     const COMPOSITION_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS repository_remote_owners (
   repo_key TEXT PRIMARY KEY CHECK(length(repo_key)=36 AND substr(repo_key,9,1)='-' AND substr(repo_key,14,1)='-' AND substr(repo_key,19,1)='-' AND substr(repo_key,24,1)='-' AND lower(repo_key)=repo_key AND repo_key NOT GLOB '*[^0-9a-f-]*'),
@@ -4776,6 +8917,406 @@ CREATE TABLE IF NOT EXISTS local_submissions (
 CREATE UNIQUE INDEX IF NOT EXISTS local_submissions_creating_workspace
 ON local_submissions(workspace_id)
 WHERE state='creating';
+"#;
+
+    const COMPOSITION_SCHEMA4: &str = r#"
+CREATE TABLE IF NOT EXISTS repository_bootstrap_requests (
+  request_path BLOB PRIMARY KEY,
+  storage_root_path BLOB NOT NULL,
+  rift_registry_path BLOB NOT NULL,
+  repo_key TEXT REFERENCES repository_policies(repo_key),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS registered_repositories (
+  repo_key TEXT PRIMARY KEY REFERENCES repository_policies(repo_key),
+  owned_root_path BLOB NOT NULL UNIQUE,
+  git_binding_json TEXT NOT NULL CHECK(json_valid(git_binding_json)),
+  root_rift_id TEXT NOT NULL CHECK(root_rift_id!=''),
+  registry_identity BLOB NOT NULL,
+  registry_device INTEGER NOT NULL CHECK(registry_device>=0),
+  registry_inode INTEGER NOT NULL CHECK(registry_inode>0),
+  generation INTEGER NOT NULL CHECK(generation>=0),
+  source_sha TEXT NOT NULL CHECK(length(source_sha) IN (40,64) AND source_sha NOT GLOB '*[^0-9A-Fa-f]*'),
+  checkout_json TEXT NOT NULL CHECK(json_valid(checkout_json)),
+  development_root_path BLOB NOT NULL UNIQUE,
+  development_kind TEXT NOT NULL DEFAULT 'development' CHECK(development_kind='development'),
+  integration_root_path BLOB NOT NULL UNIQUE,
+  integration_kind TEXT NOT NULL DEFAULT 'integration' CHECK(integration_kind='integration'),
+  provisioning_json TEXT NOT NULL CHECK(json_valid(provisioning_json) AND json_extract(provisioning_json,'$.state')='ready'),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(repo_key,development_kind,development_root_path,owned_root_path,root_rift_id,registry_identity,registry_device,registry_inode)
+    REFERENCES workspace_roots(repo_key,kind,root_path,source_path,source_rift_id,registry_identity,registry_device,registry_inode) DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY(repo_key,integration_kind,integration_root_path,owned_root_path,root_rift_id,registry_identity,registry_device,registry_inode)
+    REFERENCES workspace_roots(repo_key,kind,root_path,source_path,source_rift_id,registry_identity,registry_device,registry_inode) DEFERRABLE INITIALLY DEFERRED
+);
+
+CREATE TABLE IF NOT EXISTS repository_provisioning_intents (
+  repo_key TEXT PRIMARY KEY REFERENCES repository_policies(repo_key),
+  bootstrap_path BLOB NOT NULL UNIQUE,
+  owned_root_path BLOB NOT NULL UNIQUE,
+  staging_root_path BLOB NOT NULL UNIQUE,
+  rift_registry_path BLOB NOT NULL,
+  source_sha TEXT NOT NULL CHECK(length(source_sha) IN (40,64) AND source_sha NOT GLOB '*[^0-9A-Fa-f]*'),
+  policy_bytes BLOB,
+  lifecycle_json TEXT NOT NULL CHECK(json_valid(lifecycle_json)),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS development_workspaces (
+  id TEXT PRIMARY KEY,
+  repo_key TEXT NOT NULL REFERENCES registered_repositories(repo_key),
+  name TEXT NOT NULL,
+  path BLOB NOT NULL UNIQUE,
+  rift_id TEXT,
+  source_rift_id TEXT,
+  branch TEXT NOT NULL UNIQUE,
+  base_sha TEXT NOT NULL,
+  status TEXT NOT NULL,
+  cleanup_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(repo_key,name)
+);
+
+CREATE TABLE IF NOT EXISTS local_submissions (
+  id TEXT PRIMARY KEY,
+  queue_item_id TEXT NOT NULL,
+  repo_key TEXT NOT NULL REFERENCES registered_repositories(repo_key),
+  workspace_id TEXT NOT NULL REFERENCES development_workspaces(id),
+  base_sha TEXT NOT NULL CHECK(length(base_sha) IN (40,64) AND base_sha NOT GLOB '*[^0-9A-Fa-f]*'),
+  commit_sha TEXT NOT NULL CHECK(length(commit_sha) IN (40,64) AND commit_sha NOT GLOB '*[^0-9A-Fa-f]*'),
+  private_ref TEXT NOT NULL UNIQUE,
+  staging_ref TEXT NOT NULL UNIQUE,
+  replaces_item_id TEXT,
+  state TEXT NOT NULL CHECK(state IN ('creating','queued','replaced','cancelled','integrated')),
+  created_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS local_submissions_creating_workspace
+ON local_submissions(workspace_id)
+WHERE state='creating';
+"#;
+
+    const REPOSITORY_POLICY_TABLE_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS repository_policies (
+  repo_key TEXT PRIMARY KEY CHECK(length(repo_key)=36 AND substr(repo_key,9,1)='-' AND substr(repo_key,14,1)='-' AND substr(repo_key,19,1)='-' AND substr(repo_key,24,1)='-' AND lower(repo_key)=repo_key AND repo_key NOT GLOB '*[^0-9a-f-]*'),
+  revision INTEGER NOT NULL CHECK(revision>0),
+  operation_state_json TEXT NOT NULL CHECK(json_valid(operation_state_json)),
+  canonical_repository_json TEXT NOT NULL CHECK(json_valid(canonical_repository_json)),
+  canonical_ownership_key TEXT NOT NULL UNIQUE,
+  target_branch TEXT NOT NULL CHECK(target_branch IN ('main','master')),
+  integration_policy TEXT NOT NULL CHECK(integration_policy IN ('direct','merge_request_required')),
+  replication_policy_json TEXT NOT NULL CHECK(json_valid(replication_policy_json)),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(repo_key,target_branch)
+);
+
+CREATE TABLE IF NOT EXISTS physical_repository_ownership (
+  identity_key TEXT PRIMARY KEY,
+  repo_key TEXT NOT NULL REFERENCES repository_policies(repo_key),
+  role TEXT NOT NULL CHECK(role IN ('canonical','replica')),
+  ordinal INTEGER NOT NULL CHECK(ordinal>=0),
+  repository_json TEXT NOT NULL CHECK(json_valid(repository_json)),
+  created_at TEXT NOT NULL,
+  UNIQUE(repo_key,role,ordinal)
+);
+"#;
+
+    const REPOSITORY_POLICY_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS repository_policies (
+  repo_key TEXT PRIMARY KEY CHECK(length(repo_key)=36 AND substr(repo_key,9,1)='-' AND substr(repo_key,14,1)='-' AND substr(repo_key,19,1)='-' AND substr(repo_key,24,1)='-' AND lower(repo_key)=repo_key AND repo_key NOT GLOB '*[^0-9a-f-]*'),
+  revision INTEGER NOT NULL CHECK(revision>0),
+  operation_state_json TEXT NOT NULL CHECK(json_valid(operation_state_json)),
+  canonical_repository_json TEXT NOT NULL CHECK(json_valid(canonical_repository_json)),
+  canonical_ownership_key TEXT NOT NULL UNIQUE,
+  target_branch TEXT NOT NULL CHECK(target_branch IN ('main','master')),
+  integration_policy TEXT NOT NULL CHECK(integration_policy IN ('direct','merge_request_required')),
+  replication_policy_json TEXT NOT NULL CHECK(json_valid(replication_policy_json)),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(repo_key,target_branch)
+);
+
+CREATE TABLE IF NOT EXISTS physical_repository_ownership (
+  identity_key TEXT PRIMARY KEY,
+  repo_key TEXT NOT NULL REFERENCES repository_policies(repo_key),
+  role TEXT NOT NULL CHECK(role IN ('canonical','replica')),
+  ordinal INTEGER NOT NULL CHECK(ordinal>=0),
+  repository_json TEXT NOT NULL CHECK(json_valid(repository_json)),
+  created_at TEXT NOT NULL,
+  UNIQUE(repo_key,role,ordinal)
+);
+
+CREATE TRIGGER IF NOT EXISTS repository_policy_insert_conflict_guard
+BEFORE INSERT ON repository_policies
+WHEN EXISTS(
+  SELECT 1 FROM repository_policies existing
+  WHERE existing.repo_key=NEW.repo_key
+     OR existing.canonical_ownership_key=NEW.canonical_ownership_key
+     OR (existing.repo_key=NEW.repo_key AND existing.target_branch=NEW.target_branch)
+)
+BEGIN SELECT RAISE(ABORT,'repository policy authority already exists'); END;
+
+CREATE TRIGGER IF NOT EXISTS physical_repository_ownership_insert_conflict_guard
+BEFORE INSERT ON physical_repository_ownership
+WHEN EXISTS(
+  SELECT 1 FROM physical_repository_ownership existing
+  WHERE existing.identity_key=NEW.identity_key
+     OR (existing.repo_key=NEW.repo_key AND existing.role=NEW.role AND existing.ordinal=NEW.ordinal)
+)
+BEGIN SELECT RAISE(ABORT,'physical repository ownership authority already exists'); END;
+
+CREATE TRIGGER IF NOT EXISTS physical_repository_ownership_immutable
+BEFORE UPDATE ON physical_repository_ownership
+BEGIN SELECT RAISE(ABORT,'physical repository ownership is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS physical_repository_ownership_delete_guard
+BEFORE DELETE ON physical_repository_ownership
+BEGIN SELECT RAISE(ABORT,'physical repository ownership is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS repository_policy_authority_immutable
+BEFORE UPDATE ON repository_policies
+WHEN NEW.repo_key!=OLD.repo_key
+  OR NEW.canonical_repository_json!=OLD.canonical_repository_json
+  OR NEW.canonical_ownership_key!=OLD.canonical_ownership_key
+  OR NEW.target_branch!=OLD.target_branch
+  OR NEW.integration_policy!=OLD.integration_policy
+  OR NEW.replication_policy_json!=OLD.replication_policy_json
+  OR NEW.created_at!=OLD.created_at
+BEGIN SELECT RAISE(ABORT,'repository policy authority is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS repository_policy_operation_transition
+BEFORE UPDATE OF operation_state_json,revision ON repository_policies
+WHEN NOT (
+  NEW.revision=OLD.revision+1
+  AND (
+    (json_extract(OLD.operation_state_json,'$.state')='enabled'
+      AND json_extract(NEW.operation_state_json,'$.state')='draining'
+      AND json_type(NEW.operation_state_json,'$.obligations')='array')
+    OR
+    (json_extract(OLD.operation_state_json,'$.state')='draining'
+      AND NEW.operation_state_json='{"state":"disabled"}')
+  )
+)
+BEGIN SELECT RAISE(ABORT,'invalid repository operation-state transition'); END;
+
+CREATE TRIGGER IF NOT EXISTS repository_policy_delete_guard
+BEFORE DELETE ON repository_policies
+BEGIN SELECT RAISE(ABORT,'repository policy authority is immutable'); END;
+
+CREATE TABLE IF NOT EXISTS queue_admissions (
+  item_id TEXT PRIMARY KEY REFERENCES queue_items(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK(kind IN ('local_submission','direct','merge_request','historical_merge_request')),
+  source_branch TEXT NOT NULL,
+  head_sha TEXT NOT NULL CHECK(length(head_sha) IN (40,64) AND head_sha NOT GLOB '*[^0-9A-Fa-f]*'),
+  source_ref TEXT,
+  submission_id TEXT REFERENCES local_submissions(id),
+  provider TEXT CHECK(provider IS NULL OR provider IN ('github','gitlab')),
+  provider_host TEXT,
+  provider_repository TEXT,
+  provider_repository_id TEXT,
+  target_branch TEXT,
+  base_sha TEXT CHECK(base_sha IS NULL OR (length(base_sha) IN (40,64) AND base_sha NOT GLOB '*[^0-9A-Fa-f]*')),
+  provider_merge_method TEXT CHECK(provider_merge_method IS NULL OR provider_merge_method IN ('merge','squash')),
+  merge_request_identity TEXT,
+  merge_request_url TEXT,
+  admitted_at TEXT NOT NULL,
+  CHECK(
+    (kind='local_submission' AND source_ref IS NOT NULL AND submission_id IS NOT NULL AND provider IS NULL AND provider_host IS NULL AND provider_repository IS NULL AND provider_repository_id IS NULL AND target_branch IS NULL AND base_sha IS NULL AND provider_merge_method IS NULL AND merge_request_identity IS NULL AND merge_request_url IS NULL) OR
+    (kind='direct' AND source_ref IS NULL AND submission_id IS NULL AND provider IS NULL AND provider_host IS NULL AND provider_repository IS NULL AND provider_repository_id IS NULL AND target_branch IS NULL AND base_sha IS NULL AND provider_merge_method IS NULL AND merge_request_identity IS NULL AND merge_request_url IS NULL) OR
+    (kind='merge_request' AND source_ref IS NULL AND submission_id IS NULL AND provider IS NOT NULL AND provider_host IS NOT NULL AND provider_repository IS NOT NULL AND provider_repository_id IS NOT NULL AND target_branch IN ('main','master') AND base_sha IS NOT NULL AND merge_request_identity IS NOT NULL AND merge_request_identity!='' AND merge_request_url IS NOT NULL AND merge_request_url!='') OR
+    (kind='historical_merge_request' AND source_ref IS NULL AND submission_id IS NULL AND provider IS NOT NULL AND provider_host IS NOT NULL AND provider_repository IS NOT NULL AND provider_repository_id IS NOT NULL AND target_branch IN ('main','master') AND merge_request_identity IS NOT NULL AND merge_request_identity!='' AND merge_request_url IS NOT NULL AND merge_request_url!='')
+  )
+);
+
+CREATE TRIGGER queue_admission_identity_immutable
+BEFORE UPDATE ON queue_admissions
+BEGIN SELECT RAISE(ABORT,'queue admission identity is immutable'); END;
+
+CREATE TRIGGER queue_admission_insert_conflict_guard
+BEFORE INSERT ON queue_admissions
+WHEN EXISTS(
+  SELECT 1 FROM queue_admissions admission
+  WHERE admission.item_id=NEW.item_id
+    AND (admission.kind IS NOT NEW.kind
+      OR admission.source_branch IS NOT NEW.source_branch
+      OR admission.head_sha IS NOT NEW.head_sha
+      OR admission.source_ref IS NOT NEW.source_ref
+      OR admission.submission_id IS NOT NEW.submission_id
+      OR admission.provider IS NOT NEW.provider
+      OR admission.provider_host IS NOT NEW.provider_host
+      OR admission.provider_repository IS NOT NEW.provider_repository
+      OR admission.provider_repository_id IS NOT NEW.provider_repository_id
+      OR admission.target_branch IS NOT NEW.target_branch
+      OR admission.base_sha IS NOT NEW.base_sha
+      OR admission.provider_merge_method IS NOT NEW.provider_merge_method
+      OR admission.merge_request_identity IS NOT NEW.merge_request_identity
+      OR admission.merge_request_url IS NOT NEW.merge_request_url
+      OR admission.admitted_at IS NOT NEW.admitted_at)
+)
+BEGIN SELECT RAISE(ABORT,'queue admission insert conflicts with immutable identity'); END;
+
+CREATE TRIGGER queue_admission_delete_guard
+BEFORE DELETE ON queue_admissions
+WHEN EXISTS(SELECT 1 FROM queue_items WHERE id=OLD.item_id)
+  AND NOT EXISTS(SELECT 1 FROM queue_item_purge_authority WHERE item_id=OLD.item_id)
+BEGIN SELECT RAISE(ABORT,'queue admission authority cannot be removed before queue-item purge'); END;
+
+CREATE TABLE IF NOT EXISTS queue_item_purge_authority (
+  item_id TEXT PRIMARY KEY,
+  authorized_at TEXT NOT NULL
+);
+
+CREATE TRIGGER queue_item_purge_authority_guard
+BEFORE INSERT ON queue_item_purge_authority
+WHEN NOT EXISTS(
+    SELECT 1 FROM queue_items item
+    WHERE item.id=NEW.item_id
+      AND item.status IN ('integrated','cancelled')
+      AND item.integration_workspace_path IS NULL
+      AND item.integration_workspace_rift_id IS NULL
+      AND item.integration_workspace_source_rift_id IS NULL
+  )
+  OR EXISTS(SELECT 1 FROM integration_attempts WHERE item_id=NEW.item_id AND (finished_at IS NULL OR result IS NULL))
+  OR EXISTS(SELECT 1 FROM integration_efforts WHERE item_id=NEW.item_id AND state NOT IN ('integrated','cancelled'))
+  OR EXISTS(SELECT 1 FROM integration_efforts effort JOIN integration_cycles cycle ON cycle.effort_id=effort.id WHERE effort.item_id=NEW.item_id AND cycle.status IN ('starting','running'))
+  OR EXISTS(SELECT 1 FROM integration_efforts effort JOIN runner_termination_debt debt ON debt.effort_id=effort.id WHERE effort.item_id=NEW.item_id)
+  OR EXISTS(SELECT 1 FROM integration_efforts effort JOIN guidance_requests request ON request.effort_id=effort.id WHERE effort.item_id=NEW.item_id AND request.status='open')
+  OR EXISTS(SELECT 1 FROM prompts WHERE item_id=NEW.item_id AND status='open')
+  OR EXISTS(SELECT 1 FROM integration_efforts effort JOIN projection_debt debt ON debt.effort_id=effort.id WHERE effort.item_id=NEW.item_id)
+  OR EXISTS(SELECT 1 FROM integration_efforts effort JOIN state_repository_artifacts artifact ON artifact.effort_id=effort.id WHERE effort.item_id=NEW.item_id AND artifact.state!='closed')
+  OR EXISTS(SELECT 1 FROM item_state_repository_bindings WHERE item_id=NEW.item_id AND reservation_state='pending')
+  OR EXISTS(SELECT 1 FROM item_state_repository_reservations WHERE item_id=NEW.item_id)
+  OR EXISTS(SELECT 1 FROM terminal_workspace_cleanup_debt WHERE item_id=NEW.item_id)
+  OR EXISTS(SELECT 1 FROM durable_events event JOIN notification_deliveries delivery ON delivery.event_id=event.id WHERE event.item_id=NEW.item_id AND delivery.state NOT IN ('delivered','failed','expired'))
+  OR EXISTS(SELECT 1 FROM replication_debt WHERE item_id=NEW.item_id AND outcome NOT IN ('succeeded','superseded'))
+  OR EXISTS(SELECT 1 FROM integration_attempts attempt JOIN private_ref_cleanup_debt debt ON debt.owner_id=attempt.id WHERE attempt.item_id=NEW.item_id AND debt.kind='landing')
+BEGIN SELECT RAISE(ABORT,'queue-item purge requires terminal state with no unfinished obligations'); END;
+
+CREATE TRIGGER queue_item_delete_guard
+BEFORE DELETE ON queue_items
+WHEN NOT EXISTS(SELECT 1 FROM queue_item_purge_authority WHERE item_id=OLD.id)
+BEGIN SELECT RAISE(ABORT,'queue-item deletion requires explicit purge authority'); END;
+
+CREATE TRIGGER queue_item_purge_authority_cleanup
+AFTER DELETE ON queue_items
+BEGIN DELETE FROM queue_item_purge_authority WHERE item_id=OLD.id; END;
+
+CREATE TRIGGER historical_merge_request_terminal_insert
+BEFORE INSERT ON queue_admissions
+WHEN NEW.kind='historical_merge_request' AND NOT EXISTS(
+  SELECT 1 FROM queue_items WHERE id=NEW.item_id AND status IN ('integrated','cancelled')
+)
+BEGIN SELECT RAISE(ABORT,'historical MR admission requires a terminal queue item'); END;
+
+CREATE TABLE IF NOT EXISTS workspace_git_bindings (
+  owner_kind TEXT NOT NULL CHECK(owner_kind IN ('development','integration')),
+  owner_id TEXT NOT NULL,
+  top_level BLOB NOT NULL UNIQUE,
+  binding_json TEXT NOT NULL CHECK(json_valid(binding_json)),
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(owner_kind,owner_id)
+);
+
+CREATE TRIGGER IF NOT EXISTS workspace_git_binding_immutable
+BEFORE UPDATE ON workspace_git_bindings
+BEGIN SELECT RAISE(ABORT,'workspace Git binding is immutable'); END;
+
+CREATE TABLE IF NOT EXISTS private_ref_cleanup_debt (
+  repo_key TEXT NOT NULL REFERENCES registered_repositories(repo_key),
+  kind TEXT NOT NULL CHECK(kind IN ('repository_target','landing')),
+  owner_id TEXT NOT NULL CHECK(owner_id!=''),
+  ref_name TEXT NOT NULL CHECK(ref_name!=''),
+  expected_sha TEXT NOT NULL CHECK(length(expected_sha) IN (40,64) AND expected_sha NOT GLOB '*[^0-9A-Fa-f]*'),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(repo_key,ref_name),
+  CHECK(
+    (kind='repository_target' AND owner_id=expected_sha AND ref_name='refs/iq/repository-targets/'||repo_key||'/'||expected_sha) OR
+    (kind='landing' AND instr(owner_id,'/')=0 AND ref_name='refs/iq/landings/'||owner_id)
+  )
+);
+
+CREATE TRIGGER IF NOT EXISTS private_ref_cleanup_identity_immutable
+BEFORE UPDATE OF repo_key,kind,owner_id,ref_name,expected_sha,created_at ON private_ref_cleanup_debt
+BEGIN SELECT RAISE(ABORT,'private-ref cleanup identity is immutable'); END;
+
+CREATE TABLE IF NOT EXISTS provider_landing_guarantees (
+  item_id TEXT PRIMARY KEY REFERENCES queue_items(id) ON DELETE CASCADE,
+  provider TEXT NOT NULL CHECK(provider IN ('github','gitlab')),
+  provider_host TEXT NOT NULL,
+  provider_repository TEXT NOT NULL,
+  provider_repository_id TEXT NOT NULL,
+  merge_request_identity TEXT NOT NULL,
+  admitted_base_sha TEXT NOT NULL,
+  admitted_head_sha TEXT NOT NULL,
+  validated_target_sha TEXT NOT NULL,
+  validated_candidate_sha TEXT NOT NULL,
+  validated_tree_sha TEXT NOT NULL,
+  landed_commit_sha TEXT NOT NULL,
+  landed_tree_sha TEXT NOT NULL,
+  first_parent_sha TEXT NOT NULL,
+  history_contract TEXT NOT NULL CHECK(history_contract IN ('preserve_head','squash')),
+  contains_admitted_head INTEGER NOT NULL CHECK(contains_admitted_head IN (0,1)),
+  verified_at TEXT NOT NULL,
+  CHECK(history_contract='squash' OR contains_admitted_head=1)
+);
+
+CREATE TABLE IF NOT EXISTS replication_debt (
+  id TEXT PRIMARY KEY,
+  item_id TEXT NOT NULL REFERENCES queue_items(id),
+  repo_key TEXT NOT NULL REFERENCES registered_repositories(repo_key),
+  canonical_source_sha TEXT NOT NULL CHECK(length(canonical_source_sha) IN (40,64) AND canonical_source_sha NOT GLOB '*[^0-9A-Fa-f]*'),
+  destination_key TEXT NOT NULL,
+  target_branch TEXT NOT NULL CHECK(target_branch IN ('main','master')),
+  sequence INTEGER NOT NULL CHECK(sequence>0),
+  replica_json TEXT NOT NULL CHECK(json_valid(replica_json)),
+  expected_destination_sha TEXT,
+  operation TEXT NOT NULL CHECK(operation IN ('pin_source','resolve_destination','advance_exact_target')),
+  outcome TEXT NOT NULL CHECK(outcome IN ('pinning','pending','applying','uncertain','applied','succeeded','failed','superseded_cleanup_pending','superseded')),
+  application_id TEXT,
+  failure TEXT,
+  superseded_by_id TEXT REFERENCES replication_debt(id),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK((operation IN ('pin_source','resolve_destination') AND expected_destination_sha IS NULL) OR (operation='advance_exact_target' AND expected_destination_sha IS NOT NULL)),
+  CHECK((outcome IN ('failed','uncertain') AND failure IS NOT NULL AND failure!='') OR (outcome NOT IN ('failed','uncertain') AND failure IS NULL)),
+  CHECK((outcome IN ('applying','uncertain') AND application_id IS NOT NULL) OR (outcome NOT IN ('applying','uncertain') AND application_id IS NULL)),
+  CHECK((outcome='pinning' AND operation='pin_source') OR outcome!='pinning'),
+  CHECK((outcome IN ('superseded_cleanup_pending','superseded') AND superseded_by_id IS NOT NULL) OR (outcome NOT IN ('superseded_cleanup_pending','superseded') AND superseded_by_id IS NULL)),
+  UNIQUE(item_id,destination_key),
+  UNIQUE(destination_key,target_branch,sequence)
+);
+
+CREATE TRIGGER IF NOT EXISTS replication_debt_identity_immutable
+BEFORE UPDATE OF id,item_id,repo_key,canonical_source_sha,destination_key,target_branch,sequence,replica_json,created_at
+ON replication_debt
+BEGIN SELECT RAISE(ABORT,'replication debt identity is immutable'); END;
+
+CREATE VIEW queue_items_runtime AS
+SELECT item.*,CAST(repository.owned_root_path AS TEXT) AS owned_root_path,policy.target_branch,
+       admission.kind AS admission_kind,admission.head_sha AS admission_head_sha,
+       admission.source_branch AS admission_source_branch,
+       admission.source_ref AS admission_source_ref,
+       admission.submission_id AS admission_submission_id,
+       admission.provider AS admission_provider,
+       admission.provider_host AS admission_provider_host,
+       admission.provider_repository AS admission_provider_repository,
+       admission.provider_repository_id AS admission_provider_repository_id,
+       admission.target_branch AS admission_target_branch,
+       admission.base_sha AS admission_base_sha,
+       admission.provider_merge_method AS admission_provider_merge_method,
+       admission.merge_request_identity AS admission_merge_request_identity,
+       admission.merge_request_url AS admission_merge_request_url
+FROM queue_items item
+JOIN registered_repositories repository ON repository.repo_key=item.repo_key
+JOIN repository_policies policy ON policy.repo_key=item.repo_key
+JOIN queue_admissions admission ON admission.item_id=item.id;
 "#;
 
     const LANDING_STATE_TRIGGERS: &str = r#"
@@ -4970,6 +9511,135 @@ BEGIN
   SELECT RAISE(ABORT, 'local submission identity is immutable');
 END;
 "#;
+
+    const REGISTERED_REPOSITORY_TRIGGERS4: &str = r#"
+CREATE TRIGGER registered_repository_path_identity_insert
+BEFORE INSERT ON registered_repositories
+WHEN NEW.owned_root_path=NEW.development_root_path
+  OR NEW.owned_root_path=NEW.integration_root_path
+  OR NEW.development_root_path=NEW.integration_root_path
+  OR EXISTS(
+    SELECT 1 FROM registered_repositories existing
+    WHERE NEW.owned_root_path IN (existing.owned_root_path,existing.development_root_path,existing.integration_root_path)
+       OR NEW.development_root_path IN (existing.owned_root_path,existing.development_root_path,existing.integration_root_path)
+       OR NEW.integration_root_path IN (existing.owned_root_path,existing.development_root_path,existing.integration_root_path)
+  )
+  OR EXISTS(
+    SELECT 1 FROM workspace_roots root
+    WHERE root.root_path IN (NEW.owned_root_path,NEW.development_root_path,NEW.integration_root_path)
+  )
+BEGIN SELECT RAISE(ABORT,'owned repository paths overlap existing repository authority'); END;
+
+CREATE TRIGGER registered_repository_excludes_provisioning_intent
+BEFORE INSERT ON registered_repositories
+WHEN EXISTS(SELECT 1 FROM repository_provisioning_intents intent WHERE intent.repo_key=NEW.repo_key)
+BEGIN SELECT RAISE(ABORT,'ready repository cannot coexist with provisioning intent'); END;
+
+CREATE TRIGGER repository_provisioning_intent_excludes_ready
+BEFORE INSERT ON repository_provisioning_intents
+WHEN EXISTS(SELECT 1 FROM registered_repositories repository WHERE repository.repo_key=NEW.repo_key)
+BEGIN SELECT RAISE(ABORT,'provisioning intent cannot coexist with ready repository'); END;
+
+CREATE TRIGGER registered_repository_identity_immutable
+BEFORE UPDATE OF repo_key,owned_root_path,git_binding_json,root_rift_id,registry_identity,registry_device,registry_inode,development_root_path,development_kind,integration_root_path,integration_kind,created_at ON registered_repositories
+BEGIN SELECT RAISE(ABORT,'owned repository identity is immutable'); END;
+
+CREATE TRIGGER registered_repository_exact_provisioning_insert
+BEFORE INSERT ON registered_repositories
+WHEN (SELECT COUNT(*) FROM json_each(NEW.provisioning_json))!=1
+  OR EXISTS(SELECT 1 FROM json_each(NEW.provisioning_json) WHERE key!='state')
+BEGIN SELECT RAISE(ABORT,'owned repository ready state has invalid keys'); END;
+
+CREATE TRIGGER registered_repository_checkout_insert
+BEFORE INSERT ON registered_repositories
+WHEN json_extract(NEW.checkout_json,'$.state')!='ready'
+  OR (SELECT COUNT(*) FROM json_each(NEW.checkout_json))!=2
+  OR EXISTS(SELECT 1 FROM json_each(NEW.checkout_json) WHERE key NOT IN ('state','target_sha'))
+  OR length(json_extract(NEW.checkout_json,'$.target_sha')) NOT IN (40,64)
+  OR json_extract(NEW.checkout_json,'$.target_sha') GLOB '*[^0-9A-Fa-f]*'
+  OR json_extract(NEW.checkout_json,'$.target_sha')!=NEW.source_sha
+BEGIN SELECT RAISE(ABORT,'owned repository initial checkout state is invalid'); END;
+
+CREATE TRIGGER registered_repository_checkout_update
+BEFORE UPDATE OF source_sha,checkout_json ON registered_repositories
+WHEN NOT (
+  (json_extract(NEW.checkout_json,'$.state')='ready'
+    AND (SELECT COUNT(*) FROM json_each(NEW.checkout_json))=2
+    AND NOT EXISTS(SELECT 1 FROM json_each(NEW.checkout_json) WHERE key NOT IN ('state','target_sha'))
+    AND length(json_extract(NEW.checkout_json,'$.target_sha')) IN (40,64)
+    AND json_extract(NEW.checkout_json,'$.target_sha') NOT GLOB '*[^0-9A-Fa-f]*'
+    AND json_extract(NEW.checkout_json,'$.target_sha')=NEW.source_sha) OR
+  (json_extract(NEW.checkout_json,'$.state')='pending'
+    AND (SELECT COUNT(*) FROM json_each(NEW.checkout_json))=2
+    AND NOT EXISTS(SELECT 1 FROM json_each(NEW.checkout_json) WHERE key NOT IN ('state','target_sha'))
+    AND length(json_extract(NEW.checkout_json,'$.target_sha')) IN (40,64)
+    AND json_extract(NEW.checkout_json,'$.target_sha') NOT GLOB '*[^0-9A-Fa-f]*') OR
+  (json_extract(NEW.checkout_json,'$.state')='failed'
+    AND (SELECT COUNT(*) FROM json_each(NEW.checkout_json))=3
+    AND NOT EXISTS(SELECT 1 FROM json_each(NEW.checkout_json) WHERE key NOT IN ('state','target_sha','message'))
+    AND length(json_extract(NEW.checkout_json,'$.target_sha')) IN (40,64)
+    AND json_extract(NEW.checkout_json,'$.target_sha') NOT GLOB '*[^0-9A-Fa-f]*'
+    AND trim(json_extract(NEW.checkout_json,'$.message'))!='')
+)
+BEGIN SELECT RAISE(ABORT,'owned repository checkout state is invalid'); END;
+
+CREATE TRIGGER registered_repository_delete_guard
+BEFORE DELETE ON registered_repositories
+WHEN EXISTS(SELECT 1 FROM queue_items WHERE repo_key=OLD.repo_key)
+BEGIN SELECT RAISE(ABORT,'owned repository has queue history'); END;
+
+CREATE TRIGGER workspace_root_exact_identity_insert
+BEFORE INSERT ON workspace_roots
+WHEN NOT EXISTS(
+  SELECT 1 FROM registered_repositories repository
+  WHERE repository.repo_key=NEW.repo_key
+    AND NEW.source_path=repository.owned_root_path
+    AND NEW.source_rift_id=repository.root_rift_id
+    AND NEW.registry_identity=repository.registry_identity
+    AND NEW.registry_device=repository.registry_device
+    AND NEW.registry_inode=repository.registry_inode
+    AND ((NEW.kind='development' AND NEW.root_path=repository.development_root_path)
+      OR (NEW.kind='integration' AND NEW.root_path=repository.integration_root_path))
+)
+BEGIN SELECT RAISE(ABORT,'workspace root differs from exact registered repository authority'); END;
+
+CREATE TRIGGER workspace_root_exact_identity_update
+BEFORE UPDATE OF repo_key,kind,root_path,source_path,source_rift_id,registry_identity,registry_device,registry_inode ON workspace_roots
+WHEN NOT EXISTS(
+  SELECT 1 FROM registered_repositories repository
+  WHERE repository.repo_key=NEW.repo_key
+    AND NEW.source_path=repository.owned_root_path
+    AND NEW.source_rift_id=repository.root_rift_id
+    AND NEW.registry_identity=repository.registry_identity
+    AND NEW.registry_device=repository.registry_device
+    AND NEW.registry_inode=repository.registry_inode
+    AND ((NEW.kind='development' AND NEW.root_path=repository.development_root_path)
+      OR (NEW.kind='integration' AND NEW.root_path=repository.integration_root_path))
+)
+BEGIN SELECT RAISE(ABORT,'workspace root update differs from exact registered repository authority'); END;
+
+CREATE TRIGGER workspace_root_delete_guard
+BEFORE DELETE ON workspace_roots
+WHEN EXISTS(SELECT 1 FROM registered_repositories repository WHERE repository.repo_key=OLD.repo_key)
+BEGIN SELECT RAISE(ABORT,'registered repository child-root authority cannot be removed'); END;
+
+CREATE TRIGGER queue_admission_local_source_insert
+BEFORE INSERT ON queue_admissions
+WHEN NEW.kind='local_submission' AND NOT EXISTS (
+  SELECT 1 FROM local_submissions submission
+  WHERE submission.id=NEW.submission_id
+    AND submission.repo_key=(SELECT repo_key FROM queue_items WHERE id=NEW.item_id)
+    AND submission.commit_sha=NEW.head_sha
+    AND submission.private_ref=NEW.source_ref
+    AND submission.queue_item_id=NEW.item_id
+    AND submission.state='creating'
+)
+BEGIN SELECT RAISE(ABORT,'local queue admission does not match exact submission intent'); END;
+
+CREATE TRIGGER local_submission_identity_immutable
+BEFORE UPDATE OF id,queue_item_id,repo_key,workspace_id,base_sha,commit_sha,private_ref,staging_ref,replaces_item_id,created_at ON local_submissions
+BEGIN SELECT RAISE(ABORT,'local submission identity is immutable'); END;
+"#;
 }
 
 pub mod integrator {
@@ -4984,9 +9654,8 @@ pub mod integrator {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
-    use std::process::{Command, ExitStatus, Output, Stdio};
+    use std::process::{ExitStatus, Output, Stdio};
     use std::sync::atomic::{AtomicI64, Ordering};
     use std::sync::mpsc;
     use std::sync::OnceLock;
@@ -5072,6 +9741,11 @@ pub mod integrator {
         control_store: crate::control_store::ControlStore,
     }
 
+    enum MovedBaseCause<'a> {
+        TargetMoved(&'a str),
+        DefiniteLandingRejection(&'a crate::control_store::DefiniteLandingRejection),
+    }
+
     pub(crate) struct RiftWorkspaceManager {
         source: PathBuf,
         source_id: String,
@@ -5084,7 +9758,7 @@ pub mod integrator {
         registry_dev: u64,
         registry_ino: u64,
         generation: AtomicI64,
-        program: String,
+        program: crate::agent_config::ExecutableAuthority,
         database: Option<OsString>,
         root_directory: fs::File,
     }
@@ -5206,6 +9880,10 @@ pub mod integrator {
             let home = std::env::var_os("HOME").context("HOME is required for Rift registry")?;
             Ok(PathBuf::from(home).join(".local/share/rift/rift.sqlite"))
         }
+    }
+
+    fn rift_executable_authority() -> Result<crate::agent_config::ExecutableAuthority> {
+        crate::agent_config::rift_executable_authority()
     }
 
     fn resolve_rift_database(
@@ -6232,34 +10910,56 @@ pub mod integrator {
                     source.display()
                 );
             }
-            let program = std::env::var("IQ_RIFT_CLI").unwrap_or_else(|_| "rift".into());
-            let mut args = Vec::new();
+            let program = rift_executable_authority()?;
+            let mut ancestors_args = Vec::new();
             if let Some(database) = database.as_ref() {
-                args.push(OsString::from("--database"));
-                args.push(database.clone());
+                ancestors_args.push(OsString::from("--database"));
+                ancestors_args.push(database.clone());
             }
-            args.extend([OsString::from("ancestors"), source.as_os_str().into()]);
-            let ancestors = command_output_timeout(
-                &program,
-                args,
-                None,
+            ancestors_args.extend([OsString::from("ancestors"), source.as_os_str().into()]);
+            let mut list_args = Vec::new();
+            if let Some(database) = database.as_ref() {
+                list_args.push(OsString::from("--database"));
+                list_args.push(database.clone());
+            }
+            list_args.extend([OsString::from("list"), source.as_os_str().into()]);
+            let mut commands = [ancestors_args, list_args]
+                .into_iter()
+                .map(|args| {
+                    let mut command = gated_process(
+                        &CommandProgram::Descriptor {
+                            label: "rift",
+                            authority: &program,
+                        },
+                        args,
+                    )?;
+                    crate::agent_config::harden_rift_environment(&mut command);
+                    Ok(command)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut outputs = crate::agent_runner::service_read_operation(
+                &mut commands,
                 StdDuration::from_secs(60),
-                |gate| {
-                    gate.write_all(b"run\n")?;
-                    Ok(true)
-                },
-                || Ok(ExecutionAuthority::Active),
-            )?;
-            let ancestors = match ancestors {
-                CommandOutputOutcome::Exited(output) if output.status.success() => output,
-                CommandOutputOutcome::Exited(output) => anyhow::bail!(
+                |_| Ok(()),
+            )?
+            .into_iter();
+            let ancestors = outputs
+                .next()
+                .context("Rift ancestors operation output is absent")?;
+            let ancestors = if ancestors.status.success() {
+                ancestors
+            } else {
+                anyhow::bail!(
                     "verify Rift source root failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ),
-                CommandOutputOutcome::Cancelled => {
-                    anyhow::bail!("verify Rift source root lost command authority")
-                }
+                    String::from_utf8_lossy(&ancestors.stderr).trim()
+                )
             };
+            let listed = outputs
+                .next()
+                .context("Rift list operation output is absent")?;
+            if outputs.next().is_some() {
+                anyhow::bail!("Rift verification operation returned extra output");
+            }
             if !String::from_utf8_lossy(&ancestors.stdout).trim().is_empty() {
                 anyhow::bail!(
                     "repository {} is a child Rift; IQ requires an independently managed Rift root",
@@ -6311,32 +11011,13 @@ pub mod integrator {
                     }
                 }
                 if entry_exists(&marker)? {
-                    let mut list_args = Vec::new();
-                    if let Some(database) = database.as_ref() {
-                        list_args.push(OsString::from("--database"));
-                        list_args.push(database.clone());
-                    }
-                    list_args.extend([OsString::from("list"), source.as_os_str().into()]);
-                    let listed = command_output_timeout(
-                        &program,
-                        list_args,
-                        None,
-                        StdDuration::from_secs(60),
-                        |gate| {
-                            gate.write_all(b"run\n")?;
-                            Ok(true)
-                        },
-                        || Ok(ExecutionAuthority::Active),
-                    )?;
-                    let listed = match listed {
-                        CommandOutputOutcome::Exited(output) if output.status.success() => output,
-                        CommandOutputOutcome::Exited(output) => anyhow::bail!(
+                    let listed = if listed.status.success() {
+                        listed
+                    } else {
+                        anyhow::bail!(
                             "list source Rifts failed: {}",
-                            String::from_utf8_lossy(&output.stderr).trim()
-                        ),
-                        CommandOutputOutcome::Cancelled => {
-                            anyhow::bail!("list source Rifts lost command authority")
-                        }
+                            String::from_utf8_lossy(&listed.stderr).trim()
+                        )
                     };
                     let listed = String::from_utf8(listed.stdout)?
                         .lines()
@@ -6446,7 +11127,7 @@ pub mod integrator {
                 registry_dev,
                 registry_ino,
                 generation: AtomicI64::new(0),
-                program: std::env::var("IQ_RIFT_CLI").unwrap_or_else(|_| "rift".into()),
+                program: rift_executable_authority()?,
                 database,
                 root_directory,
             };
@@ -6505,7 +11186,7 @@ pub mod integrator {
                 registry_dev,
                 registry_ino,
                 generation: AtomicI64::new(persisted_generation),
-                program: std::env::var("IQ_RIFT_CLI").unwrap_or_else(|_| "rift".into()),
+                program: rift_executable_authority()?,
                 database,
                 root_directory,
             };
@@ -6844,7 +11525,7 @@ pub mod integrator {
         pub(crate) fn create(
             &self,
             item_id: &str,
-            authorize_start: impl FnOnce(&mut dyn Write) -> Result<bool>,
+            authorize_start: impl FnOnce(&mut CommandRelease) -> Result<bool>,
             check_authority: impl FnMut() -> Result<ExecutionAuthority>,
         ) -> Result<(PathBuf, String)> {
             let _root_lock = acquire_root_lock(&self.root)?;
@@ -6926,6 +11607,7 @@ pub mod integrator {
                             self.source.display()
                         );
                     }
+                    crate::git_command::authorize_current(&path)?;
                     Ok(WorkspaceIdentity {
                         path: path
                             .to_str()
@@ -6946,7 +11628,7 @@ pub mod integrator {
             complete_mutation: F,
         ) -> Result<bool>
         where
-            A: FnMut(&mut dyn Write) -> Result<bool>,
+            A: FnMut(&mut CommandRelease) -> Result<bool>,
             C: FnMut() -> Result<ExecutionAuthority>,
             F: FnOnce() -> Result<()>,
         {
@@ -6970,7 +11652,7 @@ pub mod integrator {
         ) -> Result<()>
         where
             P: FnMut(u64, u64, [u8; 32], Option<&ResidueChildMove>) -> Result<()>,
-            A: FnMut(&mut dyn Write) -> Result<bool>,
+            A: FnMut(&mut CommandRelease) -> Result<bool>,
             C: FnMut() -> Result<ExecutionAuthority>,
             F: FnOnce() -> Result<()>,
         {
@@ -7063,8 +11745,8 @@ pub mod integrator {
                     }
                     ExecutionAuthority::Lost(message) => anyhow::bail!(message),
                 }
-                let mut sink = std::io::sink();
-                if !authorize_mutation(&mut sink)? {
+                let mut release = CommandRelease::new();
+                if !authorize_mutation(&mut release)? {
                     anyhow::bail!("cleanup residue discard was not authorized");
                 }
                 if self
@@ -7105,8 +11787,8 @@ pub mod integrator {
                     }
                     ExecutionAuthority::Lost(message) => anyhow::bail!(message),
                 }
-                let mut sink = std::io::sink();
-                if !authorize_mutation(&mut sink)? {
+                let mut release = CommandRelease::new();
+                if !authorize_mutation(&mut release)? {
                     anyhow::bail!("cleanup residue discard was not authorized");
                 }
                 if self
@@ -7130,8 +11812,8 @@ pub mod integrator {
                 }
                 ExecutionAuthority::Lost(message) => anyhow::bail!(message),
             }
-            let mut sink = std::io::sink();
-            if !authorize_mutation(&mut sink)? {
+            let mut release = CommandRelease::new();
+            if !authorize_mutation(&mut release)? {
                 anyhow::bail!("cleanup residue discard was not authorized");
             }
             if let Some(actual) = self
@@ -7175,8 +11857,8 @@ pub mod integrator {
                     }
                     ExecutionAuthority::Lost(message) => anyhow::bail!(message),
                 }
-                let mut sink = std::io::sink();
-                if !authorize_mutation(&mut sink)? {
+                let mut release = CommandRelease::new();
+                if !authorize_mutation(&mut release)? {
                     anyhow::bail!("cleanup residue discard was not authorized");
                 }
                 if let Some(actual) = self
@@ -7325,7 +12007,7 @@ pub mod integrator {
             complete_mutation: F,
         ) -> Result<bool>
         where
-            A: FnMut(&mut dyn Write) -> Result<bool>,
+            A: FnMut(&mut CommandRelease) -> Result<bool>,
             C: FnMut() -> Result<ExecutionAuthority>,
             F: FnOnce() -> Result<()>,
         {
@@ -7448,7 +12130,7 @@ pub mod integrator {
             check_authority: &mut C,
         ) -> Result<()>
         where
-            A: FnMut(&mut dyn Write) -> Result<bool>,
+            A: FnMut(&mut CommandRelease) -> Result<bool>,
             C: FnMut() -> Result<ExecutionAuthority>,
         {
             self.verify_owned_path(path)?;
@@ -7470,8 +12152,8 @@ pub mod integrator {
                 }
                 ExecutionAuthority::Lost(message) => anyhow::bail!(message),
             }
-            let mut sink = std::io::sink();
-            if !authorize_mutation(&mut sink)? {
+            let mut release = CommandRelease::new();
+            if !authorize_mutation(&mut release)? {
                 anyhow::bail!("cleanup residue removal was not authorized");
             }
             if self
@@ -7532,7 +12214,7 @@ pub mod integrator {
             complete_mutation: F,
         ) -> Result<()>
         where
-            A: FnOnce(&mut dyn Write) -> Result<bool>,
+            A: FnOnce(&mut CommandRelease) -> Result<bool>,
             C: FnMut() -> Result<ExecutionAuthority>,
             F: FnOnce() -> Result<()>,
         {
@@ -7545,7 +12227,7 @@ pub mod integrator {
 
         fn gc_unlocked<A, C>(&self, authorize_mutation: A, check_authority: C) -> Result<()>
         where
-            A: FnOnce(&mut dyn Write) -> Result<bool>,
+            A: FnOnce(&mut CommandRelease) -> Result<bool>,
             C: FnMut() -> Result<ExecutionAuthority>,
         {
             self.run_supervised(
@@ -7662,8 +12344,11 @@ pub mod integrator {
                 command_args.push(database.clone());
             }
             command_args.extend(args);
-            let outcome = command_output_timeout(
-                &self.program,
+            let outcome = command_output_timeout_with_prepare(
+                CommandProgram::Descriptor {
+                    label: "rift",
+                    authority: &self.program,
+                },
                 command_args,
                 None,
                 StdDuration::from_secs(60),
@@ -7672,6 +12357,10 @@ pub mod integrator {
                     Ok(true)
                 },
                 || Ok(ExecutionAuthority::Active),
+                |command| {
+                    crate::agent_config::harden_rift_environment(command);
+                    Ok(())
+                },
             )
             .with_context(|| format!("run {label}"))?;
             match outcome {
@@ -7690,7 +12379,7 @@ pub mod integrator {
             &self,
             args: I,
             label: &str,
-            authorize_start: impl FnOnce(&mut dyn Write) -> Result<bool>,
+            authorize_start: impl FnOnce(&mut CommandRelease) -> Result<bool>,
             check_authority: impl FnMut() -> Result<ExecutionAuthority>,
         ) -> Result<Output>
         where
@@ -7703,13 +12392,20 @@ pub mod integrator {
                 command_args.push(database.clone());
             }
             command_args.extend(args);
-            let outcome = command_output_timeout(
-                &self.program,
+            let outcome = command_output_timeout_with_prepare(
+                CommandProgram::Descriptor {
+                    label: "rift",
+                    authority: &self.program,
+                },
                 command_args,
                 None,
                 StdDuration::from_secs(60),
                 authorize_start,
                 check_authority,
+                |command| {
+                    crate::agent_config::harden_rift_environment(command);
+                    Ok(())
+                },
             )
             .with_context(|| format!("run {label}"))?;
             match outcome {
@@ -7970,9 +12666,71 @@ pub mod integrator {
         TimedOut(ExitStatus),
     }
 
-    enum CommandOutputOutcome {
+    pub(crate) enum CommandOutputOutcome {
         Exited(Output),
         Cancelled,
+    }
+
+    pub(crate) enum CommandProgram<'a> {
+        SearchPath(&'a str),
+        Descriptor {
+            label: &'a str,
+            authority: &'a crate::agent_config::ExecutableAuthority,
+        },
+    }
+
+    impl CommandProgram<'_> {
+        fn label(&self) -> &str {
+            match self {
+                Self::SearchPath(program) | Self::Descriptor { label: program, .. } => program,
+            }
+        }
+    }
+
+    pub(crate) struct CommandRelease {
+        token: Vec<u8>,
+        https_credential: Option<crate::git_command::HttpsCredential>,
+    }
+
+    impl CommandRelease {
+        fn new() -> Self {
+            Self {
+                token: Vec::new(),
+                https_credential: None,
+            }
+        }
+
+        pub(crate) fn set_https_credential(
+            &mut self,
+            credential: Option<crate::git_command::HttpsCredential>,
+        ) {
+            self.https_credential = credential;
+        }
+    }
+
+    impl Write for CommandRelease {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.token.write(buffer)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    pub(crate) enum CommandInfrastructureError {
+        #[error("{program} timed out after {timeout_seconds} seconds")]
+        TimedOut {
+            program: String,
+            timeout_seconds: u64,
+        },
+        #[error("{program} {stream} exceeded the {maximum_bytes}-byte capture limit")]
+        OutputLimit {
+            program: String,
+            stream: &'static str,
+            maximum_bytes: usize,
+        },
     }
 
     struct LeaseHeartbeat {
@@ -7994,8 +12752,7 @@ pub mod integrator {
     #[cfg(not(debug_assertions))]
     fn pause_repository_operation_after_acquire() {}
 
-    #[doc(hidden)]
-    pub struct RepositoryOperationLease {
+    pub(crate) struct RepositoryOperationLease {
         queue: SqliteQueue,
         _database_lease: crate::control_store::DatabaseProcessLease,
         repo_key: String,
@@ -8067,7 +12824,7 @@ pub mod integrator {
             }))
         }
 
-        pub fn acquire(
+        pub(crate) fn acquire(
             queue: SqliteQueue,
             repository: &Path,
             repo_key: &str,
@@ -8078,18 +12835,31 @@ pub mod integrator {
                 .with_context(|| format!("repository queue {repo_key} has an active operation"))
         }
 
-        pub fn ensure(&self) -> Result<()> {
+        pub(crate) fn ensure(&self) -> Result<()> {
+            self.ensure_lease()?;
+            self.queue
+                .verify_owned_repository(&self.repo_key)
+                .context("reverify owned repository operation authority")?;
+            Ok(())
+        }
+
+        fn ensure_lease(&self) -> Result<()> {
             if self.queue.ensure_repo_lease_owner(
                 &self.repo_key,
                 &self.owner_id,
                 self.ttl_seconds,
             )? {
-                self.queue
-                    .verify_owned_repository(&self.repo_key)
-                    .context("reverify owned repository operation authority")?;
                 Ok(())
             } else {
                 anyhow::bail!("repository operation lease was lost for {}", self.repo_key)
+            }
+        }
+
+        fn ensure_command_authority(&self, program: &str, args: &[OsString]) -> Result<()> {
+            if program == "git" && crate::git_command::is_read_only_operation(args) {
+                self.ensure_lease()
+            } else {
+                self.ensure()
             }
         }
 
@@ -8098,7 +12868,69 @@ pub mod integrator {
         }
 
         #[doc(hidden)]
-        pub fn run_command<I, S>(
+        pub(crate) fn run_command<I, S>(
+            &self,
+            program: &str,
+            args: I,
+            cwd: Option<&Path>,
+            timeout: StdDuration,
+            label: &str,
+        ) -> Result<Output>
+        where
+            I: IntoIterator<Item = S>,
+            S: AsRef<OsStr>,
+        {
+            let args = args
+                .into_iter()
+                .map(|argument| argument.as_ref().to_os_string())
+                .collect::<Vec<_>>();
+            let outcome = command_output_timeout(
+                program,
+                &args,
+                cwd,
+                timeout,
+                |gate| {
+                    self.ensure_command_authority(program, &args)?;
+                    if program == "git" && crate::git_command::is_external_operation(&args) {
+                        let cwd =
+                            cwd.context("Git command requires an explicit working directory")?;
+                        let repository = self.queue.repository(&self.repo_key)?;
+                        let canonical = repository.policy.canonical_repository;
+                        let credential =
+                            crate::git_command::authorize_external_effect(cwd, &args, &canonical)?;
+                        self.ensure_command_authority(program, &args)?;
+                        if self
+                            .queue
+                            .repository(&self.repo_key)?
+                            .policy
+                            .canonical_repository
+                            != canonical
+                        {
+                            anyhow::bail!("repository policy changed during provider verification");
+                        }
+                        crate::git_command::authorize_external_effect_with_verified_provider(
+                            cwd, &args, &canonical,
+                        )?;
+                        gate.set_https_credential(credential);
+                    }
+                    gate.write_all(b"run\n")?;
+                    Ok(true)
+                },
+                || self.authority(),
+            )?;
+            match outcome {
+                CommandOutputOutcome::Exited(output) if output.status.success() => Ok(output),
+                CommandOutputOutcome::Exited(output) => anyhow::bail!(
+                    "{label} failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+                CommandOutputOutcome::Cancelled => {
+                    anyhow::bail!("{label} lost repository operation authority")
+                }
+            }
+        }
+
+        pub(crate) fn run_internal_command<I, S>(
             &self,
             program: &str,
             args: I,
@@ -8117,6 +12949,176 @@ pub mod integrator {
                 timeout,
                 |gate| {
                     self.ensure()?;
+                    gate.write_all(b"run\n")?;
+                    Ok(true)
+                },
+                || self.authority(),
+            )?;
+            match outcome {
+                CommandOutputOutcome::Exited(output) if output.status.success() => Ok(output),
+                CommandOutputOutcome::Exited(output) => anyhow::bail!(
+                    "{label} failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+                CommandOutputOutcome::Cancelled => {
+                    anyhow::bail!("{label} lost repository operation authority")
+                }
+            }
+        }
+
+        pub(crate) fn run_new_work_command<I, S>(
+            &self,
+            program: &str,
+            args: I,
+            cwd: Option<&Path>,
+            timeout: StdDuration,
+            label: &str,
+        ) -> Result<Output>
+        where
+            I: IntoIterator<Item = S>,
+            S: AsRef<OsStr>,
+        {
+            let args = args
+                .into_iter()
+                .map(|argument| argument.as_ref().to_os_string())
+                .collect::<Vec<_>>();
+            self.run_policy_command(
+                program,
+                &args,
+                cwd,
+                timeout,
+                label,
+                || self.queue.authorize_new_work(&self.repo_key),
+                || {
+                    Ok(self
+                        .queue
+                        .repository(&self.repo_key)?
+                        .policy
+                        .canonical_repository)
+                },
+            )
+        }
+
+        pub(crate) fn run_obligation_command<I, S>(
+            &self,
+            obligation: &crate::repository_policy::Obligation,
+            program: &str,
+            args: I,
+            cwd: Option<&Path>,
+            timeout: StdDuration,
+            label: &str,
+        ) -> Result<Output>
+        where
+            I: IntoIterator<Item = S>,
+            S: AsRef<OsStr>,
+        {
+            let args = args
+                .into_iter()
+                .map(|argument| argument.as_ref().to_os_string())
+                .collect::<Vec<_>>();
+            self.run_policy_command(
+                program,
+                &args,
+                cwd,
+                timeout,
+                label,
+                || self.queue.authorize_obligation(&self.repo_key, obligation),
+                || {
+                    Ok(self
+                        .queue
+                        .repository(&self.repo_key)?
+                        .policy
+                        .canonical_repository)
+                },
+            )
+        }
+
+        pub(crate) fn run_replication_command<I, S>(
+            &self,
+            debt_id: &str,
+            program: &str,
+            args: I,
+            cwd: Option<&Path>,
+            timeout: StdDuration,
+            label: &str,
+        ) -> Result<Output>
+        where
+            I: IntoIterator<Item = S>,
+            S: AsRef<OsStr>,
+        {
+            let args = args
+                .into_iter()
+                .map(|argument| argument.as_ref().to_os_string())
+                .collect::<Vec<_>>();
+            self.run_policy_command(
+                program,
+                &args,
+                cwd,
+                timeout,
+                label,
+                || {
+                    self.queue.authorize_replication_command(
+                        &self.repo_key,
+                        debt_id,
+                        &self.owner_id,
+                        &args,
+                    )?;
+                    Ok(())
+                },
+                || {
+                    let debt = self.queue.replication_debt(debt_id)?;
+                    Ok(debt.replica)
+                },
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn run_policy_command<I, S>(
+            &self,
+            program: &str,
+            args: I,
+            cwd: Option<&Path>,
+            timeout: StdDuration,
+            label: &str,
+            authorize: impl Fn() -> Result<()>,
+            external_repository: impl Fn() -> Result<crate::repository_policy::GitRepository>,
+        ) -> Result<Output>
+        where
+            I: IntoIterator<Item = S>,
+            S: AsRef<OsStr>,
+        {
+            let args = args
+                .into_iter()
+                .map(|argument| argument.as_ref().to_os_string())
+                .collect::<Vec<_>>();
+            let outcome = command_output_timeout(
+                program,
+                &args,
+                cwd,
+                timeout,
+                |gate| {
+                    self.ensure_command_authority(program, &args)?;
+                    authorize()?;
+                    if program == "git" && crate::git_command::is_external_operation(&args) {
+                        let cwd =
+                            cwd.context("Git command requires an explicit working directory")?;
+                        let repository = external_repository()?;
+                        let credential =
+                            crate::git_command::authorize_external_effect(cwd, &args, &repository)?;
+                        self.ensure_command_authority(program, &args)?;
+                        authorize()?;
+                        if external_repository()? != repository {
+                            anyhow::bail!(
+                                "external repository policy changed during provider verification"
+                            );
+                        }
+                        crate::git_command::authorize_external_effect_with_verified_provider(
+                            cwd,
+                            &args,
+                            &repository,
+                        )?;
+                        gate.set_https_credential(credential);
+                    }
                     gate.write_all(b"run\n")?;
                     Ok(true)
                 },
@@ -8333,7 +13335,7 @@ pub mod integrator {
             &self,
             item: &QueueItem,
             attempt: &Attempt,
-        ) -> Result<crate::control_store::IntegrationEffort> {
+        ) -> Result<Option<crate::control_store::IntegrationEffort>> {
             let workspace = item
                 .workspace
                 .identity()
@@ -8357,7 +13359,8 @@ pub mod integrator {
             };
             let landing_variant = item.landing_policy.to_string();
             let state_repository = self.control_store.item_state_repository_binding(&item.id)?;
-            self.control_store
+            match self
+                .control_store
                 .create_effort(crate::control_store::NewEffort {
                     item_id: &item.id,
                     attempt_id: &attempt.id,
@@ -8368,7 +13371,22 @@ pub mod integrator {
                     workspace,
                     runner: &runner,
                     state_repository: &state_repository,
-                })
+                }) {
+                Ok(effort) => Ok(Some(effort)),
+                Err(error)
+                    if matches!(
+                        error.downcast_ref::<crate::control_store::EffortCreationError>(),
+                        Some(crate::control_store::EffortCreationError::Cancelled { .. })
+                    ) =>
+                {
+                    let cancelled = self.queue.get_item(&item.id)?;
+                    if cancelled.status != QueueStatus::Cancelled {
+                        anyhow::bail!("effort creation reported cancellation for an active item");
+                    }
+                    Ok(None)
+                }
+                Err(error) => Err(error),
+            }
         }
 
         fn verify_registered_remote_identity_for(
@@ -8392,7 +13410,35 @@ pub mod integrator {
                     registered_remote.name
                 );
             }
-            crate::composition::verify_remote_identity(repo_path, &registered_remote)?;
+            let canonical = queue.repository(repo_key)?.policy.canonical_repository;
+            crate::composition::verify_remote_identity(repo_path, &registered_remote, &canonical)?;
+            Ok(true)
+        }
+
+        fn verify_registered_remote_transport_identity_for(
+            queue: &SqliteQueue,
+            repo_key: &str,
+            repo_path: &Path,
+            target: &str,
+            remote_name: &str,
+        ) -> Result<bool> {
+            let Some((registered_path, registered_target, registered_remote)) =
+                queue.registered_remote_identity(repo_key)?
+            else {
+                return Ok(false);
+            };
+            if registered_path != repo_path
+                || registered_target != target
+                || registered_remote.name != remote_name
+            {
+                anyhow::bail!("configured remote differs from registered repository identity");
+            }
+            let canonical = queue.repository(repo_key)?.policy.canonical_repository;
+            crate::composition::verify_remote_transport_identity(
+                repo_path,
+                &registered_remote,
+                &canonical,
+            )?;
             Ok(true)
         }
 
@@ -8411,23 +13457,124 @@ pub mod integrator {
             Ok(())
         }
 
+        fn ensure_registered_remote_transport_identity(&self) -> Result<()> {
+            let (_, target, _) = self
+                .queue
+                .registered_remote_identity(&self.options.repo_key)?
+                .context("queue repository is not registered")?;
+            Self::verify_registered_remote_transport_identity_for(
+                &self.queue,
+                &self.options.repo_key,
+                &self.options.repo_path,
+                &target,
+                &self.options.base_remote,
+            )?;
+            Ok(())
+        }
+
+        fn ensure_registered_remote_identity_for_item(
+            &self,
+            item: &QueueItem,
+            attempt: &Attempt,
+            expected_status: QueueStatus,
+        ) -> Result<()> {
+            self.ensure_registered_remote_transport_identity()?;
+            let canonical = self
+                .queue
+                .repository(&self.options.repo_key)?
+                .policy
+                .canonical_repository;
+            if let Some(provider) = canonical.provider() {
+                let mut executor = |provider_kind, program: &str, args: &[OsString]| {
+                    self.run_supervised_provider_command(
+                        &item.id,
+                        &attempt.id,
+                        expected_status,
+                        provider_kind,
+                        program,
+                        args,
+                    )
+                };
+                crate::providers::verify_repository_with(
+                    provider,
+                    canonical.object_format(),
+                    &mut executor,
+                )
+                .context("verify immutable provider repository identity")?;
+            }
+            Ok(())
+        }
+
+        fn canonical_fetch_transport(&self) -> Result<String> {
+            self.ensure_registered_remote_transport_identity()?;
+            let canonical = self
+                .queue
+                .repository(&self.options.repo_key)?
+                .policy
+                .canonical_repository;
+            canonical.verify_local_bare()?;
+            Ok(canonical.operational_fetch_url())
+        }
+
+        fn canonical_push_transport(&self) -> Result<String> {
+            self.ensure_registered_remote_transport_identity()?;
+            let canonical = self
+                .queue
+                .repository(&self.options.repo_key)?
+                .policy
+                .canonical_repository;
+            canonical.verify_local_bare()?;
+            Ok(canonical.operational_push_url())
+        }
+
+        fn require_item_integration_policy(&self, item: &QueueItem) -> Result<()> {
+            let repository = self.queue.repository(&item.repo_key)?;
+            let authorized = matches!(
+                (&repository.policy.integration_policy, &item.admission),
+                (
+                    crate::repository_policy::IntegrationPolicy::Direct,
+                    crate::sqlite::QueueAdmission::Direct { .. }
+                        | crate::sqlite::QueueAdmission::LocalSubmission { .. }
+                ) | (
+                    crate::repository_policy::IntegrationPolicy::MergeRequestRequired,
+                    crate::sqlite::QueueAdmission::MergeRequest(_)
+                )
+            );
+            if !authorized {
+                anyhow::bail!("queue admission is not authorized by repository policy");
+            }
+            Ok(())
+        }
+
         pub fn run_once(&self) -> Result<Option<QueueItem>> {
-            let _operation = RepositoryOperationLease::acquire(
+            let operation = RepositoryOperationLease::acquire(
                 self.queue.clone(),
                 &self.options.repo_path,
                 &self.options.repo_key,
                 &self.lease_owner_id,
                 self.options.lease_ttl_seconds,
             )?;
+            let repository_policy = &self.queue.repository(&self.options.repo_key)?.policy;
+            match &repository_policy.operation_state {
+                crate::repository_policy::OperationState::Enabled => {}
+                crate::repository_policy::OperationState::Draining { .. } => {}
+                crate::repository_policy::OperationState::Disabled => {
+                    anyhow::bail!("repository is disabled")
+                }
+            }
             self.initialize_workspaces()?;
             cleanup_terminal_agent_artifacts(&self.queue, &self.options.repo_key, false)?;
             self.synchronize_workspace_generation()?;
             self.with_lease_heartbeat("workspace cleanup", || {
                 self.reconcile_workspaces(TerminalCleanupMode::Automatic)
             })?;
+            self.reconcile_pending_replication()?;
+            self.reconcile_private_refs(&operation)?;
             let Some(active) = self.queue.oldest_active_item(&self.options.repo_key)? else {
                 return Ok(None);
             };
+            repository_policy.require_queue_mutation(&active.id)?;
+            self.require_item_integration_policy(&active)?;
             if let Some(blocked) = self.enforce_item_boundary(&active)? {
                 return Ok(Some(blocked));
             }
@@ -8437,7 +13584,9 @@ pub mod integrator {
                 return Ok(Some(active));
             }
             if active.status != QueueStatus::Ready {
-                return self.resume_item_owned(&active.id).map(Some);
+                let item = self.resume_item_owned(&active.id, &operation)?;
+                self.reconcile_private_refs(&operation)?;
+                return Ok(Some(item));
             }
             let (_, snapshot, digest) =
                 crate::composition::load_local_policy(&self.options.repo_path)?;
@@ -8465,32 +13614,53 @@ pub mod integrator {
             ) {
                 return Ok(Some(item));
             }
-            let item =
-                self.with_lease_heartbeat("integrating", || self.integrate_item(item, &attempt))?;
+            let item = self.with_lease_heartbeat("integrating", || {
+                self.integrate_item(item, &attempt, &operation)
+            })?;
+            self.reconcile_private_refs(&operation)?;
             Ok(Some(item))
         }
 
-        pub fn with_repo_lease<T>(
-            &self,
-            operation: impl FnOnce() -> Result<T>,
-        ) -> Result<Option<T>> {
-            let Some(_operation) = RepositoryOperationLease::try_acquire(
-                self.queue.clone(),
-                &self.options.repo_path,
-                &self.options.repo_key,
+        fn reconcile_private_refs(&self, operation: &RepositoryOperationLease) -> Result<()> {
+            let repository = self.queue.repository(&self.options.repo_key)?;
+            crate::composition::reconcile_private_refs(
+                &self.queue,
+                &repository,
                 &self.lease_owner_id,
-                self.options.lease_ttl_seconds,
-            )?
-            else {
-                return Ok(None);
-            };
-            self.initialize_workspaces()?;
-            self.with_lease_heartbeat("communication", operation)
-                .map(Some)
+                |args, cwd, label| {
+                    operation.run_internal_command(
+                        "git",
+                        args,
+                        Some(cwd),
+                        StdDuration::from_secs(20),
+                        label,
+                    )
+                },
+            )?;
+            Ok(())
+        }
+
+        fn reconcile_pending_replication(&self) -> Result<()> {
+            let mut targets = std::collections::BTreeSet::new();
+            for debt in self.queue.replication_debts(Some(&self.options.repo_key))? {
+                if matches!(debt.outcome.as_str(), "succeeded" | "superseded")
+                    || !targets.insert(debt.destination_key.clone())
+                {
+                    continue;
+                }
+                crate::composition::reconcile_replication_debt(
+                    &self.queue,
+                    &self.lease_owner_id,
+                    &debt.id,
+                    true,
+                    |debt_id, args, cwd, _label| self.run_replication_git(debt_id, args, cwd),
+                )?;
+            }
+            Ok(())
         }
 
         pub fn resume_item(&self, item_id: &str) -> Result<QueueItem> {
-            let _operation = RepositoryOperationLease::acquire(
+            let operation = RepositoryOperationLease::acquire(
                 self.queue.clone(),
                 &self.options.repo_path,
                 &self.options.repo_key,
@@ -8498,6 +13668,11 @@ pub mod integrator {
                 self.options.lease_ttl_seconds,
             )?;
             self.initialize_workspaces()?;
+            self.reconcile_private_refs(&operation)?;
+            self.queue
+                .repository(&self.options.repo_key)?
+                .policy
+                .require_queue_mutation(item_id)?;
             let oldest = self
                 .queue
                 .oldest_active_item(&self.options.repo_key)?
@@ -8508,10 +13683,16 @@ pub mod integrator {
                     oldest.id
                 );
             }
-            self.resume_item_owned(item_id)
+            let item = self.resume_item_owned(item_id, &operation)?;
+            self.reconcile_private_refs(&operation)?;
+            Ok(item)
         }
 
-        fn resume_item_owned(&self, item_id: &str) -> Result<QueueItem> {
+        fn resume_item_owned(
+            &self,
+            item_id: &str,
+            operation: &RepositoryOperationLease,
+        ) -> Result<QueueItem> {
             let item = self.queue.get_item(item_id)?;
             if item.repo_key != self.options.repo_key {
                 anyhow::bail!(
@@ -8520,6 +13701,7 @@ pub mod integrator {
                     self.options.repo_key
                 );
             }
+            self.require_item_integration_policy(&item)?;
             if let Some(blocked) = self.enforce_item_boundary(&item)? {
                 return Ok(blocked);
             }
@@ -8534,18 +13716,16 @@ pub mod integrator {
                         return self.run_agent_cycle(item, &attempt)
                     }
                     crate::control_domain::IntegrationEffortState::AgentLaunching(launch) => {
-                        if matches!(
-                            crate::agent_runner::systemd_unit_state(
-                                &effort.runner.sandbox.systemctl,
-                                &launch.unit_name,
-                            )?,
-                            crate::agent_runner::SystemdUnitState::Loaded { .. }
-                        ) {
-                            crate::agent_runner::stop_systemd_unit(
-                                &effort.runner.sandbox.systemctl,
-                                &launch.unit_name,
-                            )?;
+                        if crate::agent_runner::exact_process_is_alive(
+                            launch.launcher.pid,
+                            launch.launcher.process_start_ticks,
+                        )? {
+                            return Ok(item);
                         }
+                        crate::agent_runner::stop_and_verify_systemd_unit(
+                            &effort.runner.sandbox.systemctl,
+                            &launch.unit_name,
+                        )?;
                         let workspace = self.load_owned_workspace(&item)?;
                         crate::agent_runner::quarantine_restart_artifacts(
                             &workspace,
@@ -8568,7 +13748,12 @@ pub mod integrator {
                             .resume_provider_reconciliation(&effort.id)?;
                         let item = self.queue.get_item(item_id)?;
                         return self.with_lease_heartbeat("provider reconciliation", || {
-                            self.integrate_item(item, &attempt)
+                            self.integrate_item(item, &attempt, operation)
+                        });
+                    }
+                    crate::control_domain::IntegrationEffortState::TargetMovePending(_) => {
+                        return self.with_lease_heartbeat("target-move reconciliation", || {
+                            self.integrate_item(item, &attempt, operation)
                         });
                     }
                     crate::control_domain::IntegrationEffortState::ReplacementPending(_)
@@ -8579,10 +13764,12 @@ pub mod integrator {
                     | crate::control_domain::IntegrationEffortState::Integrated(_)
                     | crate::control_domain::IntegrationEffortState::Cancelled(_) => {}
                     crate::control_domain::IntegrationEffortState::AgentRunning(running) => {
-                        crate::agent_runner::terminate_exact_process(
+                        crate::agent_runner::stop_exact_runner_service(
+                            &effort.runner.sandbox.systemctl,
+                            &running.unit_name,
+                            &running.control_group,
                             running.pid,
                             running.process_start_ticks,
-                            running.process_group_id,
                         )?;
                         let workspace = self.load_owned_workspace(&item)?;
                         match crate::agent_runner::read_restart_result(
@@ -8677,7 +13864,9 @@ pub mod integrator {
                     ) {
                         return Ok(item);
                     }
-                    self.with_lease_heartbeat("integrating", || self.integrate_item(item, &attempt))
+                    self.with_lease_heartbeat("integrating", || {
+                        self.integrate_item(item, &attempt, operation)
+                    })
                 }
                 QueueStatus::Merged => {
                     let item = self.with_lease_heartbeat("validating", || {
@@ -8689,7 +13878,9 @@ pub mod integrator {
                     ) {
                         return Ok(item);
                     }
-                    self.with_lease_heartbeat("integrating", || self.integrate_item(item, &attempt))
+                    self.with_lease_heartbeat("integrating", || {
+                        self.integrate_item(item, &attempt, operation)
+                    })
                 }
                 QueueStatus::Validating => {
                     let item = self.with_lease_heartbeat("validating", || {
@@ -8701,14 +13892,16 @@ pub mod integrator {
                     ) {
                         return Ok(item);
                     }
-                    self.with_lease_heartbeat("integrating", || self.integrate_item(item, &attempt))
+                    self.with_lease_heartbeat("integrating", || {
+                        self.integrate_item(item, &attempt, operation)
+                    })
                 }
-                QueueStatus::Validated => {
-                    self.with_lease_heartbeat("integrating", || self.integrate_item(item, &attempt))
-                }
-                QueueStatus::Integrating => {
-                    self.with_lease_heartbeat("integrating", || self.integrate_item(item, &attempt))
-                }
+                QueueStatus::Validated => self.with_lease_heartbeat("integrating", || {
+                    self.integrate_item(item, &attempt, operation)
+                }),
+                QueueStatus::Integrating => self.with_lease_heartbeat("integrating", || {
+                    self.integrate_item(item, &attempt, operation)
+                }),
                 QueueStatus::Blocked => anyhow::bail!(
                     "item {item_id} is still blocked; answer prompt or requeue before resume"
                 ),
@@ -8895,6 +14088,47 @@ pub mod integrator {
             )
         }
 
+        fn run_supervised_internal_git_command<I, S>(
+            &self,
+            item_id: &str,
+            attempt_id: &str,
+            args: I,
+            cwd: &Path,
+        ) -> Result<Output>
+        where
+            I: IntoIterator<Item = S>,
+            S: AsRef<OsStr>,
+        {
+            let outcome = command_output_timeout(
+                "git",
+                args,
+                Some(cwd),
+                StdDuration::from_secs(20),
+                |gate| {
+                    self.authorize_execution_start(
+                        item_id,
+                        attempt_id,
+                        QueueStatus::Integrating,
+                        |_| {
+                            gate.write_all(b"run\n")
+                                .context("release internal Git command gate")
+                        },
+                    )
+                },
+                || self.execution_authority(item_id),
+            )?;
+            match outcome {
+                CommandOutputOutcome::Exited(output) if output.status.success() => Ok(output),
+                CommandOutputOutcome::Exited(output) => anyhow::bail!(
+                    "internal Git command failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+                CommandOutputOutcome::Cancelled => {
+                    anyhow::bail!("internal Git command lost execution authority")
+                }
+            }
+        }
+
         #[allow(clippy::too_many_arguments)]
         fn run_supervised_item_command<I, S>(
             &self,
@@ -8947,16 +14181,192 @@ pub mod integrator {
             I: IntoIterator<Item = S>,
             S: AsRef<OsStr>,
         {
-            let outcome = command_output_timeout(
+            self.run_supervised_item_command_output_with_landing_release(
+                item_id,
+                attempt_id,
+                expected_status,
                 program,
                 args,
                 cwd,
                 timeout,
+                label,
+                None,
+            )
+        }
+
+        fn run_supervised_provider_command(
+            &self,
+            item_id: &str,
+            attempt_id: &str,
+            expected_status: QueueStatus,
+            provider: crate::repository_policy::Provider,
+            program: &str,
+            args: &[OsString],
+        ) -> Result<Output> {
+            let outcome = crate::providers::output_with_authority(
+                provider,
+                program,
+                args,
+                None,
+                StdDuration::from_secs(20),
                 |gate| {
-                    self.authorize_execution_start(item_id, attempt_id, expected_status, || {
+                    self.authorize_execution_start(item_id, attempt_id, expected_status, |_| {
                         gate.write_all(b"run\n")
-                            .with_context(|| format!("release {label} command admission gate"))
+                            .context("release provider CLI command admission gate")
                     })
+                },
+                || self.execution_authority(item_id),
+            )
+            .map_err(|error| {
+                crate::providers::ProviderInfrastructureError::from_execution(program, error)
+            })?;
+            match outcome {
+                CommandOutputOutcome::Exited(output) => Ok(output),
+                CommandOutputOutcome::Cancelled => {
+                    Err(crate::providers::ProviderInfrastructureError::Cancelled {
+                        program: program.to_string(),
+                    }
+                    .into())
+                }
+            }
+        }
+
+        fn run_provider_command_at_effect_release(
+            &self,
+            item_id: &str,
+            provider: crate::repository_policy::Provider,
+            program: &str,
+            args: &[OsString],
+        ) -> Result<Output> {
+            let outcome = crate::providers::output_with_authority(
+                provider,
+                program,
+                args,
+                None,
+                StdDuration::from_secs(20),
+                |gate| match self.execution_authority(item_id)? {
+                    ExecutionAuthority::Active => {
+                        gate.write_all(b"run\n")?;
+                        Ok(true)
+                    }
+                    ExecutionAuthority::Cancelled => Ok(false),
+                    ExecutionAuthority::Lost(message) => anyhow::bail!(message),
+                },
+                || self.execution_authority(item_id),
+            )
+            .map_err(|error| {
+                crate::providers::ProviderInfrastructureError::from_execution(program, error)
+            })?;
+            match outcome {
+                CommandOutputOutcome::Exited(output) => Ok(output),
+                CommandOutputOutcome::Cancelled => {
+                    Err(crate::providers::ProviderInfrastructureError::Cancelled {
+                        program: program.to_string(),
+                    }
+                    .into())
+                }
+            }
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn run_supervised_item_command_output_with_landing_release<I, S>(
+            &self,
+            item_id: &str,
+            attempt_id: &str,
+            expected_status: QueueStatus,
+            program: &str,
+            args: I,
+            cwd: Option<&Path>,
+            timeout: StdDuration,
+            label: &str,
+            landing_release: Option<(&str, &str)>,
+        ) -> Result<Output>
+        where
+            I: IntoIterator<Item = S>,
+            S: AsRef<OsStr>,
+        {
+            let args = args
+                .into_iter()
+                .map(|argument| argument.as_ref().to_os_string())
+                .collect::<Vec<_>>();
+            let outcome = command_output_timeout(
+                program,
+                &args,
+                cwd,
+                timeout,
+                |gate| {
+                    let mut external_policy = if program == "git"
+                        && crate::git_command::is_external_operation(&args)
+                    {
+                        let cwd =
+                            cwd.context("Git command requires an explicit working directory")?;
+                        let repository = self.queue.repository(&self.options.repo_key)?;
+                        let canonical = repository.policy.canonical_repository;
+                        crate::git_command::authorize_external_effect_with_verified_provider(
+                            cwd, &args, &canonical,
+                        )?;
+                        let credential = if let Some(provider) = canonical.provider() {
+                            let mut executor = |provider, program: &str, args: &[OsString]| {
+                                self.run_provider_command_at_effect_release(
+                                    item_id, provider, program, args,
+                                )
+                            };
+                            crate::providers::verify_repository_with(
+                                provider,
+                                canonical.object_format(),
+                                &mut executor,
+                            )
+                            .context("reverify provider identity at Git effect release boundary")?;
+                            if crate::git_command::external_effect_uses_https(&args, &canonical)? {
+                                crate::providers::https_credential_with(provider, &mut executor)?
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        Some((repository.policy_revision, canonical, credential))
+                    } else {
+                        None
+                    };
+                    let record_release = |tx: &rusqlite::Transaction<'_>| {
+                        if let Some((effort_id, command_id)) = landing_release {
+                            crate::control_store::ControlStore::release_landing(
+                                tx, effort_id, command_id,
+                            )?;
+                        }
+                        Ok(())
+                    };
+                    let authorized = match &external_policy {
+                        Some((revision, canonical, _)) => self
+                            .authorize_execution_start_after_provider_check(
+                                item_id,
+                                attempt_id,
+                                expected_status,
+                                *revision,
+                                canonical,
+                                record_release,
+                            ),
+                        None => self.authorize_execution_start(
+                            item_id,
+                            attempt_id,
+                            expected_status,
+                            record_release,
+                        ),
+                    }?;
+                    if !authorized {
+                        return Ok(false);
+                    }
+                    if let Some((_, _, credential)) = &mut external_policy {
+                        gate.set_https_credential(credential.take());
+                    }
+                    gate.write_all(if landing_release.is_some() {
+                        b"landing\n"
+                    } else {
+                        b"run\n"
+                    })
+                    .with_context(|| format!("release {label} command admission gate"))?;
+                    Ok(true)
                 },
                 || self.execution_authority(item_id),
             )?;
@@ -8978,11 +14388,43 @@ pub mod integrator {
             item_id: &str,
             attempt_id: &str,
             expected_status: QueueStatus,
-            release_gate: impl FnOnce() -> Result<()>,
+            release_gate: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<()>,
         ) -> Result<bool> {
             self.ensure_repo_lease()?;
-            self.queue
-                .authorize_execution_start(item_id, attempt_id, expected_status, release_gate)
+            self.queue.authorize_execution_start(
+                item_id,
+                attempt_id,
+                expected_status,
+                crate::sqlite::ExecutionStartAuthority::RepositoryLease {
+                    repo_key: &self.options.repo_key,
+                    owner_id: &self.lease_owner_id,
+                },
+                release_gate,
+            )
+        }
+
+        fn authorize_execution_start_after_provider_check(
+            &self,
+            item_id: &str,
+            attempt_id: &str,
+            expected_status: QueueStatus,
+            policy_revision: i64,
+            canonical: &crate::repository_policy::GitRepository,
+            release_gate: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<()>,
+        ) -> Result<bool> {
+            self.ensure_repo_lease()?;
+            self.queue.authorize_execution_start(
+                item_id,
+                attempt_id,
+                expected_status,
+                crate::sqlite::ExecutionStartAuthority::ProviderVerified {
+                    repo_key: &self.options.repo_key,
+                    owner_id: &self.lease_owner_id,
+                    policy_revision,
+                    canonical,
+                },
+                release_gate,
+            )
         }
 
         fn begin_landing_owned(
@@ -9000,6 +14442,14 @@ pub mod integrator {
                 .context("landing item has no integration effort")?;
             if effort.attempt_id != attempt_id {
                 anyhow::bail!("landing attempt differs from effort authority");
+            }
+            if let crate::control_domain::IntegrationEffortState::Landing(landing) = &effort.state {
+                if landing.candidate_sha != candidate_sha
+                    || landing.expected_target_sha != expected_target_sha
+                {
+                    anyhow::bail!("prepared landing authority differs from requested command");
+                }
+                return Ok(None);
             }
             let attempt = self.queue.get_attempt(attempt_id)?;
             let policy = self.policy_for_attempt(&attempt)?;
@@ -9088,6 +14538,10 @@ pub mod integrator {
             }
             self.control_store
                 .mark_integrated(&effort.id, landed_commit_sha, remote_target_sha)?;
+            #[cfg(debug_assertions)]
+            if std::env::var_os("IQ_TEST_INTEGRATION_STOP_AFTER_MARK_INTEGRATED").is_some() {
+                std::process::exit(95);
+            }
             let item = self.queue.get_item(item_id)?;
             let repository = self.queue.repository(&item.repo_key)?;
             crate::composition::reconcile_registered_checkout(
@@ -9099,8 +14553,118 @@ pub mod integrator {
                     anyhow::bail!("registered checkout changed after exact landing verification")
                 },
             )?;
+            self.replicate_canonical_landing(&item, landed_commit_sha)?;
             self.cleanup_terminal_item(&item)?;
             self.queue.get_item(item_id)
+        }
+
+        fn replicate_canonical_landing(&self, item: &QueueItem, landed_sha: &str) -> Result<()> {
+            let debts = self
+                .queue
+                .replication_debts(Some(&item.repo_key))?
+                .into_iter()
+                .filter(|debt| debt.item_id == item.id)
+                .collect::<Vec<_>>();
+            for debt in debts {
+                if debt.canonical_source_sha != landed_sha {
+                    anyhow::bail!("replication debt differs from exact canonical landing");
+                }
+                if debt.operation == "pin_source" {
+                    let repository = self.queue.repository(&item.repo_key)?;
+                    crate::composition::publish_replication_source_pin(
+                        &self.queue,
+                        &repository,
+                        &self.lease_owner_id,
+                        &debt,
+                        &mut |debt_id, args, cwd, _label| {
+                            self.run_replication_git(debt_id, args, cwd)
+                        },
+                    )?;
+                }
+            }
+            self.reconcile_pending_replication()
+        }
+
+        fn run_replication_git<I, S>(
+            &self,
+            debt_id: &str,
+            args: I,
+            cwd: Option<&Path>,
+        ) -> Result<Output>
+        where
+            I: IntoIterator<Item = S>,
+            S: AsRef<OsStr>,
+        {
+            let args = args
+                .into_iter()
+                .map(|argument| argument.as_ref().to_os_string())
+                .collect::<Vec<_>>();
+            let outcome = command_output_timeout(
+                "git",
+                &args,
+                cwd,
+                StdDuration::from_secs(60),
+                |gate| {
+                    self.ensure_repo_lease()?;
+                    let debt = self.queue.authorize_replication_command(
+                        &self.options.repo_key,
+                        debt_id,
+                        &self.lease_owner_id,
+                        &args,
+                    )?;
+                    if debt.operation != "pin_source" {
+                        let repository = self.queue.repository(&self.options.repo_key)?;
+                        let preserved_ref = format!("refs/iq/replication/{debt_id}");
+                        let preserved = git_output(
+                            &repository.owned_root_path,
+                            ["rev-parse", "--verify", preserved_ref.as_str()],
+                        )?;
+                        if preserved != debt.canonical_source_sha {
+                            anyhow::bail!(
+                                "replication source pin differs from landed item authority"
+                            );
+                        }
+                    }
+                    if crate::git_command::is_external_operation(&args) {
+                        let cwd =
+                            cwd.context("Git command requires an explicit working directory")?;
+                        let credential = crate::git_command::authorize_external_effect(
+                            cwd,
+                            &args,
+                            &debt.replica,
+                        )?;
+                        self.ensure_repo_lease()?;
+                        let current = self.queue.authorize_replication_command(
+                            &self.options.repo_key,
+                            debt_id,
+                            &self.lease_owner_id,
+                            &args,
+                        )?;
+                        if current != debt {
+                            anyhow::bail!("replication debt changed during provider verification");
+                        }
+                        crate::git_command::authorize_external_effect_with_verified_provider(
+                            cwd,
+                            &args,
+                            &debt.replica,
+                        )?;
+                        gate.set_https_credential(credential);
+                    }
+                    gate.write_all(b"run\n")?;
+                    Ok(true)
+                },
+                || self.lease_authority(),
+            )?;
+            match outcome {
+                CommandOutputOutcome::Exited(output) if output.status.success() => Ok(output),
+                CommandOutputOutcome::Exited(output) => anyhow::bail!(
+                    "replication Git command failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+                CommandOutputOutcome::Cancelled => {
+                    anyhow::bail!("replication lost repository operation authority")
+                }
+            }
         }
 
         fn cleanup_terminal_item(&self, item: &QueueItem) -> Result<()> {
@@ -9199,6 +14763,7 @@ pub mod integrator {
             attempt: &Attempt,
             repository: &crate::sqlite::RegisteredRepository,
         ) -> Result<()> {
+            let canonical_fetch = self.canonical_fetch_transport()?;
             let target_sha = repository.checkout_reconciliation.target_sha();
             let attempt_target = self.queue.get_attempt(&attempt.id)?.target_base_sha;
             let private_target_ref = match attempt_target.as_deref() {
@@ -9219,12 +14784,7 @@ pub mod integrator {
             self.fetch_for_merge(
                 item,
                 attempt,
-                [
-                    "fetch",
-                    "--no-tags",
-                    &self.options.base_remote,
-                    &exact_refspec,
-                ],
+                ["fetch", "--no-tags", &canonical_fetch, &exact_refspec],
             )?;
             let fetched = git_output(&self.options.repo_path, ["rev-parse", &private_target_ref])?;
             if fetched != target_sha {
@@ -9280,6 +14840,7 @@ pub mod integrator {
 
         fn merge_item(&self, item: QueueItem, attempt: &Attempt) -> Result<QueueItem> {
             let repository = self.queue.repository(&item.repo_key)?;
+            let canonical_fetch = self.canonical_fetch_transport()?;
             if !matches!(
                 &repository.checkout_reconciliation,
                 crate::sqlite::CheckoutReconciliationState::Ready(_)
@@ -9318,7 +14879,7 @@ pub mod integrator {
                     [
                         "ls-remote",
                         "--exit-code",
-                        &self.options.base_remote,
+                        &canonical_fetch,
                         &target_full_ref,
                     ],
                     Some(&self.options.repo_path),
@@ -9336,8 +14897,11 @@ pub mod integrator {
                         ),
                     );
                 }
-                let observed =
-                    crate::composition::parse_exact_remote_ref(&observed.stdout, &target_full_ref)?;
+                let observed = crate::composition::parse_exact_remote_ref(
+                    &observed.stdout,
+                    &target_full_ref,
+                    repository.policy.canonical_repository.object_format(),
+                )?;
                 self.ensure_repo_lease()?;
                 self.queue.begin_initial_target_fetch(
                     &item.repo_key,
@@ -9359,12 +14923,7 @@ pub mod integrator {
                 if let Err(error) = self.fetch_for_merge(
                     &item,
                     attempt,
-                    [
-                        "fetch",
-                        "--no-tags",
-                        &self.options.base_remote,
-                        &exact_refspec,
-                    ],
+                    ["fetch", "--no-tags", &canonical_fetch, &exact_refspec],
                 ) {
                     return self.block_and_get(
                         &item.id,
@@ -9425,16 +14984,40 @@ pub mod integrator {
             }
             let source_sha = match &item.source {
                 crate::core::QueueSource::RemoteBranch { .. } => {
-                    let source_refspec = format!(
-                        "+refs/heads/{}:refs/remotes/{}/{}",
-                        item.source_branch, self.options.base_remote, item.source_branch
-                    );
+                    let (source_refspec, fetched_ref) = match &item.admission {
+                        crate::sqlite::QueueAdmission::Direct { .. } => (
+                            format!(
+                                "+refs/heads/{}:refs/remotes/{}/{}",
+                                item.source_branch, self.options.base_remote, item.source_branch
+                            ),
+                            format!(
+                                "refs/remotes/{}/{}",
+                                self.options.base_remote, item.source_branch
+                            ),
+                        ),
+                        crate::sqlite::QueueAdmission::MergeRequest(_) => {
+                            let fetched_ref = format!("refs/iq/mr-sources/{}", item.id);
+                            (
+                                format!("+{}:{fetched_ref}", item.source_branch),
+                                fetched_ref,
+                            )
+                        }
+                        crate::sqlite::QueueAdmission::LocalSubmission { .. } => {
+                            anyhow::bail!("remote queue source has local admission")
+                        }
+                        crate::sqlite::QueueAdmission::HistoricalMergeRequest(_) => {
+                            anyhow::bail!("terminal historical MR admission cannot be integrated")
+                        }
+                    };
                     match self.fetch_for_merge(
                         &item,
                         attempt,
-                        ["fetch", &self.options.base_remote, &source_refspec],
+                        ["fetch", &canonical_fetch, &source_refspec],
                     ) {
-                        Ok(()) => self.source_remote_sha(&item)?,
+                        Ok(()) => git_output(
+                            &self.options.repo_path,
+                            ["rev-parse", fetched_ref.as_str()],
+                        )?,
                         Err(error) => {
                             return self.block_and_get(
                                 &item.id,
@@ -9527,7 +15110,7 @@ pub mod integrator {
                         &item.id,
                         &attempt.id,
                         QueueStatus::Merging,
-                        || {
+                        |_| {
                             gate.write_all(b"run\n")
                                 .context("release Rift creation admission gate")
                         },
@@ -9535,6 +15118,7 @@ pub mod integrator {
                 },
                 || self.execution_authority(&item.id),
             )?;
+            crate::git_command::authorize_current(&created)?;
             if created != workspace {
                 anyhow::bail!(
                     "created Rift {} does not match persisted intent {}",
@@ -9584,16 +15168,6 @@ pub mod integrator {
                     Some(&workspace),
                     StdDuration::from_secs(60),
                     "Rift preparation",
-                )?;
-                self.run_supervised_item_command(
-                    &item.id,
-                    &attempt.id,
-                    QueueStatus::Merging,
-                    "git",
-                    ["config", "commit.gpgSign", "false"],
-                    Some(&workspace),
-                    StdDuration::from_secs(20),
-                    "Rift Git configuration",
                 )?;
                 let actual = git_output(&workspace, ["rev-parse", "HEAD"])?;
                 if actual != base_sha {
@@ -9662,14 +15236,19 @@ pub mod integrator {
                     "workspace_path": workspace,
                 });
                 self.ensure_repo_lease()?;
-                self.queue.set_conflict_metadata(
+                let composed = self.queue.set_conflict_metadata(
                     &item.id,
+                    &attempt.id,
                     &conflict_json,
                     &base_sha,
                     &source_sha,
                 )?;
-                let composed = self.queue.get_item(&item.id)?;
-                let effort = self.ensure_effort_after_composition(&composed, attempt)?;
+                if composed.status == QueueStatus::Cancelled {
+                    return Ok(composed);
+                }
+                let Some(effort) = self.ensure_effort_after_composition(&composed, attempt)? else {
+                    return self.queue.get_item(&item.id);
+                };
                 if let Err(error) = crate::composition::reject_tracked_policy(&workspace) {
                     self.control_store.block_infrastructure(
                         &effort.id,
@@ -9688,14 +15267,19 @@ pub mod integrator {
                 return self.run_agent_cycle(composed, &composed_attempt);
             }
 
-            self.queue.set_conflict_metadata(
+            let composed = self.queue.set_conflict_metadata(
                 &item.id,
+                &attempt.id,
                 &json!({"files": [], "target_sha": base_sha, "source_sha": source_sha}),
                 &base_sha,
                 &source_sha,
             )?;
-            let composed = self.queue.get_item(&item.id)?;
-            let effort = self.ensure_effort_after_composition(&composed, attempt)?;
+            if composed.status == QueueStatus::Cancelled {
+                return Ok(composed);
+            }
+            let Some(effort) = self.ensure_effort_after_composition(&composed, attempt)? else {
+                return self.queue.get_item(&item.id);
+            };
             if let Err(error) = crate::composition::reject_tracked_policy(&workspace) {
                 self.control_store.block_infrastructure(
                     &effort.id,
@@ -9732,6 +15316,12 @@ pub mod integrator {
             else {
                 anyhow::bail!("integration effort is not ready for an agent cycle");
             };
+            if self
+                .control_store
+                .candidate_publication_waits_for_cleanup(&effort.id)?
+            {
+                return Ok(item);
+            }
             let workspace = self.load_owned_workspace(&item)?;
             let cycle_id = Uuid::new_v4().to_string();
             let identity = ExactEffortIdentity {
@@ -9763,6 +15353,12 @@ pub mod integrator {
                 repository: RepositoryIdentity {
                     repo_key: item.repo_key.clone(),
                     target_branch: item.target_branch.clone(),
+                    object_format: self
+                        .queue
+                        .repository(&item.repo_key)?
+                        .policy
+                        .canonical_repository
+                        .object_format(),
                 },
                 source: match &item.source {
                     crate::core::QueueSource::RemoteBranch { branch } => {
@@ -9782,7 +15378,12 @@ pub mod integrator {
                 landing: match item.landing_policy {
                     crate::core::LandingPolicy::Direct => LandingVariant::Direct,
                     crate::core::LandingPolicy::Provider => LandingVariant::Provider {
-                        url: item.pr_url.clone().context("provider item has no URL")?,
+                        url: item
+                            .admission
+                            .merge_request()
+                            .context("provider item has no MR admission")?
+                            .url
+                            .clone(),
                     },
                     crate::core::LandingPolicy::Squash => LandingVariant::Squash,
                 },
@@ -9831,6 +15432,11 @@ pub mod integrator {
             }
             let protected = vec![self.options.repo_path.clone()];
             let launch_operation_id = Uuid::new_v4().to_string();
+            let launcher = crate::control_domain::LauncherAuthority {
+                pid: std::process::id(),
+                process_start_ticks: crate::agent_runner::process_start_ticks(std::process::id())?,
+                token: Uuid::new_v4().to_string(),
+            };
             let outcome = runner.run(
                 &workspace,
                 &input,
@@ -9845,36 +15451,63 @@ pub mod integrator {
                                 cycle_id: cycle_id.clone(),
                                 cycle_number: ready.next_cycle,
                                 authority_lease_id: self.lease_owner_id.clone(),
+                                launcher: launcher.clone(),
                                 input_sha256: format!("{:x}", Sha256::digest(&input_bytes)),
                                 protocol_directory: protocol.to_path_buf(),
                                 prepared_at: chrono::Utc::now().to_rfc3339(),
+                                spawn_authority: crate::control_domain::SpawnAuthority::Open,
                             },
+                        )
+                    },
+                    on_spawn_surrender: || {
+                        self.control_store.surrender_cycle_spawn_authority(
+                            &effort.id,
+                            &launch_operation_id,
+                            &self.lease_owner_id,
+                            &launcher,
+                        )
+                    },
+                    recheck_spawn_authority: || {
+                        self.control_store.authorize_cycle_spawn(
+                            &effort.id,
+                            &launch_operation_id,
+                            &self.lease_owner_id,
+                            &launcher,
+                        )
+                    },
+                    on_spawn_failed: || {
+                        self.control_store.acknowledge_cycle_spawn_failed(
+                            &effort.id,
+                            &launch_operation_id,
+                            &self.lease_owner_id,
+                            &launcher,
                         )
                     },
                     on_started: |pid: u32,
                                  start: u64,
-                                 group: i32,
+                                 control_group: &str,
                                  sandbox: &str,
-                                 protocol: &Path| {
+                                 _protocol: &Path| {
                         self.control_store.record_cycle_started(
                             &effort.id,
                             &AgentRunning {
                                 launch_operation_id: launch_operation_id.clone(),
-                                unit_name: format!("iq-agent-{cycle_id}"),
+                                unit_name: crate::control_domain::systemd_unit_name(&cycle_id)?,
                                 cycle_id: cycle_id.clone(),
                                 cycle_number: ready.next_cycle,
                                 pid,
                                 process_start_ticks: start,
-                                process_group_id: group,
+                                control_group: control_group.to_string(),
                                 authority_lease_id: self.lease_owner_id.clone(),
+                                launcher: launcher.clone(),
                                 sandbox_id: sandbox.to_string(),
                                 input_sha256: format!("{:x}", Sha256::digest(&input_bytes)),
                                 result: AtomicResultState::Absent,
                                 started_at: chrono::Utc::now().to_rfc3339(),
                             },
-                        )?;
-                        let _ = protocol;
-                        Ok(())
+                            &self.lease_owner_id,
+                            &launcher,
+                        )
                     },
                     on_writing: |state: &crate::control_domain::AtomicResultState| {
                         self.control_store
@@ -10134,7 +15767,8 @@ pub mod integrator {
             }
             args.push("-m".into());
             args.push(message);
-            let output = Command::new("git")
+            let mut command = crate::git_command::command_in(&workspace)?;
+            command
                 .args(&args)
                 .env("GIT_AUTHOR_NAME", "IQ Integration Builder")
                 .env("GIT_AUTHOR_EMAIL", "iq@localhost")
@@ -10147,9 +15781,8 @@ pub mod integrator {
                 .env(
                     "GIT_COMMITTER_DATE",
                     format!("{} +0000", intent.committer_timestamp),
-                )
-                .current_dir(&workspace)
-                .output()?;
+                );
+            let output = crate::git_command::service_output(&mut command)?;
             if !output.status.success() {
                 anyhow::bail!(
                     "candidate builder commit-tree failed: {}",
@@ -10157,13 +15790,16 @@ pub mod integrator {
                 );
             }
             let candidate = String::from_utf8(output.stdout)?.trim().to_string();
+            let zero_oid = crate::git_command::expected_binding(&workspace)?
+                .object_format
+                .zero_oid();
             git(
                 &workspace,
                 [
                     "update-ref",
                     operation_ref.as_str(),
                     candidate.as_str(),
-                    "0000000000000000000000000000000000000000",
+                    zero_oid.as_str(),
                 ],
             )?;
             git(&workspace, ["reset", "--hard", candidate.as_str()])?;
@@ -10203,7 +15839,8 @@ pub mod integrator {
                 }
                 args.push("-m".into());
                 args.push(building.message.clone());
-                let output = Command::new("git")
+                let mut command = crate::git_command::command_in(&workspace)?;
+                command
                     .args(args)
                     .env("GIT_AUTHOR_NAME", &building.author_name)
                     .env("GIT_AUTHOR_EMAIL", &building.author_email)
@@ -10216,9 +15853,8 @@ pub mod integrator {
                     .env(
                         "GIT_COMMITTER_DATE",
                         format!("{} +0000", building.committer_timestamp),
-                    )
-                    .current_dir(&workspace)
-                    .output()?;
+                    );
+                let output = crate::git_command::service_output(&mut command)?;
                 if !output.status.success() {
                     anyhow::bail!(
                         "candidate reconciliation commit-tree failed: {}",
@@ -10226,13 +15862,16 @@ pub mod integrator {
                     );
                 }
                 let candidate = String::from_utf8(output.stdout)?.trim().to_string();
+                let zero_oid = crate::git_command::expected_binding(&workspace)?
+                    .object_format
+                    .zero_oid();
                 git(
                     &workspace,
                     [
                         "update-ref",
                         building.operation_ref.as_str(),
                         candidate.as_str(),
-                        "0000000000000000000000000000000000000000",
+                        zero_oid.as_str(),
                     ],
                 )?;
                 candidate
@@ -10556,7 +16195,7 @@ pub mod integrator {
                         &item.id,
                         &attempt.id,
                         QueueStatus::Validating,
-                        || {
+                        |_| {
                             gate.write_all(b"run\n")
                                 .context("release command admission gate")
                         },
@@ -10666,7 +16305,12 @@ pub mod integrator {
             self.queue.get_item(&item.id)
         }
 
-        fn integrate_item(&self, item: QueueItem, attempt: &Attempt) -> Result<QueueItem> {
+        fn integrate_item(
+            &self,
+            item: QueueItem,
+            attempt: &Attempt,
+            operation: &RepositoryOperationLease,
+        ) -> Result<QueueItem> {
             if let Some(blocked) = self.enforce_item_boundary(&item)? {
                 return Ok(blocked);
             }
@@ -10696,6 +16340,7 @@ pub mod integrator {
                     }
                 ) | crate::control_domain::IntegrationEffortState::Landing(_)
                     | crate::control_domain::IntegrationEffortState::LandingUncertain(_)
+                    | crate::control_domain::IntegrationEffortState::TargetMovePending(_)
             ) {
                 anyhow::bail!("integration effort is not ready for landing gates");
             }
@@ -10713,18 +16358,20 @@ pub mod integrator {
                     );
                 }
             }
-            match item.landing_policy {
-                crate::core::LandingPolicy::Provider => {
+            match &item.admission {
+                crate::sqlite::QueueAdmission::MergeRequest(_) => {
                     let pr_url = item
-                        .pr_url
-                        .clone()
-                        .context("provider landing policy has no PR/MR URL")?;
-                    return self.integrate_provider_item(item, attempt, &pr_url);
+                        .admission
+                        .merge_request()
+                        .context("provider landing has no exact MR admission")?
+                        .url
+                        .clone();
+                    return self.integrate_provider_item(item, attempt, &pr_url, operation);
                 }
-                crate::core::LandingPolicy::Direct | crate::core::LandingPolicy::Squash => {
-                    if item.pr_url.is_some() {
-                        anyhow::bail!("non-provider landing policy cannot carry a PR/MR URL");
-                    }
+                crate::sqlite::QueueAdmission::Direct { .. }
+                | crate::sqlite::QueueAdmission::LocalSubmission { .. } => {}
+                crate::sqlite::QueueAdmission::HistoricalMergeRequest(_) => {
+                    anyhow::bail!("terminal historical MR admission cannot enter landing")
                 }
             }
             let workspace = self.load_owned_workspace(&item)?;
@@ -10756,7 +16403,6 @@ pub mod integrator {
                 return self.reconcile_fenced_exact_landing(
                     &item,
                     attempt,
-                    &workspace,
                     &remote_ref,
                     &remote_sha,
                 );
@@ -10774,7 +16420,8 @@ pub mod integrator {
                     attempt,
                     &workspace,
                     &remote_sha,
-                    "target branch moved before direct landing",
+                    MovedBaseCause::TargetMoved("target branch moved before direct landing"),
+                    operation,
                 )? {
                     return Ok(blocked);
                 }
@@ -10843,7 +16490,8 @@ pub mod integrator {
                     attempt,
                     &workspace,
                     &target_after_signoff,
-                    "target branch moved after signoff",
+                    MovedBaseCause::TargetMoved("target branch moved after signoff"),
+                    operation,
                 )? {
                     return Ok(blocked);
                 }
@@ -10861,7 +16509,14 @@ pub mod integrator {
                 }
                 return self.queue.get_item(&item.id);
             }
-            self.land_exact_candidate(&item, attempt, &workspace, &landed_sha, &remote_sha)
+            self.land_exact_candidate(
+                &item,
+                attempt,
+                &workspace,
+                &landed_sha,
+                &remote_sha,
+                operation,
+            )
         }
 
         fn land_exact_candidate(
@@ -10871,7 +16526,9 @@ pub mod integrator {
             workspace: &Path,
             candidate_sha: &str,
             expected_target_sha: &str,
+            operation: &RepositoryOperationLease,
         ) -> Result<QueueItem> {
+            let canonical_push = self.canonical_push_transport()?;
             if let Some(cancelled) = self.cancelled_item(&item.id)? {
                 return Ok(cancelled);
             }
@@ -10891,7 +16548,29 @@ pub mod integrator {
                     &format!("candidate is dirty before target push: {dirty}"),
                 );
             }
-            self.ensure_registered_remote_identity()?;
+            let landing_ref = format!("refs/iq/landings/{}", attempt.id);
+            let landing_refspec = format!("+{candidate_sha}:{landing_ref}");
+            self.run_supervised_internal_git_command(
+                &item.id,
+                &attempt.id,
+                [
+                    OsString::from("fetch"),
+                    OsString::from("--no-tags"),
+                    workspace.as_os_str().to_os_string(),
+                    OsString::from(&landing_refspec),
+                ],
+                &self.options.repo_path,
+            )?;
+            let pinned_candidate =
+                git_output(&self.options.repo_path, ["rev-parse", &landing_ref])?;
+            if pinned_candidate != candidate_sha {
+                anyhow::bail!("canonical landing pin differs from validated candidate");
+            }
+            self.ensure_registered_remote_identity_for_item(
+                item,
+                attempt,
+                QueueStatus::Integrating,
+            )?;
             if let Some(cancelled) = self.begin_landing_owned(
                 &item.id,
                 &attempt.id,
@@ -10908,7 +16587,12 @@ pub mod integrator {
             );
             let push_ref = format!("{candidate_sha}:{target_ref}");
             let lease = format!("--force-with-lease={target_ref}:{expected_target_sha}");
-            let landing_result = self.run_supervised_item_command_output(
+            let effort = self
+                .control_store
+                .effort_for_item(&item.id)?
+                .context("prepared landing effort disappeared")?;
+            let command_id = format!("git-push:{}", item.id);
+            let landing_result = self.run_supervised_item_command_output_with_landing_release(
                 &item.id,
                 &attempt.id,
                 QueueStatus::Integrating,
@@ -10917,23 +16601,43 @@ pub mod integrator {
                     "push",
                     "--porcelain",
                     lease.as_str(),
-                    &self.options.base_remote,
+                    &canonical_push,
                     &push_ref,
                 ],
                 Some(workspace),
                 StdDuration::from_secs(20),
                 "landing",
+                Some((&effort.id, &command_id)),
             );
             if landing_result
                 .as_ref()
-                .is_ok_and(definite_force_with_lease_rejection)
+                .is_ok_and(|output| definite_force_with_lease_rejection(output, &target_ref))
             {
                 return self.recover_definite_cas_rejection(
                     item,
                     attempt,
                     workspace,
                     expected_target_sha,
+                    &command_id,
+                    operation,
                 );
+            }
+            if let Err(error) = &landing_result {
+                let effort = self
+                    .control_store
+                    .effort_for_item(&item.id)?
+                    .context("landing effort disappeared after command admission")?;
+                if matches!(
+                    effort.state,
+                    crate::control_domain::IntegrationEffortState::Landing(_)
+                ) {
+                    return self.block_and_get(
+                        &item.id,
+                        BlockedPhase::Integrating,
+                        BlockedReason::Infra,
+                        &format!("landing command was not released: {error:#}"),
+                    );
+                }
             }
             let landing_error = match landing_result {
                 Ok(output) if output.status.success() => None,
@@ -11008,6 +16712,8 @@ pub mod integrator {
             attempt: &Attempt,
             workspace: &Path,
             expected_target_sha: &str,
+            command_id: &str,
+            operation: &RepositoryOperationLease,
         ) -> Result<QueueItem> {
             self.ensure_repo_lease()?;
             if let Some(cancelled) = self.cancelled_item(&item.id)? {
@@ -11033,12 +16739,22 @@ pub mod integrator {
                     "compare-and-set rejected base {expected_target_sha}; rebuilding on {moved_target}"
                 ),
             )?;
+            let effort = self
+                .control_store
+                .effort_for_item(&item.id)?
+                .context("definite rejection has no integration effort")?;
+            let rejection = self.control_store.authorize_definite_landing_rejection(
+                &effort.id,
+                command_id,
+                expected_target_sha,
+            )?;
             if let Some(blocked) = self.merge_moved_base(
                 item,
                 attempt,
                 workspace,
                 &moved_target,
-                "definite compare-and-set rejection",
+                MovedBaseCause::DefiniteLandingRejection(&rejection),
+                operation,
             )? {
                 return Ok(blocked);
             }
@@ -11061,7 +16777,6 @@ pub mod integrator {
             &self,
             item: &QueueItem,
             attempt: &Attempt,
-            workspace: &Path,
             remote_ref: &str,
             remote_sha: &str,
         ) -> Result<QueueItem> {
@@ -11098,22 +16813,13 @@ pub mod integrator {
                     remote_sha,
                 );
             }
-            if remote_sha != expected_target_sha {
-                return self
-                    .merge_moved_base(
-                        item,
-                        attempt,
-                        workspace,
-                        remote_sha,
-                        "reconciled rejected compare-and-set landing",
-                    )?
-                    .context("target recomposition did not return an authoritative item state");
-            }
             self.block_and_get(
                 &item.id,
                 BlockedPhase::Integrating,
                 BlockedReason::Infra,
-                "fenced exact landing remains unresolved; retry to reconcile remote target state",
+                &format!(
+                    "fenced exact landing remains unresolved at target {remote_sha}; target observation alone is not proof of compare-and-set rejection"
+                ),
             )
         }
 
@@ -11156,7 +16862,12 @@ pub mod integrator {
             candidate_sha: &str,
             policy: &SignoffPolicy,
         ) -> Result<Option<QueueItem>> {
-            self.ensure_registered_remote_identity()?;
+            self.ensure_registered_remote_identity_for_item(
+                item,
+                attempt,
+                QueueStatus::Integrating,
+            )?;
+            let canonical_push = self.canonical_push_transport()?;
             if let Some(cancelled) = self.cancelled_item(&item.id)? {
                 return Ok(Some(cancelled));
             }
@@ -11185,7 +16896,7 @@ pub mod integrator {
                     "push",
                     "--force",
                     "--set-upstream",
-                    &self.options.base_remote,
+                    &canonical_push,
                     &candidate_push_ref,
                 ],
                 Some(workspace),
@@ -11202,7 +16913,7 @@ pub mod integrator {
                 [
                     "ls-remote",
                     "--heads",
-                    &self.options.base_remote,
+                    &canonical_push,
                     &format!("refs/heads/{candidate_branch}"),
                 ],
             )?
@@ -11243,7 +16954,7 @@ pub mod integrator {
                         &item.id,
                         &attempt.id,
                         QueueStatus::Integrating,
-                        || {
+                        |_| {
                             gate.write_all(b"run\n")
                                 .context("release command admission gate")
                         },
@@ -11376,12 +17087,14 @@ pub mod integrator {
             candidate_sha: &str,
             policy: &SignoffPolicy,
         ) -> std::result::Result<SignoffGate, SignoffQueryError> {
-            let gh = std::env::var("IQ_GITHUB_CLI").unwrap_or_else(|_| "gh".into());
+            let gh = crate::providers::provider_program(crate::repository_policy::Provider::Github)
+                .map_err(|error| SignoffQueryError::Provider(format!("{error:#}")))?;
             let endpoint = format!(
                 "repos/{}/commits/{candidate_sha}/statuses",
                 policy.repository
             );
-            let output = command_output_timeout(
+            let output = crate::providers::output_with_authority(
+                crate::repository_policy::Provider::Github,
                 &gh,
                 ["api", endpoint.as_str()],
                 None,
@@ -11391,7 +17104,7 @@ pub mod integrator {
                         item_id,
                         attempt_id,
                         QueueStatus::Integrating,
-                        || {
+                        |_| {
                             gate.write_all(b"run\n")
                                 .context("release command admission gate")
                         },
@@ -11529,18 +17242,34 @@ pub mod integrator {
             attempt: &Attempt,
             workspace: &Path,
             moved_base_sha: &str,
-            summary_prefix: &str,
+            cause: MovedBaseCause<'_>,
+            operation: &RepositoryOperationLease,
         ) -> Result<Option<QueueItem>> {
+            let (summary_prefix, landing_rejection) = match cause {
+                MovedBaseCause::TargetMoved(summary) => (summary, None),
+                MovedBaseCause::DefiniteLandingRejection(rejection) => {
+                    ("definite compare-and-set rejection", Some(rejection))
+                }
+            };
             let effort = self
                 .control_store
                 .effort_for_item(&item.id)?
                 .context("target movement item has no integration effort")?;
-            self.control_store
-                .begin_target_move(&effort.id, moved_base_sha)?;
-            self.run_supervised_landing_command(
+            match landing_rejection {
+                Some(rejection) => self
+                    .control_store
+                    .begin_target_move_after_definite_landing_rejection(
+                        &effort.id,
+                        moved_base_sha,
+                        rejection,
+                    )?,
+                None => self
+                    .control_store
+                    .begin_target_move(&effort.id, moved_base_sha)?,
+            }
+            self.run_supervised_internal_git_command(
                 &item.id,
                 &attempt.id,
-                "git",
                 [
                     "fetch",
                     self.options
@@ -11549,7 +17278,7 @@ pub mod integrator {
                         .context("registered repository path is not valid UTF-8")?,
                     moved_base_sha,
                 ],
-                Some(workspace),
+                workspace,
             )?;
             self.run_supervised_landing_command(
                 &item.id,
@@ -11627,7 +17356,20 @@ pub mod integrator {
                     "local submission is empty after target movement",
                 )?));
             }
-            self.control_store.recompose_after_target_move(
+            match landing_rejection {
+                Some(rejection) => self
+                    .control_store
+                    .prepare_target_recomposition_after_definite_landing_rejection(
+                        &effort.id,
+                        moved_base_sha,
+                        rejection,
+                    )?,
+                None => self
+                    .control_store
+                    .prepare_target_recomposition(&effort.id, moved_base_sha)?,
+            };
+            self.reconcile_private_refs(operation)?;
+            self.control_store.complete_target_recomposition(
                 &effort.id,
                 moved_base_sha,
                 &conflict_json,
@@ -11642,7 +17384,11 @@ pub mod integrator {
             if validated.status != QueueStatus::Integrating {
                 return Ok(Some(validated));
             }
-            Ok(Some(self.integrate_item(validated, &recomposed_attempt)?))
+            Ok(Some(self.integrate_item(
+                validated,
+                &recomposed_attempt,
+                operation,
+            )?))
         }
 
         fn apply_local_submission_patch(
@@ -11761,7 +17507,7 @@ pub mod integrator {
                         &item.id,
                         &attempt.id,
                         QueueStatus::Integrating,
-                        || {
+                        |_| {
                             gate.write_all(b"run\n")
                                 .context("release command admission gate")
                         },
@@ -11986,9 +17732,11 @@ pub mod integrator {
                 crate::control_domain::ProviderSignoffBlocker {
                     gate: crate::control_domain::ProviderGateKind::Provider,
                     repository: item
-                        .pr_url
-                        .clone()
-                        .context("provider item has no exact provider URL")?,
+                        .admission
+                        .merge_request()
+                        .context("provider item has no exact MR admission")?
+                        .url
+                        .clone(),
                     context: phase.to_string(),
                     candidate_sha,
                     status,
@@ -11999,10 +17747,27 @@ pub mod integrator {
 
         fn integrate_provider_item(
             &self,
-            mut item: QueueItem,
+            item: QueueItem,
             attempt: &Attempt,
             pr_url: &str,
+            operation: &RepositoryOperationLease,
         ) -> Result<QueueItem> {
+            let admission = item
+                .admission
+                .merge_request()
+                .context("provider integration has no MR admission")?;
+            if admission.url != pr_url || admission.head_sha != item.current_head_sha {
+                anyhow::bail!("provider integration differs from exact MR admission");
+            }
+            let locator = crate::providers::merge_request_locator(pr_url)?;
+            if locator.provider != admission.provider
+                || locator.host != admission.provider_host
+                || locator.repository != admission.repository
+                || locator.identity != admission.identity
+                || admission.target_branch != item.target_branch
+            {
+                anyhow::bail!("provider URL identity differs from exact MR admission");
+            }
             let provider = match crate::providers::provider_for_url(pr_url) {
                 Ok(provider) => provider,
                 Err(error) => {
@@ -12042,26 +17807,35 @@ pub mod integrator {
                         );
                     }
                     Err(error) => {
+                        let reason = if error
+                            .downcast_ref::<crate::providers::ProviderInfrastructureError>()
+                            .is_some()
+                        {
+                            BlockedReason::Infra
+                        } else {
+                            BlockedReason::Provider
+                        };
                         return self.block_and_get(
                             &item.id,
                             BlockedPhase::Integrating,
-                            BlockedReason::Provider,
+                            reason,
                             &format!("failed to reconcile fenced provider landing: {error}"),
                         );
                     }
                 }
             }
-            match self.push_provider_resolution_branch_if_needed(&item, attempt) {
-                Ok(Some(updated)) => item = updated,
-                Ok(None) => {}
-                Err(error) => {
-                    return self.block_and_get(
-                        &item.id,
-                        BlockedPhase::Integrating,
-                        BlockedReason::Infra,
-                        &format!("failed to push PR/MR conflict resolution: {error}"),
-                    );
-                }
+            if self
+                .queue
+                .events(&item.id)?
+                .iter()
+                .any(|event| event.event_type == "merge_resumed")
+            {
+                return self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    BlockedReason::NeedsAgentFix,
+                    "coding agent must update the admitted MR; IQ cannot push source changes",
+                );
             }
             if let Err(error) = self.fetch_target_supervised(&item, attempt) {
                 return self.block_and_get(
@@ -12071,7 +17845,47 @@ pub mod integrator {
                     &format!("failed to fetch target before provider policy check: {error}"),
                 );
             }
-            let snapshot = match provider.snapshot(pr_url) {
+            let expected_repository = crate::repository_policy::ProviderRepository {
+                provider: admission.provider,
+                host: admission.provider_host.clone(),
+                repository: admission.repository.clone(),
+                repository_id: admission.repository_id.clone(),
+            };
+            let mut provider_executor = |provider_kind, program: &str, args: &[OsString]| {
+                self.run_supervised_provider_command(
+                    &item.id,
+                    &attempt.id,
+                    QueueStatus::Integrating,
+                    provider_kind,
+                    program,
+                    args,
+                )
+            };
+            if let Err(error) = provider.verify_repository(
+                &expected_repository,
+                self.queue
+                    .repository(&item.repo_key)?
+                    .policy
+                    .canonical_repository
+                    .object_format(),
+                &mut provider_executor,
+            ) {
+                let reason = if error
+                    .downcast_ref::<crate::providers::ProviderInfrastructureError>()
+                    .is_some()
+                {
+                    BlockedReason::Infra
+                } else {
+                    BlockedReason::Provider
+                };
+                return self.block_and_get(
+                    &item.id,
+                    BlockedPhase::Integrating,
+                    reason,
+                    &format!("provider repository identity cannot be revalidated: {error:#}"),
+                );
+            }
+            let snapshot = match provider.snapshot(pr_url, &mut provider_executor) {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     return self.block_and_get(
@@ -12082,6 +17896,22 @@ pub mod integrator {
                     );
                 }
             };
+            if snapshot.repository != expected_repository {
+                return self.block_provider_and_get(
+                    &item,
+                    BlockedPhase::Integrating,
+                    crate::control_domain::ProviderGateStatus::Failed,
+                    "provider repository identity differs from exact admission",
+                );
+            }
+            if snapshot.target_branch != admission.target_branch {
+                return self.block_provider_and_get(
+                    &item,
+                    BlockedPhase::Integrating,
+                    crate::control_domain::ProviderGateStatus::Failed,
+                    "provider target branch moved from exact MR admission",
+                );
+            }
             if snapshot.head_sha != item.current_head_sha {
                 return self.block_and_get(
                     &item.id,
@@ -12137,7 +17967,8 @@ pub mod integrator {
                     attempt,
                     &workspace,
                     &snapshot.base_sha,
-                    "PR/MR base moved before provider landing",
+                    MovedBaseCause::TargetMoved("PR/MR base moved before provider landing"),
+                    operation,
                 )? {
                     return Ok(blocked);
                 }
@@ -12182,7 +18013,7 @@ pub mod integrator {
                     return Ok(blocked);
                 }
             }
-            let signed_snapshot = match provider.snapshot(pr_url) {
+            let signed_snapshot = match provider.snapshot(pr_url, &mut provider_executor) {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     return self.block_and_get(
@@ -12193,6 +18024,22 @@ pub mod integrator {
                     );
                 }
             };
+            if signed_snapshot.repository != snapshot.repository {
+                return self.block_provider_and_get(
+                    &item,
+                    BlockedPhase::Integrating,
+                    crate::control_domain::ProviderGateStatus::Failed,
+                    "provider repository identity moved after signoff",
+                );
+            }
+            if signed_snapshot.target_branch != admission.target_branch {
+                return self.block_provider_and_get(
+                    &item,
+                    BlockedPhase::Integrating,
+                    crate::control_domain::ProviderGateStatus::Failed,
+                    "provider target branch moved after signoff",
+                );
+            }
             if signed_snapshot.head_sha != item.current_head_sha {
                 return self.block_and_get(
                     &item.id,
@@ -12233,7 +18080,8 @@ pub mod integrator {
                     attempt,
                     &workspace,
                     &signed_snapshot.base_sha,
-                    "PR/MR base moved after signoff",
+                    MovedBaseCause::TargetMoved("PR/MR base moved after signoff"),
+                    operation,
                 )? {
                     return Ok(blocked);
                 }
@@ -12268,50 +18116,13 @@ pub mod integrator {
                 }
             }
 
-            if let Some(cancelled) = self.begin_landing_owned(
-                &item.id,
-                &attempt.id,
-                &candidate_sha,
-                &signed_snapshot.base_sha,
-                &format!("provider-merge:{}", item.id),
-            )? {
-                return Ok(cancelled);
-            }
-            let merge_command = provider.merge_command(pr_url, &item.current_head_sha);
-            let merge_error = self
-                .run_supervised_landing_command(
-                    &item.id,
-                    &attempt.id,
-                    &merge_command.program,
-                    &merge_command.args,
-                    None,
-                )
-                .err();
-            match self.reconcile_provider_landing(&item, attempt, provider.as_ref(), pr_url) {
-                Ok(Some(integrated)) => Ok(integrated),
-                Ok(None) => self.block_and_get(
-                    &item.id,
-                    BlockedPhase::Integrating,
-                    BlockedReason::Provider,
-                    &match merge_error {
-                        Some(error) => {
-                            format!("provider merge failed or remained unconfirmed: {error}")
-                        }
-                        None => "provider merge did not report the exact landed commit SHA".into(),
-                    },
-                ),
-                Err(error) => self.block_and_get(
-                    &item.id,
-                    BlockedPhase::Integrating,
-                    BlockedReason::Provider,
-                    &match merge_error {
-                        Some(merge_error) => format!(
-                            "provider merge outcome is unknown after {merge_error}; reconciliation failed: {error}"
-                        ),
-                        None => format!("failed to reconcile provider merge: {error}"),
-                    },
-                ),
-            }
+            let error = provider.atomic_landing_unsupported();
+            self.block_provider_and_get(
+                &item,
+                BlockedPhase::Integrating,
+                crate::control_domain::ProviderGateStatus::Failed,
+                &format!("provider landing is unsupported before mutation: {error:#}"),
+            )
         }
 
         fn reconcile_provider_landing(
@@ -12322,8 +18133,39 @@ pub mod integrator {
             pr_url: &str,
         ) -> Result<Option<QueueItem>> {
             self.ensure_repo_lease()?;
+            let admission = item
+                .admission
+                .merge_request()
+                .context("provider landing has no MR admission")?;
+            let expected_repository = crate::repository_policy::ProviderRepository {
+                provider: admission.provider,
+                host: admission.provider_host.clone(),
+                repository: admission.repository.clone(),
+                repository_id: admission.repository_id.clone(),
+            };
+            let mut provider_executor = |provider_kind, program: &str, args: &[OsString]| {
+                self.run_supervised_provider_command(
+                    &item.id,
+                    &attempt.id,
+                    QueueStatus::Integrating,
+                    provider_kind,
+                    program,
+                    args,
+                )
+            };
+            provider
+                .verify_repository(
+                    &expected_repository,
+                    self.queue
+                        .repository(&item.repo_key)?
+                        .policy
+                        .canonical_repository
+                        .object_format(),
+                    &mut provider_executor,
+                )
+                .context("revalidate provider repository before landing observation")?;
             let Some(landing) = provider
-                .landing(pr_url)
+                .landing(pr_url, &mut provider_executor)
                 .context("query exact provider landing revision")?
             else {
                 return Ok(None);
@@ -12350,12 +18192,39 @@ pub mod integrator {
                 .validated_commit_sha
                 .as_deref()
                 .context("provider landing attempt has no validated commit")?;
+            let admitted_base = admission
+                .base_sha
+                .as_deref()
+                .context("active provider admission has no exact admitted base")?;
+            provider
+                .verify_repository(
+                    &expected_repository,
+                    self.queue
+                        .repository(&item.repo_key)?
+                        .policy
+                        .canonical_repository
+                        .object_format(),
+                    &mut provider_executor,
+                )
+                .context("revalidate provider repository before final snapshot")?;
+            let final_snapshot = provider
+                .snapshot(pr_url, &mut provider_executor)
+                .context("query provider identity after landing")?;
+            if final_snapshot.repository != expected_repository
+                || final_snapshot.head_sha != admission.head_sha
+                || final_snapshot.target_branch != admission.target_branch
+            {
+                anyhow::bail!(
+                    "provider source, repository, or target branch moved after exact validation"
+                );
+            }
             let landed_tree = git_output(
                 &self.options.repo_path,
                 ["rev-parse", &format!("{}^{{tree}}", landing.commit_sha)],
             )?;
+            let workspace = self.load_owned_workspace(item)?;
             let validated_tree = git_output(
-                &self.options.repo_path,
+                &workspace,
                 ["rev-parse", &format!("{validated_commit}^{{tree}}")],
             )?;
             if landed_tree != validated_tree {
@@ -12367,12 +18236,40 @@ pub mod integrator {
                 &self.options.repo_path,
                 ["rev-parse", &format!("{}^1", landing.commit_sha)],
             )?;
-            let validated_fast_forward = landing.commit_sha == item.current_head_sha
-                && git_is_ancestor(&self.options.repo_path, expected_base, &landing.commit_sha)?;
-            if first_parent != expected_base && !validated_fast_forward {
+            if first_parent != expected_base {
                 anyhow::bail!(
                     "provider landed on base {first_parent}, expected validated base {expected_base}"
                 );
+            }
+            let declared_history = admission.provider_merge_method.map(|method| match method {
+                crate::repository_policy::ProviderMergeMethod::Merge => {
+                    crate::providers::ProviderLandingHistory::PreserveHead
+                }
+                crate::repository_policy::ProviderMergeMethod::Squash => {
+                    crate::providers::ProviderLandingHistory::Squash
+                }
+            });
+            let history = match (landing.history, declared_history) {
+                (Some(observed), Some(declared)) if observed != declared => {
+                    anyhow::bail!("provider landing history contradicts migrated merge method")
+                }
+                (Some(observed), _) => observed,
+                (None, Some(declared)) => declared,
+                (None, None) => anyhow::bail!(
+                    "provider landing has no durable or observable merge method authority"
+                ),
+            };
+            let contains_admitted_head = history
+                == crate::providers::ProviderLandingHistory::PreserveHead
+                && git_is_ancestor(
+                    &self.options.repo_path,
+                    &item.current_head_sha,
+                    &landing.commit_sha,
+                )?;
+            if history == crate::providers::ProviderLandingHistory::PreserveHead
+                && !contains_admitted_head
+            {
+                anyhow::bail!("provider landing violates its admitted-head history contract");
             }
             git(
                 &self.options.repo_path,
@@ -12391,6 +18288,31 @@ pub mod integrator {
             })?;
             let remote_target_sha =
                 git_output(&self.options.repo_path, ["rev-parse", &remote_ref])?;
+            self.queue.record_provider_landing_guarantee(
+                &item.repo_key,
+                &self.lease_owner_id,
+                &crate::sqlite::ProviderLandingEvidence {
+                    item_id: &item.id,
+                    provider: admission.provider,
+                    provider_host: &admission.provider_host,
+                    provider_repository: &admission.repository,
+                    provider_repository_id: &admission.repository_id,
+                    merge_request_identity: &admission.identity,
+                    admitted_base_sha: admitted_base,
+                    admitted_head_sha: &admission.head_sha,
+                    validated_target_sha: expected_base,
+                    validated_candidate_sha: validated_commit,
+                    validated_tree_sha: &validated_tree,
+                    landed_commit_sha: &landing.commit_sha,
+                    landed_tree_sha: &landed_tree,
+                    first_parent_sha: &first_parent,
+                    history_contract: match history {
+                        crate::providers::ProviderLandingHistory::PreserveHead => "preserve_head",
+                        crate::providers::ProviderLandingHistory::Squash => "squash",
+                    },
+                    contains_admitted_head,
+                },
+            )?;
             self.reconcile_registered_checkout(item, &attempt.id, &remote_target_sha)?;
             self.mark_integrated_owned(
                 &item.id,
@@ -12399,53 +18321,6 @@ pub mod integrator {
                 &remote_target_sha,
             )
             .map(Some)
-        }
-
-        fn push_provider_resolution_branch_if_needed(
-            &self,
-            item: &QueueItem,
-            attempt: &Attempt,
-        ) -> Result<Option<QueueItem>> {
-            let events = self.queue.events(&item.id)?;
-            if !events
-                .iter()
-                .any(|event| event.event_type == "merge_resumed")
-            {
-                return Ok(None);
-            }
-            let workspace = self.load_owned_workspace(item)?;
-            let workspace_head = git_output(&workspace, ["rev-parse", "HEAD"])?;
-            if workspace_head == item.current_head_sha {
-                return Ok(None);
-            }
-            self.ensure_registered_remote_identity()?;
-            let push_ref = format!("HEAD:refs/heads/{}", item.source_branch);
-            self.run_supervised_landing_command(
-                &item.id,
-                &attempt.id,
-                "git",
-                ["push", &self.options.base_remote, &push_ref],
-                Some(&workspace),
-            )?;
-            self.run_supervised_landing_command(
-                &item.id,
-                &attempt.id,
-                "git",
-                ["fetch", &self.options.base_remote, &item.source_branch],
-                Some(&self.options.repo_path),
-            )?;
-            self.ensure_repo_lease()?;
-            self.queue.record_event(
-                &item.id,
-                "source_branch_pushed",
-                &format!(
-                    "pushed conflict resolution {} to {}",
-                    workspace_head, item.source_branch
-                ),
-            )?;
-            self.queue
-                .update_current_head(&item.id, &workspace_head)
-                .map(Some)
         }
 
         pub fn workspace_status(&self) -> Result<Vec<WorkspaceStatus>> {
@@ -12849,7 +18724,7 @@ pub mod integrator {
             I: IntoIterator<Item = S>,
             S: AsRef<OsStr>,
         {
-            self.ensure_registered_remote_identity()?;
+            self.ensure_registered_remote_identity_for_item(item, attempt, QueueStatus::Merging)?;
             self.run_supervised_item_command(
                 &item.id,
                 &attempt.id,
@@ -12865,7 +18740,12 @@ pub mod integrator {
 
         fn fetch_target_supervised(&self, item: &QueueItem, attempt: &Attempt) -> Result<()> {
             self.ensure_repo_lease()?;
-            self.ensure_registered_remote_identity()?;
+            self.ensure_registered_remote_identity_for_item(
+                item,
+                attempt,
+                QueueStatus::Integrating,
+            )?;
+            let canonical_fetch = self.canonical_fetch_transport()?;
             let repository = self.queue.repository(&self.options.repo_key)?;
             let target_sha = if matches!(
                 repository.checkout_reconciliation,
@@ -12879,17 +18759,23 @@ pub mod integrator {
                     [
                         "ls-remote",
                         "--exit-code",
-                        &self.options.base_remote,
+                        &canonical_fetch,
                         &target_full_ref,
                     ],
                     Some(&self.options.repo_path),
                 )?;
-                let observed_target =
-                    crate::composition::parse_exact_remote_ref(&observed.stdout, &target_full_ref)?;
+                let observed_target = crate::composition::parse_exact_remote_ref(
+                    &observed.stdout,
+                    &target_full_ref,
+                    repository.policy.canonical_repository.object_format(),
+                )?;
                 self.queue.update_checkout_reconciliation(
                     &self.options.repo_key,
                     &self.lease_owner_id,
-                    &crate::sqlite::CheckoutReconciliationState::pending(&observed_target)?,
+                    &crate::sqlite::CheckoutReconciliationState::pending(
+                        &observed_target,
+                        repository.policy.canonical_repository.object_format(),
+                    )?,
                 )?;
                 stop_supervised_target_after("observation");
                 observed_target
@@ -12902,12 +18788,7 @@ pub mod integrator {
                 &item.id,
                 &attempt.id,
                 "git",
-                [
-                    "fetch",
-                    "--no-tags",
-                    &self.options.base_remote,
-                    &exact_refspec,
-                ],
+                ["fetch", "--no-tags", &canonical_fetch, &exact_refspec],
                 Some(&self.options.repo_path),
             )?;
             let private_sha = git_output(&self.options.repo_path, ["rev-parse", &private_ref])?;
@@ -12954,14 +18835,6 @@ pub mod integrator {
             )?;
             stop_supervised_target_after("reconciled");
             Ok(())
-        }
-
-        fn source_remote_sha(&self, item: &QueueItem) -> Result<String> {
-            let source_ref = format!(
-                "refs/remotes/{}/{}",
-                self.options.base_remote, item.source_branch
-            );
-            git_output(&self.options.repo_path, ["rev-parse", &source_ref])
         }
 
         fn enforce_item_boundary(&self, item: &QueueItem) -> Result<Option<QueueItem>> {
@@ -13056,7 +18929,7 @@ pub mod integrator {
         pub conflict_files: Vec<String>,
     }
 
-    pub fn workspace_status(
+    pub(crate) fn workspace_status(
         queue: &SqliteQueueReader,
         repo_key: &str,
     ) -> Result<Vec<WorkspaceStatus>> {
@@ -13081,7 +18954,7 @@ pub mod integrator {
         Ok(statuses)
     }
 
-    pub fn git<I, S>(cwd: &Path, args: I) -> Result<()>
+    pub(crate) fn git<I, S>(cwd: &Path, args: I) -> Result<()>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -13103,7 +18976,7 @@ pub mod integrator {
         }
     }
 
-    pub fn git_output<I, S>(cwd: &Path, args: I) -> Result<String>
+    pub(crate) fn git_output<I, S>(cwd: &Path, args: I) -> Result<String>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -13124,24 +18997,37 @@ pub mod integrator {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    fn definite_force_with_lease_rejection(output: &Output) -> bool {
+    fn definite_force_with_lease_rejection(output: &Output, expected_target_ref: &str) -> bool {
         if output.status.success() {
             return false;
         }
-        let report = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let porcelain_rejection = report.lines().any(|line| {
-            line.starts_with("!\t")
-                && ((line.contains("[rejected]") && line.contains("(stale info)"))
-                    || (line.contains("[remote rejected]")
-                        && line.contains("(failed to update ref)")))
+        let Ok(report) = std::str::from_utf8(&output.stdout) else {
+            return false;
+        };
+        let mut statuses = report.lines().filter(|line| {
+            line.as_bytes()
+                .first()
+                .is_some_and(|status| matches!(status, b' ' | b'+' | b'-' | b'*' | b'!' | b'='))
         });
-        porcelain_rejection
-            && (report.contains("(stale info)")
-                || (report.contains("cannot lock ref") && report.contains("but expected")))
+        let Some(status) = statuses.next() else {
+            return false;
+        };
+        if statuses.next().is_some() {
+            return false;
+        }
+        let mut fields = status.split('\t');
+        if fields.next() != Some("!") {
+            return false;
+        }
+        let Some(mapping) = fields.next() else {
+            return false;
+        };
+        let Some((_, target_ref)) = mapping.rsplit_once(':') else {
+            return false;
+        };
+        target_ref == expected_target_ref
+            && fields.next() == Some("[rejected] (stale info)")
+            && fields.next().is_none()
     }
 
     fn verify_one_parent_candidate(cwd: &Path, candidate: &str, base: &str) -> Result<()> {
@@ -13173,73 +19059,163 @@ pub mod integrator {
         }
     }
 
-    fn command_output_timeout<I, S>(
+    pub(crate) fn command_output_timeout<I, S>(
         program: &str,
         args: I,
         cwd: Option<&Path>,
         timeout: StdDuration,
-        authorize_start: impl FnOnce(&mut dyn Write) -> Result<bool>,
+        authorize_start: impl FnOnce(&mut CommandRelease) -> Result<bool>,
+        check_authority: impl FnMut() -> Result<ExecutionAuthority>,
+    ) -> Result<CommandOutputOutcome>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        command_output_timeout_with_prepare(
+            CommandProgram::SearchPath(program),
+            args,
+            cwd,
+            timeout,
+            authorize_start,
+            check_authority,
+            |_| Ok(()),
+        )
+    }
+
+    pub(crate) fn command_output_timeout_with_prepare<I, S>(
+        program: CommandProgram<'_>,
+        args: I,
+        cwd: Option<&Path>,
+        timeout: StdDuration,
+        authorize_start: impl FnOnce(&mut CommandRelease) -> Result<bool>,
         mut check_authority: impl FnMut() -> Result<ExecutionAuthority>,
+        prepare_spawn: impl FnOnce(&mut crate::agent_config::AuthorizedCommand) -> Result<()>,
     ) -> Result<CommandOutputOutcome>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
         const POLL_INTERVAL: StdDuration = StdDuration::from_millis(10);
-        const CANCELLATION_GRACE: StdDuration = StdDuration::from_millis(50);
-        const TIMEOUT_GRACE: StdDuration = StdDuration::from_secs(5);
 
-        let mut process = gated_process(program, args);
-        if let Some(cwd) = cwd {
-            process.current_dir(cwd);
+        let args = args
+            .into_iter()
+            .map(|argument| argument.as_ref().to_os_string())
+            .collect::<Vec<_>>();
+        let label = program.label();
+        let git_binding = if label == "git" {
+            let cwd = cwd.context("Git command requires an explicit working directory")?;
+            crate::git_command::require_verified_cwd(cwd)?;
+            crate::git_command::require_safe_local_config(cwd)?;
+            if crate::git_command::is_external_operation(&args) {
+                crate::git_command::require_no_url_rewrites(cwd)?;
+            }
+            Some(crate::git_command::expected_binding(cwd)?)
+        } else {
+            None
+        };
+        let mut process = gated_process(&program, &args)?;
+        let git_authority = git_binding
+            .as_ref()
+            .map(|binding| crate::git_command::bind_verified(&mut process, binding))
+            .transpose()?;
+        if git_authority.is_none() {
+            if let Some(cwd) = cwd {
+                process.current_dir(cwd);
+            }
         }
         process.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let Some((mut child, process_group, authority_pipe)) =
-            spawn_authorized(process, authorize_start, &format!("run {program}"))?
-        else {
+        if let Some(authority) = &git_authority {
+            authority.verify_control_state()?;
+            crate::git_command::initialize_executable_authority()?;
+        }
+        prepare_spawn(&mut process)?;
+        let mut release = CommandRelease::new();
+        if !authorize_start(&mut release)? {
             return Ok(CommandOutputOutcome::Cancelled);
-        };
+        }
+        if release.token != b"run\n" && release.token != b"landing\n" {
+            anyhow::bail!("command authorization produced an invalid release token");
+        }
+        #[cfg(debug_assertions)]
+        if release.token == b"landing\n"
+            && std::env::var_os("IQ_TEST_LANDING_STOP_AFTER_RELEASE_COMMIT").is_some()
+        {
+            std::process::exit(91);
+        }
+        #[cfg(debug_assertions)]
+        if release.token == b"landing\n"
+            && std::env::var_os("IQ_TEST_LANDING_FAIL_AFTER_RELEASE_COMMIT").is_some()
+        {
+            anyhow::bail!("test failure after landing release commit");
+        }
+        let _askpass = release
+            .https_credential
+            .as_ref()
+            .map(|credential| crate::git_command::apply_https_credential(&mut process, credential))
+            .transpose()?;
+        if let Some(authority) = &git_authority {
+            authority.verify_control_state()?;
+        }
+        unsafe {
+            process.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = process.spawn().with_context(|| format!("run {label}"))?;
         let stdout = child.stdout.take().context("capture command stdout")?;
         let stderr = child.stderr.take().context("capture command stderr")?;
-        let stdout_thread = thread::spawn(move || capture_memory_bounded(stdout));
-        let stderr_thread = thread::spawn(move || capture_memory_bounded(stderr));
+        let stop_capture = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stdout_stop = stop_capture.clone();
+        let stderr_stop = stop_capture.clone();
+        let stdout_thread = thread::spawn(move || capture_memory_bounded(stdout, &stdout_stop));
+        let stderr_thread = thread::spawn(move || capture_memory_bounded(stderr, &stderr_stop));
         let deadline = Instant::now() + timeout;
         let mut timed_out = false;
         let mut cancelled = false;
         let mut cancellation_failure_started = None;
         let mut cancellation_error = None;
+        let mut termination_error = None;
         let mut next_cancellation_check = Instant::now();
         let status = loop {
             if let Some(status) = child.try_wait()? {
-                break status;
+                break Some(status);
             }
             let current_time = Instant::now();
             if current_time >= next_cancellation_check {
                 match authority_state(&mut check_authority, &mut cancellation_failure_started) {
                     Ok(Some(ExecutionAuthority::Cancelled)) => {
                         cancelled = true;
-                        break terminate_process_group(
-                            &mut child,
-                            process_group,
-                            CANCELLATION_GRACE,
-                        )?;
+                        match stop_direct_command(&mut child) {
+                            Ok(status) => break Some(status),
+                            Err(error) => {
+                                termination_error = Some(error);
+                                break None;
+                            }
+                        }
                     }
                     Ok(Some(ExecutionAuthority::Lost(message))) => {
                         cancellation_error = Some(anyhow::anyhow!(message));
-                        break terminate_process_group(
-                            &mut child,
-                            process_group,
-                            CANCELLATION_GRACE,
-                        )?;
+                        match stop_direct_command(&mut child) {
+                            Ok(status) => break Some(status),
+                            Err(error) => {
+                                termination_error = Some(error);
+                                break None;
+                            }
+                        }
                     }
                     Ok(Some(ExecutionAuthority::Active)) | Ok(None) => {}
                     Err(error) => {
                         cancellation_error = Some(error);
-                        break terminate_process_group(
-                            &mut child,
-                            process_group,
-                            CANCELLATION_GRACE,
-                        )?;
+                        match stop_direct_command(&mut child) {
+                            Ok(status) => break Some(status),
+                            Err(error) => {
+                                termination_error = Some(error);
+                                break None;
+                            }
+                        }
                     }
                 }
                 next_cancellation_check = current_time + CANCELLATION_POLL_INTERVAL;
@@ -13247,25 +19223,49 @@ pub mod integrator {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 timed_out = true;
-                break terminate_process_group(&mut child, process_group, TIMEOUT_GRACE)?;
+                match stop_direct_command(&mut child) {
+                    Ok(status) => break Some(status),
+                    Err(error) => {
+                        termination_error = Some(error);
+                        break None;
+                    }
+                }
             }
             if let Some(status) = child.wait_timeout(POLL_INTERVAL.min(remaining))? {
-                break status;
+                break Some(status);
             }
         };
-        drop(authority_pipe);
-        signal_process_group(process_group, libc::SIGKILL)?;
+        stop_capture.store(true, std::sync::atomic::Ordering::Release);
         let stdout = stdout_thread
             .join()
             .map_err(|_| anyhow::anyhow!("stdout capture thread panicked"))??;
         let stderr = stderr_thread
             .join()
             .map_err(|_| anyhow::anyhow!("stderr capture thread panicked"))??;
+        if let Some(error) = termination_error {
+            return Err(error);
+        }
         if cancelled {
             return Ok(CommandOutputOutcome::Cancelled);
         }
         if let Some(error) = cancellation_error {
             return Err(error).context("monitor command cancellation");
+        }
+        if stdout.exceeded {
+            return Err(CommandInfrastructureError::OutputLimit {
+                program: label.to_string(),
+                stream: "stdout",
+                maximum_bytes: stdout.bytes.len(),
+            }
+            .into());
+        }
+        if stderr.exceeded {
+            return Err(CommandInfrastructureError::OutputLimit {
+                program: label.to_string(),
+                stream: "stderr",
+                maximum_bytes: stderr.bytes.len(),
+            }
+            .into());
         }
         match wait_for_authority_state(&mut check_authority, &mut cancellation_failure_started)
             .context("check command authority after command exit")?
@@ -13275,28 +19275,82 @@ pub mod integrator {
             ExecutionAuthority::Lost(message) => anyhow::bail!(message),
         }
         if timed_out {
-            anyhow::bail!("{program} timed out after {} seconds", timeout.as_secs());
+            return Err(CommandInfrastructureError::TimedOut {
+                program: label.to_string(),
+                timeout_seconds: timeout.as_secs(),
+            }
+            .into());
         }
         Ok(CommandOutputOutcome::Exited(Output {
-            status,
-            stdout,
-            stderr,
+            status: status.context("command ended without an exit status")?,
+            stdout: stdout.bytes,
+            stderr: stderr.bytes,
         }))
     }
 
-    fn capture_memory_bounded(mut input: impl Read) -> Result<Vec<u8>> {
+    fn stop_direct_command(child: &mut std::process::Child) -> Result<ExitStatus> {
+        let process_group = child.id() as libc::pid_t;
+        if unsafe { libc::kill(-process_group, libc::SIGTERM) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error).context("stop command process group");
+            }
+        }
+        if let Some(status) = child.wait_timeout(StdDuration::from_secs(2))? {
+            return Ok(status);
+        }
+        if unsafe { libc::kill(-process_group, libc::SIGKILL) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error).context("kill command process group");
+            }
+        }
+        child.wait().context("reap command process")
+    }
+
+    struct MemoryCapture {
+        bytes: Vec<u8>,
+        exceeded: bool,
+    }
+
+    fn capture_memory_bounded(
+        mut input: impl Read + AsRawFd,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> Result<MemoryCapture> {
         const MAX_BYTES: usize = 1024 * 1024;
+        let descriptor = input.as_raw_fd();
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        if flags < 0
+            || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } != 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("make command capture stream nonblocking");
+        }
         let mut output = Vec::new();
+        let mut exceeded = false;
         let mut buffer = [0_u8; 8192];
         loop {
-            let count = input.read(&mut buffer)?;
-            if count == 0 {
-                break;
+            match input.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => {
+                    let remaining = MAX_BYTES.saturating_sub(output.len());
+                    output.extend_from_slice(&buffer[..remaining.min(count)]);
+                    exceeded |= count > remaining;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if stop.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
+                    thread::sleep(StdDuration::from_millis(5));
+                }
+                Err(error) => return Err(error).context("capture command output"),
             }
-            let remaining = MAX_BYTES.saturating_sub(output.len());
-            output.extend_from_slice(&buffer[..remaining.min(count)]);
         }
-        Ok(output)
+        Ok(MemoryCapture {
+            bytes: output,
+            exceeded,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -13307,13 +19361,13 @@ pub mod integrator {
         log_directory: &fs::File,
         environment: &[(&str, &str)],
         timeout: StdDuration,
-        authorize_start: impl FnOnce(&mut dyn Write) -> Result<bool>,
+        authorize_start: impl FnOnce(&mut CommandRelease) -> Result<bool>,
         mut check_authority: impl FnMut() -> Result<ExecutionAuthority>,
     ) -> Result<EvidenceCommandOutcome> {
         const POLL_INTERVAL: StdDuration = StdDuration::from_millis(10);
-        const CANCELLATION_GRACE: StdDuration = StdDuration::from_millis(50);
-        const TIMEOUT_GRACE: StdDuration = StdDuration::from_secs(5);
 
+        let binding = crate::git_command::expected_binding(cwd)?;
+        binding.verify()?;
         let stdout_path = log_path.with_extension("stdout.tmp");
         let stderr_path = log_path.with_extension("stderr.tmp");
         let log_name = log_path
@@ -13329,7 +19383,7 @@ pub mod integrator {
             create_file_at(log_directory, stdout_name, "temporary evidence stdout")?;
         let stderr_capture =
             create_file_at(log_directory, stderr_name, "temporary evidence stderr")?;
-        let mut process = gated_process("sh", ["-lc", command]);
+        let mut process = gated_process(&CommandProgram::SearchPath("/bin/sh"), ["-lc", command])?;
         process
             .current_dir(cwd)
             .stdout(Stdio::piped())
@@ -13337,18 +19391,30 @@ pub mod integrator {
         for (key, value) in environment {
             process.env(key, value);
         }
-        let Some((mut child, process_group, authority_pipe)) = spawn_authorized(
-            process,
-            authorize_start,
-            &format!("run evidence command: {command}"),
-        )?
-        else {
+        crate::git_command::harden_authorized(&mut process);
+        binding.verify()?;
+        let mut release = CommandRelease::new();
+        if !authorize_start(&mut release)? {
             let mut log = create_file_at(log_directory, log_name, "evidence log")?;
             writeln!(log, "$ {command}\n\n[IQ cancelled before command start]")?;
             remove_file_at(log_directory, stdout_name, "evidence stdout")?;
             remove_file_at(log_directory, stderr_name, "evidence stderr")?;
             return Ok(EvidenceCommandOutcome::Cancelled(None));
-        };
+        }
+        if release.token != b"run\n" {
+            anyhow::bail!("evidence command authorization produced an invalid release token");
+        }
+        unsafe {
+            process.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = process
+            .spawn()
+            .with_context(|| format!("run evidence command: {command}"))?;
         let stdout = child.stdout.take().context("capture command stdout")?;
         let stderr = child.stderr.take().context("capture command stderr")?;
         let stdout_thread = thread::spawn(move || capture_bounded(stdout, stdout_capture));
@@ -13371,28 +19437,16 @@ pub mod integrator {
                 match authority_state(&mut check_authority, &mut cancellation_failure_started) {
                     Ok(Some(ExecutionAuthority::Cancelled)) => {
                         cancelled = true;
-                        break terminate_process_group(
-                            &mut child,
-                            process_group,
-                            CANCELLATION_GRACE,
-                        )?;
+                        break stop_direct_command(&mut child)?;
                     }
                     Ok(Some(ExecutionAuthority::Lost(message))) => {
                         cancellation_error = Some(anyhow::anyhow!(message));
-                        break terminate_process_group(
-                            &mut child,
-                            process_group,
-                            CANCELLATION_GRACE,
-                        )?;
+                        break stop_direct_command(&mut child)?;
                     }
                     Ok(Some(ExecutionAuthority::Active)) | Ok(None) => {}
                     Err(error) => {
                         cancellation_error = Some(error);
-                        break terminate_process_group(
-                            &mut child,
-                            process_group,
-                            CANCELLATION_GRACE,
-                        )?;
+                        break stop_direct_command(&mut child)?;
                     }
                 }
                 next_cancellation_check = current_time + CANCELLATION_POLL_INTERVAL;
@@ -13400,7 +19454,7 @@ pub mod integrator {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 timed_out = true;
-                break terminate_process_group(&mut child, process_group, TIMEOUT_GRACE)?;
+                break stop_direct_command(&mut child)?;
             }
             if let Some(status) = child
                 .wait_timeout(POLL_INTERVAL.min(remaining))
@@ -13409,8 +19463,6 @@ pub mod integrator {
                 break status;
             }
         };
-        drop(authority_pipe);
-        signal_process_group(process_group, libc::SIGKILL)?;
         stdout_thread
             .join()
             .map_err(|_| anyhow::anyhow!("stdout capture thread panicked"))??;
@@ -13502,93 +19554,25 @@ pub mod integrator {
         }
     }
 
-    fn gated_process<I, S>(program: &str, args: I) -> Command
+    fn gated_process<I, S>(
+        program: &CommandProgram<'_>,
+        args: I,
+    ) -> Result<crate::agent_config::AuthorizedCommand>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let mut process = Command::new("sh");
-        process
-            .arg("-c")
-            .arg(
-                r#"IFS= read -r gate && [ "$gate" = run ] || exit 125
-exec 3<&0
-"$@" &
-command_pid=$!
-(
-  while IFS= read -r _; do :; done
-  kill -TERM -$$ 2>/dev/null || true
-) <&3 &
-watcher_pid=$!
-wait "$command_pid"
-status=$?
-kill "$watcher_pid" 2>/dev/null || true
-wait "$watcher_pid" 2>/dev/null || true
-exit "$status""#,
-            )
-            .arg("iq-command-gate")
-            .arg(program)
-            .args(args)
-            .stdin(Stdio::piped())
-            .process_group(0);
-        process
-    }
-
-    fn spawn_authorized(
-        mut process: Command,
-        authorize_start: impl FnOnce(&mut dyn Write) -> Result<bool>,
-        description: &str,
-    ) -> Result<Option<(std::process::Child, i32, std::process::ChildStdin)>> {
-        const CANCELLATION_GRACE: StdDuration = StdDuration::from_millis(50);
-
-        let mut child = process.spawn().with_context(|| description.to_string())?;
-        let process_group = -(child.id() as i32);
-        let mut gate = match child.stdin.take() {
-            Some(gate) => gate,
-            None => {
-                terminate_process_group(&mut child, process_group, CANCELLATION_GRACE)?;
-                anyhow::bail!("capture command admission gate");
+        let mut process = match program {
+            CommandProgram::SearchPath("git") => crate::git_command::command()?,
+            CommandProgram::SearchPath(program) => {
+                let identity = crate::agent_config::search_path_executable_identity(program)?;
+                crate::agent_config::open_executable_authority(&identity)?.command()
             }
+            CommandProgram::Descriptor { authority, .. } => authority.command(),
         };
-        let authorized = match authorize_start(&mut gate) {
-            Ok(authorized) => authorized,
-            Err(error) => {
-                drop(gate);
-                terminate_process_group(&mut child, process_group, CANCELLATION_GRACE)?;
-                return Err(error).context("authorize command start");
-            }
-        };
-        if !authorized {
-            drop(gate);
-            terminate_process_group(&mut child, process_group, CANCELLATION_GRACE)?;
-            return Ok(None);
-        }
-        Ok(Some((child, process_group, gate)))
-    }
-
-    fn terminate_process_group(
-        child: &mut std::process::Child,
-        process_group: i32,
-        grace: StdDuration,
-    ) -> Result<ExitStatus> {
-        signal_process_group(process_group, libc::SIGTERM)?;
-        if let Some(status) = child.wait_timeout(grace)? {
-            return Ok(status);
-        }
-        signal_process_group(process_group, libc::SIGKILL)?;
-        child.wait().context("reap terminated command")
-    }
-
-    fn signal_process_group(process_group: i32, signal: i32) -> Result<()> {
-        if unsafe { libc::kill(process_group, signal) } == 0 {
-            return Ok(());
-        }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
-        } else {
-            Err(error).context("signal command process group")
-        }
+        crate::git_command::harden_authorized(&mut process);
+        process.args(args).stdin(Stdio::null());
+        Ok(process)
     }
 
     fn capture_bounded(mut input: impl Read, mut output: fs::File) -> Result<()> {
@@ -13654,16 +19638,21 @@ exit "$status""#,
         }
     }
 
-    pub fn git_status<I, S>(cwd: &Path, args: I) -> Result<Output>
+    pub(crate) fn git_status<I, S>(cwd: &Path, args: I) -> Result<Output>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        Command::new("git")
-            .args(["-c", "commit.gpgSign=false"])
-            .args(args)
-            .current_dir(cwd)
-            .output()
+        let args = args
+            .into_iter()
+            .map(|argument| argument.as_ref().to_os_string())
+            .collect::<Vec<_>>();
+        if crate::git_command::is_external_operation(&args) {
+            crate::git_command::require_no_url_rewrites(cwd)?;
+        }
+        let mut command = crate::git_command::command_in(cwd)?;
+        command.args(["-c", "commit.gpgSign=false"]).args(args);
+        crate::git_command::service_output(&mut command)
             .with_context(|| format!("run git in {}", cwd.display()))
     }
 
@@ -13676,11 +19665,9 @@ exit "$status""#,
             .into_iter()
             .map(|argument| argument.as_ref().to_os_string())
             .collect::<Vec<OsString>>();
-        let output = Command::new("git")
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .args(&args)
-            .current_dir(cwd)
-            .output()
+        let mut command = crate::git_command::command_in(cwd)?;
+        command.env("GIT_OPTIONAL_LOCKS", "0").args(&args);
+        let output = crate::git_command::service_output(&mut command)
             .with_context(|| format!("run observational git in {}", cwd.display()))?;
         if !output.status.success() {
             anyhow::bail!(
@@ -13788,7 +19775,423 @@ exit "$status""#,
 pub mod providers {
     use anyhow::{Context, Result};
     use serde::Deserialize;
-    use std::process::Command;
+    use std::ffi::OsString;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::process::Output;
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    #[cfg(not(test))]
+    static GITHUB_EXECUTABLE: OnceLock<
+        std::result::Result<crate::control_domain::ExecutableIdentity, String>,
+    > = OnceLock::new();
+    #[cfg(not(test))]
+    static GITLAB_EXECUTABLE: OnceLock<
+        std::result::Result<crate::control_domain::ExecutableIdentity, String>,
+    > = OnceLock::new();
+
+    #[cfg(any(debug_assertions, test, feature = "test-hooks"))]
+    static TEST_EXECUTABLES: OnceLock<
+        std::sync::Mutex<(
+            Option<crate::control_domain::ExecutableIdentity>,
+            Option<crate::control_domain::ExecutableIdentity>,
+        )>,
+    > = OnceLock::new();
+
+    #[cfg(test)]
+    static TEST_PROVIDER_EXECUTION_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+
+    #[cfg(test)]
+    pub(crate) fn lock_test_provider_execution() -> std::sync::MutexGuard<'static, ()> {
+        TEST_PROVIDER_EXECUTION_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[cfg(any(debug_assertions, test, feature = "test-hooks"))]
+    pub struct TestProviderExecutableGuard {
+        provider: crate::repository_policy::Provider,
+        previous: Option<crate::control_domain::ExecutableIdentity>,
+    }
+
+    #[cfg(any(debug_assertions, test, feature = "test-hooks"))]
+    impl Drop for TestProviderExecutableGuard {
+        fn drop(&mut self) {
+            let mut authorities = TEST_EXECUTABLES
+                .get_or_init(|| std::sync::Mutex::new((None, None)))
+                .lock()
+                .expect("test provider executable authority is poisoned");
+            *match self.provider {
+                crate::repository_policy::Provider::Github => &mut authorities.0,
+                crate::repository_policy::Provider::Gitlab => &mut authorities.1,
+            } = self.previous.take();
+        }
+    }
+
+    #[cfg(any(debug_assertions, test, feature = "test-hooks"))]
+    pub fn inject_test_provider_executable(
+        provider: crate::repository_policy::Provider,
+        path: &std::path::Path,
+    ) -> Result<TestProviderExecutableGuard> {
+        let identity = crate::agent_config::executable_identity(path)?;
+        let mut authorities = TEST_EXECUTABLES
+            .get_or_init(|| std::sync::Mutex::new((None, None)))
+            .lock()
+            .map_err(|_| anyhow::anyhow!("test provider executable authority is poisoned"))?;
+        let authority = match provider {
+            crate::repository_policy::Provider::Github => &mut authorities.0,
+            crate::repository_policy::Provider::Gitlab => &mut authorities.1,
+        };
+        let previous = authority.replace(identity);
+        Ok(TestProviderExecutableGuard { provider, previous })
+    }
+
+    #[cfg(any(debug_assertions, feature = "test-hooks"))]
+    pub(crate) fn test_provider_executable_is_injected() -> bool {
+        TEST_EXECUTABLES
+            .get_or_init(|| std::sync::Mutex::new((None, None)))
+            .lock()
+            .is_ok_and(|authorities| authorities.0.is_some() || authorities.1.is_some())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn provider_program(provider: crate::repository_policy::Provider) -> Result<String> {
+        let injected = {
+            let authorities = TEST_EXECUTABLES
+                .get_or_init(|| std::sync::Mutex::new((None, None)))
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test provider executable authority is poisoned"))?;
+            match provider {
+                crate::repository_policy::Provider::Github => authorities.0.clone(),
+                crate::repository_policy::Provider::Gitlab => authorities.1.clone(),
+            }
+        };
+        if let Some(identity) = injected {
+            crate::agent_config::verify_executable(&identity)?;
+            return identity
+                .path
+                .into_os_string()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("provider executable path is not UTF-8"));
+        }
+        Ok(match provider {
+            crate::repository_policy::Provider::Github => "/test/gh".into(),
+            crate::repository_policy::Provider::Gitlab => "/test/glab".into(),
+        })
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn provider_program(provider: crate::repository_policy::Provider) -> Result<String> {
+        validate_executable_environment()?;
+        #[cfg(any(debug_assertions, feature = "test-hooks"))]
+        let injected = {
+            let authorities = TEST_EXECUTABLES
+                .get_or_init(|| std::sync::Mutex::new((None, None)))
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test provider executable authority is poisoned"))?;
+            match provider {
+                crate::repository_policy::Provider::Github => authorities.0.clone(),
+                crate::repository_policy::Provider::Gitlab => authorities.1.clone(),
+            }
+        };
+        #[cfg(any(debug_assertions, feature = "test-hooks"))]
+        if let Some(identity) = injected {
+            crate::agent_config::verify_executable(&identity)?;
+            return identity
+                .path
+                .into_os_string()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("provider executable path is not UTF-8"));
+        }
+        let (program, authority) = match provider {
+            crate::repository_policy::Provider::Github => ("gh", &GITHUB_EXECUTABLE),
+            crate::repository_policy::Provider::Gitlab => ("glab", &GITLAB_EXECUTABLE),
+        };
+        let identity = authority
+            .get_or_init(|| {
+                crate::agent_config::trusted_executable_identity(program)
+                    .map_err(|error| format!("{error:#}"))
+            })
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!(error.clone()))?;
+        crate::agent_config::verify_executable(identity)?;
+        identity
+            .path
+            .to_str()
+            .map(str::to_string)
+            .context("provider executable path is not UTF-8")
+    }
+
+    pub fn validate_executable_environment() -> Result<()> {
+        if std::env::var_os("IQ_GITHUB_CLI").is_some()
+            || std::env::var_os("IQ_GITLAB_CLI").is_some()
+        {
+            anyhow::bail!("provider executable environment overrides are forbidden");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn harden_authorized_provider_environment(
+        provider: crate::repository_policy::Provider,
+        command: &mut crate::agent_config::AuthorizedCommand,
+    ) {
+        if let Some((name, directory)) = provider_config_directory(provider) {
+            command.env(name, directory);
+        }
+        #[cfg(debug_assertions)]
+        for (key, value) in std::env::vars_os() {
+            if key.as_encoded_bytes().starts_with(b"IQ_TEST_PROVIDER_") {
+                command.env(key, value);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn harden_provider_environment(
+        provider: crate::repository_policy::Provider,
+        command: &mut std::process::Command,
+    ) {
+        command.env_clear();
+        if let Some((name, directory)) = provider_config_directory(provider) {
+            command.env(name, directory);
+        }
+        #[cfg(debug_assertions)]
+        for (key, value) in std::env::vars_os() {
+            if key.as_encoded_bytes().starts_with(b"IQ_TEST_PROVIDER_") {
+                command.env(key, value);
+            }
+        }
+    }
+
+    fn provider_config_directory(
+        provider: crate::repository_policy::Provider,
+    ) -> Option<(&'static str, PathBuf)> {
+        let (variable, configured, directory_name) = match provider {
+            crate::repository_policy::Provider::Github => {
+                ("GH_CONFIG_DIR", std::env::var_os("GH_CONFIG_DIR"), "gh")
+            }
+            crate::repository_policy::Provider::Gitlab => (
+                "GLAB_CONFIG_DIR",
+                std::env::var_os("GLAB_CONFIG_DIR"),
+                "glab-cli",
+            ),
+        };
+        let directory = configured
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("XDG_CONFIG_HOME")
+                    .map(PathBuf::from)
+                    .map(|root| root.join(directory_name))
+            })
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|root| root.join(".config").join(directory_name))
+            })?;
+        directory.is_absolute().then_some((variable, directory))
+    }
+
+    pub(crate) fn reverify_provider_program(
+        provider: crate::repository_policy::Provider,
+        program: &str,
+    ) -> Result<Option<crate::control_domain::ExecutableIdentity>> {
+        #[cfg(debug_assertions)]
+        {
+            let path = std::path::Path::new(program);
+            let authorities = TEST_EXECUTABLES
+                .get_or_init(|| std::sync::Mutex::new((None, None)))
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test provider executable authority is poisoned"))?;
+            let identity = match provider {
+                crate::repository_policy::Provider::Github => &authorities.0,
+                crate::repository_policy::Provider::Gitlab => &authorities.1,
+            };
+            if let Some(identity) = identity {
+                if identity.path != path {
+                    anyhow::bail!("provider executable path differs from requested authority");
+                }
+                crate::agent_config::verify_executable(identity)?;
+                return Ok(Some(identity.clone()));
+            }
+        }
+        #[cfg(test)]
+        if matches!(
+            (provider, program),
+            (crate::repository_policy::Provider::Github, "/test/gh")
+                | (crate::repository_policy::Provider::Gitlab, "/test/glab")
+        ) {
+            return Ok(None);
+        }
+        #[cfg(not(test))]
+        {
+            let candidate = provider_program(provider)?;
+            if candidate != program {
+                anyhow::bail!("provider executable path differs from requested authority");
+            }
+            let authority = match provider {
+                crate::repository_policy::Provider::Github => &GITHUB_EXECUTABLE,
+                crate::repository_policy::Provider::Gitlab => &GITLAB_EXECUTABLE,
+            };
+            let identity = authority
+                .get()
+                .context("provider executable authority was not initialized")?
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!(error.clone()))?;
+            crate::agent_config::verify_executable(identity)?;
+            Ok(Some(identity.clone()))
+        }
+        #[cfg(test)]
+        anyhow::bail!("provider executable does not match the requested pinned authority")
+    }
+
+    #[cfg(not(test))]
+    const PROVIDER_TIMEOUT: Duration = Duration::from_secs(20);
+    #[cfg(test)]
+    const PROVIDER_TIMEOUT: Duration = Duration::from_millis(200);
+
+    #[derive(Debug, thiserror::Error)]
+    pub enum ProviderInfrastructureError {
+        #[error("provider CLI {program} execution failed: {detail}")]
+        Execution { program: String, detail: String },
+        #[error("provider CLI {program} timed out after {timeout_seconds} seconds")]
+        TimedOut {
+            program: String,
+            timeout_seconds: u64,
+        },
+        #[error("provider CLI {program} {stream} exceeded the {maximum_bytes}-byte capture limit")]
+        OutputLimit {
+            program: String,
+            stream: &'static str,
+            maximum_bytes: usize,
+        },
+        #[error("provider CLI {program} lost item execution authority")]
+        Cancelled { program: String },
+        #[error("provider CLI {program} failed with status {status:?}: {stderr}")]
+        Exit {
+            program: String,
+            status: Option<i32>,
+            stderr: String,
+        },
+    }
+
+    impl ProviderInfrastructureError {
+        pub(crate) fn from_execution(program: &str, error: anyhow::Error) -> Self {
+            match error.downcast_ref::<crate::integrator::CommandInfrastructureError>() {
+                Some(crate::integrator::CommandInfrastructureError::TimedOut {
+                    timeout_seconds,
+                    ..
+                }) => Self::TimedOut {
+                    program: program.to_string(),
+                    timeout_seconds: *timeout_seconds,
+                },
+                Some(crate::integrator::CommandInfrastructureError::OutputLimit {
+                    stream,
+                    maximum_bytes,
+                    ..
+                }) => Self::OutputLimit {
+                    program: program.to_string(),
+                    stream,
+                    maximum_bytes: *maximum_bytes,
+                },
+                None => Self::Execution {
+                    program: program.to_string(),
+                    detail: format!("{error:#}"),
+                },
+            }
+        }
+    }
+
+    pub trait ProviderCommandExecutor {
+        fn output(
+            &mut self,
+            provider: crate::repository_policy::Provider,
+            program: &str,
+            args: &[OsString],
+        ) -> Result<Output>;
+    }
+
+    impl<F> ProviderCommandExecutor for F
+    where
+        F: FnMut(crate::repository_policy::Provider, &str, &[OsString]) -> Result<Output>,
+    {
+        fn output(
+            &mut self,
+            provider: crate::repository_policy::Provider,
+            program: &str,
+            args: &[OsString],
+        ) -> Result<Output> {
+            self(provider, program, args)
+        }
+    }
+
+    pub(crate) struct DirectProviderExecutor;
+
+    impl ProviderCommandExecutor for DirectProviderExecutor {
+        fn output(
+            &mut self,
+            provider: crate::repository_policy::Provider,
+            program: &str,
+            args: &[OsString],
+        ) -> Result<Output> {
+            let outcome = output_with_authority(
+                provider,
+                program,
+                args,
+                None,
+                PROVIDER_TIMEOUT,
+                |gate| {
+                    gate.write_all(b"run\n")?;
+                    Ok(true)
+                },
+                || Ok(crate::sqlite::ExecutionAuthority::Active),
+            )
+            .map_err(|error| ProviderInfrastructureError::from_execution(program, error))?;
+            match outcome {
+                crate::integrator::CommandOutputOutcome::Exited(output) => Ok(output),
+                crate::integrator::CommandOutputOutcome::Cancelled => {
+                    Err(ProviderInfrastructureError::Cancelled {
+                        program: program.to_string(),
+                    }
+                    .into())
+                }
+            }
+        }
+    }
+
+    pub(crate) fn output_with_authority<I, S>(
+        provider: crate::repository_policy::Provider,
+        program: &str,
+        args: I,
+        cwd: Option<&std::path::Path>,
+        timeout: Duration,
+        authorize_start: impl FnOnce(&mut crate::integrator::CommandRelease) -> Result<bool>,
+        check_authority: impl FnMut() -> Result<crate::sqlite::ExecutionAuthority>,
+    ) -> Result<crate::integrator::CommandOutputOutcome>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let identity = reverify_provider_program(provider, program)?
+            .context("provider executable has no descriptor authority")?;
+        let executable = crate::agent_config::open_executable_authority(&identity)?;
+        crate::integrator::command_output_timeout_with_prepare(
+            crate::integrator::CommandProgram::Descriptor {
+                label: program,
+                authority: &executable,
+            },
+            args,
+            cwd,
+            timeout,
+            authorize_start,
+            check_authority,
+            |command| {
+                harden_authorized_provider_environment(provider, command);
+                Ok(())
+            },
+        )
+    }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub enum ProviderKind {
@@ -13805,33 +20208,122 @@ pub mod providers {
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct ProviderSnapshot {
+        pub repository: crate::repository_policy::ProviderRepository,
         pub head_sha: String,
         pub base_sha: String,
+        pub target_branch: String,
         pub gate: ProviderGate,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
-    pub struct ProviderMergeCommand {
-        pub program: String,
-        pub args: Vec<String>,
+    pub struct MergeRequestLocator {
+        pub provider: crate::repository_policy::Provider,
+        pub host: String,
+        pub repository: String,
+        pub identity: String,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct ProviderLanding {
         pub head_sha: String,
         pub commit_sha: String,
+        pub history: Option<ProviderLandingHistory>,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum ProviderLandingHistory {
+        PreserveHead,
+        Squash,
     }
 
     pub trait ProviderAdapter {
         fn kind(&self) -> ProviderKind;
-        fn snapshot(&self, url: &str) -> Result<ProviderSnapshot>;
-        fn merge_command(&self, url: &str, expected_head_sha: &str) -> ProviderMergeCommand;
-        fn landing(&self, url: &str) -> Result<Option<ProviderLanding>>;
+        fn verify_repository(
+            &self,
+            expected: &crate::repository_policy::ProviderRepository,
+            object_format: crate::git_object::GitObjectFormat,
+            executor: &mut dyn ProviderCommandExecutor,
+        ) -> Result<()>;
+        fn snapshot(
+            &self,
+            url: &str,
+            executor: &mut dyn ProviderCommandExecutor,
+        ) -> Result<ProviderSnapshot>;
+        fn atomic_landing_unsupported(&self) -> anyhow::Error;
+        fn landing(
+            &self,
+            url: &str,
+            executor: &mut dyn ProviderCommandExecutor,
+        ) -> Result<Option<ProviderLanding>>;
     }
 
     pub fn provider_for_url(url: &str) -> Result<Box<dyn ProviderAdapter>> {
+        let locator = merge_request_locator(url)?;
+        match locator.provider {
+            crate::repository_policy::Provider::Github => Ok(Box::new(GitHubProvider)),
+            crate::repository_policy::Provider::Gitlab => Ok(Box::new(GitLabProvider)),
+        }
+    }
+
+    pub fn verify_repository(
+        expected: &crate::repository_policy::ProviderRepository,
+        object_format: crate::git_object::GitObjectFormat,
+    ) -> Result<()> {
+        verify_repository_with(expected, object_format, &mut DirectProviderExecutor)
+    }
+
+    pub fn verify_repository_with(
+        expected: &crate::repository_policy::ProviderRepository,
+        object_format: crate::git_object::GitObjectFormat,
+        executor: &mut dyn ProviderCommandExecutor,
+    ) -> Result<()> {
+        let adapter: Box<dyn ProviderAdapter> = match expected.provider {
+            crate::repository_policy::Provider::Github => Box::new(GitHubProvider),
+            crate::repository_policy::Provider::Gitlab => Box::new(GitLabProvider),
+        };
+        adapter.verify_repository(expected, object_format, executor)
+    }
+
+    pub(crate) fn https_credential(
+        expected: &crate::repository_policy::ProviderRepository,
+    ) -> Result<Option<crate::git_command::HttpsCredential>> {
+        https_credential_with(expected, &mut DirectProviderExecutor)
+    }
+
+    pub(crate) fn https_credential_with(
+        expected: &crate::repository_policy::ProviderRepository,
+        executor: &mut dyn ProviderCommandExecutor,
+    ) -> Result<Option<crate::git_command::HttpsCredential>> {
+        let program = provider_program(expected.provider)?;
+        let args = [
+            OsString::from("auth"),
+            OsString::from("token"),
+            OsString::from("--hostname"),
+            OsString::from(&expected.host),
+        ];
+        let output = executor.output(expected.provider, &program, &args)?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let token = std::str::from_utf8(&output.stdout)
+            .context("provider HTTPS credential is not UTF-8")?
+            .trim_end_matches(['\r', '\n']);
+        let username = match expected.provider {
+            crate::repository_policy::Provider::Github => "x-access-token",
+            crate::repository_policy::Provider::Gitlab => "oauth2",
+        };
+        Ok(Some(crate::git_command::HttpsCredential::new(
+            username, token,
+        )?))
+    }
+
+    pub fn snapshot(adapter: &dyn ProviderAdapter, url: &str) -> Result<ProviderSnapshot> {
+        adapter.snapshot(url, &mut DirectProviderExecutor)
+    }
+
+    pub fn merge_request_locator(url: &str) -> Result<MergeRequestLocator> {
         let (scheme, location) = url.split_once("://").context("PR/MR URL has no scheme")?;
-        if !matches!(scheme, "http" | "https") {
+        if scheme != "https" {
             anyhow::bail!("unsupported PR/MR URL scheme: {scheme}");
         }
         let (host, path) = location
@@ -13842,20 +20334,34 @@ pub mod providers {
             .next()
             .context("PR/MR URL has no path")?;
         let segments = path.split('/').collect::<Vec<_>>();
-        let github_pull = host.eq_ignore_ascii_case("github.com")
-            && matches!(segments.as_slice(), [owner, repository, "pull", number] if !owner.is_empty() && !repository.is_empty() && number.parse::<u64>().is_ok());
-        let gitlab_merge_request = host.to_ascii_lowercase().contains("gitlab")
-            && segments.len() >= 5
+        let host = host.to_ascii_lowercase();
+        if host.is_empty() || host.contains([':', '@']) {
+            anyhow::bail!("PR/MR URL has an invalid host");
+        }
+        let github_pull = matches!(segments.as_slice(), [owner, repository, "pull", number] if !owner.is_empty() && !repository.is_empty() && number.parse::<u64>().is_ok_and(|number| number > 0));
+        let gitlab_merge_request = segments.len() >= 5
             && segments[segments.len() - 3] == "-"
             && segments[segments.len() - 2] == "merge_requests"
-            && segments[segments.len() - 1].parse::<u64>().is_ok()
+            && segments[segments.len() - 1]
+                .parse::<u64>()
+                .is_ok_and(|number| number > 0)
             && segments[..segments.len() - 3]
                 .iter()
                 .all(|segment| !segment.is_empty());
         if github_pull {
-            Ok(Box::new(GitHubProvider))
+            Ok(MergeRequestLocator {
+                provider: crate::repository_policy::Provider::Github,
+                host,
+                repository: format!("{}/{}", segments[0], segments[1]),
+                identity: segments[3].to_string(),
+            })
         } else if gitlab_merge_request {
-            Ok(Box::new(GitLabProvider))
+            Ok(MergeRequestLocator {
+                provider: crate::repository_policy::Provider::Gitlab,
+                host,
+                repository: segments[..segments.len() - 3].join("/"),
+                identity: segments[segments.len() - 1].to_string(),
+            })
         } else {
             anyhow::bail!("unsupported PR/MR provider URL: {url}")
         }
@@ -13869,46 +20375,114 @@ pub mod providers {
             ProviderKind::GitHub
         }
 
-        fn snapshot(&self, url: &str) -> Result<ProviderSnapshot> {
+        fn verify_repository(
+            &self,
+            expected: &crate::repository_policy::ProviderRepository,
+            object_format: crate::git_object::GitObjectFormat,
+            executor: &mut dyn ProviderCommandExecutor,
+        ) -> Result<()> {
+            if expected.provider != crate::repository_policy::Provider::Github {
+                anyhow::bail!("GitHub adapter cannot verify a non-GitHub repository");
+            }
+            let (owner, name) = expected
+                .repository
+                .split_once('/')
+                .context("GitHub repository identity has no owner/name boundary")?;
+            let endpoint = format!("repos/{owner}/{name}");
             let value = provider_json(
-                std::env::var("IQ_GITHUB_CLI").unwrap_or_else(|_| "gh".into()),
+                crate::repository_policy::Provider::Github,
+                provider_program(crate::repository_policy::Provider::Github)?,
+                [
+                    "api",
+                    "--hostname",
+                    expected.host.as_str(),
+                    endpoint.as_str(),
+                ],
+                executor,
+            )?;
+            let observed: GitHubVerifiedRepository =
+                serde_json::from_value(value).context("parse gh repository JSON")?;
+            if observed.node_id != expected.repository_id
+                || observed.full_name != expected.repository
+            {
+                anyhow::bail!("GitHub repository identity differs from policy");
+            }
+            let format_endpoint = format!("repos/{owner}/{name}/hash-algorithm");
+            let format_value = provider_json(
+                crate::repository_policy::Provider::Github,
+                provider_program(crate::repository_policy::Provider::Github)?,
+                [
+                    "api",
+                    "--hostname",
+                    expected.host.as_str(),
+                    format_endpoint.as_str(),
+                ],
+                executor,
+            )
+            .context("GitHub provider cannot report Git object format before effect")?;
+            let observed_format: GitHubHashAlgorithm =
+                serde_json::from_value(format_value).context("parse GitHub hash-algorithm JSON")?;
+            let observed_format = observed_format
+                .hash_algorithm
+                .context("GitHub hash-algorithm API omitted Git object format before effect")?;
+            if crate::git_object::GitObjectFormat::parse(&observed_format, "GitHub repository API")?
+                != object_format
+            {
+                anyhow::bail!("GitHub repository object format differs from policy");
+            }
+            Ok(())
+        }
+
+        fn snapshot(
+            &self,
+            url: &str,
+            executor: &mut dyn ProviderCommandExecutor,
+        ) -> Result<ProviderSnapshot> {
+            let value = provider_json(
+                crate::repository_policy::Provider::Github,
+                provider_program(crate::repository_policy::Provider::Github)?,
                 [
                     "pr",
                     "view",
                     url,
                     "--json",
-                    "headRefOid,baseRefOid,reviewDecision,statusCheckRollup,mergeStateStatus",
+                    "headRefOid,baseRefOid,baseRefName,baseRepository,reviewDecision,statusCheckRollup,mergeStateStatus",
                 ],
+                executor,
             )?;
             let parsed: GitHubPrView =
                 serde_json::from_value(value).context("parse gh pr view JSON")?;
             let gate = github_gate(&parsed);
+            let locator = merge_request_locator(url)?;
+            let base_repository = parsed
+                .base_repository
+                .context("gh PR JSON missing baseRepository")?;
             Ok(ProviderSnapshot {
+                repository: crate::repository_policy::ProviderRepository {
+                    provider: crate::repository_policy::Provider::Github,
+                    host: locator.host,
+                    repository: base_repository.name_with_owner,
+                    repository_id: base_repository.id,
+                },
                 head_sha: parsed.head_ref_oid,
                 base_sha: parsed.base_ref_oid,
+                target_branch: parsed.base_ref_name,
                 gate,
             })
         }
 
-        fn merge_command(&self, url: &str, expected_head_sha: &str) -> ProviderMergeCommand {
-            ProviderMergeCommand {
-                program: std::env::var("IQ_GITHUB_CLI").unwrap_or_else(|_| "gh".into()),
-                args: [
-                    "pr",
-                    "merge",
-                    url,
-                    "--merge",
-                    "--match-head-commit",
-                    expected_head_sha,
-                ]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            }
+        fn atomic_landing_unsupported(&self) -> anyhow::Error {
+            anyhow::anyhow!(
+                "GitHub CLI can pin the admitted head but cannot atomically pin the validated base"
+            )
         }
 
-        fn landing(&self, url: &str) -> Result<Option<ProviderLanding>> {
-            github_landing(url)
+        fn landing(
+            &self,
+            url: &str,
+            executor: &mut dyn ProviderCommandExecutor,
+        ) -> Result<Option<ProviderLanding>> {
+            github_landing(url, executor)
         }
     }
 
@@ -13920,14 +20494,81 @@ pub mod providers {
             ProviderKind::GitLab
         }
 
-        fn snapshot(&self, url: &str) -> Result<ProviderSnapshot> {
+        fn verify_repository(
+            &self,
+            expected: &crate::repository_policy::ProviderRepository,
+            object_format: crate::git_object::GitObjectFormat,
+            executor: &mut dyn ProviderCommandExecutor,
+        ) -> Result<()> {
+            if expected.provider != crate::repository_policy::Provider::Gitlab {
+                anyhow::bail!("GitLab adapter cannot verify a non-GitLab repository");
+            }
+            let project = percent_encode_path(&expected.repository);
+            let endpoint = format!("projects/{project}");
             let value = provider_json(
-                std::env::var("IQ_GITLAB_CLI").unwrap_or_else(|_| "glab".into()),
-                ["mr", "view", url, "--output", "json"],
+                crate::repository_policy::Provider::Gitlab,
+                provider_program(crate::repository_policy::Provider::Gitlab)?,
+                [
+                    "api",
+                    "--hostname",
+                    expected.host.as_str(),
+                    endpoint.as_str(),
+                ],
+                executor,
+            )?;
+            let observed: GitLabRepository =
+                serde_json::from_value(value).context("parse glab repository JSON")?;
+            if json_identity(&observed.id).as_deref() != Some(expected.repository_id.as_str())
+                || observed.path_with_namespace != expected.repository
+            {
+                anyhow::bail!("GitLab repository identity differs from policy");
+            }
+            let observed_format = observed
+                .repository_object_format
+                .context("GitLab repository API does not report Git object format before effect")?;
+            if crate::git_object::GitObjectFormat::parse(&observed_format, "GitLab repository API")?
+                != object_format
+            {
+                anyhow::bail!("GitLab repository object format differs from policy");
+            }
+            Ok(())
+        }
+
+        fn snapshot(
+            &self,
+            url: &str,
+            executor: &mut dyn ProviderCommandExecutor,
+        ) -> Result<ProviderSnapshot> {
+            let locator = merge_request_locator(url)?;
+            let repository_url = format!("https://{}/{}", locator.host, locator.repository);
+            let value = provider_json(
+                crate::repository_policy::Provider::Gitlab,
+                provider_program(crate::repository_policy::Provider::Gitlab)?,
+                [
+                    "mr",
+                    "view",
+                    url,
+                    "--repo",
+                    repository_url.as_str(),
+                    "--output",
+                    "json",
+                ],
+                executor,
             )?;
             let parsed: GitLabMrView =
                 serde_json::from_value(value).context("parse glab mr view JSON")?;
+            let repository_id = parsed
+                .target_project_id
+                .as_ref()
+                .and_then(json_identity)
+                .context("glab MR JSON missing target_project_id")?;
             Ok(ProviderSnapshot {
+                repository: crate::repository_policy::ProviderRepository {
+                    provider: crate::repository_policy::Provider::Gitlab,
+                    host: locator.host,
+                    repository: locator.repository,
+                    repository_id,
+                },
                 head_sha: parsed
                     .head_sha
                     .or(parsed.sha)
@@ -13936,22 +20577,25 @@ pub mod providers {
                     .base_sha
                     .or(parsed.diff_refs.and_then(|refs| refs.base_sha))
                     .context("glab MR JSON missing base_sha/diff_refs.base_sha")?,
+                target_branch: parsed
+                    .target_branch
+                    .context("glab MR JSON missing target_branch")?,
                 gate: gitlab_gate(&parsed.state, &parsed.pipeline_status, &parsed.approved),
             })
         }
 
-        fn merge_command(&self, url: &str, expected_head_sha: &str) -> ProviderMergeCommand {
-            ProviderMergeCommand {
-                program: std::env::var("IQ_GITLAB_CLI").unwrap_or_else(|_| "glab".into()),
-                args: ["mr", "merge", url, "--yes", "--sha", expected_head_sha]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-            }
+        fn atomic_landing_unsupported(&self) -> anyhow::Error {
+            anyhow::anyhow!(
+                "GitLab CLI can pin the admitted head but cannot atomically pin the validated base"
+            )
         }
 
-        fn landing(&self, url: &str) -> Result<Option<ProviderLanding>> {
-            gitlab_landing(url)
+        fn landing(
+            &self,
+            url: &str,
+            executor: &mut dyn ProviderCommandExecutor,
+        ) -> Result<Option<ProviderLanding>> {
+            gitlab_landing(url, executor)
         }
     }
 
@@ -13960,6 +20604,8 @@ pub mod providers {
     struct GitHubPrView {
         head_ref_oid: String,
         base_ref_oid: String,
+        base_ref_name: String,
+        base_repository: Option<GitHubRepository>,
         review_decision: Option<String>,
         merge_state_status: Option<String>,
         #[serde(default)]
@@ -13967,16 +20613,63 @@ pub mod providers {
     }
 
     #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct GitHubRepository {
+        id: String,
+        name_with_owner: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct GitHubVerifiedRepository {
+        node_id: String,
+        full_name: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct GitHubHashAlgorithm {
+        hash_algorithm: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct GitLabRepository {
+        id: serde_json::Value,
+        path_with_namespace: String,
+        repository_object_format: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
     struct GitLabMrView {
         sha: Option<String>,
         head_sha: Option<String>,
         base_sha: Option<String>,
+        target_branch: Option<String>,
+        target_project_id: Option<serde_json::Value>,
         merge_commit_sha: Option<String>,
         squash_commit_sha: Option<String>,
         state: Option<String>,
         pipeline_status: Option<String>,
         approved: Option<bool>,
         diff_refs: Option<GitLabDiffRefs>,
+    }
+
+    fn json_identity(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::String(value) if !value.is_empty() => Some(value.clone()),
+            serde_json::Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        }
+    }
+
+    fn percent_encode_path(value: &str) -> String {
+        value
+            .bytes()
+            .flat_map(|byte| match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    vec![byte as char]
+                }
+                _ => format!("%{byte:02X}").chars().collect(),
+            })
+            .collect()
     }
 
     #[derive(Debug, Deserialize)]
@@ -14055,10 +20748,15 @@ pub mod providers {
         ProviderGate::Pass
     }
 
-    fn github_landing(url: &str) -> Result<Option<ProviderLanding>> {
+    fn github_landing(
+        url: &str,
+        executor: &mut dyn ProviderCommandExecutor,
+    ) -> Result<Option<ProviderLanding>> {
         let value = provider_json(
-            std::env::var("IQ_GITHUB_CLI").unwrap_or_else(|_| "gh".into()),
+            crate::repository_policy::Provider::Github,
+            provider_program(crate::repository_policy::Provider::Github)?,
             ["pr", "view", url, "--json", "headRefOid,mergeCommit"],
+            executor,
         )?;
         let parsed: GitHubMergeView =
             serde_json::from_value(value).context("parse gh merge JSON")?;
@@ -14068,46 +20766,350 @@ pub mod providers {
             .map(|commit_sha| ProviderLanding {
                 head_sha: parsed.head_ref_oid,
                 commit_sha,
+                history: None,
             }))
     }
 
-    fn gitlab_landing(url: &str) -> Result<Option<ProviderLanding>> {
+    fn gitlab_landing(
+        url: &str,
+        executor: &mut dyn ProviderCommandExecutor,
+    ) -> Result<Option<ProviderLanding>> {
+        let locator = merge_request_locator(url)?;
+        let repository_url = format!("https://{}/{}", locator.host, locator.repository);
         let value = provider_json(
-            std::env::var("IQ_GITLAB_CLI").unwrap_or_else(|_| "glab".into()),
-            ["mr", "view", url, "--output", "json"],
+            crate::repository_policy::Provider::Gitlab,
+            provider_program(crate::repository_policy::Provider::Gitlab)?,
+            [
+                "mr",
+                "view",
+                url,
+                "--repo",
+                repository_url.as_str(),
+                "--output",
+                "json",
+            ],
+            executor,
         )?;
         let parsed: GitLabMrView =
             serde_json::from_value(value).context("parse glab merged MR JSON")?;
-        let commit_sha = parsed.merge_commit_sha.or(parsed.squash_commit_sha);
+        let landing = match (parsed.merge_commit_sha, parsed.squash_commit_sha) {
+            (Some(commit_sha), _) => Some((commit_sha, ProviderLandingHistory::PreserveHead)),
+            (None, Some(commit_sha)) => Some((commit_sha, ProviderLandingHistory::Squash)),
+            (None, None) => None,
+        };
         let head_sha = parsed.head_sha.or(parsed.sha);
-        match (head_sha, commit_sha) {
+        match (head_sha, landing) {
             (_, None) => Ok(None),
-            (Some(head_sha), Some(commit_sha)) => Ok(Some(ProviderLanding {
+            (Some(head_sha), Some((commit_sha, history))) => Ok(Some(ProviderLanding {
                 head_sha,
                 commit_sha,
+                history: Some(history),
             })),
             (None, Some(_)) => anyhow::bail!("glab merged MR JSON missing head_sha/sha"),
         }
     }
 
-    fn provider_json<I, S>(program: String, args: I) -> Result<serde_json::Value>
+    fn provider_json<I, S>(
+        provider: crate::repository_policy::Provider,
+        program: String,
+        args: I,
+        executor: &mut dyn ProviderCommandExecutor,
+    ) -> Result<serde_json::Value>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
-        let output = Command::new(&program)
-            .args(args)
-            .output()
-            .with_context(|| {
-                format!("run provider CLI {program}; install CLI or set provider credentials")
+        let args = args
+            .into_iter()
+            .map(|argument| argument.as_ref().to_os_string())
+            .collect::<Vec<_>>();
+        let output = executor
+            .output(provider, &program, &args)
+            .map_err(|error| {
+                if error
+                    .downcast_ref::<ProviderInfrastructureError>()
+                    .is_some()
+                {
+                    error
+                } else {
+                    ProviderInfrastructureError::Execution {
+                        program: program.clone(),
+                        detail: format!("{error:#}"),
+                    }
+                    .into()
+                }
             })?;
         if !output.status.success() {
-            anyhow::bail!(
-                "provider CLI {program} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            return Err(ProviderInfrastructureError::Exit {
+                program,
+                status: output.status.code(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            }
+            .into());
         }
         serde_json::from_slice(&output.stdout).context("parse provider CLI JSON")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{
+            DirectProviderExecutor, GitHubProvider, ProviderAdapter, ProviderCommandExecutor,
+            ProviderInfrastructureError,
+        };
+        use std::ffi::OsString;
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{ExitStatus, Output};
+
+        #[test]
+        fn github_registration_and_pr_fixtures_use_the_same_node_id() {
+            let repository_fixture =
+                include_bytes!("../tests/fixtures/github-repository-rest.json");
+            let hash_algorithm_fixture =
+                include_bytes!("../tests/fixtures/github-hash-algorithm.json");
+            let pr_fixture = include_bytes!("../tests/fixtures/github-pr-view.json");
+            let mut executor = |_: crate::repository_policy::Provider,
+                                _: &str,
+                                args: &[OsString]|
+             -> anyhow::Result<Output> {
+                let args = args
+                    .iter()
+                    .map(|argument| argument.to_str().unwrap())
+                    .collect::<Vec<_>>();
+                let stdout = if args.last() == Some(&"repos/octo-org/octo-repo") {
+                    assert_eq!(
+                        args,
+                        [
+                            "api",
+                            "--hostname",
+                            "github.com",
+                            "repos/octo-org/octo-repo",
+                        ]
+                    );
+                    repository_fixture.to_vec()
+                } else if args.last() == Some(&"repos/octo-org/octo-repo/hash-algorithm") {
+                    assert_eq!(
+                        args,
+                        [
+                            "api",
+                            "--hostname",
+                            "github.com",
+                            "repos/octo-org/octo-repo/hash-algorithm",
+                        ]
+                    );
+                    hash_algorithm_fixture.to_vec()
+                } else {
+                    assert_eq!(
+                        args,
+                        [
+                            "pr",
+                            "view",
+                            "https://github.com/octo-org/octo-repo/pull/7",
+                            "--json",
+                            "headRefOid,baseRefOid,baseRefName,baseRepository,reviewDecision,statusCheckRollup,mergeStateStatus",
+                        ]
+                    );
+                    pr_fixture.to_vec()
+                };
+                Ok(Output {
+                    status: ExitStatus::from_raw(0),
+                    stdout,
+                    stderr: Vec::new(),
+                })
+            };
+            let expected = crate::repository_policy::ProviderRepository {
+                provider: crate::repository_policy::Provider::Github,
+                host: "github.com".into(),
+                repository: "octo-org/octo-repo".into(),
+                repository_id: "R_kgDOKV0Z9Q".into(),
+            };
+            let adapter = GitHubProvider;
+
+            adapter
+                .verify_repository(
+                    &expected,
+                    crate::git_object::GitObjectFormat::Sha1,
+                    &mut executor,
+                )
+                .unwrap();
+            let snapshot = adapter
+                .snapshot(
+                    "https://github.com/octo-org/octo-repo/pull/7",
+                    &mut executor,
+                )
+                .unwrap();
+
+            assert_eq!(snapshot.repository, expected);
+        }
+
+        #[test]
+        fn direct_provider_executor_returns_typed_timeout_and_output_limit_errors() {
+            use std::os::unix::fs::PermissionsExt;
+            let _execution = super::lock_test_provider_execution();
+            let root = tempfile::tempdir().unwrap();
+            let program = root.path().join("gh");
+            std::fs::write(
+                &program,
+                "#!/bin/sh\ncase \"$1\" in sleep) /bin/sleep 30 ;; output) dd if=/dev/zero bs=1048577 count=1 2>/dev/null ;; *) exit 2 ;; esac\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _authority = super::inject_test_provider_executable(
+                crate::repository_policy::Provider::Github,
+                &program,
+            )
+            .unwrap();
+            let program = program.to_str().unwrap();
+            let mut executor = DirectProviderExecutor;
+            let timeout = executor
+                .output(
+                    crate::repository_policy::Provider::Github,
+                    program,
+                    &[OsString::from("sleep")],
+                )
+                .unwrap_err();
+            assert!(matches!(
+                timeout.downcast_ref::<ProviderInfrastructureError>(),
+                Some(ProviderInfrastructureError::TimedOut { .. })
+            ));
+
+            let output_limit = executor
+                .output(
+                    crate::repository_policy::Provider::Github,
+                    program,
+                    &[OsString::from("output")],
+                )
+                .unwrap_err();
+            assert!(matches!(
+                output_limit.downcast_ref::<ProviderInfrastructureError>(),
+                Some(ProviderInfrastructureError::OutputLimit {
+                    stream: "stdout",
+                    maximum_bytes: 1_048_576,
+                    ..
+                })
+            ));
+        }
+
+        #[test]
+        fn direct_provider_executor_rejects_unknown_and_replaced_executables() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let _execution = super::lock_test_provider_execution();
+            let mut executor = DirectProviderExecutor;
+            let unknown = executor
+                .output(crate::repository_policy::Provider::Github, "/bin/true", &[])
+                .unwrap_err();
+            assert!(format!("{unknown:#}").contains("requested pinned authority"));
+
+            let root = tempfile::tempdir().unwrap();
+            let program = root.path().join("gh");
+            let marker = root.path().join("executed");
+            std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _authority = super::inject_test_provider_executable(
+                crate::repository_policy::Provider::Github,
+                &program,
+            )
+            .unwrap();
+            std::fs::write(&program, format!("#!/bin/sh\n: > '{}'\n", marker.display())).unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let replaced = executor
+                .output(
+                    crate::repository_policy::Provider::Github,
+                    program.to_str().unwrap(),
+                    &[],
+                )
+                .unwrap_err();
+            assert!(format!("{replaced:#}").contains("executable"));
+            assert!(!marker.exists());
+        }
+
+        #[test]
+        fn provider_environment_removes_ambient_credentials_and_command_controls() {
+            let mut command = std::process::Command::new("/bin/true");
+            for key in [
+                "GH_TOKEN",
+                "GITHUB_TOKEN",
+                "GITLAB_TOKEN",
+                "GLAB_TOKEN",
+                "LD_PRELOAD",
+                "DYLD_INSERT_LIBRARIES",
+                "DYLD_LIBRARY_PATH",
+                "GIT_CONFIG_GLOBAL",
+                "GIT_EXTERNAL_DIFF",
+                "GIT_SSH_COMMAND",
+                "GIT_ASKPASS",
+                "SSH_ASKPASS",
+                "SSH_AUTH_SOCK",
+            ] {
+                command.env(key, "hostile");
+            }
+
+            super::harden_provider_environment(
+                crate::repository_policy::Provider::Github,
+                &mut command,
+            );
+
+            let environment = command
+                .get_envs()
+                .filter_map(|(key, value)| value.map(|value| (key, value)))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            for key in [
+                "GH_TOKEN",
+                "GITHUB_TOKEN",
+                "GITLAB_TOKEN",
+                "GLAB_TOKEN",
+                "LD_PRELOAD",
+                "DYLD_INSERT_LIBRARIES",
+                "DYLD_LIBRARY_PATH",
+                "GIT_CONFIG_GLOBAL",
+                "GIT_EXTERNAL_DIFF",
+                "GIT_SSH_COMMAND",
+                "GIT_ASKPASS",
+                "SSH_ASKPASS",
+                "SSH_AUTH_SOCK",
+                "HOME",
+                "PATH",
+                "XDG_CONFIG_HOME",
+            ] {
+                assert!(!environment.contains_key(std::ffi::OsStr::new(key)));
+            }
+        }
+
+        #[test]
+        fn github_execution_does_not_require_gitlab_authority() {
+            execute_with_only_requested_provider(crate::repository_policy::Provider::Github, "gh");
+        }
+
+        #[test]
+        fn gitlab_execution_does_not_require_github_authority() {
+            execute_with_only_requested_provider(
+                crate::repository_policy::Provider::Gitlab,
+                "glab",
+            );
+        }
+
+        fn execute_with_only_requested_provider(
+            provider: crate::repository_policy::Provider,
+            name: &str,
+        ) {
+            use std::os::unix::fs::PermissionsExt;
+
+            let _execution = super::lock_test_provider_execution();
+            let root = tempfile::tempdir().unwrap();
+            let program = root.path().join(name);
+            std::fs::write(&program, "#!/bin/sh\nprintf requested-provider\n").unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _authority = super::inject_test_provider_executable(provider, &program).unwrap();
+            let mut executor = DirectProviderExecutor;
+
+            let output = executor
+                .output(provider, program.to_str().unwrap(), &[])
+                .unwrap();
+
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"requested-provider");
+        }
     }
 }
 
@@ -14117,10 +21119,6 @@ pub mod issue_backends {
     use anyhow::{Context, Result};
     use serde::Deserialize;
     use std::collections::HashSet;
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    use std::time::Duration;
-    use wait_timeout::ChildExt;
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct IssueProjection {
@@ -14211,8 +21209,8 @@ pub mod issue_backends {
                 "<!-- iq:item:{} -->\nrepo: `{}`\nsource: `{}`\ntarget: `{}`\nhead: `{}`\nstatus: `{}`\n",
                 item.id, item.repo_key, item.source_branch, item.target_branch, item.current_head_sha, item.status
             );
-            if let Some(pr_url) = &item.pr_url {
-                body.push_str(&format!("pr: {pr_url}\n"));
+            if let Some(admission) = item.admission.merge_request() {
+                body.push_str(&format!("mr: {}\n", admission.url));
             }
             if let (Some(phase), Some(reason)) = (item.blocked_phase, item.blocked_reason) {
                 body.push_str(&format!("blocked: `{phase}` / `{reason}`\n"));
@@ -14278,7 +21276,8 @@ pub mod issue_backends {
             target: &IssueSyncTarget,
             projection: &IssueProjection,
         ) -> Result<IssueSyncResult> {
-            let program = std::env::var("IQ_GITHUB_CLI").unwrap_or_else(|_| "gh".into());
+            let program =
+                crate::providers::provider_program(crate::repository_policy::Provider::Github)?;
             let issue = if let Some(issue) = target.issue.as_ref() {
                 let existing = github_issue_view(&program, target, issue)?;
                 let label_update = ManagedLabelUpdate::new(&existing.labels, &projection.labels);
@@ -14318,7 +21317,8 @@ pub mod issue_backends {
                     args.push("--label".to_string());
                     args.push(projection.labels.join(","));
                 }
-                let output = command_output(&program, args)?;
+                let output =
+                    command_output(crate::repository_policy::Provider::Github, &program, args)?;
                 let issue =
                     parse_issue_number(&output).context("parse GitHub created issue number")?;
                 sync_missing_github_comments(&program, target, &issue, projection, &[])?;
@@ -14335,8 +21335,10 @@ pub mod issue_backends {
                 .issue
                 .as_deref()
                 .context("GitHub issue number required")?;
-            let program = std::env::var("IQ_GITHUB_CLI").unwrap_or_else(|_| "gh".into());
+            let program =
+                crate::providers::provider_program(crate::repository_policy::Provider::Github)?;
             command_ok(
+                crate::repository_policy::Provider::Github,
                 &program,
                 [
                     "issue",
@@ -14351,8 +21353,13 @@ pub mod issue_backends {
         }
 
         fn verify_destination(&self, repo: &str) -> Result<()> {
-            let program = std::env::var("IQ_GITHUB_CLI").unwrap_or_else(|_| "gh".into());
-            command_ok(&program, ["repo", "view", repo, "--json", "nameWithOwner"])
+            let program =
+                crate::providers::provider_program(crate::repository_policy::Provider::Github)?;
+            command_ok(
+                crate::repository_policy::Provider::Github,
+                &program,
+                ["repo", "view", repo, "--json", "nameWithOwner"],
+            )
         }
 
         fn answer_comments(&self, target: &IssueSyncTarget) -> Result<Vec<IssueAnswerComment>> {
@@ -14360,7 +21367,8 @@ pub mod issue_backends {
                 .issue
                 .as_deref()
                 .context("GitHub issue number required")?;
-            let program = std::env::var("IQ_GITHUB_CLI").unwrap_or_else(|_| "gh".into());
+            let program =
+                crate::providers::provider_program(crate::repository_policy::Provider::Github)?;
             let view = github_issue_view(&program, target, issue)?;
             issue_answer_comments(view.comments, "GitHub")
         }
@@ -14374,7 +21382,8 @@ pub mod issue_backends {
             target: &IssueSyncTarget,
             projection: &IssueProjection,
         ) -> Result<IssueSyncResult> {
-            let program = std::env::var("IQ_GITLAB_CLI").unwrap_or_else(|_| "glab".into());
+            let program =
+                crate::providers::provider_program(crate::repository_policy::Provider::Gitlab)?;
             let issue = if let Some(issue) = target.issue.as_ref() {
                 let existing = gitlab_issue_view(&program, target, issue)?;
                 let label_update = ManagedLabelUpdate::new(&existing.labels, &projection.labels);
@@ -14414,7 +21423,8 @@ pub mod issue_backends {
                     args.push("--label".to_string());
                     args.push(projection.labels.join(","));
                 }
-                let output = command_output(&program, args)?;
+                let output =
+                    command_output(crate::repository_policy::Provider::Gitlab, &program, args)?;
                 let issue =
                     parse_issue_number(&output).context("parse GitLab created issue number")?;
                 sync_missing_gitlab_comments(&program, target, &issue, projection, &[])?;
@@ -14431,13 +21441,23 @@ pub mod issue_backends {
                 .issue
                 .as_deref()
                 .context("GitLab issue number required")?;
-            let program = std::env::var("IQ_GITLAB_CLI").unwrap_or_else(|_| "glab".into());
-            command_ok(&program, ["issue", "close", issue, "--repo", &target.repo])
+            let program =
+                crate::providers::provider_program(crate::repository_policy::Provider::Gitlab)?;
+            command_ok(
+                crate::repository_policy::Provider::Gitlab,
+                &program,
+                ["issue", "close", issue, "--repo", &target.repo],
+            )
         }
 
         fn verify_destination(&self, repo: &str) -> Result<()> {
-            let program = std::env::var("IQ_GITLAB_CLI").unwrap_or_else(|_| "glab".into());
-            command_ok(&program, ["repo", "view", repo, "--output", "json"])
+            let program =
+                crate::providers::provider_program(crate::repository_policy::Provider::Gitlab)?;
+            command_ok(
+                crate::repository_policy::Provider::Gitlab,
+                &program,
+                ["repo", "view", repo, "--output", "json"],
+            )
         }
 
         fn answer_comments(&self, target: &IssueSyncTarget) -> Result<Vec<IssueAnswerComment>> {
@@ -14445,7 +21465,8 @@ pub mod issue_backends {
                 .issue
                 .as_deref()
                 .context("GitLab issue number required")?;
-            let program = std::env::var("IQ_GITLAB_CLI").unwrap_or_else(|_| "glab".into());
+            let program =
+                crate::providers::provider_program(crate::repository_policy::Provider::Gitlab)?;
             issue_answer_comments(gitlab_issue_notes(&program, target, issue)?, "GitLab")
         }
     }
@@ -14459,6 +21480,7 @@ pub mod issue_backends {
             .context("issue projection is missing a stable IQ marker")?;
         if marker.starts_with("iq:binding:") {
             let output = command_output(
+                crate::repository_policy::Provider::Github,
                 program,
                 [
                     "api",
@@ -14482,6 +21504,7 @@ pub mod issue_backends {
             );
         }
         let output = command_output(
+            crate::repository_policy::Provider::Github,
             program,
             [
                 "issue",
@@ -14510,6 +21533,7 @@ pub mod issue_backends {
             .context("issue projection is missing a stable IQ marker")?;
         if marker.starts_with("iq:binding:") {
             let output = command_output(
+                crate::repository_policy::Provider::Gitlab,
                 program,
                 [
                     "api",
@@ -14520,6 +21544,7 @@ pub mod issue_backends {
             return find_exact_issue(&output, &marker, "GitLab");
         }
         let output = command_output(
+            crate::repository_policy::Provider::Gitlab,
             program,
             [
                 "issue",
@@ -14623,7 +21648,7 @@ pub mod issue_backends {
             args.push("--remove-label".to_string());
             args.push(label_update.remove.join(","));
         }
-        command_ok(program, args)
+        command_ok(crate::repository_policy::Provider::Github, program, args)
     }
 
     fn github_issue_view(
@@ -14632,6 +21657,7 @@ pub mod issue_backends {
         issue: &str,
     ) -> Result<IssueView> {
         let value = command_json(
+            crate::repository_policy::Provider::Github,
             program,
             [
                 "issue",
@@ -14652,6 +21678,7 @@ pub mod issue_backends {
         issue: &str,
     ) -> Result<IssueView> {
         let value = command_json(
+            crate::repository_policy::Provider::Gitlab,
             program,
             [
                 "issue",
@@ -14675,6 +21702,7 @@ pub mod issue_backends {
         issue: &str,
     ) -> Result<Vec<IssueComment>> {
         let output = command_output(
+            crate::repository_policy::Provider::Gitlab,
             program,
             [
                 "api",
@@ -14717,7 +21745,7 @@ pub mod issue_backends {
             args.push("--unlabel".to_string());
             args.push(label_update.remove.join(","));
         }
-        command_ok(program, args)
+        command_ok(crate::repository_policy::Provider::Gitlab, program, args)
     }
 
     fn sync_missing_github_comments(
@@ -14729,6 +21757,7 @@ pub mod issue_backends {
     ) -> Result<()> {
         for comment in comments_missing_from_issue(&projection.comments, existing_comments) {
             command_ok(
+                crate::repository_policy::Provider::Github,
                 program,
                 [
                     "issue",
@@ -14753,6 +21782,7 @@ pub mod issue_backends {
     ) -> Result<()> {
         for comment in comments_missing_from_issue(&projection.comments, existing_comments) {
             command_ok(
+                crate::repository_policy::Provider::Gitlab,
                 program,
                 [
                     "issue",
@@ -14911,68 +21941,88 @@ pub mod issue_backends {
         (!number.is_empty()).then_some(number)
     }
 
-    fn command_json<I, S>(program: &str, args: I) -> Result<serde_json::Value>
+    fn command_json<I, S>(
+        provider: crate::repository_policy::Provider,
+        program: &str,
+        args: I,
+    ) -> Result<serde_json::Value>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
-        let output = command_output(program, args)?;
+        let output = command_output(provider, program, args)?;
         serde_json::from_str(&output).context("parse issue CLI JSON")
     }
 
-    fn command_output<I, S>(program: &str, args: I) -> Result<String>
+    fn command_output<I, S>(
+        provider: crate::repository_policy::Provider,
+        program: &str,
+        args: I,
+    ) -> Result<String>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
-        let mut child = Command::new(program)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("run issue CLI {program}"))?;
-        let stdout = child.stdout.take().context("capture issue CLI stdout")?;
-        let stderr = child.stderr.take().context("capture issue CLI stderr")?;
-        let stdout_reader = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let result = std::io::BufReader::new(stdout).read_to_end(&mut bytes);
-            (result, bytes)
-        });
-        let stderr_reader = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let result = std::io::BufReader::new(stderr).read_to_end(&mut bytes);
-            (result, bytes)
-        });
-        let status = match child.wait_timeout(Duration::from_secs(30))? {
-            Some(status) => status,
-            None => {
-                child.kill()?;
-                child.wait()?;
-                anyhow::bail!("issue CLI {program} timed out after 30 seconds");
-            }
-        };
-        let (stdout_result, stdout) = stdout_reader
-            .join()
-            .map_err(|_| anyhow::anyhow!("issue CLI stdout reader panicked"))?;
-        stdout_result?;
-        let (stderr_result, stderr) = stderr_reader
-            .join()
-            .map_err(|_| anyhow::anyhow!("issue CLI stderr reader panicked"))?;
-        stderr_result?;
-        if !status.success() {
+        let args = args
+            .into_iter()
+            .map(|argument| argument.as_ref().to_os_string())
+            .collect::<Vec<_>>();
+        let mut executor = crate::providers::DirectProviderExecutor;
+        let output = crate::providers::ProviderCommandExecutor::output(
+            &mut executor,
+            provider,
+            program,
+            &args,
+        )?;
+        if !output.status.success() {
             anyhow::bail!(
                 "issue CLI {program} failed: {}",
-                String::from_utf8_lossy(&stderr)
+                String::from_utf8_lossy(&output.stderr)
             );
         }
-        Ok(String::from_utf8_lossy(&stdout).trim().to_string())
+        Ok(String::from_utf8(output.stdout)
+            .context("issue CLI stdout is not UTF-8")?
+            .trim()
+            .to_string())
     }
 
-    fn command_ok<I, S>(program: &str, args: I) -> Result<()>
+    fn command_ok<I, S>(
+        provider: crate::repository_policy::Provider,
+        program: &str,
+        args: I,
+    ) -> Result<()>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
-        command_output(program, args).map(|_| ())
+        command_output(provider, program, args).map(|_| ())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{GitHubIssueBackend, IssueRemoteAdapter};
+        use std::os::unix::fs::PermissionsExt;
+
+        #[test]
+        fn issue_backend_uses_bounded_provider_execution() {
+            let _execution = crate::providers::lock_test_provider_execution();
+            let root = tempfile::tempdir().unwrap();
+            let program = root.path().join("gh");
+            std::fs::write(&program, "#!/bin/sh\n/bin/sleep 30\n").unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _authority = crate::providers::inject_test_provider_executable(
+                crate::repository_policy::Provider::Github,
+                &program,
+            )
+            .unwrap();
+
+            let error = GitHubIssueBackend
+                .verify_destination("owner/repository")
+                .unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<crate::providers::ProviderInfrastructureError>(),
+                Some(crate::providers::ProviderInfrastructureError::TimedOut { .. })
+            ));
+        }
     }
 }

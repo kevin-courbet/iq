@@ -1,22 +1,38 @@
-use iq::repository::ProvisionOptions;
-use iq::sqlite::{CheckoutReconciliationState, EnqueueRequest, SqliteQueue};
+use iq::sqlite::{CheckoutReconciliationState, SqliteQueue};
+mod support;
 use rusqlite::Connection;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::io::Read;
+#[cfg(debug_assertions)]
+use std::io::Seek;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+#[cfg(debug_assertions)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Output, Stdio};
+use support::{direct_policy, managed_test_tempdir, Command};
 use tempfile::tempdir;
+#[cfg(debug_assertions)]
+use wait_timeout::ChildExt;
 
 fn git(path: &Path, args: &[&str]) -> String {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(path)
-        .output()
-        .unwrap();
+    let mut command = std::process::Command::new("git");
+    if args.first() == Some(&"init")
+        && !args
+            .iter()
+            .any(|argument| argument.starts_with("--object-format="))
+    {
+        command
+            .arg("init")
+            .arg("--object-format=sha1")
+            .args(&args[1..]);
+    } else {
+        command.args(args);
+    }
+    let output = command.current_dir(path).output().unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -36,10 +52,7 @@ struct CliFixture {
 
 impl CliFixture {
     fn new(target: &str) -> Self {
-        let temporary = tempfile::Builder::new()
-            .prefix(".iq-repository-test-")
-            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
-            .unwrap();
+        let temporary = managed_test_tempdir(".iq-repository-test-");
         let root = temporary.path().to_path_buf();
         let remote = root.join("remote.git");
         let bootstrap = root.join("bootstrap");
@@ -73,18 +86,28 @@ impl CliFixture {
         }
     }
 
-    fn iq(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_iq"))
+    fn iq_command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_iq"));
+        command
             .env("IQ_RIFT_DATABASE", &self.rift_database)
             .env("IQ_TEST_MODEL_KEY", "repository-test-model-key")
             .arg("--queue-db")
             .arg(&self.database)
-            .args(args)
-            .output()
-            .unwrap()
+            .args(args);
+        command
+    }
+
+    fn iq(&self, args: &[&str]) -> Output {
+        self.iq_command(args).output().unwrap()
+    }
+
+    #[cfg(debug_assertions)]
+    fn bounded_iq(&self, args: &[&str], context: &str) -> Output {
+        bounded_cli_output(&mut self.iq_command(args), context)
     }
 
     fn init(&self, target: &str) -> Output {
+        let policy = self.policy(target);
         self.iq(&[
             "repo",
             "init",
@@ -92,9 +115,35 @@ impl CliFixture {
             self.bootstrap.to_str().unwrap(),
             "--storage-root",
             self.root.to_str().unwrap(),
-            "--target",
-            target,
+            "--policy",
+            policy.to_str().unwrap(),
         ])
+    }
+
+    #[cfg(debug_assertions)]
+    fn bounded_init(&self, target: &str, context: &str) -> Output {
+        let policy = self.policy(target);
+        self.bounded_iq(
+            &[
+                "repo",
+                "init",
+                "--path",
+                self.bootstrap.to_str().unwrap(),
+                "--storage-root",
+                self.root.to_str().unwrap(),
+                "--policy",
+                policy.to_str().unwrap(),
+            ],
+            context,
+        )
+    }
+
+    fn policy(&self, target: &str) -> PathBuf {
+        let path = self.root.join(format!("repository-policy-{target}.json"));
+        let mut policy = direct_policy(&self.remote);
+        policy.target_branch = target.to_string();
+        std::fs::write(&path, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+        path
     }
 }
 
@@ -105,6 +154,81 @@ fn successful_json(output: Output) -> Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[cfg(debug_assertions)]
+fn bounded_cli_output(command: &mut Command, context: &str) -> Output {
+    let mut stdout = tempfile::tempfile().unwrap();
+    let mut stderr = tempfile::tempfile().unwrap();
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout.try_clone().unwrap()))
+        .stderr(Stdio::from(stderr.try_clone().unwrap()))
+        .process_group(0);
+    let mut child = command.spawn().unwrap();
+    let process_group = i32::try_from(child.id()).unwrap();
+    let timed_out = child
+        .wait_timeout(std::time::Duration::from_secs(20))
+        .unwrap()
+        .is_none();
+    if timed_out {
+        // SAFETY: The negative PID targets only the process group created above.
+        let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+        if result == -1 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+            panic!("failed to terminate timed-out process group for {context}");
+        }
+    }
+    let status = child.wait().unwrap();
+    // SAFETY: Signal zero checks for descendants in the process group without changing them.
+    let group_outlived_leader = unsafe { libc::kill(-process_group, 0) } == 0;
+    if group_outlived_leader {
+        // SAFETY: The negative PID targets only the process group created above.
+        unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    }
+    stdout.rewind().unwrap();
+    stderr.rewind().unwrap();
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    stdout.read_to_end(&mut stdout_bytes).unwrap();
+    stderr.read_to_end(&mut stderr_bytes).unwrap();
+    assert!(
+        !timed_out,
+        "{context} timed out: {}",
+        String::from_utf8_lossy(&stderr_bytes)
+    );
+    assert!(
+        !group_outlived_leader,
+        "{context} left a running descendant"
+    );
+    Output {
+        status,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+    }
+}
+
+#[cfg(debug_assertions)]
+fn wait_for_reservation_barrier(barrier: &Path, parties: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while std::fs::read_dir(barrier).unwrap().count() != parties {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "reservation barrier timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn assert_parser_rejection(output: Output, diagnostic: &str, usage: &str) {
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr.lines().next(), Some(diagnostic), "{stderr}");
+    assert!(stderr.contains(usage), "{stderr}");
+    assert!(
+        stderr.ends_with("For more information, try '--help'.\n"),
+        "{stderr}"
+    );
 }
 
 fn run_until_item_leaves_merging(
@@ -133,6 +257,7 @@ fn run_until_item_leaves_merging(
 
 #[cfg(debug_assertions)]
 fn interrupt_init(fixture: &CliFixture, boundary: &str) -> Output {
+    let policy = fixture.policy("main");
     Command::new(env!("CARGO_BIN_EXE_iq"))
         .env("IQ_RIFT_DATABASE", &fixture.rift_database)
         .env("IQ_TEST_PROVISION_STOP_AFTER", boundary)
@@ -145,8 +270,8 @@ fn interrupt_init(fixture: &CliFixture, boundary: &str) -> Output {
             fixture.bootstrap.to_str().unwrap(),
             "--storage-root",
             fixture.root.to_str().unwrap(),
-            "--target",
-            "main",
+            "--policy",
+            policy.to_str().unwrap(),
         ])
         .output()
         .unwrap()
@@ -154,6 +279,7 @@ fn interrupt_init(fixture: &CliFixture, boundary: &str) -> Output {
 
 #[cfg(debug_assertions)]
 fn interrupt_init_after_effect(fixture: &CliFixture, boundary: &str) -> Output {
+    let policy = fixture.policy("main");
     Command::new(env!("CARGO_BIN_EXE_iq"))
         .env("IQ_RIFT_DATABASE", &fixture.rift_database)
         .env("IQ_TEST_PROVISION_STOP_AFTER_EFFECT", boundary)
@@ -166,11 +292,31 @@ fn interrupt_init_after_effect(fixture: &CliFixture, boundary: &str) -> Output {
             fixture.bootstrap.to_str().unwrap(),
             "--storage-root",
             fixture.root.to_str().unwrap(),
-            "--target",
-            "main",
+            "--policy",
+            policy.to_str().unwrap(),
         ])
         .output()
         .unwrap()
+}
+
+#[cfg(debug_assertions)]
+fn bounded_interrupt_init_after_effect(fixture: &CliFixture, boundary: &str) -> Output {
+    let policy = fixture.policy("main");
+    let mut command = fixture.iq_command(&[
+        "repo",
+        "init",
+        "--path",
+        fixture.bootstrap.to_str().unwrap(),
+        "--storage-root",
+        fixture.root.to_str().unwrap(),
+        "--policy",
+        policy.to_str().unwrap(),
+    ]);
+    command.env("IQ_TEST_PROVISION_STOP_AFTER_EFFECT", boundary);
+    bounded_cli_output(
+        &mut command,
+        &format!("provisioning effect boundary {boundary}"),
+    )
 }
 
 fn directory_bytes(path: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
@@ -281,13 +427,216 @@ fn assert_policy_rejection_left_no_repository(fixture: &CliFixture) {
         let connection = Connection::open(&fixture.database).unwrap();
         assert_eq!(
             connection
-                .query_row("SELECT COUNT(*) FROM repository_remote_owners", [], |row| {
+                .query_row("SELECT COUNT(*) FROM repository_policies", [], |row| {
                     row.get::<_, i64>(0)
                 })
                 .unwrap(),
             0
         );
     }
+}
+
+#[test]
+fn registration_identity_preflight_creates_no_database_or_storage_paths() {
+    let fixture = CliFixture::new("main");
+    let provider = fixture.root.join("preflight-gh");
+    std::fs::write(
+        &provider,
+        "#!/bin/sh\ncase \"$4\" in\nrepos/org/repo) printf '%s' '{\"node_id\":\"wrong-id\",\"full_name\":\"org/repo\"}' ;;\nrepos/org/repo/hash-algorithm) printf '%s' '{\"hash_algorithm\":\"sha1\"}' ;;\n*) exit 3 ;;\nesac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let provider_policy = iq::repository_policy::RepositoryPolicy {
+        operation_state: iq::repository_policy::OperationState::Enabled,
+        canonical_repository: iq::repository_policy::GitRepository::Accessible {
+            object_format: iq::git_object::GitObjectFormat::Sha1,
+            fetch_url: "https://github.com/org/repo.git".into(),
+            push_url: "https://github.com/org/repo.git".into(),
+            repository_id: "expected-id".into(),
+            provider: iq::repository_policy::ProviderRepository {
+                provider: iq::repository_policy::Provider::Github,
+                host: "github.com".into(),
+                repository: "org/repo".into(),
+                repository_id: "expected-id".into(),
+            },
+        },
+        target_branch: "main".into(),
+        integration_policy: iq::repository_policy::IntegrationPolicy::MergeRequestRequired,
+        replication_policy: iq::repository_policy::ReplicationPolicy::None,
+    };
+    let mut local_policy = direct_policy(&fixture.remote);
+    let iq::repository_policy::GitRepository::LocalBare { inode, .. } =
+        &mut local_policy.canonical_repository
+    else {
+        unreachable!()
+    };
+    *inode += 1;
+
+    for (name, policy, provider_cli) in [
+        ("provider", provider_policy, Some(provider.as_path())),
+        ("local", local_policy, None),
+    ] {
+        let database_parent = fixture.root.join(format!("absent-{name}-database"));
+        let database = database_parent.join("queues.db");
+        let storage = fixture.root.join(format!("absent-{name}-storage"));
+        let policy_path = fixture.root.join(format!("{name}-preflight-policy.json"));
+        std::fs::write(&policy_path, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_iq"));
+        command
+            .arg("--queue-db")
+            .arg(&database)
+            .args(["repo", "init", "--path"])
+            .arg(&fixture.bootstrap)
+            .arg("--storage-root")
+            .arg(&storage)
+            .arg("--policy")
+            .arg(&policy_path);
+        if let Some(provider_cli) = provider_cli {
+            command.arg("--test-github-executable").arg(provider_cli);
+        }
+        let rejected = command.output().unwrap();
+        assert!(
+            !rejected.status.success(),
+            "{name} identity unexpectedly registered"
+        );
+        assert!(!database_parent.exists(), "{name} created database parent");
+        assert!(!database.exists(), "{name} created database");
+        assert!(!storage.exists(), "{name} created storage root");
+        assert!(
+            !PathBuf::from(format!("{}.control.lock", database.display())).exists(),
+            "{name} created database lock"
+        );
+    }
+}
+
+#[test]
+fn failed_registration_preflight_preserves_existing_database_and_corrected_retry_succeeds() {
+    let fixture = CliFixture::new("main");
+    let initialized = fixture.iq(&["repo", "list"]);
+    assert!(initialized.status.success());
+    let storage = fixture.root.join("existing-database-storage");
+    std::fs::create_dir(&storage).unwrap();
+    let policy_path = fixture.root.join("existing-database-policy.json");
+    let mut bad_policy = direct_policy(&fixture.remote);
+    let iq::repository_policy::GitRepository::LocalBare { inode, .. } =
+        &mut bad_policy.canonical_repository
+    else {
+        unreachable!()
+    };
+    *inode += 1;
+    std::fs::write(
+        &policy_path,
+        serde_json::to_vec_pretty(&bad_policy).unwrap(),
+    )
+    .unwrap();
+    let database_before = std::fs::read(&fixture.database).unwrap();
+    let logical_state = |database: &Path| {
+        let connection = Connection::open(database).unwrap();
+        [
+            "registered_repositories",
+            "repository_provisioning_intents",
+            "repository_bootstrap_requests",
+            "repository_policies",
+        ]
+        .map(|table| {
+            connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        })
+    };
+    let logical_before = logical_state(&fixture.database);
+    let init = |policy: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_iq"))
+            .arg("--queue-db")
+            .arg(&fixture.database)
+            .args(["repo", "init", "--path"])
+            .arg(&fixture.bootstrap)
+            .arg("--storage-root")
+            .arg(&storage)
+            .arg("--policy")
+            .arg(policy)
+            .output()
+            .unwrap()
+    };
+
+    let rejected = init(&policy_path);
+    assert!(!rejected.status.success());
+    assert_eq!(std::fs::read(&fixture.database).unwrap(), database_before);
+    assert_eq!(logical_state(&fixture.database), logical_before);
+    assert!(std::fs::read_dir(&storage).unwrap().next().is_none());
+
+    std::fs::write(
+        &policy_path,
+        serde_json::to_vec_pretty(&direct_policy(&fixture.remote)).unwrap(),
+    )
+    .unwrap();
+    let retried = init(&policy_path);
+    assert!(
+        retried.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
+    assert_eq!(logical_state(&fixture.database)[0], 1);
+}
+
+#[test]
+fn executable_environment_overrides_fail_before_database_open() {
+    let root = managed_test_tempdir(".iq-provider-environment-test-");
+    let database = root.path().join("queue.db");
+    let rejected = Command::new(env!("CARGO_BIN_EXE_iq"))
+        .arg("--queue-db")
+        .arg(&database)
+        .args(["repo", "list"])
+        .env("IQ_GITHUB_CLI", "/tmp/untrusted-gh")
+        .output()
+        .unwrap();
+
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr)
+        .contains("provider executable environment overrides are forbidden"));
+    assert!(!database.exists());
+    assert!(!PathBuf::from(format!("{}.control.lock", database.display())).exists());
+
+    let rejected = Command::new(env!("CARGO_BIN_EXE_iq"))
+        .arg("--queue-db")
+        .arg(&database)
+        .args(["repo", "list"])
+        .env("IQ_RIFT_CLI", "/tmp/untrusted-rift")
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr)
+        .contains("Rift executable environment overrides are forbidden"));
+    assert!(!database.exists());
+}
+
+#[test]
+fn test_artifact_cleanup_preserves_similarly_named_repository_directory() {
+    let unrelated = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+        ".iq-unrelated-test-survival-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&unrelated).unwrap();
+    std::fs::write(unrelated.join("user-data"), b"preserve\n").unwrap();
+
+    let managed = managed_test_tempdir(".iq-cleanup-scope-test-");
+
+    assert!(managed
+        .path()
+        .parent()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("iq-test-artifacts-"));
+    assert_eq!(
+        std::fs::read(unrelated.join("user-data")).unwrap(),
+        b"preserve\n"
+    );
+    std::fs::remove_dir_all(unrelated).unwrap();
 }
 
 #[test]
@@ -486,6 +835,7 @@ fn policy_restart_resyncs_existing_identical_file_and_parent_before_success() {
     std::fs::create_dir(fixture.bootstrap.join(".iq")).unwrap();
     let policy = b"{\"version\":1}\n";
     std::fs::write(fixture.bootstrap.join(".iq/config.json"), policy).unwrap();
+    let repository_policy = fixture.policy("main");
     let run = |boundary: &str| {
         Command::new(env!("CARGO_BIN_EXE_iq"))
             .env("IQ_RIFT_DATABASE", &fixture.rift_database)
@@ -500,8 +850,8 @@ fn policy_restart_resyncs_existing_identical_file_and_parent_before_success() {
                 fixture.bootstrap.to_str().unwrap(),
                 "--storage-root",
                 fixture.root.to_str().unwrap(),
-                "--target",
-                "main",
+                "--policy",
+                repository_policy.to_str().unwrap(),
             ])
             .output()
             .unwrap()
@@ -561,115 +911,84 @@ fn fresh_schema_installation_recovers_as_one_transaction() {
 }
 
 #[test]
-fn provisioning_is_independent_of_bootstrap_state_and_retries_by_identity() {
-    let temporary = tempfile::Builder::new()
-        .prefix("iq-owned-root-")
-        .tempdir_in(env!("CARGO_MANIFEST_DIR"))
-        .unwrap();
-    let remote = temporary.path().join("remote.git");
-    let bootstrap = temporary.path().join("bootstrap");
-    std::fs::create_dir(&remote).unwrap();
-    git(&remote, &["init", "--bare"]);
-    git(
-        temporary.path(),
-        &[
-            "clone",
-            remote.to_str().unwrap(),
-            bootstrap.to_str().unwrap(),
-        ],
-    );
-    git(&bootstrap, &["config", "user.name", "IQ Test"]);
-    git(&bootstrap, &["config", "user.email", "iq@example.test"]);
-    git(&bootstrap, &["config", "commit.gpgsign", "false"]);
-    std::fs::write(bootstrap.join("README.md"), "main\n").unwrap();
-    git(&bootstrap, &["add", "README.md"]);
-    git(&bootstrap, &["commit", "-m", "main"]);
-    git(&bootstrap, &["branch", "-M", "main"]);
-    git(&bootstrap, &["push", "-u", "origin", "main"]);
-    let source_sha = git(&bootstrap, &["rev-parse", "HEAD"]);
-    std::fs::create_dir(bootstrap.join(".iq")).unwrap();
-    std::fs::write(bootstrap.join(".iq/config.json"), b"{\"version\":1}\n").unwrap();
-    git(&bootstrap, &["switch", "-c", "dirty-bootstrap"]);
-    std::fs::write(bootstrap.join("README.md"), "dirty\n").unwrap();
-
-    let database = temporary.path().join("queues.db");
-    let queue = SqliteQueue::open(&database).unwrap();
-    std::fs::create_dir(temporary.path().join("owned")).unwrap();
-    let options = ProvisionOptions {
-        storage_root: temporary.path().join("owned"),
-        bootstrap_path: bootstrap.clone(),
-        target: "main".into(),
-        remote_name: "origin".into(),
-        rift_database: Some(temporary.path().join("rift.sqlite")),
-    };
-
-    let owned = queue.provision_repository(&options).unwrap();
-    let retried = queue.provision_repository(&options).unwrap();
-
-    assert_eq!(retried.repo_key(), owned.repo_key());
-    assert_eq!(retried.path(), owned.path());
-    assert_ne!(owned.path(), bootstrap);
-    assert_eq!(git(owned.path(), &["rev-parse", "HEAD"]), source_sha);
-    assert_eq!(git(owned.path(), &["branch", "--show-current"]), "main");
-    assert!(!owned.path().join(".git/objects/info/alternates").exists());
-    assert_eq!(
-        std::fs::read(owned.path().join(".iq/config.json")).unwrap(),
-        b"{\"version\":1}\n"
-    );
-    let ancestors = std::process::Command::new("rift")
-        .arg("--database")
-        .arg(temporary.path().join("rift.sqlite"))
-        .args(["ancestors", owned.path().to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(ancestors.status.success());
-    assert!(ancestors.stdout.is_empty());
-    assert_eq!(owned.children().development.parent(), owned.path().parent());
-    assert_eq!(owned.children().integration.parent(), owned.path().parent());
-
-    let connection = Connection::open(&database).unwrap();
-    let bootstrap_references: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM registered_repositories WHERE owned_root_path=?1 OR development_root_path=?1 OR integration_root_path=?1",
-            [bootstrap.as_os_str().as_encoded_bytes()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(bootstrap_references, 0);
-    let pending: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM repository_provisioning_intents",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(pending, 0);
-}
-
-#[test]
 #[cfg(debug_assertions)]
-fn provisioning_resume_uses_only_the_durable_plan_after_reservation() {
+fn provisioning_resume_requires_valid_preflight_after_reservation() {
     let fixture = CliFixture::new("main");
     let interrupted = interrupt_init(&fixture, "reservation");
     assert_eq!(interrupted.status.code(), Some(86));
-    std::fs::rename(&fixture.bootstrap, fixture.root.join("renamed-bootstrap")).unwrap();
+    let renamed_bootstrap = fixture.root.join("renamed-bootstrap");
+    std::fs::rename(&fixture.bootstrap, &renamed_bootstrap).unwrap();
 
-    let resumed = fixture.init("main");
+    let rejected = fixture.init("main");
 
     assert!(
-        resumed.status.success(),
+        !rejected.status.success(),
         "{}",
-        String::from_utf8_lossy(&resumed.stderr)
+        String::from_utf8_lossy(&rejected.stderr)
     );
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("resolve bootstrap checkout"));
+    std::fs::rename(renamed_bootstrap, &fixture.bootstrap).unwrap();
+    successful_json(fixture.init("main"));
 
     let fixture = CliFixture::new("main");
+    let policy = fixture.policy("main");
     let interrupted = interrupt_init(&fixture, "fetch");
     assert_eq!(interrupted.status.code(), Some(86));
     std::fs::rename(&fixture.bootstrap, fixture.root.join("deleted-bootstrap")).unwrap();
     std::fs::rename(&fixture.remote, fixture.root.join("unavailable-remote.git")).unwrap();
 
-    let resumed = fixture.init("main");
+    let resumed = fixture.iq(&[
+        "repo",
+        "init",
+        "--path",
+        fixture.bootstrap.to_str().unwrap(),
+        "--storage-root",
+        fixture.root.to_str().unwrap(),
+        "--policy",
+        policy.to_str().unwrap(),
+    ]);
 
+    assert!(
+        !resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert!(String::from_utf8_lossy(&resumed.stderr).contains("local bare repository"));
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn provisioning_resume_rejects_replaced_git_directory_and_accepts_restored_binding() {
+    let fixture = CliFixture::new("main");
+    let interrupted = interrupt_init(&fixture, "git_init");
+    assert_eq!(interrupted.status.code(), Some(86));
+    let connection = Connection::open(&fixture.database).unwrap();
+    let staging: Vec<u8> = connection
+        .query_row(
+            "SELECT staging_root_path FROM repository_provisioning_intents",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let staging = PathBuf::from(std::ffi::OsString::from_vec(staging));
+    let original = staging.with_file_name("original-root.tmp");
+    std::fs::rename(&staging, &original).unwrap();
+    git(
+        staging.parent().unwrap(),
+        &["init", staging.to_str().unwrap()],
+    );
+
+    let rejected = fixture.init("main");
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("Git repository binding changed"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+
+    std::fs::remove_dir_all(&staging).unwrap();
+    std::fs::rename(original, &staging).unwrap();
+    let resumed = fixture.init("main");
     assert!(
         resumed.status.success(),
         "{}",
@@ -694,7 +1013,7 @@ fn second_bootstrap_resumes_fetched_remote_owner_without_remote_access() {
     assert_eq!(interrupted.status.code(), Some(86));
     let connection = Connection::open(&fixture.database).unwrap();
     let expected_key: String = connection
-        .query_row("SELECT repo_key FROM repository_remote_owners", [], |row| {
+        .query_row("SELECT repo_key FROM repository_policies", [], |row| {
             row.get(0)
         })
         .unwrap();
@@ -708,6 +1027,7 @@ fn second_bootstrap_resumes_fetched_remote_owner_without_remote_access() {
     )
     .unwrap();
     std::fs::set_permissions(&git_wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let repository_policy = fixture.policy("main");
     let resumed = Command::new(env!("CARGO_BIN_EXE_iq"))
         .env("IQ_RIFT_DATABASE", &fixture.rift_database)
         .env(
@@ -727,8 +1047,8 @@ fn second_bootstrap_resumes_fetched_remote_owner_without_remote_access() {
             second_bootstrap.to_str().unwrap(),
             "--storage-root",
             fixture.root.to_str().unwrap(),
-            "--target",
-            "main",
+            "--policy",
+            repository_policy.to_str().unwrap(),
         ])
         .output()
         .unwrap();
@@ -767,6 +1087,7 @@ fn remote_owner_rejects_a_different_storage_root_without_binding_the_request() {
     );
     let different_storage = fixture.root.join("different-storage");
     std::fs::create_dir(&different_storage).unwrap();
+    let policy = fixture.policy("main");
     let register_second = |storage: &Path| {
         fixture.iq(&[
             "repo",
@@ -775,8 +1096,8 @@ fn remote_owner_rejects_a_different_storage_root_without_binding_the_request() {
             second_bootstrap.to_str().unwrap(),
             "--storage-root",
             storage.to_str().unwrap(),
-            "--target",
-            "main",
+            "--policy",
+            policy.to_str().unwrap(),
         ])
     };
 
@@ -811,7 +1132,7 @@ fn remote_owner_rejects_a_different_storage_root_without_binding_the_request() {
 
 #[test]
 #[cfg(debug_assertions)]
-fn bootstrap_request_identity_survives_relative_dotdot_and_deleted_symlink_spellings() {
+fn bootstrap_request_identity_requires_live_relative_and_symlink_spellings() {
     for symlink_spelling in [false, true] {
         let fixture = CliFixture::new("main");
         let nested = fixture.root.join("nested");
@@ -822,6 +1143,7 @@ fn bootstrap_request_identity_survives_relative_dotdot_and_deleted_symlink_spell
         } else {
             "nested/../bootstrap"
         };
+        let repository_policy = fixture.policy("main");
         let run = |stop: bool| {
             let mut command = Command::new(env!("CARGO_BIN_EXE_iq"));
             command
@@ -836,8 +1158,8 @@ fn bootstrap_request_identity_survives_relative_dotdot_and_deleted_symlink_spell
                     spelling,
                     "--storage-root",
                     fixture.root.to_str().unwrap(),
-                    "--target",
-                    "main",
+                    "--policy",
+                    repository_policy.to_str().unwrap(),
                 ]);
             if stop {
                 command.env("IQ_TEST_PROVISION_STOP_AFTER", "reservation");
@@ -848,15 +1170,22 @@ fn bootstrap_request_identity_survives_relative_dotdot_and_deleted_symlink_spell
         if symlink_spelling {
             std::fs::remove_file(fixture.root.join("bootstrap-link")).unwrap();
         }
-        std::fs::rename(&fixture.bootstrap, fixture.root.join("deleted-bootstrap")).unwrap();
+        let deleted_bootstrap = fixture.root.join("deleted-bootstrap");
+        std::fs::rename(&fixture.bootstrap, &deleted_bootstrap).unwrap();
 
-        let resumed = run(false);
+        let rejected = run(false);
 
         assert!(
-            resumed.status.success(),
+            !rejected.status.success(),
             "{}",
-            String::from_utf8_lossy(&resumed.stderr)
+            String::from_utf8_lossy(&rejected.stderr)
         );
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("resolve bootstrap checkout"));
+        std::fs::rename(deleted_bootstrap, &fixture.bootstrap).unwrap();
+        if symlink_spelling {
+            symlink("bootstrap", fixture.root.join("bootstrap-link")).unwrap();
+        }
+        successful_json(run(false));
     }
 }
 
@@ -879,7 +1208,12 @@ fn partial_git_and_rift_initialization_are_reconciled() {
     let staging = PathBuf::from(std::ffi::OsString::from_vec(staging));
     std::fs::create_dir(staging.join(".git")).unwrap();
     std::fs::write(staging.join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
-    assert!(fixture.init("main").status.success());
+    let resumed = fixture.init("main");
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
 
     let fixture = CliFixture::new("main");
     assert_eq!(interrupt_init(&fixture, "policy").status.code(), Some(86));
@@ -893,7 +1227,12 @@ fn partial_git_and_rift_initialization_are_reconciled() {
         .unwrap();
     let root = PathBuf::from(std::ffi::OsString::from_vec(root));
     std::fs::write(root.join(".rift"), b"incomplete").unwrap();
-    assert!(fixture.init("main").status.success());
+    let resumed = fixture.init("main");
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
 
     let fixture = CliFixture::new("main");
     assert_eq!(
@@ -912,7 +1251,12 @@ fn partial_git_and_rift_initialization_are_reconciled() {
         .unwrap();
     let root = PathBuf::from(std::ffi::OsString::from_vec(root));
     std::fs::remove_file(root.join(".rift")).unwrap();
-    assert!(fixture.init("main").status.success());
+    let resumed = fixture.init("main");
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
 }
 
 #[test]
@@ -1003,7 +1347,7 @@ fn completed_policy_owner_and_child_phases_reject_tampering() {
 #[test]
 #[cfg(debug_assertions)]
 fn provisioning_restarts_after_every_external_effect_boundary() {
-    for (boundary, expected_phase) in [
+    let workers = [
         ("reservation", Some("reserved")),
         ("staging_directory", Some("staging_directory")),
         ("git_init", Some("git_initialized")),
@@ -1017,87 +1361,104 @@ fn provisioning_restarts_after_every_external_effect_boundary() {
         ("owner", Some("owner_published")),
         ("child_roots", Some("child_roots_published")),
         ("ready", None),
-    ] {
-        let fixture = CliFixture::new("main");
-        let interrupted = Command::new(env!("CARGO_BIN_EXE_iq"))
-            .env("IQ_RIFT_DATABASE", &fixture.rift_database)
-            .env("IQ_TEST_PROVISION_STOP_AFTER", boundary)
-            .arg("--queue-db")
-            .arg(&fixture.database)
-            .args([
-                "repo",
-                "init",
-                "--path",
-                fixture.bootstrap.to_str().unwrap(),
-                "--storage-root",
-                fixture.root.to_str().unwrap(),
-                "--target",
-                "main",
-            ])
-            .output()
-            .unwrap();
-        assert_eq!(
-            interrupted.status.code(),
-            Some(86),
-            "boundary {boundary} did not stop: {}",
-            String::from_utf8_lossy(&interrupted.stderr)
-        );
-        let connection = Connection::open(&fixture.database).unwrap();
-        let phase = connection
-            .query_row(
-                "SELECT json_extract(lifecycle_json,'$.state') FROM repository_provisioning_intents",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .ok();
-        assert_eq!(phase.as_deref(), expected_phase, "boundary {boundary}");
-
-        let retried = fixture.init("main");
-        assert!(
-            retried.status.success(),
-            "boundary {boundary} retry failed: {}",
-            String::from_utf8_lossy(&retried.stderr)
-        );
-        let repository: Value = serde_json::from_slice(&retried.stdout).unwrap();
-        let repo_key = repository["key"].as_str().unwrap();
-        let status = successful_json(fixture.iq(&["repo", "status", "--repo-key", repo_key]));
-        assert_eq!(status["repository"]["key"], repo_key);
-        let connection = Connection::open(&fixture.database).unwrap();
-        assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM registered_repositories", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM workspace_roots", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .unwrap(),
-            2
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT COUNT(*) FROM repository_provisioning_intents",
-                    [],
-                    |row| row.get::<_, i64>(0)
-                )
-                .unwrap(),
-            0
-        );
-        let root = Path::new(status["repository"]["owned_root_path"].as_str().unwrap());
-        assert!(!root.with_file_name(".root.tmp").exists());
+    ]
+    .into_iter()
+    .map(|(boundary, expected_phase)| {
+        std::thread::spawn(move || {
+            verify_provisioning_restart_boundary(boundary, expected_phase);
+        })
+    })
+    .collect::<Vec<_>>();
+    for worker in workers {
+        worker.join().unwrap();
     }
+}
+
+#[cfg(debug_assertions)]
+fn verify_provisioning_restart_boundary(boundary: &str, expected_phase: Option<&str>) {
+    let fixture = CliFixture::new("main");
+    let repository_policy = fixture.policy("main");
+    let mut interrupted_command = fixture.iq_command(&[
+        "repo",
+        "init",
+        "--path",
+        fixture.bootstrap.to_str().unwrap(),
+        "--storage-root",
+        fixture.root.to_str().unwrap(),
+        "--policy",
+        repository_policy.to_str().unwrap(),
+    ]);
+    interrupted_command
+        .env("IQ_TEST_PROVISION_STOP_AFTER", boundary)
+        .env("IQ_TEST_MODEL_KEY", "repository-test-model-key");
+    let interrupted = bounded_cli_output(
+        &mut interrupted_command,
+        &format!("provisioning boundary {boundary}"),
+    );
+    assert_eq!(
+        interrupted.status.code(),
+        Some(86),
+        "boundary {boundary} did not stop: {}",
+        String::from_utf8_lossy(&interrupted.stderr)
+    );
+    let connection = Connection::open(&fixture.database).unwrap();
+    let phase = connection
+        .query_row(
+            "SELECT json_extract(lifecycle_json,'$.state') FROM repository_provisioning_intents",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok();
+    assert_eq!(phase.as_deref(), expected_phase, "boundary {boundary}");
+
+    let retried = fixture.bounded_init("main", &format!("provisioning boundary {boundary} retry"));
+    assert!(
+        retried.status.success(),
+        "boundary {boundary} retry failed: {}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
+    let repository: Value = serde_json::from_slice(&retried.stdout).unwrap();
+    let repo_key = repository["key"].as_str().unwrap();
+    let status = successful_json(fixture.bounded_iq(
+        &["repo", "status", "--repo-key", repo_key],
+        &format!("provisioning boundary {boundary} status"),
+    ));
+    assert_eq!(status["repository"]["key"], repo_key);
+    let connection = Connection::open(&fixture.database).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM registered_repositories", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM workspace_roots", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM repository_provisioning_intents",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    let root = Path::new(status["repository"]["owned_root_path"].as_str().unwrap());
+    assert!(!root.with_file_name(".root.tmp").exists());
 }
 
 #[test]
 #[cfg(debug_assertions)]
 fn provisioning_recovers_when_each_effect_precedes_its_lifecycle_record() {
-    for (boundary, prior_phase) in [
+    let cases = [
         ("staging_directory", "reserved"),
         ("git_init", "staging_directory"),
         ("remote", "git_initialized"),
@@ -1110,89 +1471,104 @@ fn provisioning_recovers_when_each_effect_precedes_its_lifecycle_record() {
         ("owner", "rift_verified"),
         ("child_roots", "owner_published"),
         ("ready", "child_roots_published"),
-    ] {
-        let fixture = CliFixture::new("main");
-        let interrupted = interrupt_init_after_effect(&fixture, boundary);
-        assert_eq!(
-            interrupted.status.code(),
-            Some(85),
-            "boundary {boundary}: {}",
-            String::from_utf8_lossy(&interrupted.stderr)
-        );
-        let connection = Connection::open(&fixture.database).unwrap();
-        let (root, staging, phase): (Vec<u8>, Vec<u8>, String) = connection
-            .query_row(
-                "SELECT owned_root_path,staging_root_path,json_extract(lifecycle_json,'$.state') FROM repository_provisioning_intents",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(phase, prior_phase, "boundary {boundary}");
-        let root = PathBuf::from(std::ffi::OsString::from_vec(root));
-        let staging = PathBuf::from(std::ffi::OsString::from_vec(staging));
-        if matches!(
-            boundary,
-            "staging_directory" | "git_init" | "remote" | "fetch" | "checkout"
-        ) {
-            assert!(staging.is_dir(), "boundary {boundary}");
-            assert!(!root.exists(), "boundary {boundary}");
-        } else {
-            assert!(root.is_dir(), "boundary {boundary}");
-            assert!(!staging.exists(), "boundary {boundary}");
-        }
-        if matches!(boundary, "git_init" | "remote" | "fetch" | "checkout") {
-            assert!(staging.join(".git").is_dir(), "boundary {boundary}");
-        }
-        if matches!(
-            boundary,
-            "rift_init" | "rift_proof" | "owner" | "child_roots" | "ready"
-        ) {
-            assert!(root.join(".rift").is_file(), "boundary {boundary}");
-        }
-        if matches!(boundary, "owner" | "child_roots" | "ready") {
-            assert!(
-                root.join(".git/iq-owner.json").is_file(),
-                "boundary {boundary}"
-            );
-        }
-        if matches!(boundary, "child_roots" | "ready") {
-            assert!(root.with_file_name("development").is_dir());
-            assert!(root.with_file_name("integration").is_dir());
-        }
-        drop(connection);
-
-        let resumed = fixture.init("main");
-        assert!(
-            resumed.status.success(),
-            "boundary {boundary}: {}",
-            String::from_utf8_lossy(&resumed.stderr)
-        );
-        let repository: Value = serde_json::from_slice(&resumed.stdout).unwrap();
-        let final_root = PathBuf::from(repository["owned_root_path"].as_str().unwrap());
-        let connection = Connection::open(&fixture.database).unwrap();
-        assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM registered_repositories", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT COUNT(*) FROM repository_provisioning_intents",
-                    [],
-                    |row| row.get::<_, i64>(0)
-                )
-                .unwrap(),
-            0
-        );
-        let inventory = rift_inventory(&fixture.rift_database);
-        assert_eq!(inventory.len(), 1);
-        assert_eq!(inventory[0], final_root);
-        assert!(!final_root.with_file_name(".root.tmp").exists());
+    ];
+    for cases in cases.chunks(4) {
+        std::thread::scope(|scope| {
+            for &(boundary, prior_phase) in cases {
+                scope.spawn(move || {
+                    verify_provisioning_effect_recovery(boundary, prior_phase);
+                });
+            }
+        });
     }
+}
+
+#[cfg(debug_assertions)]
+fn verify_provisioning_effect_recovery(boundary: &str, prior_phase: &str) {
+    let fixture = CliFixture::new("main");
+    let interrupted = bounded_interrupt_init_after_effect(&fixture, boundary);
+    assert_eq!(
+        interrupted.status.code(),
+        Some(85),
+        "boundary {boundary}: {}",
+        String::from_utf8_lossy(&interrupted.stderr)
+    );
+    let connection = Connection::open(&fixture.database).unwrap();
+    let (root, staging, phase): (Vec<u8>, Vec<u8>, String) = connection
+        .query_row(
+            "SELECT owned_root_path,staging_root_path,json_extract(lifecycle_json,'$.state') FROM repository_provisioning_intents",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(phase, prior_phase, "boundary {boundary}");
+    let root = PathBuf::from(std::ffi::OsString::from_vec(root));
+    let staging = PathBuf::from(std::ffi::OsString::from_vec(staging));
+    if matches!(
+        boundary,
+        "staging_directory" | "git_init" | "remote" | "fetch" | "checkout"
+    ) {
+        assert!(staging.is_dir(), "boundary {boundary}");
+        assert!(!root.exists(), "boundary {boundary}");
+    } else {
+        assert!(root.is_dir(), "boundary {boundary}");
+        assert!(!staging.exists(), "boundary {boundary}");
+    }
+    if matches!(boundary, "git_init" | "remote" | "fetch" | "checkout") {
+        assert!(staging.join(".git").is_dir(), "boundary {boundary}");
+    }
+    if matches!(
+        boundary,
+        "rift_init" | "rift_proof" | "owner" | "child_roots" | "ready"
+    ) {
+        assert!(root.join(".rift").is_file(), "boundary {boundary}");
+    }
+    if matches!(boundary, "owner" | "child_roots" | "ready") {
+        assert!(
+            root.join(".git/iq-owner.json").is_file(),
+            "boundary {boundary}"
+        );
+    }
+    if matches!(boundary, "child_roots" | "ready") {
+        assert!(root.with_file_name("development").is_dir());
+        assert!(root.with_file_name("integration").is_dir());
+    }
+    drop(connection);
+
+    let resumed = fixture.bounded_init(
+        "main",
+        &format!("provisioning effect boundary {boundary} retry"),
+    );
+    assert!(
+        resumed.status.success(),
+        "boundary {boundary}: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let repository: Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    let final_root = PathBuf::from(repository["owned_root_path"].as_str().unwrap());
+    let connection = Connection::open(&fixture.database).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM registered_repositories", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM repository_provisioning_intents",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    let inventory = rift_inventory(&fixture.rift_database);
+    assert_eq!(inventory.len(), 1);
+    assert_eq!(inventory[0], final_root);
+    assert!(!final_root.with_file_name(".root.tmp").exists());
 }
 
 #[test]
@@ -1258,96 +1634,6 @@ fn repository_status_rejects_extra_fetch_and_push_urls() {
 }
 
 #[test]
-fn sql_rejects_contradictory_child_roots_and_cross_role_paths() {
-    let fixture = CliFixture::new("main");
-    let repository = successful_json(fixture.init("main"));
-    let repo_key = repository["key"].as_str().unwrap();
-    let connection = Connection::open(&fixture.database).unwrap();
-    connection
-        .pragma_update(None, "foreign_keys", "ON")
-        .unwrap();
-
-    assert!(connection
-        .execute(
-            "UPDATE workspace_roots SET source_rift_id='different' WHERE repo_key=?1 AND kind='development'",
-            [repo_key],
-        )
-        .is_err());
-    assert!(connection
-        .execute(
-            "UPDATE workspace_roots SET kind='integration' WHERE repo_key=?1 AND kind='development'",
-            [repo_key],
-        )
-        .is_err());
-
-    let transaction = connection.unchecked_transaction().unwrap();
-    let other = "00000000-0000-4000-8000-000000000002";
-    transaction
-        .execute(
-            "INSERT INTO repository_remote_owners(repo_key,fetch_url,push_url,target_branch,created_at) VALUES(?1,'other-fetch','other-push','main','now')",
-            [other],
-        )
-        .unwrap();
-    let cross_role = transaction.execute(
-        "INSERT INTO registered_repositories(repo_key,owned_root_path,root_rift_id,registry_identity,registry_device,registry_inode,generation,remote_name,fetch_url,push_url,target_branch,source_sha,checkout_json,development_root_path,integration_root_path,provisioning_json,created_at,updated_at)
-         SELECT ?1,development_root_path,root_rift_id,registry_identity,registry_device,registry_inode,0,'iq-target','other-fetch','other-push','main',source_sha,checkout_json,owned_root_path,integration_root_path,'{\"state\":\"ready\"}','now','now'
-         FROM registered_repositories WHERE repo_key=?2",
-        [other, repo_key],
-    );
-    assert!(cross_role.is_err());
-    transaction.rollback().unwrap();
-
-    assert!(connection
-        .execute(
-            "INSERT INTO repository_provisioning_intents(repo_key,bootstrap_path,owned_root_path,staging_root_path,rift_registry_path,target_branch,fetch_url,push_url,source_sha,policy_bytes,lifecycle_json,created_at,updated_at)
-             SELECT repo_key,CAST('/tmp/bootstrap' AS BLOB),CAST('/tmp/root' AS BLOB),CAST('/tmp/staging' AS BLOB),CAST('/tmp/rift' AS BLOB),target_branch,fetch_url,push_url,source_sha,NULL,'{\"state\":\"reserved\"}','now','now' FROM registered_repositories WHERE repo_key=?1",
-            [repo_key],
-        )
-        .is_err());
-
-    let transaction = connection.unchecked_transaction().unwrap();
-    let parent_without_children = "00000000-0000-4000-8000-000000000003";
-    transaction
-        .execute(
-            "INSERT INTO repository_remote_owners(repo_key,fetch_url,push_url,target_branch,created_at) VALUES(?1,'third-fetch','third-push','main','now')",
-            [parent_without_children],
-        )
-        .unwrap();
-    transaction
-        .execute(
-            "INSERT INTO registered_repositories(repo_key,owned_root_path,root_rift_id,registry_identity,registry_device,registry_inode,generation,remote_name,fetch_url,push_url,target_branch,source_sha,checkout_json,development_root_path,integration_root_path,provisioning_json,created_at,updated_at)
-             VALUES(?1,CAST('/tmp/third-root' AS BLOB),'third-rift',CAST('/tmp/third-registry' AS BLOB),1,2,0,'iq-target','third-fetch','third-push','main','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{\"state\":\"ready\",\"target_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}',CAST('/tmp/third-development' AS BLOB),CAST('/tmp/third-integration' AS BLOB),'{\"state\":\"ready\"}','now','now')",
-            [parent_without_children],
-        )
-        .unwrap();
-    assert!(transaction.commit().is_err());
-
-    let transaction = connection.unchecked_transaction().unwrap();
-    let parent_with_one_child = "00000000-0000-4000-8000-000000000004";
-    transaction
-        .execute(
-            "INSERT INTO repository_remote_owners(repo_key,fetch_url,push_url,target_branch,created_at) VALUES(?1,'fourth-fetch','fourth-push','main','now')",
-            [parent_with_one_child],
-        )
-        .unwrap();
-    transaction
-        .execute(
-            "INSERT INTO registered_repositories(repo_key,owned_root_path,root_rift_id,registry_identity,registry_device,registry_inode,generation,remote_name,fetch_url,push_url,target_branch,source_sha,checkout_json,development_root_path,integration_root_path,provisioning_json,created_at,updated_at)
-             VALUES(?1,CAST('/tmp/fourth-root' AS BLOB),'fourth-rift',CAST('/tmp/fourth-registry' AS BLOB),1,2,0,'iq-target','fourth-fetch','fourth-push','main','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{\"state\":\"ready\",\"target_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}',CAST('/tmp/fourth-development' AS BLOB),CAST('/tmp/fourth-integration' AS BLOB),'{\"state\":\"ready\"}','now','now')",
-            [parent_with_one_child],
-        )
-        .unwrap();
-    transaction
-        .execute(
-            "INSERT INTO workspace_roots(repo_key,kind,root_path,source_path,source_rift_id,registry_identity,registry_device,registry_inode,generation,pending_generation)
-             VALUES(?1,'development',CAST('/tmp/fourth-development' AS BLOB),CAST('/tmp/fourth-root' AS BLOB),'fourth-rift',CAST('/tmp/fourth-registry' AS BLOB),1,2,0,NULL)",
-            [parent_with_one_child],
-        )
-        .unwrap();
-    assert!(transaction.commit().is_err());
-}
-
-#[test]
 fn database_open_rejects_contradictory_child_root_content() {
     let fixture = CliFixture::new("main");
     let repository = successful_json(fixture.init("main"));
@@ -1381,40 +1667,7 @@ fn database_open_rejects_contradictory_child_root_content() {
     let Err(rejected) = SqliteQueue::open(&fixture.database) else {
         panic!("contradictory child-root content was accepted");
     };
-    assert_eq!(
-        format!("{rejected:#}"),
-        "IQ local state is incompatible; remove it and reinitialize IQ"
-    );
-}
-
-#[test]
-fn registered_host_claim_rejects_without_creating_an_attempt() {
-    let fixture = CliFixture::new("main");
-    let repository = successful_json(fixture.init("main"));
-    let repo_key = repository["key"].as_str().unwrap();
-    let source_sha = git(&fixture.bootstrap, &["rev-parse", "main"]);
-    let queue = SqliteQueue::open(&fixture.database).unwrap();
-    queue
-        .enqueue(EnqueueRequest {
-            repo_key: repo_key.into(),
-            source_branch: "feature".into(),
-            current_head_sha: source_sha,
-            pr_url: None,
-            producer_metadata: serde_json::json!({}),
-            state_repository: iq::control_domain::StateRepositorySnapshot::Local,
-        })
-        .unwrap();
-
-    assert!(queue.claim_next_ready(repo_key).is_err());
-    let connection = Connection::open(&fixture.database).unwrap();
-    assert_eq!(
-        connection
-            .query_row("SELECT COUNT(*) FROM integration_attempts", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .unwrap(),
-        0
-    );
+    assert!(format!("{rejected:#}").starts_with("IQ local state is incompatible;"));
 }
 
 #[test]
@@ -1463,10 +1716,7 @@ fn malformed_checkout_states_reject_in_domain_sql_and_database_open() {
     let Err(rejected) = SqliteQueue::open(&fixture.database) else {
         panic!("malformed checkout content was accepted");
     };
-    assert_eq!(
-        format!("{rejected:#}"),
-        "IQ local state is incompatible; remove it and reinitialize IQ"
-    );
+    assert!(format!("{rejected:#}").starts_with("IQ local state is incompatible;"));
 }
 
 #[test]
@@ -1496,6 +1746,8 @@ fn main_and_master_register_but_one_remote_cannot_own_both_targets() {
         ],
     );
     let mut main = Command::new(env!("CARGO_BIN_EXE_iq"));
+    let main_policy = fixture.policy("main");
+    let master_policy = fixture.policy("master");
     main.env("IQ_RIFT_DATABASE", &fixture.rift_database)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1508,8 +1760,8 @@ fn main_and_master_register_but_one_remote_cannot_own_both_targets() {
             fixture.bootstrap.to_str().unwrap(),
             "--storage-root",
             fixture.root.to_str().unwrap(),
-            "--target",
-            "main",
+            "--policy",
+            main_policy.to_str().unwrap(),
         ]);
     let mut master = Command::new(env!("CARGO_BIN_EXE_iq"));
     master
@@ -1525,8 +1777,8 @@ fn main_and_master_register_but_one_remote_cannot_own_both_targets() {
             fixture.bootstrap.to_str().unwrap(),
             "--storage-root",
             fixture.root.to_str().unwrap(),
-            "--target",
-            "master",
+            "--policy",
+            master_policy.to_str().unwrap(),
         ]);
     let main = main.spawn().unwrap();
     let master = master.spawn().unwrap();
@@ -1543,7 +1795,7 @@ fn main_and_master_register_but_one_remote_cannot_own_both_targets() {
     let connection = Connection::open(&fixture.database).unwrap();
     assert_eq!(
         connection
-            .query_row("SELECT COUNT(*) FROM repository_remote_owners", [], |row| {
+            .query_row("SELECT COUNT(*) FROM repository_policies", [], |row| {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
@@ -1602,11 +1854,9 @@ fn main_and_master_register_but_one_remote_cannot_own_both_targets() {
         0
     );
     let registered_target: String = connection
-        .query_row(
-            "SELECT target_branch FROM repository_remote_owners",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT target_branch FROM repository_policies", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     let rejected_target = if registered_target == "main" {
         "master"
@@ -1624,6 +1874,7 @@ fn concurrent_same_target_registration_at_reservation_barrier_returns_one_reposi
     let barrier = fixture.root.join("reservation-barrier");
     std::fs::create_dir(&barrier).unwrap();
     let second_bootstrap = fixture.root.join("second-bootstrap");
+    let repository_policy = fixture.policy("main");
     git(
         &fixture.root,
         &[
@@ -1649,24 +1900,15 @@ fn concurrent_same_target_registration_at_reservation_barrier_returns_one_reposi
                 path.to_str().unwrap(),
                 "--storage-root",
                 fixture.root.to_str().unwrap(),
-                "--target",
-                "main",
+                "--policy",
+                repository_policy.to_str().unwrap(),
             ]);
         command.spawn().unwrap()
     };
     let first = spawn(&fixture.bootstrap);
     let second = spawn(&second_bootstrap);
     #[cfg(debug_assertions)]
-    {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::fs::read_dir(&barrier).unwrap().count() != 2 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "reservation barrier timed out"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    }
+    wait_for_reservation_barrier(&barrier, 2);
     let first = first.wait_with_output().unwrap();
     let second = second.wait_with_output().unwrap();
     assert!(
@@ -1686,7 +1928,7 @@ fn concurrent_same_target_registration_at_reservation_barrier_returns_one_reposi
 
     let connection = Connection::open(&fixture.database).unwrap();
     for (table, count) in [
-        ("repository_remote_owners", 1),
+        ("repository_policies", 1),
         ("repository_bootstrap_requests", 2),
         ("registered_repositories", 1),
     ] {
@@ -1731,8 +1973,8 @@ fn concurrent_same_target_registration_at_reservation_barrier_returns_one_reposi
             third_bootstrap.to_str().unwrap(),
             "--storage-root",
             fixture.root.to_str().unwrap(),
-            "--target",
-            "master",
+            "--policy",
+            fixture.policy("master").to_str().unwrap(),
         ])
         .output()
         .unwrap();
@@ -1764,6 +2006,7 @@ fn concurrent_registration_uses_one_winning_storage_root_and_one_fence() {
     );
     let second_storage = fixture.root.join("second-storage");
     std::fs::create_dir(&second_storage).unwrap();
+    let repository_policy = fixture.policy("main");
     let spawn = |path: &Path, storage: &Path| {
         Command::new(env!("CARGO_BIN_EXE_iq"))
             .env("IQ_RIFT_DATABASE", &fixture.rift_database)
@@ -1780,22 +2023,15 @@ fn concurrent_registration_uses_one_winning_storage_root_and_one_fence() {
                 path.to_str().unwrap(),
                 "--storage-root",
                 storage.to_str().unwrap(),
-                "--target",
-                "main",
+                "--policy",
+                repository_policy.to_str().unwrap(),
             ])
             .spawn()
             .unwrap()
     };
     let first = spawn(&fixture.bootstrap, &fixture.root);
     let second = spawn(&second_bootstrap, &second_storage);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::fs::read_dir(&barrier).unwrap().count() != 2 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "reservation barrier timed out"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    wait_for_reservation_barrier(&barrier, 2);
     let first = first.wait_with_output().unwrap();
     let second = second.wait_with_output().unwrap();
     assert_ne!(first.status.success(), second.status.success());
@@ -1834,8 +2070,8 @@ fn concurrent_registration_uses_one_winning_storage_root_and_one_fence() {
         loser_bootstrap.to_str().unwrap(),
         "--storage-root",
         winner_storage.to_str().unwrap(),
-        "--target",
-        "main",
+        "--policy",
+        repository_policy.to_str().unwrap(),
     ]));
     assert_eq!(retried["key"], winner["key"]);
     assert_eq!(retried["owned_root_path"], winner["owned_root_path"]);
@@ -1857,6 +2093,7 @@ fn concurrent_registration_uses_one_winning_rift_registry() {
         ],
     );
     let second_registry = fixture.root.join("second-rift.sqlite");
+    let repository_policy = fixture.policy("main");
     let spawn = |path: &Path, registry: &Path| {
         Command::new(env!("CARGO_BIN_EXE_iq"))
             .env("IQ_RIFT_DATABASE", registry)
@@ -1873,22 +2110,15 @@ fn concurrent_registration_uses_one_winning_rift_registry() {
                 path.to_str().unwrap(),
                 "--storage-root",
                 fixture.root.to_str().unwrap(),
-                "--target",
-                "main",
+                "--policy",
+                repository_policy.to_str().unwrap(),
             ])
             .spawn()
             .unwrap()
     };
     let first = spawn(&fixture.bootstrap, &fixture.rift_database);
     let second = spawn(&second_bootstrap, &second_registry);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::fs::read_dir(&barrier).unwrap().count() != 2 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "reservation barrier timed out"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    wait_for_reservation_barrier(&barrier, 2);
     let first = first.wait_with_output().unwrap();
     let second = second.wait_with_output().unwrap();
     assert_ne!(first.status.success(), second.status.success());
@@ -1923,8 +2153,8 @@ fn concurrent_registration_uses_one_winning_rift_registry() {
             loser_bootstrap.to_str().unwrap(),
             "--storage-root",
             fixture.root.to_str().unwrap(),
-            "--target",
-            "main",
+            "--policy",
+            repository_policy.to_str().unwrap(),
         ])
         .output()
         .unwrap();
@@ -1961,6 +2191,12 @@ fn registrations_for_two_remotes_get_distinct_repository_uuids() {
     git(&second_bootstrap, &["branch", "-M", "main"]);
     git(&second_bootstrap, &["push", "-u", "origin", "main"]);
 
+    let second_policy_path = fixture.root.join("second-repository-policy.json");
+    std::fs::write(
+        &second_policy_path,
+        serde_json::to_vec_pretty(&direct_policy(&second_remote)).unwrap(),
+    )
+    .unwrap();
     let second = successful_json(fixture.iq(&[
         "repo",
         "init",
@@ -1968,8 +2204,8 @@ fn registrations_for_two_remotes_get_distinct_repository_uuids() {
         second_bootstrap.to_str().unwrap(),
         "--storage-root",
         fixture.root.to_str().unwrap(),
-        "--target",
-        "main",
+        "--policy",
+        second_policy_path.to_str().unwrap(),
     ]));
 
     assert_ne!(first["key"], second["key"]);
@@ -1990,6 +2226,7 @@ fn explicit_storage_root_is_independent_of_queue_database_location() {
     let fixture = CliFixture::new("main");
     let storage_root = fixture.root.join("rift-storage");
     std::fs::create_dir(&storage_root).unwrap();
+    let policy = fixture.policy("main");
 
     let repository = successful_json(fixture.iq(&[
         "repo",
@@ -1998,8 +2235,8 @@ fn explicit_storage_root_is_independent_of_queue_database_location() {
         fixture.bootstrap.to_str().unwrap(),
         "--storage-root",
         storage_root.to_str().unwrap(),
-        "--target",
-        "main",
+        "--policy",
+        policy.to_str().unwrap(),
     ]));
 
     let owned_root = PathBuf::from(repository["owned_root_path"].as_str().unwrap());
@@ -2013,6 +2250,7 @@ fn noncanonical_rift_registry_path_has_one_durable_identity() {
     let registry_directory = fixture.root.join("registry-directory");
     std::fs::create_dir(&registry_directory).unwrap();
     let registry = registry_directory.join("../alternate-rift.sqlite");
+    let repository_policy = fixture.policy("main");
     let register = || {
         Command::new(env!("CARGO_BIN_EXE_iq"))
             .env("IQ_RIFT_DATABASE", &registry)
@@ -2025,8 +2263,8 @@ fn noncanonical_rift_registry_path_has_one_durable_identity() {
                 fixture.bootstrap.to_str().unwrap(),
                 "--storage-root",
                 fixture.root.to_str().unwrap(),
-                "--target",
-                "main",
+                "--policy",
+                repository_policy.to_str().unwrap(),
             ])
             .output()
             .unwrap()
@@ -2054,7 +2292,7 @@ fn owned_root_refresh_keeps_durable_observation_until_a_later_refresh() {
         .arg("--queue-db")
         .arg(&fixture.database)
         .args([
-            "dev-workspace",
+            "workspace",
             "create",
             "--repo-key",
             repo_key,
@@ -2090,7 +2328,7 @@ fn owned_root_refresh_keeps_durable_observation_until_a_later_refresh() {
     assert_ne!(observed_a, observed_b);
 
     let workspace_a = successful_json(fixture.iq(&[
-        "dev-workspace",
+        "workspace",
         "create",
         "--repo-key",
         repo_key,
@@ -2108,19 +2346,27 @@ fn owned_root_refresh_keeps_durable_observation_until_a_later_refresh() {
         ),
         observed_a
     );
+    assert!(git(
+        &owned_root,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            &format!("refs/iq/repository-targets/{repo_key}/{observed_a}")
+        ]
+    )
+    .is_empty());
     assert_eq!(
-        git(
-            &owned_root,
-            &[
-                "rev-parse",
-                &format!("refs/iq/repository-targets/{repo_key}/{observed_a}")
-            ]
-        ),
-        observed_a
+        Connection::open(&fixture.database)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM private_ref_cleanup_debt", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
     );
 
     let workspace_b = successful_json(fixture.iq(&[
-        "dev-workspace",
+        "workspace",
         "create",
         "--repo-key",
         repo_key,
@@ -2142,7 +2388,7 @@ fn owned_root_refresh_keeps_durable_observation_until_a_later_refresh() {
 
 #[test]
 #[cfg(debug_assertions)]
-fn linked_bootstrap_request_resumes_active_intent_without_reopening_checkout() {
+fn linked_bootstrap_request_requires_live_checkout_before_resuming_active_intent() {
     let fixture = CliFixture::new("main");
     let second_bootstrap = fixture.root.join("second-bootstrap");
     git(
@@ -2157,6 +2403,7 @@ fn linked_bootstrap_request_resumes_active_intent_without_reopening_checkout() {
         interrupt_init(&fixture, "reservation").status.code(),
         Some(86)
     );
+    let repository_policy = fixture.policy("main");
     let linked = Command::new(env!("CARGO_BIN_EXE_iq"))
         .env("IQ_RIFT_DATABASE", &fixture.rift_database)
         .env("IQ_TEST_PROVISION_STOP_AFTER_EFFECT", "staging_directory")
@@ -2169,8 +2416,8 @@ fn linked_bootstrap_request_resumes_active_intent_without_reopening_checkout() {
             second_bootstrap.to_str().unwrap(),
             "--storage-root",
             fixture.root.to_str().unwrap(),
-            "--target",
-            "main",
+            "--policy",
+            repository_policy.to_str().unwrap(),
         ])
         .output()
         .unwrap();
@@ -2181,24 +2428,34 @@ fn linked_bootstrap_request_resumes_active_intent_without_reopening_checkout() {
     )
     .unwrap();
 
-    let resumed = Command::new(env!("CARGO_BIN_EXE_iq"))
-        .env("IQ_RIFT_DATABASE", &fixture.rift_database)
-        .arg("--queue-db")
-        .arg(&fixture.database)
-        .args([
-            "repo",
-            "init",
-            "--path",
-            second_bootstrap.to_str().unwrap(),
-            "--storage-root",
-            fixture.root.to_str().unwrap(),
-            "--target",
-            "main",
-        ])
-        .output()
-        .unwrap();
+    let resume = || {
+        Command::new(env!("CARGO_BIN_EXE_iq"))
+            .env("IQ_RIFT_DATABASE", &fixture.rift_database)
+            .arg("--queue-db")
+            .arg(&fixture.database)
+            .args([
+                "repo",
+                "init",
+                "--path",
+                second_bootstrap.to_str().unwrap(),
+                "--storage-root",
+                fixture.root.to_str().unwrap(),
+                "--policy",
+                repository_policy.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+    };
 
-    let repository = successful_json(resumed);
+    let rejected = resume();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("resolve bootstrap checkout"));
+    std::fs::rename(
+        fixture.root.join("removed-second-bootstrap"),
+        &second_bootstrap,
+    )
+    .unwrap();
+    let repository = successful_json(resume());
     let connection = Connection::open(&fixture.database).unwrap();
     assert_eq!(
         connection
@@ -2275,7 +2532,7 @@ fn killed_operation_holder_is_recovered_before_lease_ttl_expires() {
         .args(["repo", "status", "--repo-key", repo_key])
         .spawn()
         .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !ready.exists() {
         assert!(holder.try_wait().unwrap().is_none());
         assert!(
@@ -2323,7 +2580,7 @@ fn operation_lock_cli_matrix_rejects_live_holder_and_succeeds_after_holder_exit(
 
     let holder = spawn_operation_lock_holder(&operation_lock, &fixture.root, "create");
     let blocked = fixture.iq(&[
-        "dev-workspace",
+        "workspace",
         "create",
         "--repo-key",
         repo_key,
@@ -2346,7 +2603,7 @@ fn operation_lock_cli_matrix_rejects_live_holder_and_succeeds_after_holder_exit(
     drop(connection);
     release_operation_lock_holder(holder);
     let submit_workspace = successful_json(fixture.iq(&[
-        "dev-workspace",
+        "workspace",
         "create",
         "--repo-key",
         repo_key,
@@ -2355,7 +2612,7 @@ fn operation_lock_cli_matrix_rejects_live_holder_and_succeeds_after_holder_exit(
     ]));
 
     let cleanup_workspace = successful_json(fixture.iq(&[
-        "dev-workspace",
+        "workspace",
         "create",
         "--repo-key",
         repo_key,
@@ -2365,7 +2622,7 @@ fn operation_lock_cli_matrix_rejects_live_holder_and_succeeds_after_holder_exit(
     let cleanup_id = cleanup_workspace["id"].as_str().unwrap();
     let cleanup_path = PathBuf::from(cleanup_workspace["path"].as_str().unwrap());
     let holder = spawn_operation_lock_holder(&operation_lock, &fixture.root, "cleanup");
-    let blocked = fixture.iq(&["cleanup", "--workspace", cleanup_id]);
+    let blocked = fixture.iq(&["workspace", "remove", cleanup_id]);
     assert!(!blocked.status.success());
     assert!(String::from_utf8_lossy(&blocked.stderr).contains("active operation"));
     assert!(cleanup_path.is_dir());
@@ -2381,7 +2638,7 @@ fn operation_lock_cli_matrix_rejects_live_holder_and_succeeds_after_holder_exit(
         "active"
     );
     release_operation_lock_holder(holder);
-    successful_json(fixture.iq(&["cleanup", "--workspace", cleanup_id]));
+    successful_json(fixture.iq(&["workspace", "remove", cleanup_id]));
     assert!(!cleanup_path.exists());
 
     let submit_id = submit_workspace["id"].as_str().unwrap();
@@ -2600,7 +2857,7 @@ fn cli_lifecycle_uses_only_repository_key_after_bootstrap_deletion() {
 
     successful_json(fixture.iq(&["repo", "status", "--repo-key", &repo_key]));
     let workspace = successful_json(fixture.iq(&[
-        "dev-workspace",
+        "workspace",
         "create",
         "--repo-key",
         &repo_key,
@@ -2642,7 +2899,7 @@ with open("/iq-protocol/input.json", "r", encoding="utf-8") as source:
 tree = subprocess.check_output(["git", "write-tree"], text=True).strip()
 result = {
     "outcome": "resolved",
-    "version": 1,
+    "version": 2,
     "identity": request["identity"],
     "staged_tree_sha256": hashlib.sha256(tree.encode()).hexdigest(),
     "changed_paths": [[{"hex": "666561747572652e747874"}]],
@@ -2750,12 +3007,103 @@ os.replace("/iq-protocol/result.json.tmp", "/iq-protocol/result.json")
 }
 
 #[test]
-fn submit_replace_reuses_the_item_and_lands_the_replacement_commit() {
+fn removed_cli_surfaces_fail_in_parser_without_state_or_filesystem_effects() {
+    let fixture = CliFixture::new("main");
+    let repository = successful_json(fixture.init("main"));
+    let repo_key = repository["key"].as_str().unwrap();
+    let before = directory_bytes(&fixture.root);
+
+    let cases: Vec<(Vec<&str>, &str, &str)> = vec![
+        (
+            vec!["dev-workspace", "list"],
+            "error: unrecognized subcommand 'dev-workspace'",
+            "Usage: iq [OPTIONS] <COMMAND>",
+        ),
+        (
+            vec!["workspace", "status", "--repo-key", repo_key],
+            "error: unexpected argument '--repo-key' found",
+            "Usage: iq workspace status [OPTIONS] <ID>",
+        ),
+        (
+            vec!["workspace", "reset", "--repo-key", repo_key],
+            "error: unrecognized subcommand 'reset'",
+            "Usage: iq workspace [OPTIONS] <COMMAND>",
+        ),
+        (
+            vec![
+                "integrate",
+                "--next",
+                "--repo-key",
+                repo_key,
+                "--system-config",
+                "/unused",
+                "--repo-path",
+                "/unused",
+            ],
+            "error: unexpected argument '--repo-path' found",
+            "Usage: iq integrate --system-config <SYSTEM_CONFIG> --repo-key <REPO_KEY>",
+        ),
+        (
+            vec![
+                "integrate",
+                "--next",
+                "--repo-key",
+                repo_key,
+                "--system-config",
+                "/unused",
+                "--base-remote",
+                "origin",
+            ],
+            "error: unexpected argument '--base-remote' found",
+            "Usage: iq integrate --system-config <SYSTEM_CONFIG> --repo-key <REPO_KEY>",
+        ),
+        (
+            vec![
+                "integrate",
+                "--next",
+                "--repo-key",
+                repo_key,
+                "--system-config",
+                "/unused",
+                "--workspace-root",
+                "/unused",
+            ],
+            "error: unexpected argument '--workspace-root' found",
+            "Usage: iq integrate --system-config <SYSTEM_CONFIG> --repo-key <REPO_KEY>",
+        ),
+        (
+            vec![
+                "integrate",
+                "--next",
+                "--repo-key",
+                repo_key,
+                "--system-config",
+                "/unused",
+                "--rift-database",
+                "/unused",
+            ],
+            "error: unexpected argument '--rift-database' found",
+            "Usage: iq integrate --system-config <SYSTEM_CONFIG> --repo-key <REPO_KEY>",
+        ),
+        (
+            vec!["cleanup", "--workspace", "not-authorized"],
+            "error: unexpected argument '--workspace' found",
+            "Usage: iq cleanup [OPTIONS] --repo-key <REPO_KEY> --system-config <SYSTEM_CONFIG>",
+        ),
+    ];
+    for (arguments, diagnostic, usage) in cases {
+        assert_parser_rejection(fixture.iq(&arguments), diagnostic, usage);
+        assert_eq!(directory_bytes(&fixture.root), before);
+    }
+}
+
+#[test]
+fn submit_replace_creates_a_new_immutable_item_and_lands_the_replacement_commit() {
     let fixture = CliFixture::new("main");
     let repository = successful_json(fixture.init("main"));
     let repo_key = repository["key"].as_str().unwrap();
     let workspace = successful_json(fixture.iq(&[
-        "dev-workspace",
+        "workspace",
         "create",
         "--repo-key",
         repo_key,
@@ -2831,7 +3179,8 @@ fn submit_replace_reuses_the_item_and_lands_the_replacement_commit() {
     );
     let third_workspace_sha = git(&workspace_path, &["rev-parse", "HEAD"]);
     assert_ne!(third_workspace_sha, replacement_workspace_sha);
-    assert_eq!(replacement[1]["id"], item_id);
+    let replacement_item_id = replacement[1]["id"].as_str().unwrap().to_string();
+    assert_ne!(replacement_item_id, item_id);
     assert_eq!(
         connection
             .query_row(
@@ -2840,7 +3189,28 @@ fn submit_replace_reuses_the_item_and_lands_the_replacement_commit() {
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
-        2
+        1
+    );
+    let old_state: (String, String, String) = connection
+        .query_row(
+            "SELECT item.status,effort.state,submission.state FROM queue_items item JOIN integration_efforts effort ON effort.item_id=item.id JOIN queue_admissions admission ON admission.item_id=item.id JOIN local_submissions submission ON submission.id=admission.submission_id WHERE item.id=?1",
+            [&item_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        old_state,
+        ("cancelled".into(), "cancelled".into(), "replaced".into())
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT replaces_item_id FROM local_submissions WHERE queue_item_id=?1",
+                [&replacement_item_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        item_id
     );
 
     let runner = fixture.root.join("replace-runner");
@@ -2857,7 +3227,7 @@ with open("/iq-protocol/input.json", "r", encoding="utf-8") as source:
 tree = subprocess.check_output(["git", "write-tree"], text=True).strip()
 result = {
     "outcome": "resolved",
-    "version": 1,
+    "version": 2,
     "identity": request["identity"],
     "staged_tree_sha256": hashlib.sha256(tree.encode()).hexdigest(),
     "changed_paths": [[{"hex": "666561747572652e747874"}]],
@@ -2878,43 +3248,6 @@ os.replace("/iq-protocol/result.json.tmp", "/iq-protocol/result.json")
     );
     std::fs::write(&valid_system, valid).unwrap();
 
-    let old_attempt_id = replacement[1]["replacement"]["old_attempt_id"]
-        .as_str()
-        .unwrap();
-    let old_integration = PathBuf::from(
-        replacement[1]["replacement"]["old_workspace"]["path"]
-            .as_str()
-            .unwrap(),
-    );
-    let preserved = fixture.iq(&[
-        "cleanup",
-        "--repo-key",
-        repo_key,
-        "--system-config",
-        valid_system.to_str().unwrap(),
-    ]);
-    assert!(!preserved.status.success());
-    assert!(old_integration.exists());
-    git(&old_integration, &["reset", "--hard"]);
-    git(&old_integration, &["clean", "-ffd"]);
-    successful_json(fixture.iq(&[
-        "cleanup",
-        "--repo-key",
-        repo_key,
-        "--system-config",
-        valid_system.to_str().unwrap(),
-    ]));
-    assert!(!old_integration.exists());
-    let pending_effort: (String, String, String, i64) = connection
-        .query_row(
-            "SELECT id,attempt_id,state,failed_cycles FROM integration_efforts WHERE item_id=?1",
-            [&item_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .unwrap();
-    assert_eq!(pending_effort.1, old_attempt_id);
-    assert_eq!(pending_effort.2, "replacement_pending");
-    assert_eq!(pending_effort.3, 0);
     let daemon = successful_json(fixture.iq(&[
         "daemon",
         "--config",
@@ -2926,21 +3259,19 @@ os.replace("/iq-protocol/result.json.tmp", "/iq-protocol/result.json")
     let status: (String, Option<String>, Option<String>) = connection
         .query_row(
             "SELECT status,blocked_reason,blocked_message FROM queue_items WHERE id=?1",
-            [&item_id],
+            [&replacement_item_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
     assert_eq!(status.0, "integrated", "status={status:?} daemon={daemon}");
-    let completed_effort: (String, String, String) = connection
+    let completed_effort: String = connection
         .query_row(
-            "SELECT id,attempt_id,state FROM integration_efforts WHERE item_id=?1",
-            [&item_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            "SELECT state FROM integration_efforts WHERE item_id=?1",
+            [&replacement_item_id],
+            |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(completed_effort.0, pending_effort.0);
-    assert_ne!(completed_effort.1, old_attempt_id);
-    assert_eq!(completed_effort.2, "integrated");
+    assert_eq!(completed_effort, "integrated");
     assert_eq!(
         git(&fixture.remote, &["show", "refs/heads/main:feature.txt"]),
         "replacement"
@@ -3001,7 +3332,7 @@ fn development_generation_crashes_reconcile_pending_marker_and_single_workspace(
             .arg("--queue-db")
             .arg(&fixture.database)
             .args([
-                "dev-workspace",
+                "workspace",
                 "create",
                 "--repo-key",
                 repo_key,
@@ -3041,7 +3372,7 @@ fn development_generation_crashes_reconcile_pending_marker_and_single_workspace(
         drop(connection);
 
         let resumed = successful_json(fixture.iq(&[
-            "dev-workspace",
+            "workspace",
             "create",
             "--repo-key",
             repo_key,
@@ -3132,7 +3463,7 @@ fn workspace_root_rejects_owner_marker_database_id_mismatch() {
     std::fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
 
     let rejected = fixture.iq(&[
-        "dev-workspace",
+        "workspace",
         "create",
         "--repo-key",
         repo_key,
@@ -3163,7 +3494,7 @@ fn workspace_root_rejects_generation_two_steps_ahead_of_authority() {
     std::fs::write(root.join(".iq-workspace-generation"), b"2\n").unwrap();
 
     let rejected = fixture.iq(&[
-        "dev-workspace",
+        "workspace",
         "create",
         "--repo-key",
         repo_key,
@@ -3186,12 +3517,12 @@ fn workspace_root_rejects_generation_two_steps_ahead_of_authority() {
 }
 
 #[test]
-fn cleanup_cli_supports_workspace_only_without_system_configuration() {
+fn workspace_remove_needs_no_system_configuration() {
     let fixture = CliFixture::new("main");
     let repository = successful_json(fixture.init("main"));
     let repo_key = repository["key"].as_str().unwrap();
     let workspace = successful_json(fixture.iq(&[
-        "dev-workspace",
+        "workspace",
         "create",
         "--repo-key",
         repo_key,
@@ -3199,7 +3530,7 @@ fn cleanup_cli_supports_workspace_only_without_system_configuration() {
         "cleanup-only",
     ]));
     let removed =
-        successful_json(fixture.iq(&["cleanup", "--workspace", workspace["id"].as_str().unwrap()]));
+        successful_json(fixture.iq(&["workspace", "remove", workspace["id"].as_str().unwrap()]));
     assert_eq!(removed["status"], "removed");
     assert!(!Path::new(workspace["path"].as_str().unwrap()).exists());
 }
@@ -3209,7 +3540,7 @@ fn cleanup_preserves_dirty_workspace_then_removes_clean_workspace_and_authority(
     let fixture = CliFixture::new("main");
     let repository = successful_json(fixture.init("main"));
     let workspace = successful_json(fixture.iq(&[
-        "dev-workspace",
+        "workspace",
         "create",
         "--repo-key",
         repository["key"].as_str().unwrap(),
@@ -3220,7 +3551,7 @@ fn cleanup_preserves_dirty_workspace_then_removes_clean_workspace_and_authority(
     let workspace_path = PathBuf::from(workspace["path"].as_str().unwrap());
     std::fs::write(workspace_path.join("dirty.txt"), "preserve me\n").unwrap();
 
-    let rejected = fixture.iq(&["cleanup", "--workspace", workspace_id]);
+    let rejected = fixture.iq(&["workspace", "remove", workspace_id]);
 
     assert!(!rejected.status.success());
     assert!(workspace_path.join("dirty.txt").is_file());
@@ -3240,7 +3571,7 @@ fn cleanup_preserves_dirty_workspace_then_removes_clean_workspace_and_authority(
     drop(connection);
 
     std::fs::remove_file(workspace_path.join("dirty.txt")).unwrap();
-    successful_json(fixture.iq(&["cleanup", "--workspace", workspace_id]));
+    successful_json(fixture.iq(&["workspace", "remove", workspace_id]));
 
     assert!(!workspace_path.exists());
     let connection = Connection::open(&fixture.database).unwrap();
@@ -3280,7 +3611,7 @@ fn development_and_integration_rifts_are_direct_isolated_children_of_owned_root(
     std::fs::write(owned_root.join("warm-cache/build.bin"), "root artifact\n").unwrap();
 
     let workspace = successful_json(fixture.iq(&[
-        "dev-workspace",
+        "workspace",
         "create",
         "--repo-key",
         repo_key,

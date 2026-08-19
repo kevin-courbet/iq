@@ -2,6 +2,8 @@
 
 IQ reads strict YAML from an explicit absolute path. Unknown fields are errors.
 
+Every command that can use Rift takes the global `--rift-executable <absolute-path>` option. IQ opens, verifies, and seals that exact executable during process startup. It never resolves Rift through `PATH`, and it rejects `IQ_RIFT_CLI`.
+
 ```yaml
 integration_agent:
   runner: opencode
@@ -41,7 +43,7 @@ notifications:
 
 The `notifications` section is optional. When it is omitted, IQ enables no backends and uses the non-zero bounds shown above.
 
-`credential_env` names the model credential that IQ reads from its environment and passes directly to OpenCode. IQ does not put its value in protocol files or logs. Child tools can inherit it.
+`credential_env` names the model credential that IQ reads from its environment. IQ passes it only to the sandboxed agent process. It does not put the value in arguments, protocol files, or logs.
 
 The Linux runner mounts the normal runtime trees `/usr`, `/bin`, `/lib`, and `/lib64` read-only when they are present. No runtime command or path manifest is required.
 
@@ -52,3 +54,9 @@ When the current user's OpenCode configuration directory exists, IQ mounts it re
 The fixed automatic-cycle limit is 10 and is not a configuration field.
 
 `iq doctor` verifies the exact runner executable identity, basic sandbox tools, state repository, socket path, and notification backend availability. An unavailable notification backend is degraded. It does not stop integration.
+
+IQ resolves Git, provider, Rift, and sandbox executables to absolute paths. `IQ_GIT_EXECUTABLE`, `IQ_GIT_CLI`, `IQ_GITHUB_CLI`, and `IQ_GITLAB_CLI` are forbidden production overrides. Host executables and same-user host processes are trusted.
+
+The agent runner uses one transient `iq-agent-<cycle-id>.service` per cycle. Other Git, provider, and Rift commands run directly. The default test suite excludes the long end-to-end integrator target. Run it explicitly with `cargo test --locked --features slow-tests --test integrator_tests`.
+
+Each runner sandbox contains an ownership manifest for its parent and root filesystem identities. Cleanup requires an exclusively user-owned parent, verifies the live root against the manifest, and quarantines the exact directory under that parent before removal. Replacement or symlink roots fail closed.

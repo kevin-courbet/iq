@@ -1,0 +1,18 @@
+{
+  "headRefOid": "1111111111111111111111111111111111111111",
+  "baseRefOid": "2222222222222222222222222222222222222222",
+  "baseRefName": "main",
+  "baseRepository": {
+    "id": "R_kgDOKV0Z9Q",
+    "nameWithOwner": "octo-org/octo-repo"
+  },
+  "reviewDecision": "APPROVED",
+  "mergeStateStatus": "CLEAN",
+  "statusCheckRollup": [
+    {
+      "__typename": "CheckRun",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS"
+    }
+  ]
+}

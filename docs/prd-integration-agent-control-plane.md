@@ -167,15 +167,15 @@ A cycle starts only after sandbox admission and runner launch succeed. A consume
 
 ADR 0006 defines IQ as solo local tooling. The runner boundary provides basic process isolation and resource bounds, not security hardening against a malicious repository, agent, or child tool.
 
-- [ ] The OpenCode runner executes with Bubblewrap, an unprivileged user and mount namespace, and a user-systemd scope. IQ fails before cycle start with `infrastructure(configuration|sandbox|runner)` when these controls are not available.
+- [ ] The OpenCode runner executes with Bubblewrap, an unprivileged user and mount namespace, and an exact transient user-systemd `Type=exec` service. IQ fails before cycle start with `infrastructure(configuration|sandbox|runner)` when these controls are not available.
 - [ ] The retained integration Rift uses a bounded writable tmpfs overlay. Normal runtime trees are mounted read-only without a command or path manifest.
 - [ ] IQ does not deliberately mount its SQLite files, other workspaces, host home, SSH agents, or repository remote credentials.
 - [ ] IQ reads the configured model credential from the named environment variable and passes it directly to OpenCode. Child tools can inherit it.
 - [ ] Btrfs qgroups, persistent filesystem quotas, exact runtime closure, credential proxying, and credential isolation from child tools are not required.
-- [ ] OS controls enforce process count, memory, CPU, wall time, open files, writable bytes, and output bytes. IQ kills the complete process group on cancellation, timeout, target movement, or authority loss.
+- [ ] OS controls enforce process count, memory, CPU, wall time, open files, writable bytes, and output bytes. IQ kills and verifies the exact systemd cgroup on cancellation, timeout, target movement, or authority loss.
 - [ ] IQ opens input/result paths relative to verified directory descriptors, rejects symlinks and non-regular files, verifies result and Rift identity before and after execution, and rejects path traversal and hard-link escape.
 - [ ] Post-run checks reject writes outside the retained Rift, changed Git remotes/config, commits or refs made by the agent, untracked protocol artifacts, unresolved index entries for `resolved`, and staged identity that differs from the reported result.
-- [ ] IQ persists runner PID, process start identity from the OS, process-group identity, sandbox identity, started time, input SHA-256 digest, result temporary/final path identity, and atomic result state `absent`, `writing`, or `complete`.
+- [ ] IQ persists the exact runner service, cgroup, PID and process-start identity from the OS, sandbox identity, started time, input SHA-256 digest, result temporary/final path identity, and atomic result state `absent`, `writing`, or `complete`.
 - [ ] Loss of queue or repository lease authority terminates OpenCode before any result can be accepted.
 - [ ] On daemon restart, IQ does not claim that a runner resumes. It first proves the persisted process identity is dead or kills the exact surviving identity, classifies the started cycle as interrupted, validates the retained Rift and atomic result state, and applies the outcome matrix.
 - [ ] A complete valid result can be classified after restart. A partial/missing result is an interrupted consumed cycle. A moved target supersedes it without count. The next cycle always starts as a new OS process.
@@ -191,7 +191,7 @@ ADR 0006 defines IQ as solo local tooling. The runner boundary provides basic pr
 - [ ] `mechanical_failure` contains all identities, typed operation, bounded reason/evidence, and whether the Rift may be inspected. The agent cannot classify infrastructure, provider, or signoff failures.
 - [ ] IQ rejects unknown fields/variants, wrong versions/identities, absolute or parent paths, duplicate entries, invalid UTF-8 where text is required, result size over the configured limit, and any field over its own bound.
 - [ ] A valid complete result takes precedence over exit code if post-run checks pass. Without a valid complete result, timeout/cancellation takes precedence, then crash/non-zero exit, then invalid or missing result. Exit zero alone never means success.
-- [ ] IQ first marks cancellation or timeout and removes cycle authority, then kills the process group. A result completed after authority removal is stale and cannot be accepted.
+- [ ] IQ first records cancellation or timeout, then kills and verifies the exact systemd cgroup. A result completed after authority removal is stale and cannot be accepted.
 
 ### State Repository And Answer Authorization
 
@@ -233,7 +233,7 @@ ADR 0006 defines IQ as solo local tooling. The runner boundary provides basic pr
 - [ ] A separate `local` repository case proves no GitHub or GitLab issue is created and a peer-credential-authenticated local answer resumes the effort.
 - [ ] Cycle acceptance proves cycles 1 through 9 retry automatically, the 10th failed consumed cycle creates one cycle-limit blocker and one alert, and no cycle 11 starts.
 - [ ] Restart acceptance injects a crash at runner launch, atomic result rename, candidate record, validation evidence record, issue projection, answer receipt, notification delivery, landing command, and landing reconciliation. Each restart produces one valid state and no duplicate authority or event.
-- [ ] Sandbox acceptance proves the retained Rift overlay, read-only runtime trees, process/memory/CPU/wall/log/result/writable bounds, process-group termination, protocol path checks, and no deliberate repository-credential mount.
+- [ ] Sandbox acceptance proves the retained Rift overlay, read-only runtime trees, process/memory/CPU/wall/log/result/writable bounds, cgroup termination, protocol path checks, and no deliberate repository-credential mount.
 - [ ] Notification tests invoke each backend command through an automated fake executable and assert arguments, payload bounds, retries, and dedupe. One manual WSLg test and one manual Windows test confirm a visible toast on a supported host.
 
 ## Technical Approach

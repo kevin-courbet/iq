@@ -1,23 +1,25 @@
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::agent_config::{verify_executable, IntegrationAgentConfig};
+use crate::agent_config::IntegrationAgentConfig;
 use crate::agent_protocol::{
     atomic_write_json, parse_result, prepare_publication, protocol_directory,
     publish_result_bundle, read_complete_result, read_published_result, AgentInput, AgentResult,
 };
 use crate::control_domain::{InfrastructureCause, RunnerSnapshot};
 
+const SANDBOX_OWNERSHIP_FILE: &str = ".iq-sandbox-owner.json";
 const SANDBOX_HELPER: &str = r#"#!/bin/sh
 set -eu
 root=$1
@@ -62,6 +64,17 @@ done
 exit "$status"
 "#;
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SandboxOwnership {
+    version: u32,
+    cycle_id: String,
+    parent_device: u64,
+    parent_inode: u64,
+    root_device: u64,
+    root_inode: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RunnerOutcome {
     Complete {
@@ -104,8 +117,11 @@ pub struct OpenCodeRunner {
     snapshot: RunnerSnapshot,
 }
 
-pub struct RunnerLifecycle<P, S, W, A> {
+pub struct RunnerLifecycle<P, C, R, F, S, W, A> {
     pub on_prepared: P,
+    pub on_spawn_surrender: C,
+    pub recheck_spawn_authority: R,
+    pub on_spawn_failed: F,
     pub on_started: S,
     pub on_writing: W,
     pub authority_active: A,
@@ -121,7 +137,7 @@ pub struct RestartResult {
 
 impl OpenCodeRunner {
     pub fn new(config: IntegrationAgentConfig, snapshot: RunnerSnapshot) -> Result<Self> {
-        verify_executable(&snapshot.executable)?;
+        crate::agent_config::open_executable_authority(&snapshot.executable)?;
         if snapshot.sandbox.implementation != "linux_userns_tmpfs_overlay_v1" {
             anyhow::bail!("unsupported sandbox implementation identity");
         }
@@ -129,17 +145,22 @@ impl OpenCodeRunner {
     }
 
     pub fn verify_capability(&self, state_database: &Path) -> Result<()> {
-        verify_executable(&self.snapshot.executable)?;
+        let systemd_run =
+            crate::agent_config::open_executable_authority(&self.snapshot.sandbox.systemd_run)?;
+        let unshare =
+            crate::agent_config::open_executable_authority(&self.snapshot.sandbox.unshare)?;
+        crate::agent_config::open_executable_authority(&self.snapshot.executable)?;
         verify_sandbox_helpers(&self.snapshot.sandbox)?;
         if !state_database.is_absolute() {
             anyhow::bail!("state database path must be absolute");
         }
-        let output = Command::new(&self.snapshot.sandbox.unshare)
+        let output = unshare
+            .command()
             .args([
                 "--user",
                 "--map-root-user",
                 "--mount",
-                "sh",
+                "/bin/sh",
                 "-c",
                 "mount -t tmpfs -o size=1048576,nosuid,nodev tmpfs /mnt && umount /mnt",
             ])
@@ -151,46 +172,63 @@ impl OpenCodeRunner {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        let output = Command::new(&self.snapshot.sandbox.systemd_run)
+        let mut systemd_command = systemd_run.command();
+        crate::agent_config::harden_user_systemd_environment(&mut systemd_command)?;
+        let output = systemd_command
             .args([
                 "--user",
-                "--scope",
                 "--quiet",
-                "-p",
+                "--collect",
+                "--wait",
+                "--pipe",
+                "--property=Type=exec",
+                "--property",
                 "MemoryMax=16777216",
-                "-p",
+                "--property",
                 "TasksMax=4",
-                "true",
+                "--",
+                "/bin/true",
             ])
             .output()
-            .context("probe user-systemd resource scope")?;
+            .context("probe user-systemd transient service")?;
         if !output.status.success() {
             anyhow::bail!(
-                "user-systemd resource scopes are unavailable: {}",
+                "user-systemd transient services are unavailable: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
         Ok(())
     }
 
-    pub fn run<P, S, W, A>(
+    pub fn run<P, C, R, F, S, W, A>(
         &self,
         retained_rift: &Path,
         input: &AgentInput,
         protected_paths: &[PathBuf],
-        lifecycle: RunnerLifecycle<P, S, W, A>,
+        lifecycle: RunnerLifecycle<P, C, R, F, S, W, A>,
     ) -> Result<RunnerOutcome>
     where
         P: FnOnce(&str, &Path) -> Result<()>,
-        S: FnOnce(u32, u64, i32, &str, &Path) -> Result<()>,
+        C: FnOnce() -> Result<bool>,
+        R: FnOnce() -> Result<bool>,
+        F: FnOnce() -> Result<()>,
+        S: FnOnce(u32, u64, &str, &str, &Path) -> Result<bool>,
         W: FnOnce(&crate::control_domain::AtomicResultState) -> Result<()>,
         A: Fn() -> Result<bool>,
     {
         input.validate()?;
-        verify_executable(&self.snapshot.executable)?;
+        let systemd_run =
+            crate::agent_config::open_executable_authority(&self.snapshot.sandbox.systemd_run)?;
+        crate::agent_config::open_executable_authority(&self.snapshot.executable)?;
         verify_sandbox_helpers(&self.snapshot.sandbox)?;
         let retained = retained_rift.canonicalize()?;
         let before_git = git_identity(&retained)?;
+        let credential = std::env::var_os(&self.config.credential_env).with_context(|| {
+            format!(
+                "required model credential {} is unavailable",
+                self.config.credential_env
+            )
+        })?;
 
         let cycle_root = retained
             .parent()
@@ -213,86 +251,147 @@ impl OpenCodeRunner {
                 fs::Permissions::from_mode(0o700),
             )?;
         }
-        let helper = cycle_root.join("sandbox-entry");
-        write_helper(&helper)?;
-
+        write_sandbox_ownership(&cycle_root, &input.identity.cycle_id)?;
+        write_helper(&cycle_root.join("sandbox-entry"))?;
         let protocol = protocol_directory(&retained, &input.identity.cycle_id)?;
         atomic_write_json(&protocol, "input.json", input)?;
-        let unit_name = format!("iq-agent-{}", input.identity.cycle_id);
+        let unit_name = crate::control_domain::systemd_unit_name(&input.identity.cycle_id)?;
         (lifecycle.on_prepared)(&unit_name, &protocol)
             .context("persist runner launch authority")?;
-        let prompt = "Read /iq-protocol/input.json. Integrate target and source behavior in /repo, stage the complete result, and atomically write protocol version 1 JSON to /iq-protocol/result.json. Do not commit, create refs, change Git config/remotes, or access providers. Return exactly resolved, guidance_required, or mechanical_failure.";
+        let prompt = format!(
+            "Read /iq-protocol/input.json. Integrate target and source behavior in /repo, use only the pinned Git executable /iq-git, stage the complete result, and atomically write protocol version {} JSON to /iq-protocol/result.json. Do not commit, create refs, change Git config/remotes, or access providers. Return exactly resolved, guidance_required, or mechanical_failure.",
+            crate::control_domain::PROTOCOL_VERSION
+        );
 
-        let credential = std::env::var_os(&self.config.credential_env).with_context(|| {
-            format!(
-                "required model credential {} is unavailable",
-                self.config.credential_env
-            )
-        })?;
         let log_path = cycle_root.join("runner.log");
         let log_out = bounded_log_file(&log_path)?;
         let log_err = log_out.try_clone()?;
         let export = cycle_root.join("export");
-        let sandbox_args = sandbox_command(
+        let args = sandbox_command(
             &self.config,
             &self.snapshot,
             &cycle_root,
             &retained,
             &input.identity.cycle_id,
-            prompt,
+            &prompt,
             credential,
         )?;
-        let mut command = Command::new(&self.snapshot.sandbox.systemd_run);
+        let mut command = systemd_run.command();
+        crate::agent_config::harden_user_systemd_environment(&mut command)?;
         command
-            .process_group(0)
+            .env("PATH", "/usr/bin:/bin")
             .args([
                 "--user",
-                "--scope",
                 "--quiet",
                 "--collect",
-                "--unit",
-                &unit_name,
-                "-p",
+                "--wait",
+                "--pipe",
+                "--property=Type=exec",
+                &format!("--unit={unit_name}"),
+                "--property",
                 &format!("MemoryMax={}", self.snapshot.bounds.memory_bytes),
-                "-p",
+                "--property",
                 &format!("TasksMax={}", self.snapshot.bounds.max_processes),
-                "-p",
+                "--property",
                 "CPUQuota=100%",
                 "--",
             ])
-            .args(sandbox_args)
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::from(log_out))
             .stderr(Stdio::from(log_err));
-        let mut child = command
-            .spawn()
-            .context("launch OpenCode sandbox in user-systemd scope")?;
-        let pid = child.id();
-        let process_start_ticks = process_start_ticks(pid)?;
-        let process_group_id = unsafe { libc::getpgid(pid as i32) };
-        if process_group_id < 0 {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(std::io::Error::last_os_error())
-                .context("read runner process-group identity");
+        if !(lifecycle.on_spawn_surrender)()? {
+            return Ok(RunnerOutcome::AuthorityLost { log: Vec::new() });
         }
-        if let Err(error) = (lifecycle.on_started)(
+        if !(lifecycle.recheck_spawn_authority)()? {
+            (lifecycle.on_spawn_failed)()?;
+            return Ok(RunnerOutcome::AuthorityLost { log: Vec::new() });
+        }
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                (lifecycle.on_spawn_failed)()?;
+                return Err(error).context("launch OpenCode sandbox in user-systemd service");
+            }
+        };
+        let service = match wait_for_service(&self.snapshot.sandbox.systemctl, &unit_name) {
+            Ok(service) => service,
+            Err(error) => {
+                return Err(abort_unrecorded_spawn(
+                    &mut child,
+                    &self.snapshot.sandbox.systemctl,
+                    &unit_name,
+                    lifecycle.on_spawn_failed,
+                    error.context("verify runner service identity"),
+                ));
+            }
+        };
+        let pid = service.main_pid;
+        let process_start_ticks = match process_start_ticks(pid) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(abort_unrecorded_spawn(
+                    &mut child,
+                    &self.snapshot.sandbox.systemctl,
+                    &unit_name,
+                    lifecycle.on_spawn_failed,
+                    error.context("read runner process start identity"),
+                ));
+            }
+        };
+        let started_authority = (lifecycle.on_started)(
             pid,
             process_start_ticks,
-            process_group_id,
+            &service.control_group,
             &format!("linux-userns-overlay:{}", input.identity.cycle_id),
             &protocol,
-        ) {
-            let _ = terminate_child_group(&mut child, process_group_id);
-            return Err(error).context("persist runner start authority");
+        );
+        let started_authority = match started_authority {
+            Ok(active) => active,
+            Err(error) => {
+                let diagnostic =
+                    read_prefix(&log_path, self.snapshot.bounds.max_log_bytes).unwrap_or_default();
+                return Err(abort_unrecorded_spawn(
+                    &mut child,
+                    &self.snapshot.sandbox.systemctl,
+                    &unit_name,
+                    lifecycle.on_spawn_failed,
+                    error.context(format!(
+                        "persist runner start authority: {}",
+                        String::from_utf8_lossy(&diagnostic)
+                    )),
+                ));
+            }
+        };
+        if !started_authority {
+            terminate_runner_service(
+                &mut child,
+                &self.snapshot.sandbox.systemctl,
+                &unit_name,
+                &service.control_group,
+                pid,
+                process_start_ticks,
+            )?;
+            (lifecycle.on_spawn_failed)()?;
+            return Ok(RunnerOutcome::AuthorityLost { log: Vec::new() });
         }
         let mut admission = child
             .stdin
             .take()
             .context("runner admission gate is absent")?;
         if let Err(error) = admission.write_all(b"run\n") {
-            let _ = terminate_child_group(&mut child, process_group_id);
-            return Err(error).context("release runner admission gate");
+            let diagnostic =
+                read_prefix(&log_path, self.snapshot.bounds.max_log_bytes).unwrap_or_default();
+            return Err(abort_unrecorded_spawn(
+                &mut child,
+                &self.snapshot.sandbox.systemctl,
+                &unit_name,
+                lifecycle.on_spawn_failed,
+                anyhow::Error::new(error).context(format!(
+                    "release runner admission gate: {}",
+                    String::from_utf8_lossy(&diagnostic)
+                )),
+            ));
         }
         drop(admission);
         let protected_baseline = protected_paths
@@ -308,7 +407,14 @@ impl OpenCodeRunner {
             }
             if !(lifecycle.authority_active)()? {
                 authority_lost = true;
-                terminate_child_group(&mut child, process_group_id)?;
+                terminate_runner_service(
+                    &mut child,
+                    &self.snapshot.sandbox.systemctl,
+                    &unit_name,
+                    &service.control_group,
+                    pid,
+                    process_start_ticks,
+                )?;
                 break None;
             }
             let log_length = fs::symlink_metadata(&log_path)?.len();
@@ -318,7 +424,14 @@ impl OpenCodeRunner {
             if log_length > self.snapshot.bounds.max_log_bytes
                 || result_length > self.snapshot.bounds.max_result_bytes
             {
-                terminate_child_group(&mut child, process_group_id)?;
+                terminate_runner_service(
+                    &mut child,
+                    &self.snapshot.sandbox.systemctl,
+                    &unit_name,
+                    &service.control_group,
+                    pid,
+                    process_start_ticks,
+                )?;
                 let log = read_prefix(&log_path, self.snapshot.bounds.max_log_bytes)?;
                 return Ok(RunnerOutcome::InvalidResult {
                     log,
@@ -327,11 +440,25 @@ impl OpenCodeRunner {
                 });
             }
             if started.elapsed() >= timeout {
-                terminate_child_group(&mut child, process_group_id)?;
+                terminate_runner_service(
+                    &mut child,
+                    &self.snapshot.sandbox.systemctl,
+                    &unit_name,
+                    &service.control_group,
+                    pid,
+                    process_start_ticks,
+                )?;
                 break None;
             }
             std::thread::sleep(Duration::from_millis(100));
         };
+        stop_exact_runner_service(
+            &self.snapshot.sandbox.systemctl,
+            &unit_name,
+            &service.control_group,
+            pid,
+            process_start_ticks,
+        )?;
         let log = read_bounded(&log_path, self.snapshot.bounds.max_log_bytes)?;
         if !(lifecycle.authority_active)()? {
             return Ok(RunnerOutcome::AuthorityLost { log });
@@ -404,19 +531,73 @@ impl OpenCodeRunner {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SystemdUnitState {
     Missing,
-    Loaded { main_pid: Option<u32> },
+    Inactive { main_pid: Option<u32> },
+    Active { main_pid: Option<u32> },
 }
 
-pub fn systemd_unit_state(systemctl: &Path, unit_name: &str) -> Result<SystemdUnitState> {
-    verify_sandbox_helper(systemctl, "systemctl")?;
-    crate::control_domain::require_exact_text(unit_name, "systemd unit name")?;
-    let output = Command::new(systemctl)
+pub fn systemd_unit_state(
+    systemctl: &crate::control_domain::ExecutableIdentity,
+    unit_name: &str,
+) -> Result<SystemdUnitState> {
+    Ok(inspect_systemd_unit(systemctl, unit_name)?.state)
+}
+
+#[derive(Debug)]
+struct SystemdUnitInspection {
+    state: SystemdUnitState,
+    control_group: Option<String>,
+}
+
+struct ServiceBrokerAuthority {
+    main_pid: u32,
+    control_group: String,
+}
+
+fn wait_for_service(
+    systemctl: &crate::control_domain::ExecutableIdentity,
+    unit_name: &str,
+) -> Result<ServiceBrokerAuthority> {
+    let mut last = None;
+    for _ in 0..100 {
+        let inspection = inspect_systemd_unit(systemctl, unit_name)?;
+        if let SystemdUnitState::Active { main_pid } = inspection.state {
+            let main_pid = main_pid.context("runner service has no MainPID")?;
+            let control_group = inspection
+                .control_group
+                .filter(|value| !value.is_empty())
+                .context("runner service has no control group")?;
+            return Ok(ServiceBrokerAuthority {
+                main_pid,
+                control_group,
+            });
+        }
+        last = Some(format!("{inspection:?}"));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    anyhow::bail!(
+        "runner systemd service did not become active: {}",
+        last.as_deref().unwrap_or("no inspection")
+    )
+}
+
+fn inspect_systemd_unit(
+    systemctl: &crate::control_domain::ExecutableIdentity,
+    unit_name: &str,
+) -> Result<SystemdUnitInspection> {
+    let systemctl = crate::agent_config::open_executable_authority(systemctl)?;
+    validate_iq_systemd_unit(unit_name)?;
+    let mut command = systemctl.command();
+    crate::agent_config::harden_user_systemd_environment(&mut command)?;
+    let output = command
         .args([
             "--user",
             "show",
-            unit_name,
             "--property=LoadState",
+            "--property=ActiveState",
             "--property=MainPID",
+            "--property=ControlGroup",
+            "--",
+            unit_name,
         ])
         .output()?;
     if !output.status.success() {
@@ -427,31 +608,53 @@ pub fn systemd_unit_state(systemctl: &Path, unit_name: &str) -> Result<SystemdUn
     }
     let properties = String::from_utf8(output.stdout)?;
     let mut load_state = None;
+    let mut active_state = None;
     let mut pid = None;
+    let mut control_group = None;
     for line in properties.lines() {
         if let Some(value) = line.strip_prefix("LoadState=") {
             load_state = Some(value);
+        } else if let Some(value) = line.strip_prefix("ActiveState=") {
+            active_state = Some(value);
         } else if let Some(value) = line.strip_prefix("MainPID=") {
             pid = Some(value.parse::<u32>()?);
+        } else if let Some(value) = line.strip_prefix("ControlGroup=") {
+            control_group = Some(value.to_string());
         }
     }
     if load_state == Some("not-found") {
-        return Ok(SystemdUnitState::Missing);
+        return Ok(SystemdUnitInspection {
+            state: SystemdUnitState::Missing,
+            control_group,
+        });
     }
     if load_state != Some("loaded") {
         anyhow::bail!("prepared systemd unit has an unexpected load state");
     }
-    let pid = pid.context("prepared systemd unit has no MainPID property")?;
-    Ok(SystemdUnitState::Loaded {
-        main_pid: (pid != 0).then_some(pid),
+    let main_pid = pid.filter(|pid| *pid != 0);
+    let state = match active_state {
+        Some("inactive" | "failed") => SystemdUnitState::Inactive { main_pid },
+        Some("active" | "activating" | "deactivating" | "reloading") => {
+            SystemdUnitState::Active { main_pid }
+        }
+        _ => anyhow::bail!("prepared systemd unit has an unexpected active state"),
+    };
+    Ok(SystemdUnitInspection {
+        state,
+        control_group,
     })
 }
 
-pub fn stop_systemd_unit(systemctl: &Path, unit_name: &str) -> Result<()> {
-    verify_sandbox_helper(systemctl, "systemctl")?;
-    crate::control_domain::require_exact_text(unit_name, "systemd unit name")?;
-    let output = Command::new(systemctl)
-        .args(["--user", "stop", unit_name])
+pub fn stop_systemd_unit(
+    systemctl: &crate::control_domain::ExecutableIdentity,
+    unit_name: &str,
+) -> Result<()> {
+    let systemctl = crate::agent_config::open_executable_authority(systemctl)?;
+    validate_iq_systemd_unit(unit_name)?;
+    let mut command = systemctl.command();
+    crate::agent_config::harden_user_systemd_environment(&mut command)?;
+    let output = command
+        .args(["--user", "stop", "--no-block", "--", unit_name])
         .output()?;
     if !output.status.success() {
         anyhow::bail!(
@@ -462,88 +665,375 @@ pub fn stop_systemd_unit(systemctl: &Path, unit_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn terminate_child_group(child: &mut std::process::Child, process_group_id: i32) -> Result<()> {
-    if process_group_id <= 0 {
-        anyhow::bail!("runner process group identity is invalid");
+fn validate_iq_systemd_unit(unit_name: &str) -> Result<()> {
+    if let Some(cycle_id) = unit_name
+        .strip_prefix("iq-agent-")
+        .and_then(|name| name.strip_suffix(".service"))
+    {
+        return crate::control_domain::validate_systemd_unit_name(cycle_id, unit_name);
     }
-    if unsafe { libc::kill(-process_group_id, libc::SIGTERM) } != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            return Err(error).context("terminate runner process group");
+    if let Some(cycle_id) = unit_name
+        .strip_prefix("iq-agent-")
+        .and_then(|name| name.strip_suffix(".scope"))
+    {
+        return crate::control_domain::validate_legacy_systemd_scope_name(cycle_id, unit_name);
+    }
+    anyhow::bail!("systemd unit name has no canonical IQ runner boundary")
+}
+
+pub fn stop_and_verify_systemd_unit(
+    systemctl: &crate::control_domain::ExecutableIdentity,
+    unit_name: &str,
+) -> Result<()> {
+    let inspection = inspect_systemd_unit(systemctl, unit_name)?;
+    if let Some(control_group) = inspection
+        .control_group
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        kill_control_group(control_group)?;
+    }
+    stop_systemd_unit_if_active(systemctl, unit_name)?;
+    verify_systemd_unit_stopped(systemctl, unit_name)
+}
+
+pub fn stop_exact_runner_service(
+    systemctl: &crate::control_domain::ExecutableIdentity,
+    unit_name: &str,
+    control_group: &str,
+    pid: u32,
+    process_start_ticks: u64,
+) -> Result<()> {
+    stop_exact_systemd_process(
+        systemctl,
+        unit_name,
+        control_group,
+        pid,
+        process_start_ticks,
+        true,
+    )
+}
+
+pub fn stop_exact_legacy_runner_scope(
+    systemctl: &crate::control_domain::ExecutableIdentity,
+    unit_name: &str,
+    control_group: &str,
+    pid: u32,
+    process_start_ticks: u64,
+) -> Result<()> {
+    crate::control_domain::validate_legacy_systemd_scope_name(
+        unit_name
+            .strip_prefix("iq-agent-")
+            .and_then(|name| name.strip_suffix(".scope"))
+            .context("legacy runner scope has no cycle identity")?,
+        unit_name,
+    )?;
+    stop_exact_systemd_process(
+        systemctl,
+        unit_name,
+        control_group,
+        pid,
+        process_start_ticks,
+        false,
+    )
+}
+
+fn stop_exact_systemd_process(
+    systemctl: &crate::control_domain::ExecutableIdentity,
+    unit_name: &str,
+    control_group: &str,
+    pid: u32,
+    process_start_ticks: u64,
+    require_main_pid: bool,
+) -> Result<()> {
+    let inspection = inspect_systemd_unit(systemctl, unit_name)?;
+    match inspection.state {
+        SystemdUnitState::Active { .. }
+            if inspection.control_group.as_deref() != Some(control_group) =>
+        {
+            anyhow::bail!("durable runner cgroup differs from its active systemd unit");
+        }
+        SystemdUnitState::Inactive { .. }
+            if inspection
+                .control_group
+                .as_deref()
+                .is_some_and(|observed| !observed.is_empty() && observed != control_group) =>
+        {
+            anyhow::bail!("durable runner cgroup differs from its inactive systemd unit");
+        }
+        _ => {}
+    }
+    let members = systemd_control_group_members(control_group)?;
+    let process_alive = exact_process_is_alive(pid, process_start_ticks)?;
+    if process_alive && !members.contains(&pid) {
+        anyhow::bail!("exact runner process is outside its durable systemd cgroup");
+    }
+    if require_main_pid && process_alive {
+        match inspection.state {
+            SystemdUnitState::Active {
+                main_pid: Some(main_pid),
+            } if main_pid == pid => {}
+            _ => anyhow::bail!("exact runner PID differs from systemd MainPID authority"),
         }
     }
-    for _ in 0..20 {
-        if child.try_wait()?.is_some() {
+    kill_control_group(control_group)?;
+    stop_systemd_unit_if_active(systemctl, unit_name)?;
+    verify_systemd_unit_stopped(systemctl, unit_name)?;
+    for _ in 0..100 {
+        if systemd_control_group_members(control_group)?.is_empty() {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    if unsafe { libc::kill(-process_group_id, libc::SIGKILL) } != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            return Err(error).context("kill runner process group");
+    anyhow::bail!("durable runner cgroup retains live members after exact stop")
+}
+
+pub fn verify_live_runner_service_authority(
+    systemctl: &crate::control_domain::ExecutableIdentity,
+    authority: &crate::control_domain::RunnerServiceAuthority,
+) -> Result<()> {
+    authority.validate()?;
+    verify_live_systemd_process(systemctl, authority, true)
+}
+
+pub fn verify_live_legacy_runner_scope_authority(
+    systemctl: &crate::control_domain::ExecutableIdentity,
+    authority: &crate::control_domain::LegacyRunnerScopeAuthority,
+) -> Result<()> {
+    authority.validate()?;
+    verify_live_systemd_process(systemctl, authority, false)
+}
+
+trait SystemdProcessAuthority {
+    fn unit_name(&self) -> &str;
+    fn control_group(&self) -> &str;
+    fn pid(&self) -> u32;
+    fn process_start_ticks(&self) -> u64;
+}
+
+impl SystemdProcessAuthority for crate::control_domain::RunnerServiceAuthority {
+    fn unit_name(&self) -> &str {
+        &self.unit_name
+    }
+    fn control_group(&self) -> &str {
+        &self.control_group
+    }
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+    fn process_start_ticks(&self) -> u64 {
+        self.process_start_ticks
+    }
+}
+
+impl SystemdProcessAuthority for crate::control_domain::LegacyRunnerScopeAuthority {
+    fn unit_name(&self) -> &str {
+        &self.unit_name
+    }
+    fn control_group(&self) -> &str {
+        &self.control_group
+    }
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+    fn process_start_ticks(&self) -> u64 {
+        self.process_start_ticks
+    }
+}
+
+fn verify_live_systemd_process(
+    systemctl: &crate::control_domain::ExecutableIdentity,
+    authority: &impl SystemdProcessAuthority,
+    require_main_pid: bool,
+) -> Result<()> {
+    let inspection = inspect_systemd_unit(systemctl, authority.unit_name())?;
+    if !matches!(inspection.state, SystemdUnitState::Active { .. })
+        || inspection.control_group.as_deref() != Some(authority.control_group())
+    {
+        anyhow::bail!("migration runner authority differs from the active systemd unit");
+    }
+    if require_main_pid
+        && !matches!(inspection.state, SystemdUnitState::Active { main_pid: Some(pid) } if pid == authority.pid())
+    {
+        anyhow::bail!("migration runner PID differs from systemd MainPID authority");
+    }
+    if !exact_process_is_alive(authority.pid(), authority.process_start_ticks())? {
+        anyhow::bail!("migration runner authority process is not alive");
+    }
+    let process_cgroups = fs::read_to_string(format!("/proc/{}/cgroup", authority.pid()))?;
+    if !process_cgroups.lines().any(|line| {
+        line.strip_prefix("0::")
+            .is_some_and(|path| path == authority.control_group())
+    }) || !systemd_control_group_members(authority.control_group())?.contains(&authority.pid())
+    {
+        anyhow::bail!("migration runner process is outside its exact systemd cgroup");
+    }
+    Ok(())
+}
+
+pub fn stop_systemd_unit_if_active(
+    systemctl: &crate::control_domain::ExecutableIdentity,
+    unit_name: &str,
+) -> Result<()> {
+    if matches!(
+        systemd_unit_state(systemctl, unit_name)?,
+        SystemdUnitState::Active { .. }
+    ) {
+        if let Err(error) = stop_systemd_unit(systemctl, unit_name) {
+            if matches!(
+                systemd_unit_state(systemctl, unit_name)?,
+                SystemdUnitState::Active { .. }
+            ) {
+                return Err(error);
+            }
         }
     }
+    Ok(())
+}
+
+pub fn verify_systemd_unit_stopped(
+    systemctl: &crate::control_domain::ExecutableIdentity,
+    unit_name: &str,
+) -> Result<()> {
+    for _ in 0..100 {
+        let inspection = inspect_systemd_unit(systemctl, unit_name)?;
+        let stopped = matches!(
+            inspection.state,
+            SystemdUnitState::Missing | SystemdUnitState::Inactive { main_pid: None }
+        );
+        if stopped && !systemd_control_group_has_live_members(inspection.control_group.as_deref())?
+        {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    anyhow::bail!("runner systemd unit remains active after exact stop")
+}
+
+fn systemd_control_group_has_live_members(control_group: Option<&str>) -> Result<bool> {
+    let Some(control_group) = control_group.filter(|path| !path.is_empty()) else {
+        return Ok(false);
+    };
+    let relative = control_group
+        .strip_prefix('/')
+        .context("systemd control group is not absolute")?;
+    let relative = Path::new(relative);
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        anyhow::bail!("systemd control group escapes the cgroup root");
+    }
+    Ok(!systemd_control_group_members(control_group)?.is_empty())
+}
+
+fn systemd_control_group_members(control_group: &str) -> Result<Vec<u32>> {
+    let relative = control_group
+        .strip_prefix('/')
+        .context("systemd control group is not absolute")?;
+    let relative = Path::new(relative);
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        anyhow::bail!("systemd control group escapes the cgroup root");
+    }
+    let members = match fs::read_to_string(
+        Path::new("/sys/fs/cgroup")
+            .join(relative)
+            .join("cgroup.procs"),
+    ) {
+        Ok(members) => members,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("inspect systemd control-group members"),
+    };
+    members
+        .lines()
+        .filter(|member| !member.trim().is_empty())
+        .map(|member| {
+            member
+                .parse::<u32>()
+                .context("parse systemd control-group member")
+        })
+        .collect()
+}
+
+fn abort_unrecorded_spawn<F>(
+    child: &mut std::process::Child,
+    systemctl: &crate::control_domain::ExecutableIdentity,
+    unit_name: &str,
+    on_spawn_failed: F,
+    cause: anyhow::Error,
+) -> anyhow::Error
+where
+    F: FnOnce() -> Result<()>,
+{
+    let cleanup = (|| {
+        stop_and_verify_systemd_unit(systemctl, unit_name)?;
+        let _ = child.wait();
+        on_spawn_failed().context("close failed runner spawn authority")
+    })();
+    match cleanup {
+        Ok(()) => cause,
+        Err(error) => error.context(format!(
+            "runner launch also failed before cleanup: {cause:#}"
+        )),
+    }
+}
+
+fn terminate_runner_service(
+    child: &mut std::process::Child,
+    systemctl: &crate::control_domain::ExecutableIdentity,
+    unit_name: &str,
+    control_group: &str,
+    pid: u32,
+    process_start_ticks: u64,
+) -> Result<()> {
+    stop_exact_runner_service(
+        systemctl,
+        unit_name,
+        control_group,
+        pid,
+        process_start_ticks,
+    )?;
     let _ = child.wait();
     Ok(())
 }
 
-pub fn process_start_ticks(pid: u32) -> Result<u64> {
+fn process_stat(pid: u32) -> Result<(u8, u64)> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let end = stat
         .rfind(')')
         .context("process stat has no command terminator")?;
-    stat[end + 2..]
-        .split_whitespace()
-        .nth(19)
+    let fields = stat[end + 2..].split_whitespace().collect::<Vec<_>>();
+    let state = fields
+        .first()
+        .and_then(|value| value.as_bytes().first())
+        .copied()
+        .context("process stat has no state")?;
+    let start_ticks = fields
+        .get(19)
         .context("process stat has no start time")?
         .parse()
-        .context("parse process start ticks")
+        .context("parse process start ticks")?;
+    Ok((state, start_ticks))
 }
 
-pub fn terminate_exact_process(pid: u32, start_ticks: u64, process_group_id: i32) -> Result<()> {
-    match process_start_ticks(pid) {
-        Ok(actual) if actual == start_ticks => {
-            if process_group_id <= 0 {
-                anyhow::bail!("persisted runner process-group identity is invalid");
-            }
-            let actual_group = unsafe { libc::getpgid(pid as i32) };
-            if actual_group < 0 {
-                return Err(std::io::Error::last_os_error())
-                    .context("inspect persisted runner process-group identity");
-            }
-            if actual_group != process_group_id {
-                anyhow::bail!("persisted runner process now belongs to a different process group");
-            }
-            if unsafe { libc::kill(-process_group_id, libc::SIGTERM) } != 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    return Err(error).context("terminate exact surviving runner process group");
-                }
-            }
-            for _ in 0..20 {
-                if process_start_ticks(pid).is_err() {
-                    return Ok(());
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            if unsafe { libc::kill(-process_group_id, libc::SIGKILL) } != 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    return Err(error).context("kill exact surviving runner process group");
-                }
-            }
-            Ok(())
-        }
-        Ok(_) => Ok(()),
+pub fn process_start_ticks(pid: u32) -> Result<u64> {
+    process_stat(pid).map(|(_, start_ticks)| start_ticks)
+}
+
+pub fn exact_process_is_alive(pid: u32, start_ticks: u64) -> Result<bool> {
+    match process_stat(pid) {
+        Ok((state, actual)) => Ok(actual == start_ticks && !matches!(state, b'Z' | b'X')),
         Err(error)
             if error
                 .downcast_ref::<std::io::Error>()
                 .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
         {
-            Ok(())
+            Ok(false)
         }
-        Err(error) => Err(error).context("inspect persisted runner process identity"),
+        Err(error) => Err(error).context("inspect exact process identity"),
     }
 }
 
@@ -608,10 +1098,7 @@ pub fn cleanup_terminal_cycle_artifacts(
     {
         anyhow::bail!("terminal cycle artifacts differ from the owned workspace root");
     }
-    crate::control_domain::require_exact_text(&artifacts.cycle_id, "cycle ID")?;
-    if artifacts.cycle_id.as_bytes().contains(&b'/') {
-        anyhow::bail!("cycle ID is not a valid path component");
-    }
+    crate::control_domain::validate_cycle_id(&artifacts.cycle_id)?;
     let workspace_exists = match fs::symlink_metadata(workspace) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
             anyhow::bail!("terminal cycle workspace is not a regular directory")
@@ -709,9 +1196,8 @@ pub fn import_staged_result(
         retained_rift,
         ["clean", "-ffd", "-e", ".iq-agent-protocol/"],
     )?;
-    let mut child = Command::new("git")
+    let mut child = crate::git_command::command_in(retained_rift)?
         .args(["apply", "--index", "--binary", "--whitespace=nowarn", "--"])
-        .current_dir(retained_rift)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -745,12 +1231,98 @@ pub fn remove_sandbox_export(export_directory: &Path) -> Result<()> {
     {
         anyhow::bail!("sandbox export path has an unexpected identity");
     }
-    let metadata = fs::symlink_metadata(sandbox_root)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        anyhow::bail!("sandbox export root is not a regular directory");
+    let parent_path = sandbox_root
+        .parent()
+        .context("sandbox root has no owned parent")?;
+    let root_name = sandbox_root
+        .file_name()
+        .context("sandbox root has no name")?;
+    let root = crate::secure_fs::DirectoryHandle::open(sandbox_root, "sandbox root")?;
+    let ownership = read_sandbox_ownership(root.directory())?;
+    let parent_metadata = fs::metadata(parent_path)?;
+    let root_metadata = root.directory().metadata()?;
+    if parent_metadata.uid() != unsafe { libc::geteuid() }
+        || parent_metadata.permissions().mode() & 0o022 != 0
+    {
+        anyhow::bail!("sandbox parent is not exclusively owned by the current user");
     }
-    fs::remove_dir_all(sandbox_root)?;
+    if ownership.version != 1
+        || ownership.cycle_id
+            != root_name
+                .as_bytes()
+                .strip_prefix(b".iq-agent-sandbox-")
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .context("sandbox root has no exact cycle identity")?
+        || (ownership.parent_device, ownership.parent_inode)
+            != (parent_metadata.dev(), parent_metadata.ino())
+        || (ownership.root_device, ownership.root_inode)
+            != (root_metadata.dev(), root_metadata.ino())
+    {
+        anyhow::bail!("sandbox ownership manifest differs from live filesystem identity");
+    }
+    root.remove("sandbox root")
+}
+
+fn write_sandbox_ownership(root: &Path, cycle_id: &str) -> Result<()> {
+    let parent = root.parent().context("sandbox root has no parent")?;
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    let root_metadata = fs::symlink_metadata(root)?;
+    if parent_metadata.file_type().is_symlink()
+        || !parent_metadata.is_dir()
+        || root_metadata.file_type().is_symlink()
+        || !root_metadata.is_dir()
+    {
+        anyhow::bail!("sandbox ownership requires real parent and root directories");
+    }
+    let ownership = SandboxOwnership {
+        version: 1,
+        cycle_id: cycle_id.to_string(),
+        parent_device: parent_metadata.dev(),
+        parent_inode: parent_metadata.ino(),
+        root_device: root_metadata.dev(),
+        root_inode: root_metadata.ino(),
+    };
+    let path = root.join(SANDBOX_OWNERSHIP_FILE);
+    let mut manifest = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    serde_json::to_writer(&mut manifest, &ownership)?;
+    manifest.write_all(b"\n")?;
+    manifest.sync_all()?;
+    File::open(root)?.sync_all()?;
+    File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+#[cfg(any(debug_assertions, feature = "test-hooks"))]
+#[doc(hidden)]
+pub fn write_test_sandbox_ownership(root: &Path, cycle_id: &str) -> Result<()> {
+    write_sandbox_ownership(root, cycle_id)
+}
+
+fn read_sandbox_ownership(root: &File) -> Result<SandboxOwnership> {
+    let name = std::ffi::CString::new(SANDBOX_OWNERSHIP_FILE)?;
+    let descriptor = unsafe {
+        libc::openat(
+            root.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error()).context("open sandbox ownership manifest");
+    }
+    let mut file = unsafe { File::from_raw_fd(descriptor) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > 4096 {
+        anyhow::bail!("sandbox ownership manifest is not a bounded regular file");
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)?;
+    serde_json::from_slice(&bytes).context("parse sandbox ownership manifest")
 }
 
 pub fn staged_tree_digest(repository: &Path) -> Result<String> {
@@ -760,6 +1332,43 @@ pub fn staged_tree_digest(repository: &Path) -> Result<String> {
         anyhow::bail!("Git did not return a staged tree identity");
     }
     Ok(format!("{:x}", Sha256::digest(tree.as_bytes())))
+}
+
+pub(crate) fn service_read_operation(
+    commands: &mut [crate::agent_config::AuthorizedCommand],
+    _timeout: Duration,
+    mut before_release: impl FnMut(usize) -> Result<()>,
+) -> Result<Vec<std::process::Output>> {
+    if commands.is_empty() {
+        anyhow::bail!("read command operation is empty");
+    }
+    let mut outputs = Vec::with_capacity(commands.len());
+    for (index, command) in commands.iter_mut().enumerate() {
+        before_release(index).context("authorize bounded read command release")?;
+        outputs.push(command.output()?);
+    }
+    Ok(outputs)
+}
+
+fn kill_control_group(control_group: &str) -> Result<()> {
+    let relative = control_group
+        .strip_prefix('/')
+        .context("systemd control group is not absolute")?;
+    let relative = Path::new(relative);
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        anyhow::bail!("systemd control group escapes the cgroup root");
+    }
+    let kill = Path::new("/sys/fs/cgroup")
+        .join(relative)
+        .join("cgroup.kill");
+    match fs::write(&kill, b"1\n") {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("kill exact command control group"),
+    }
 }
 
 fn sandbox_command(
@@ -774,8 +1383,9 @@ fn sandbox_command(
     if snapshot.credential_env != config.credential_env {
         anyhow::bail!("credential source identity changed after effort snapshot");
     }
+    let git = crate::git_command::executable_identity()?;
     let mut command = vec![
-        snapshot.sandbox.unshare.as_os_str().to_os_string(),
+        snapshot.sandbox.unshare.path.as_os_str().to_os_string(),
         OsString::from("--user"),
         OsString::from("--map-root-user"),
         OsString::from("--mount"),
@@ -799,7 +1409,7 @@ fn sandbox_command(
             .div_ceil(512)
             .to_string()
             .into(),
-        snapshot.sandbox.bubblewrap.as_os_str().to_os_string(),
+        snapshot.sandbox.bubblewrap.path.as_os_str().to_os_string(),
         OsString::from("--die-with-parent"),
         OsString::from("--new-session"),
         OsString::from("--clearenv"),
@@ -825,6 +1435,14 @@ fn sandbox_command(
         OsString::from("/iq-protocol"),
         OsString::from("--dir"),
         OsString::from("/etc"),
+        OsString::from("--dir"),
+        OsString::from("/iq-bin"),
+        OsString::from("--ro-bind"),
+        git.path.as_os_str().to_os_string(),
+        OsString::from("/iq-git"),
+        OsString::from("--ro-bind"),
+        snapshot.executable.path.as_os_str().to_os_string(),
+        OsString::from("/iq-runner"),
     ];
     for path in ["/usr", "/bin", "/lib", "/lib64"] {
         if Path::new(path).exists() {
@@ -859,21 +1477,27 @@ fn sandbox_command(
         ]);
     }
     command.extend([
-        OsString::from("--ro-bind"),
-        snapshot.executable.path.as_os_str().to_os_string(),
-        OsString::from("/iq-runner"),
+        OsString::from("--symlink"),
+        OsString::from("/iq-git"),
+        OsString::from("/iq-bin/git"),
         OsString::from("--setenv"),
         OsString::from("HOME"),
         OsString::from("/home/iq"),
         OsString::from("--setenv"),
         OsString::from("PATH"),
-        OsString::from("/usr/local/bin:/usr/bin:/bin"),
+        OsString::from("/iq-bin:/usr/bin:/bin"),
+        OsString::from("--setenv"),
+        OsString::from("IQ_GIT_EXECUTABLE"),
+        OsString::from("/iq-git"),
         OsString::from("--setenv"),
         OsString::from("GIT_CONFIG_NOSYSTEM"),
         OsString::from("1"),
         OsString::from("--setenv"),
         OsString::from("GIT_CONFIG_GLOBAL"),
         OsString::from("/dev/null"),
+        OsString::from("--setenv"),
+        OsString::from("GIT_NO_REPLACE_OBJECTS"),
+        OsString::from("1"),
         OsString::from("--setenv"),
         OsString::from("GIT_TERMINAL_PROMPT"),
         OsString::from("0"),
@@ -994,12 +1618,8 @@ fn git_identity(repository: &Path) -> Result<BTreeMap<String, String>> {
         git_output(repository, ["rev-parse", "HEAD"])?,
     );
     identity.insert(
-        "config-list".to_string(),
-        git_output(repository, ["config", "--local", "--list", "--show-origin"])?,
-    );
-    identity.insert(
-        "remotes".to_string(),
-        git_output(repository, ["remote", "-v"])?,
+        "config".to_string(),
+        crate::git_command::local_config_digest(repository)?,
     );
     Ok(identity)
 }
@@ -1014,15 +1634,9 @@ fn verify_exported_git_identity(export: &Path, before: &BTreeMap<String, String>
     {
         anyhow::bail!("agent changed Git HEAD");
     }
-    for (file, key) in [
-        ("refs", "refs"),
-        ("config", "config-list"),
-        ("remotes", "remotes"),
-    ] {
-        let actual = String::from_utf8(read_bounded(&export.join(file), 1024 * 1024)?)?;
-        if before.get(key).is_some_and(|expected| expected != &actual) {
-            anyhow::bail!("agent changed Git {key}");
-        }
+    let refs = String::from_utf8(read_bounded(&export.join("refs"), 1024 * 1024)?)?;
+    if before.get("refs").is_some_and(|expected| expected != &refs) {
+        anyhow::bail!("agent changed Git refs");
     }
     Ok(())
 }
@@ -1045,9 +1659,8 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let output = Command::new("git")
+    let output = crate::git_command::command_in(repository)?
         .args(args)
-        .current_dir(repository)
         .output()?;
     if !output.status.success() {
         anyhow::bail!(
@@ -1071,9 +1684,8 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let output = Command::new("git")
+    let output = crate::git_command::command_in(repository)?
         .args(args)
-        .current_dir(repository)
         .output()?;
     if !output.status.success() {
         anyhow::bail!(
@@ -1091,29 +1703,14 @@ pub fn sandbox_blocker(error: &anyhow::Error) -> InfrastructureCause {
 }
 
 fn verify_sandbox_helpers(sandbox: &crate::control_domain::SandboxIdentity) -> Result<()> {
-    for (path, name) in [
+    for (executable, name) in [
         (&sandbox.bubblewrap, "bwrap"),
         (&sandbox.unshare, "unshare"),
         (&sandbox.systemd_run, "systemd-run"),
         (&sandbox.systemctl, "systemctl"),
     ] {
-        verify_sandbox_helper(path, name)?;
-    }
-    Ok(())
-}
-
-fn verify_sandbox_helper(path: &Path, name: &str) -> Result<()> {
-    let metadata = fs::metadata(path).with_context(|| {
-        format!(
-            "inspect required sandbox helper {name} at {}",
-            path.display()
-        )
-    })?;
-    if !path.is_absolute() || !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
-        anyhow::bail!(
-            "required sandbox helper is not executable: {}",
-            path.display()
-        );
+        crate::agent_config::open_executable_authority(executable)
+            .with_context(|| format!("open required sandbox helper {name}"))?;
     }
     Ok(())
 }

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::{CString, OsStr};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -12,8 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
 use crate::control_domain::{
-    require_exact_text, require_sha, EncodedPath, ExactEffortIdentity, GuidanceAlternatives,
-    PROTOCOL_VERSION,
+    require_exact_text, EncodedPath, ExactEffortIdentity, GuidanceAlternatives, PROTOCOL_VERSION,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -38,6 +37,7 @@ pub struct AgentInput {
 pub struct RepositoryIdentity {
     pub repo_key: String,
     pub target_branch: String,
+    pub object_format: crate::git_object::GitObjectFormat,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -201,10 +201,32 @@ impl AgentInput {
         if self.version != PROTOCOL_VERSION {
             anyhow::bail!("unsupported integration-agent input version");
         }
-        validate_identity(&self.identity)?;
+        let object_format = self.repository.object_format;
+        validate_identity(&self.identity, object_format)?;
         require_exact_text(&self.repository.repo_key, "repository identity")?;
         require_exact_text(&self.repository.target_branch, "target branch")?;
-        require_sha(&self.base_sha, "base SHA")?;
+        object_format.require_oid(&self.base_sha, "base SHA")?;
+        match &self.source {
+            SourceVariant::RemoteBranch { branch, sha } => {
+                require_exact_text(branch, "source branch")?;
+                object_format.require_oid(sha, "source SHA")?;
+            }
+            SourceVariant::LocalSubmission { submission_id, sha } => {
+                require_exact_text(submission_id, "local submission identity")?;
+                object_format.require_oid(sha, "source SHA")?;
+            }
+        }
+        for conflict in &self.conflicts {
+            for (blob, label) in [
+                (&conflict.base_blob, "base conflict blob"),
+                (&conflict.target_blob, "target conflict blob"),
+                (&conflict.source_blob, "source conflict blob"),
+            ] {
+                if let Some(blob) = blob {
+                    object_format.require_oid(blob, label)?;
+                }
+            }
+        }
         validate_paths(
             self.conflicts.iter().map(|entry| &entry.path),
             self.limits.max_paths,
@@ -365,7 +387,10 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn validate_identity(identity: &ExactEffortIdentity) -> Result<()> {
+fn validate_identity(
+    identity: &ExactEffortIdentity,
+    object_format: crate::git_object::GitObjectFormat,
+) -> Result<()> {
     for (value, label) in [
         (&identity.effort_id, "effort ID"),
         (&identity.item_id, "item ID"),
@@ -374,10 +399,11 @@ fn validate_identity(identity: &ExactEffortIdentity) -> Result<()> {
     ] {
         require_exact_text(value, label)?;
     }
-    require_sha(&identity.target_sha, "target SHA")?;
-    require_sha(&identity.source_sha, "source SHA")?;
+    crate::control_domain::validate_cycle_id(&identity.cycle_id)?;
+    object_format.require_oid(&identity.target_sha, "target SHA")?;
+    object_format.require_oid(&identity.source_sha, "source SHA")?;
     if let Some(candidate) = &identity.candidate_sha {
-        require_sha(candidate, "candidate SHA")?;
+        object_format.require_oid(candidate, "candidate SHA")?;
     }
     Ok(())
 }
@@ -480,10 +506,7 @@ fn rename_at(directory: &File, from: &str, to: &str) -> Result<()> {
 }
 
 pub fn protocol_directory(workspace: &Path, cycle_id: &str) -> Result<PathBuf> {
-    require_exact_text(cycle_id, "cycle ID")?;
-    if cycle_id.as_bytes().contains(&b'/') {
-        anyhow::bail!("cycle ID is not a valid path component");
-    }
+    crate::control_domain::validate_cycle_id(cycle_id)?;
     let workspace_file = open_absolute_directory(workspace)?;
     let root = workspace.join(".iq-agent-protocol");
     let root_file = create_or_open_private_directory(&workspace_file, ".iq-agent-protocol")?;
@@ -675,50 +698,28 @@ pub fn read_published_result(
 pub fn remove_protocol_cycle(workspace: &Path, cycle_id: &str) -> Result<()> {
     validate_leaf(cycle_id)?;
     let workspace_file = open_absolute_directory(workspace)?;
-    let root_file = match open_directory_at(&workspace_file, ".iq-agent-protocol") {
-        Ok(file) => file,
+    let root = match crate::secure_fs::DirectoryHandle::open_child(
+        &workspace_file,
+        OsStr::new(".iq-agent-protocol"),
+        "protocol root",
+    ) {
+        Ok(root) => root,
         Err(error) if is_not_found(&error) => return Ok(()),
         Err(error) => return Err(error).context("open protocol root for removal"),
     };
-    verify_private_directory(&root_file, "protocol root")?;
-    remove_protocol_quarantines(workspace, &root_file, cycle_id)?;
-    let cycle_file = match open_directory_at(&root_file, cycle_id) {
-        Ok(file) => file,
+    verify_private_directory(root.directory(), "protocol root")?;
+    let cycle = match crate::secure_fs::DirectoryHandle::open_child(
+        root.directory(),
+        OsStr::new(cycle_id),
+        "protocol cycle",
+    ) {
+        Ok(cycle) => cycle,
         Err(error) if is_not_found(&error) => return Ok(()),
         Err(error) => return Err(error).context("open protocol cycle for removal"),
     };
-    verify_private_directory(&cycle_file, "protocol cycle")?;
-    let quarantine = format!(".remove-{cycle_id}");
-    rename_at(&root_file, cycle_id, &quarantine)?;
-    root_file.sync_all()?;
-    remove_protocol_quarantine(workspace, &root_file, &quarantine)
-}
-
-fn remove_protocol_quarantines(workspace: &Path, root_file: &File, cycle_id: &str) -> Result<()> {
-    let deterministic = format!(".remove-{cycle_id}");
-    let root = workspace.join(".iq-agent-protocol");
-    let mut quarantines = Vec::new();
-    for entry in fs::read_dir(&root)? {
-        let name = entry?.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if name == deterministic {
-            quarantines.push(name.to_string());
-        }
-    }
-    quarantines.sort();
-    for quarantine in quarantines {
-        remove_protocol_quarantine(workspace, root_file, &quarantine)?;
-    }
-    Ok(())
-}
-
-fn remove_protocol_quarantine(workspace: &Path, root_file: &File, name: &str) -> Result<()> {
-    let quarantine_file = open_directory_at(root_file, name)?;
-    verify_private_directory(&quarantine_file, "protocol cycle quarantine")?;
-    fs::remove_dir_all(workspace.join(".iq-agent-protocol").join(name))?;
-    root_file.sync_all()?;
+    verify_private_directory(cycle.directory(), "protocol cycle")?;
+    cycle.remove("protocol cycle")?;
+    root.directory().sync_all()?;
     Ok(())
 }
 

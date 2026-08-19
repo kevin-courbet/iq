@@ -6,8 +6,9 @@ IQ is a standalone, opt-in durable Git integration coordinator.
 - SQLite is current host-local durable authority. External Git, provider, process, and filesystem effects require exact identity checks and restart-safe reconciliation.
 - Preserve strict FIFO per physical repository target. Oldest blocked work prevents later integration.
 - Preserve exact source, base, candidate, signoff, and landed SHA identity.
-- The IQ-owned checkout is integration-only. Development occurs only in direct child Rifts created from that root.
-- Local submissions are immutable exact-HEAD private refs and always produce one-parent squash candidates. Empty submissions never land.
+- The IQ-owned checkout is a canonical materialization and Rift seed only. Development occurs only in direct child Rifts created from that root.
+- Direct-policy local submissions are immutable exact-HEAD private refs and always produce one-parent squash candidates. Empty submissions never land.
+- Repository operation state, canonical repository, target, integration policy, and replication policy are separate durable values. Location and remote names never imply authority.
 - Treat `.iq/config.json` as untracked local control-plane configuration in the owned root. Its absence means no validation and no signoff. Reject tracked policy.
 - At attempt start under the repository lease, persist the canonical local policy snapshot and SHA-256 digest atomically. Retries and target movement keep that snapshot; a new attempt reads current local policy.
 - Policy is explicitly no validation or a validation command with signoff exactly `none` or `required`. Required signoff has an explicit command and non-empty explicit contexts.

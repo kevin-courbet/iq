@@ -8,7 +8,6 @@ use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
@@ -34,6 +33,10 @@ static DATABASE_LEASE_BLOCKED_TEST_HOOK: std::sync::Mutex<DatabaseTestHook> =
 
 #[cfg(debug_assertions)]
 static RECOMPOSITION_PROJECTION_FAILURE_TEST_HOOK: std::sync::Mutex<Option<PathBuf>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(debug_assertions)]
+static TARGET_MOVE_COMMIT_FAILURE_TEST_HOOK: std::sync::Mutex<Option<PathBuf>> =
     std::sync::Mutex::new(None);
 
 #[doc(hidden)]
@@ -64,11 +67,18 @@ pub fn set_recomposition_projection_failure_test_hook(database_path: &Path, enab
         enabled.then(|| database_path.to_path_buf());
 }
 
+#[doc(hidden)]
+#[cfg(debug_assertions)]
+pub fn set_target_move_commit_failure_test_hook(database_path: &Path, enabled: bool) {
+    *TARGET_MOVE_COMMIT_FAILURE_TEST_HOOK.lock().unwrap() =
+        enabled.then(|| database_path.to_path_buf());
+}
+
 use crate::control_domain::{
-    AgentLaunching, AgentReady, IntegrationBlocker, IntegrationEffortState, ResumeState,
-    RunnerSnapshot, StateRepositorySnapshot, AUTOMATIC_CYCLE_LIMIT,
+    AgentLaunching, AgentReady, IntegrationBlocker, IntegrationEffortState, LauncherAuthority,
+    ResumeState, RunnerSnapshot, StateRepositorySnapshot, AUTOMATIC_CYCLE_LIMIT,
 };
-use crate::sqlite::WorkspaceIdentity;
+use crate::sqlite::{LandingState, WorkspaceIdentity};
 
 pub struct DatabaseProcessLease {
     file: File,
@@ -338,7 +348,13 @@ impl SnapshotSource {
 
     fn verify_unchanged(&self) -> Result<()> {
         let metadata = self.file.metadata()?;
-        let path_metadata = fs::symlink_metadata(&self.path)?;
+        let path_metadata = match fs::symlink_metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(DatabaseSnapshotChanged.into());
+            }
+            Err(error) => return Err(error.into()),
+        };
         if path_metadata.file_type().is_symlink()
             || !path_metadata.is_file()
             || (metadata.dev(), metadata.ino()) != (self.device, self.inode)
@@ -401,10 +417,19 @@ fn validate_database_snapshot_under_lease_inner<T>(
             sidecar_name.push(suffix);
             let source_path = database_path.with_file_name(&sidecar_name);
             match fs::symlink_metadata(&source_path) {
-                Ok(_) => sources.push(SnapshotSource::copy(
-                    &source_path,
-                    &temporary.path().join(sidecar_name),
-                )?),
+                Ok(_) => {
+                    match SnapshotSource::copy(&source_path, &temporary.path().join(sidecar_name)) {
+                        Ok(source) => sources.push(source),
+                        Err(error)
+                            if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                                error.kind() == std::io::ErrorKind::NotFound
+                            }) =>
+                        {
+                            return Err(DatabaseSnapshotChanged.into());
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
@@ -417,6 +442,7 @@ fn validate_database_snapshot_under_lease_inner<T>(
             &snapshot_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
+        crate::sqlite::configure_connection(&connection)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         let validated = validate(&connection);
@@ -604,6 +630,7 @@ impl ValidatedDatabaseAuthority {
                 });
             }
         };
+        crate::sqlite::configure_connection(&connection)?;
         self.verify_path()?;
         self.verify_connection(&connection)?;
         Ok(connection)
@@ -638,6 +665,13 @@ pub struct IntegrationEffort {
     pub state: IntegrationEffortState,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DefiniteLandingRejection {
+    effort_id: String,
+    command_id: String,
+    expected_target_sha: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -785,17 +819,24 @@ pub struct CandidateObservation {
 
 impl CandidateObservation {
     pub fn read(repository: &Path, candidate_sha: &str, operation_ref: &str) -> Result<Self> {
-        crate::control_domain::require_sha(candidate_sha, "candidate SHA")?;
+        let object_format =
+            crate::git_command::RepositoryBinding::capture(repository)?.object_format;
+        object_format.require_oid(candidate_sha, "candidate SHA")?;
         crate::control_domain::require_exact_text(operation_ref, "candidate operation ref")?;
         let reference = git_text(repository, ["rev-parse", "--verify", operation_ref])?;
         if reference != candidate_sha {
             anyhow::bail!("candidate operation ref does not name the observed candidate");
         }
         let tree_sha = git_text(repository, ["show", "-s", "--format=%T", candidate_sha])?;
-        let parent_shas = git_text(repository, ["show", "-s", "--format=%P", candidate_sha])?
-            .split_whitespace()
-            .map(str::to_string)
-            .collect();
+        let parent_shas: Vec<String> =
+            git_text(repository, ["show", "-s", "--format=%P", candidate_sha])?
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
+        object_format.require_oid(&tree_sha, "candidate tree")?;
+        for parent in &parent_shas {
+            object_format.require_oid(parent, "candidate parent")?;
+        }
         let metadata = git_text(
             repository,
             [
@@ -865,11 +906,59 @@ pub struct NewEffort<'a> {
     pub state_repository: &'a StateRepositorySnapshot,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum EffortCreationError {
+    #[error("queue item {item_id} was cancelled before effort creation")]
+    Cancelled { item_id: String },
+    #[error("queue item {item_id} no longer has merging authority for attempt {attempt_id}")]
+    AuthorityChanged { item_id: String, attempt_id: String },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", content = "payload", rename_all = "snake_case")]
 enum RunnerTerminationAuthority {
     Launching(AgentLaunching),
-    Running(crate::control_domain::AgentRunning),
+    Service(crate::control_domain::RunnerServiceAuthority),
+    LegacyScope(crate::control_domain::LegacyRunnerScopeAuthority),
+}
+
+impl RunnerTerminationAuthority {
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Launching(launching) => {
+                crate::control_domain::validate_systemd_unit_name(
+                    &launching.cycle_id,
+                    &launching.unit_name,
+                )?;
+                if !matches!(
+                    launching.spawn_authority,
+                    crate::control_domain::SpawnAuthority::CloseRequested
+                        | crate::control_domain::SpawnAuthority::Surrendered
+                        | crate::control_domain::SpawnAuthority::Closed
+                ) {
+                    anyhow::bail!("termination debt has invalid spawn authority");
+                }
+                require_launcher_authority(&launching.launcher)?;
+            }
+            Self::Service(service) => service.validate()?,
+            Self::LegacyScope(scope) => scope.validate()?,
+        }
+        Ok(())
+    }
+}
+
+fn require_launcher_authority(launcher: &LauncherAuthority) -> Result<()> {
+    if launcher.pid == 0
+        || launcher.process_start_ticks == 0
+        || launcher.token.len() < 32
+        || !launcher
+            .token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        anyhow::bail!("runner launcher authority is invalid");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -914,7 +1003,7 @@ impl ControlStore {
     pub fn terminal_cycle_artifacts(&self, repo_key: &str) -> Result<Vec<TerminalCycleArtifacts>> {
         let connection = self.connect(false)?;
         let mut statement = connection.prepare(
-            "SELECT item.id,cycle.id,effort.workspace_json FROM queue_items item JOIN integration_efforts effort ON effort.item_id=item.id JOIN integration_cycles cycle ON cycle.effort_id=effort.id WHERE item.repo_key=?1 AND item.status IN ('integrated','cancelled') AND effort.state IN ('integrated','cancelled') AND cycle.status NOT IN ('starting','running') ORDER BY item.created_at,cycle.cycle_number",
+            "SELECT item.id,cycle.id,effort.workspace_json FROM queue_items item JOIN integration_efforts effort ON effort.item_id=item.id JOIN integration_cycles cycle ON cycle.effort_id=effort.id WHERE item.repo_key=?1 AND item.status IN ('integrated','cancelled') AND effort.state IN ('integrated','cancelled') AND cycle.status NOT IN ('starting','running') AND NOT EXISTS(SELECT 1 FROM runner_termination_debt debt WHERE debt.effort_id=effort.id) ORDER BY item.created_at,cycle.cycle_number",
         )?;
         let artifacts = statement
             .query_map(params![repo_key], |row| {
@@ -1156,10 +1245,37 @@ impl ControlStore {
     }
 
     pub fn create_effort(&self, new: NewEffort<'_>) -> Result<IntegrationEffort> {
-        crate::control_domain::require_sha(new.target_sha, "effort target SHA")?;
-        crate::control_domain::require_sha(new.source_sha, "effort source SHA")?;
         let mut connection = self.connect(true)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let object_format = item_object_format(&transaction, new.item_id)?;
+        object_format.require_oid(new.target_sha, "effort target SHA")?;
+        object_format.require_oid(new.source_sha, "effort source SHA")?;
+        let (status, current_attempt_id): (String, Option<String>) = transaction.query_row(
+            "SELECT status,current_attempt_id FROM queue_items WHERE id=?1",
+            [new.item_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let active_attempt: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM integration_attempts WHERE id=?1 AND item_id=?2 AND finished_at IS NULL AND result IS NULL)",
+            params![new.attempt_id,new.item_id],
+            |row| row.get(0),
+        )?;
+        if status == "cancelled" {
+            return Err(EffortCreationError::Cancelled {
+                item_id: new.item_id.to_string(),
+            }
+            .into());
+        }
+        if status != "merging"
+            || current_attempt_id.as_deref() != Some(new.attempt_id)
+            || !active_attempt
+        {
+            return Err(EffortCreationError::AuthorityChanged {
+                item_id: new.item_id.to_string(),
+                attempt_id: new.attempt_id.to_string(),
+            }
+            .into());
+        }
         if let Some(existing) = transaction
             .query_row(
                 "SELECT id,item_id,attempt_id,target_sha,source_sha,source_variant,landing_variant,workspace_json,runner_snapshot_json,state_repository_json,failed_cycles,state_json,created_at,updated_at FROM integration_efforts WHERE item_id=?1",
@@ -1280,9 +1396,22 @@ impl ControlStore {
     }
 
     pub fn prepare_cycle_launch(&self, effort_id: &str, launch: &AgentLaunching) -> Result<()> {
+        if launch.spawn_authority != crate::control_domain::SpawnAuthority::Open {
+            anyhow::bail!("prepared cycle requires open spawn authority");
+        }
         let mut connection = self.connect(true)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let effort = required_effort(&transaction, effort_id)?;
+        let operation_state: String = transaction
+            .query_row(
+                "SELECT policy.operation_state_json FROM queue_items item JOIN repository_policies policy ON policy.repo_key=item.repo_key WHERE item.id=?1",
+                [&effort.item_id],
+                |row| row.get(0),
+            )?;
+        serde_json::from_str::<crate::repository_policy::OperationState>(&operation_state)?
+            .require_obligation(&crate::repository_policy::Obligation::QueueItem {
+                id: effort.item_id.clone(),
+            })?;
         let IntegrationEffortState::AgentReady(ready) = &effort.state else {
             anyhow::bail!("cycle start requires agent_ready effort");
         };
@@ -1307,15 +1436,287 @@ impl ControlStore {
         Ok(())
     }
 
-    pub fn record_cycle_started(
+    pub fn surrender_cycle_spawn_authority(
         &self,
         effort_id: &str,
-        running: &crate::control_domain::AgentRunning,
+        launch_operation_id: &str,
+        authority_lease_id: &str,
+        launcher: &LauncherAuthority,
+    ) -> Result<bool> {
+        if !crate::agent_runner::exact_process_is_alive(launcher.pid, launcher.process_start_ticks)?
+        {
+            anyhow::bail!("runner launcher process identity is not alive");
+        }
+        let mut connection = self.connect(true)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let effort = required_effort(&transaction, effort_id)?;
+        match &effort.state {
+            IntegrationEffortState::AgentLaunching(launch)
+                if launch.launch_operation_id == launch_operation_id
+                    && launch.authority_lease_id == authority_lease_id
+                    && launch.launcher == *launcher
+                    && launch.spawn_authority == crate::control_domain::SpawnAuthority::Open =>
+            {
+                let mut surrendered = launch.clone();
+                surrendered.spawn_authority = crate::control_domain::SpawnAuthority::Surrendered;
+                update_state(
+                    &transaction,
+                    &effort,
+                    &IntegrationEffortState::AgentLaunching(surrendered.clone()),
+                )?;
+                let changed = transaction.execute(
+                    "UPDATE integration_cycles SET process_json=?1 WHERE id=?2 AND effort_id=?3 AND status='starting'",
+                    params![serde_json::to_string(&surrendered)?, surrendered.cycle_id, effort_id],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("prepared cycle disappeared before spawn surrender");
+                }
+                append_event(
+                    &transaction,
+                    &effort,
+                    "runner_spawn_surrendered",
+                    serde_json::json!({"cycle_id":surrendered.cycle_id,"operation_id":launch_operation_id}),
+                    false,
+                )?;
+                transaction.commit()?;
+                Ok(true)
+            }
+            IntegrationEffortState::Cancelled(_)
+                if close_requested_spawn_authority(
+                    &transaction,
+                    effort_id,
+                    launch_operation_id,
+                    authority_lease_id,
+                    launcher,
+                )? =>
+            {
+                transaction.commit()?;
+                Ok(false)
+            }
+            _ => anyhow::bail!("runner spawn authority is not open for this launch operation"),
+        }
+    }
+
+    pub fn authorize_cycle_spawn(
+        &self,
+        effort_id: &str,
+        launch_operation_id: &str,
+        authority_lease_id: &str,
+        launcher: &LauncherAuthority,
+    ) -> Result<bool> {
+        let connection = self.connect(false)?;
+        let effort = required_effort(&connection, effort_id)?;
+        let IntegrationEffortState::AgentLaunching(launch) = effort.state else {
+            if matches!(effort.state, IntegrationEffortState::Cancelled(_)) {
+                require_cancelled_launcher_authority(
+                    &connection,
+                    effort_id,
+                    launch_operation_id,
+                    authority_lease_id,
+                    launcher,
+                    crate::control_domain::SpawnAuthority::Surrendered,
+                )?;
+                return Ok(false);
+            }
+            anyhow::bail!("runner spawn authorization requires agent_launching effort");
+        };
+        if launch.launch_operation_id != launch_operation_id
+            || launch.authority_lease_id != authority_lease_id
+            || launch.launcher != *launcher
+            || launch.spawn_authority != crate::control_domain::SpawnAuthority::Surrendered
+        {
+            anyhow::bail!("runner spawn authorization differs from surrendered authority");
+        }
+        crate::agent_runner::exact_process_is_alive(launcher.pid, launcher.process_start_ticks)
+    }
+
+    pub fn acknowledge_cycle_spawn_failed(
+        &self,
+        effort_id: &str,
+        launch_operation_id: &str,
+        authority_lease_id: &str,
+        launcher: &LauncherAuthority,
+    ) -> Result<()> {
+        let observed = self.effort_by_id(effort_id)?;
+        let unit_name = match &observed.state {
+            IntegrationEffortState::AgentLaunching(launch)
+                if launch.launch_operation_id == launch_operation_id
+                    && launch.authority_lease_id == authority_lease_id
+                    && launch.launcher == *launcher =>
+            {
+                launch.unit_name.clone()
+            }
+            IntegrationEffortState::AgentRunning(running)
+                if running.launch_operation_id == launch_operation_id
+                    && running.authority_lease_id == authority_lease_id
+                    && running.launcher == *launcher =>
+            {
+                running.unit_name.clone()
+            }
+            IntegrationEffortState::Cancelled(_) => {
+                let connection = self.connect(false)?;
+                let stored = connection.query_row(
+                    "SELECT authority_json FROM runner_termination_debt WHERE effort_id=?1",
+                    [effort_id],
+                    |row| row.get::<_, String>(0),
+                )?;
+                let authority: RunnerTerminationAuthority = serde_json::from_str(&stored)?;
+                let (stored_operation_id, stored_lease_id, stored_launcher, unit_name) =
+                    match authority {
+                        RunnerTerminationAuthority::Launching(launching) => (
+                            launching.launch_operation_id,
+                            launching.authority_lease_id,
+                            launching.launcher,
+                            launching.unit_name,
+                        ),
+                        RunnerTerminationAuthority::Service(_)
+                        | RunnerTerminationAuthority::LegacyScope(_) => anyhow::bail!(
+                            "cancelled failed spawn has only systemd termination authority"
+                        ),
+                    };
+                if stored_operation_id != launch_operation_id
+                    || stored_lease_id != authority_lease_id
+                    || stored_launcher != *launcher
+                {
+                    anyhow::bail!("cancelled failed spawn differs from termination authority");
+                }
+                unit_name
+            }
+            _ => anyhow::bail!("failed spawn does not match durable launch authority"),
+        };
+        require_terminal_systemd_unit(&observed.runner.sandbox.systemctl, &unit_name)?;
+        self.acknowledge_terminated_cycle_spawn(
+            effort_id,
+            launch_operation_id,
+            authority_lease_id,
+            launcher,
+        )
+    }
+
+    fn acknowledge_terminated_cycle_spawn(
+        &self,
+        effort_id: &str,
+        launch_operation_id: &str,
+        authority_lease_id: &str,
+        launcher: &LauncherAuthority,
     ) -> Result<()> {
         let mut connection = self.connect(true)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let effort = required_effort(&transaction, effort_id)?;
+        match &effort.state {
+            IntegrationEffortState::AgentLaunching(launch)
+                if launch.launch_operation_id == launch_operation_id
+                    && launch.authority_lease_id == authority_lease_id
+                    && launch.launcher == *launcher
+                    && launch.spawn_authority
+                        == crate::control_domain::SpawnAuthority::Surrendered =>
+            {
+                let failure = crate::control_domain::CycleFailure::Interrupted;
+                let changed = transaction.execute(
+                    "UPDATE integration_cycles SET status='failed',failure_json=?1,finished_at=?2 WHERE id=?3 AND effort_id=?4 AND status='starting'",
+                    params![serde_json::to_string(&failure)?, now(), launch.cycle_id, effort_id],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("prepared cycle authority changed after failed spawn");
+                }
+                update_state(
+                    &transaction,
+                    &effort,
+                    &IntegrationEffortState::AgentReady(AgentReady {
+                        next_cycle: next_cycle_number(&transaction, effort_id)?,
+                    }),
+                )?;
+            }
+            IntegrationEffortState::AgentRunning(running)
+                if running.launch_operation_id == launch_operation_id
+                    && running.authority_lease_id == authority_lease_id
+                    && running.launcher == *launcher =>
+            {
+                let failure = crate::control_domain::CycleFailure::Interrupted;
+                let changed = transaction.execute(
+                    "UPDATE integration_cycles SET status='failed',failure_json=?1,finished_at=?2 WHERE id=?3 AND effort_id=?4 AND status='running'",
+                    params![serde_json::to_string(&failure)?, now(), running.cycle_id, effort_id],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("running cycle authority changed after failed launch admission");
+                }
+                update_state(
+                    &transaction,
+                    &effort,
+                    &IntegrationEffortState::AgentReady(AgentReady {
+                        next_cycle: next_cycle_number(&transaction, effort_id)?,
+                    }),
+                )?;
+            }
+            IntegrationEffortState::Cancelled(_) => {
+                let stored = transaction
+                    .query_row(
+                        "SELECT authority_json FROM runner_termination_debt WHERE effort_id=?1",
+                        [effort_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                let Some(stored) = stored else {
+                    anyhow::bail!("cancelled failed spawn has no termination authority");
+                };
+                let authority: RunnerTerminationAuthority = serde_json::from_str(&stored)?;
+                let matches_launch = match &authority {
+                    RunnerTerminationAuthority::Launching(launching) => {
+                        launching.launch_operation_id == launch_operation_id
+                            && launching.authority_lease_id == authority_lease_id
+                            && launching.launcher == *launcher
+                    }
+                    RunnerTerminationAuthority::Service(_)
+                    | RunnerTerminationAuthority::LegacyScope(_) => false,
+                };
+                if !matches_launch {
+                    anyhow::bail!("cancelled failed spawn differs from termination authority");
+                }
+                if matches!(
+                    authority,
+                    RunnerTerminationAuthority::Launching(AgentLaunching {
+                        spawn_authority: crate::control_domain::SpawnAuthority::Surrendered,
+                        ..
+                    })
+                ) && !close_surrendered_spawn_authority(
+                    &transaction,
+                    effort_id,
+                    launch_operation_id,
+                    authority_lease_id,
+                    launcher,
+                )? {
+                    anyhow::bail!("cancelled failed spawn authority did not close");
+                }
+            }
+            _ => anyhow::bail!("failed spawn does not match durable launch authority"),
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn record_cycle_started(
+        &self,
+        effort_id: &str,
+        running: &crate::control_domain::AgentRunning,
+        authority_lease_id: &str,
+        launcher: &LauncherAuthority,
+    ) -> Result<bool> {
+        let mut connection = self.connect(true)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let effort = required_effort(&transaction, effort_id)?;
         let IntegrationEffortState::AgentLaunching(launch) = &effort.state else {
+            if matches!(effort.state, IntegrationEffortState::Cancelled(_)) {
+                require_cancelled_launcher_authority(
+                    &transaction,
+                    effort_id,
+                    &running.launch_operation_id,
+                    authority_lease_id,
+                    launcher,
+                    crate::control_domain::SpawnAuthority::Surrendered,
+                )?;
+                transaction.commit()?;
+                return Ok(false);
+            }
             anyhow::bail!("cycle start requires agent_launching effort");
         };
         if launch.launch_operation_id != running.launch_operation_id
@@ -1323,7 +1724,11 @@ impl ControlStore {
             || launch.cycle_id != running.cycle_id
             || launch.cycle_number != running.cycle_number
             || launch.authority_lease_id != running.authority_lease_id
+            || launch.authority_lease_id != authority_lease_id
+            || launch.launcher != *launcher
+            || running.launcher != *launcher
             || launch.input_sha256 != running.input_sha256
+            || launch.spawn_authority != crate::control_domain::SpawnAuthority::Surrendered
         {
             anyhow::bail!("started process differs from prepared launch authority");
         }
@@ -1344,7 +1749,7 @@ impl ControlStore {
             false,
         )?;
         transaction.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     pub fn reset_prepared_launch(&self, effort_id: &str, cycle_id: &str) -> Result<()> {
@@ -1356,6 +1761,12 @@ impl ControlStore {
         };
         if launch.cycle_id != cycle_id {
             anyhow::bail!("launch reset differs from prepared cycle");
+        }
+        if crate::agent_runner::exact_process_is_alive(
+            launch.launcher.pid,
+            launch.launcher.process_start_ticks,
+        )? {
+            anyhow::bail!("launch reset cannot revoke a live launcher process");
         }
         let failure = crate::control_domain::CycleFailure::Interrupted;
         let changed = transaction.execute(
@@ -1970,13 +2381,26 @@ impl ControlStore {
         effort_id: &str,
         observation: &CandidateObservation,
     ) -> Result<()> {
-        crate::control_domain::require_sha(&observation.candidate_sha, "candidate SHA")?;
         let mut connection = self.connect(true)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let effort = required_effort(&transaction, effort_id)?;
+        let object_format = effort_object_format(&transaction, effort_id)?;
+        object_format.require_oid(&observation.candidate_sha, "candidate SHA")?;
+        object_format.require_oid(&observation.tree_sha, "candidate tree")?;
+        for parent in &observation.parent_shas {
+            object_format.require_oid(parent, "candidate parent")?;
+        }
         let IntegrationEffortState::CandidateBuilding(building) = &effort.state else {
             anyhow::bail!("candidate record requires candidate_building effort");
         };
+        let pending_cleanup: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM private_ref_cleanup_debt WHERE kind='landing' AND owner_id=?1)",
+            [&effort.attempt_id],
+            |row| row.get(0),
+        )?;
+        if pending_cleanup {
+            anyhow::bail!("candidate publication waits for old landing-ref cleanup");
+        }
         if building.operation_id != observation.operation_id
             || building.tree_sha != observation.tree_sha
             || building.parent_shas != observation.parent_shas
@@ -2044,6 +2468,18 @@ impl ControlStore {
         Ok(())
     }
 
+    pub fn candidate_publication_waits_for_cleanup(&self, effort_id: &str) -> Result<bool> {
+        let connection = self.connect(false)?;
+        let effort = required_effort(&connection, effort_id)?;
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM private_ref_cleanup_debt WHERE kind='landing' AND owner_id=?1)",
+                [&effort.attempt_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     pub fn reset_interrupted_candidate_build(&self, effort_id: &str) -> Result<IntegrationEffort> {
         let mut connection = self.connect(true)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2095,10 +2531,11 @@ impl ControlStore {
     }
 
     pub fn complete_validation(&self, effort_id: &str, candidate_sha: &str) -> Result<()> {
-        crate::control_domain::require_sha(candidate_sha, "validated candidate SHA")?;
         let mut connection = self.connect(true)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let effort = required_effort(&transaction, effort_id)?;
+        effort_object_format(&transaction, effort_id)?
+            .require_oid(candidate_sha, "validated candidate SHA")?;
         let IntegrationEffortState::Validating(validating) = &effort.state else {
             anyhow::bail!("validation completion requires validating effort");
         };
@@ -2168,12 +2605,13 @@ impl ControlStore {
         command_id: &str,
         signoff: crate::control_domain::SignoffDisposition,
     ) -> Result<()> {
-        crate::control_domain::require_sha(expected_target_sha, "landing target SHA")?;
         crate::control_domain::require_exact_text(lease_id, "landing lease identity")?;
         crate::control_domain::require_exact_text(command_id, "landing command identity")?;
         let mut connection = self.connect(true)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let effort = required_effort(&transaction, effort_id)?;
+        effort_object_format(&transaction, effort_id)?
+            .require_oid(expected_target_sha, "landing target SHA")?;
         let IntegrationEffortState::Validating(validating) = &effort.state else {
             anyhow::bail!("landing requires validating effort");
         };
@@ -2210,63 +2648,47 @@ impl ControlStore {
         append_event(
             &transaction,
             &effort,
-            "landing",
+            "landing_prepared",
             serde_json::to_value(&landing_state)?,
-            false,
-        )?;
-        let uncertain =
-            IntegrationEffortState::LandingUncertain(crate::control_domain::LandingUncertain {
-                candidate_sha: landing.candidate_sha,
-                expected_target_sha: landing.expected_target_sha,
-                command_id: command_id.to_string(),
-                evidence: "command_authorized_before_external_mutation".into(),
-            });
-        let landing_effort = IntegrationEffort {
-            state: landing_state,
-            ..effort.clone()
-        };
-        update_state(&transaction, &landing_effort, &uncertain)?;
-        append_event(
-            &transaction,
-            &landing_effort,
-            "landing_uncertain",
-            serde_json::to_value(&uncertain)?,
             false,
         )?;
         transaction.commit()?;
         Ok(())
     }
 
-    pub fn mark_landing_uncertain(
-        &self,
+    pub(crate) fn release_landing(
+        transaction: &rusqlite::Transaction<'_>,
         effort_id: &str,
         command_id: &str,
-        evidence: &str,
     ) -> Result<()> {
         crate::control_domain::require_exact_text(command_id, "landing command identity")?;
-        crate::control_domain::require_exact_text(evidence, "landing reconciliation evidence")?;
-        let mut connection = self.connect(true)?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let effort = required_effort(&transaction, effort_id)?;
+        let effort = required_effort(transaction, effort_id)?;
         let IntegrationEffortState::Landing(landing) = &effort.state else {
-            anyhow::bail!("landing uncertainty requires landing effort");
+            anyhow::bail!("landing command release requires prepared landing effort");
         };
         let state =
             IntegrationEffortState::LandingUncertain(crate::control_domain::LandingUncertain {
                 candidate_sha: landing.candidate_sha.clone(),
                 expected_target_sha: landing.expected_target_sha.clone(),
                 command_id: command_id.to_string(),
-                evidence: evidence.to_string(),
+                evidence: "command_gate_released".into(),
             });
-        update_state(&transaction, &effort, &state)?;
+        update_state(transaction, &effort, &state)?;
         append_event(
-            &transaction,
+            transaction,
             &effort,
-            "landing_uncertain",
+            "landing_released",
             serde_json::to_value(&state)?,
             false,
         )?;
-        transaction.commit()?;
+        #[cfg(debug_assertions)]
+        if std::env::var_os("IQ_TEST_LANDING_FAIL_BEFORE_RELEASE_COMMIT").is_some() {
+            anyhow::bail!("test failure before landing release commit");
+        }
+        #[cfg(debug_assertions)]
+        if std::env::var_os("IQ_TEST_LANDING_STOP_BEFORE_RELEASE_COMMIT").is_some() {
+            std::process::exit(90);
+        }
         Ok(())
     }
 
@@ -2276,11 +2698,22 @@ impl ControlStore {
         landed_sha: &str,
         remote_target_sha: &str,
     ) -> Result<()> {
-        crate::control_domain::require_sha(landed_sha, "landed SHA")?;
-        crate::control_domain::require_sha(remote_target_sha, "remote target SHA")?;
         let mut connection = self.connect(true)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let effort = required_effort(&transaction, effort_id)?;
+        let object_format = effort_object_format(&transaction, effort_id)?;
+        object_format.require_oid(landed_sha, "landed SHA")?;
+        object_format.require_oid(remote_target_sha, "remote target SHA")?;
+        let (repo_key, operation_state, replication_policy): (String, String, String) = transaction
+            .query_row(
+                "SELECT item.repo_key,policy.operation_state_json,policy.replication_policy_json FROM queue_items item JOIN repository_policies policy ON policy.repo_key=item.repo_key WHERE item.id=?1",
+                [&effort.item_id],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            )?;
+        serde_json::from_str::<crate::repository_policy::OperationState>(&operation_state)?
+            .require_obligation(&crate::repository_policy::Obligation::QueueItem {
+                id: effort.item_id.clone(),
+            })?;
         let candidate_sha = match &effort.state {
             IntegrationEffortState::Landing(landing) => &landing.candidate_sha,
             IntegrationEffortState::LandingUncertain(landing) => &landing.candidate_sha,
@@ -2302,9 +2735,29 @@ impl ControlStore {
             params![landed_sha,now(),effort.attempt_id,effort.item_id],
         )?;
         update_state(&transaction, &effort, &state)?;
+        let cleanup_inserted = transaction.execute(
+            "INSERT INTO private_ref_cleanup_debt(repo_key,kind,owner_id,ref_name,expected_sha,created_at,updated_at) VALUES(?1,'landing',?2,?3,?4,?5,?5) ON CONFLICT(repo_key,ref_name) DO NOTHING",
+            params![repo_key,effort.attempt_id,format!("refs/iq/landings/{}",effort.attempt_id),candidate_sha,now()],
+        )?;
+        if cleanup_inserted == 0 {
+            let cleanup_authority: (String, String, String) = transaction.query_row(
+                "SELECT kind,owner_id,expected_sha FROM private_ref_cleanup_debt WHERE repo_key=?1 AND ref_name=?2",
+                params![repo_key,format!("refs/iq/landings/{}",effort.attempt_id)],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            )?;
+            if cleanup_authority
+                != (
+                    "landing".into(),
+                    effort.attempt_id.clone(),
+                    candidate_sha.clone(),
+                )
+            {
+                anyhow::bail!("landing cleanup debt differs from integration authority");
+            }
+        }
         let submission: Option<(String, String)> = transaction
             .query_row(
-                "SELECT submission.id,submission.workspace_id FROM queue_items item JOIN local_submissions submission ON submission.id=item.submission_id WHERE item.id=?1 AND item.source_kind='local_submission'",
+                "SELECT submission.id,submission.workspace_id FROM queue_admissions admission JOIN local_submissions submission ON submission.id=admission.submission_id WHERE admission.item_id=?1 AND admission.kind='local_submission'",
                 params![effort.item_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -2326,6 +2779,17 @@ impl ControlStore {
             "UPDATE registered_repositories SET checkout_json=json_object('state','pending','target_sha',?1),updated_at=?2 WHERE repo_key=(SELECT repo_key FROM queue_items WHERE id=?3)",
             params![remote_target_sha,now(),effort.item_id],
         )?;
+        if let crate::repository_policy::ReplicationPolicy::Replicate { targets } =
+            serde_json::from_str(&replication_policy)?
+        {
+            for replica in targets {
+                let destination_key = replica.destination_identity_key()?;
+                transaction.execute(
+                    "INSERT INTO replication_debt(id,item_id,repo_key,canonical_source_sha,destination_key,target_branch,sequence,replica_json,expected_destination_sha,operation,outcome,application_id,failure,superseded_by_id,created_at,updated_at) SELECT ?1,?2,?3,?4,?5,policy.target_branch,COALESCE((SELECT MAX(existing.sequence) FROM replication_debt existing WHERE existing.destination_key=?5 AND existing.target_branch=policy.target_branch),0)+1,?6,NULL,'pin_source','pinning',NULL,NULL,NULL,?7,?7 FROM repository_policies policy WHERE policy.repo_key=?3",
+                    params![Uuid::new_v4().to_string(),effort.item_id,repo_key,landed_sha,destination_key,serde_json::to_string(&replica)?,now()],
+                )?;
+            }
+        }
         append_event_with_id(
             &transaction,
             &event_id,
@@ -2404,24 +2868,115 @@ impl ControlStore {
         self.effort_by_id(effort_id)
     }
 
-    pub fn recompose_after_target_move(
+    pub fn prepare_target_recomposition(
+        &self,
+        effort_id: &str,
+        target_sha: &str,
+    ) -> Result<IntegrationEffort> {
+        self.prepare_target_recomposition_with_resolution(effort_id, target_sha, None)
+    }
+
+    pub(crate) fn prepare_target_recomposition_after_definite_landing_rejection(
+        &self,
+        effort_id: &str,
+        target_sha: &str,
+        rejection: &DefiniteLandingRejection,
+    ) -> Result<IntegrationEffort> {
+        self.prepare_target_recomposition_with_resolution(effort_id, target_sha, Some(rejection))
+    }
+
+    fn prepare_target_recomposition_with_resolution(
+        &self,
+        effort_id: &str,
+        target_sha: &str,
+        rejection: Option<&DefiniteLandingRejection>,
+    ) -> Result<IntegrationEffort> {
+        let mut connection = self.connect(true)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let effort = required_effort(&transaction, effort_id)?;
+        effort_object_format(&transaction, effort_id)?
+            .require_oid(target_sha, "replacement target SHA")?;
+        let IntegrationEffortState::TargetMovePending(pending) = &effort.state else {
+            require_target_move_authority(&effort, rejection)?;
+            anyhow::bail!("target recomposition requires durable pending target movement");
+        };
+        if pending.target_sha != target_sha
+            || pending.source_sha != effort.source_sha
+            || !target_move_cause_matches(&pending.cause, rejection)
+        {
+            anyhow::bail!("target recomposition differs from pending target authority");
+        }
+        let old_candidate = pending
+            .previous
+            .candidate_sha()
+            .context("target recomposition has no old candidate cleanup authority")?;
+        let (repo_key, attempt_candidate): (String, Option<String>) = transaction.query_row(
+            "SELECT item.repo_key,attempt.merge_commit_sha FROM integration_attempts attempt JOIN queue_items item ON item.id=attempt.item_id WHERE attempt.id=?1 AND item.id=?2",
+            params![effort.attempt_id,effort.item_id],
+            |row| Ok((row.get(0)?,row.get(1)?)),
+        )?;
+        if attempt_candidate.as_deref() != Some(old_candidate) {
+            anyhow::bail!("old landing-ref candidate differs from exact attempt binding");
+        }
+        let landing_ref = format!("refs/iq/landings/{}", effort.attempt_id);
+        let inserted = transaction.execute(
+            "INSERT INTO private_ref_cleanup_debt(repo_key,kind,owner_id,ref_name,expected_sha,created_at,updated_at) VALUES(?1,'landing',?2,?3,?4,?5,?5) ON CONFLICT(repo_key,ref_name) DO NOTHING",
+            params![repo_key,effort.attempt_id,landing_ref,old_candidate,now()],
+        )?;
+        if inserted == 0 {
+            let stored: (String, String, String) = transaction.query_row(
+                "SELECT kind,owner_id,expected_sha FROM private_ref_cleanup_debt WHERE repo_key=?1 AND ref_name=?2",
+                params![repo_key,landing_ref],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            )?;
+            if stored
+                != (
+                    "landing".into(),
+                    effort.attempt_id.clone(),
+                    old_candidate.into(),
+                )
+            {
+                anyhow::bail!("old landing-ref cleanup debt differs from recomposition authority");
+            }
+        }
+        transaction.commit()?;
+        stop_recomposition_after_for_test("cleanup_debt_recorded");
+        self.effort_by_id(effort_id)
+    }
+
+    pub fn complete_target_recomposition(
         &self,
         effort_id: &str,
         target_sha: &str,
         conflict: &serde_json::Value,
     ) -> Result<IntegrationEffort> {
-        crate::control_domain::require_sha(target_sha, "replacement target SHA")?;
         let mut connection = self.connect(true)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let effort = required_effort(&transaction, effort_id)?;
-        if !matches!(
-            effort.state,
-            IntegrationEffortState::CandidateReady(_)
-                | IntegrationEffortState::Validating(_)
-                | IntegrationEffortState::Landing(_)
-                | IntegrationEffortState::LandingUncertain(_)
-        ) {
-            anyhow::bail!("target movement requires candidate or landing authority");
+        effort_object_format(&transaction, effort_id)?
+            .require_oid(target_sha, "replacement target SHA")?;
+        let IntegrationEffortState::TargetMovePending(pending) = &effort.state else {
+            anyhow::bail!("target recomposition requires durable pending target movement");
+        };
+        if pending.target_sha != target_sha || pending.source_sha != effort.source_sha {
+            anyhow::bail!("target recomposition differs from pending target authority");
+        }
+        let old_candidate = pending
+            .previous
+            .candidate_sha()
+            .context("target recomposition has no old candidate cleanup authority")?;
+        let (attempt_candidate, cleanup_pending): (Option<String>, bool) = transaction.query_row(
+            "SELECT attempt.merge_commit_sha,EXISTS(SELECT 1 FROM private_ref_cleanup_debt debt JOIN queue_items item ON item.repo_key=debt.repo_key WHERE debt.kind='landing' AND debt.owner_id=attempt.id AND debt.ref_name=?1 AND debt.expected_sha=?2 AND item.id=attempt.item_id) FROM integration_attempts attempt WHERE attempt.id=?3 AND attempt.item_id=?4",
+            params![format!("refs/iq/landings/{}",effort.attempt_id),old_candidate,effort.attempt_id,effort.item_id],
+            |row| Ok((row.get(0)?,row.get(1)?)),
+        )?;
+        if attempt_candidate.as_deref() != Some(old_candidate) {
+            anyhow::bail!("old landing-ref candidate differs from exact attempt binding");
+        }
+        if cleanup_pending {
+            anyhow::bail!(
+                "target recomposition cannot clear candidate authority before landing-ref cleanup"
+            );
         }
         transaction.execute(
             "UPDATE integration_cycles SET status='superseded',finished_at=?1 WHERE effort_id=?2 AND status='resolved'",
@@ -2431,6 +2986,7 @@ impl ControlStore {
             "DELETE FROM candidate_evidence WHERE effort_id=?1",
             params![effort_id],
         )?;
+        stop_recomposition_after_for_test("candidate_cleared");
         invalidate_validation_invocations(&transaction, &effort.attempt_id)?;
         transaction.execute(
             "UPDATE integration_attempts SET target_base_sha=?1,merge_commit_sha=NULL,validated_commit_sha=NULL,validation_command=NULL,validation_exit_code=NULL,validation_log_path=NULL,signoff_evidence_json=NULL,moved_base_json=?2 WHERE id=?3",
@@ -2446,7 +3002,13 @@ impl ControlStore {
         let state = IntegrationEffortState::AgentReady(AgentReady {
             next_cycle: next_cycle_number(&transaction, effort_id)?,
         });
-        update_state(&transaction, &effort, &state)?;
+        update_state_and_count_with_resolution(
+            &transaction,
+            &effort,
+            &state,
+            effort.failed_cycles,
+            None,
+        )?;
         fail_recomposition_projection_for_test(self.path())?;
         let projected = transaction.execute(
             "UPDATE queue_items SET target_sha=?1,source_sha=?2,conflict_json=?3,updated_at=?4 WHERE id=?5 AND current_attempt_id=?6",
@@ -2467,10 +3029,40 @@ impl ControlStore {
     }
 
     pub fn begin_target_move(&self, effort_id: &str, target_sha: &str) -> Result<()> {
-        crate::control_domain::require_sha(target_sha, "replacement target SHA")?;
+        self.begin_target_move_with_resolution(effort_id, target_sha, None)
+    }
+
+    pub(crate) fn begin_target_move_after_definite_landing_rejection(
+        &self,
+        effort_id: &str,
+        target_sha: &str,
+        rejection: &DefiniteLandingRejection,
+    ) -> Result<()> {
+        self.begin_target_move_with_resolution(effort_id, target_sha, Some(rejection))
+    }
+
+    fn begin_target_move_with_resolution(
+        &self,
+        effort_id: &str,
+        target_sha: &str,
+        rejection: Option<&DefiniteLandingRejection>,
+    ) -> Result<()> {
         let mut connection = self.connect(true)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let effort = required_effort(&transaction, effort_id)?;
+        effort_object_format(&transaction, effort_id)?
+            .require_oid(target_sha, "replacement target SHA")?;
+        if let IntegrationEffortState::TargetMovePending(pending) = &effort.state {
+            if pending.target_sha != target_sha
+                || pending.source_sha != effort.source_sha
+                || !target_move_cause_matches(&pending.cause, rejection)
+            {
+                anyhow::bail!("pending target movement differs from durable authority");
+            }
+            transaction.commit()?;
+            return Ok(());
+        }
+        require_target_move_authority(&effort, rejection)?;
         if !matches!(
             effort.state,
             IntegrationEffortState::CandidateReady(_)
@@ -2484,18 +3076,47 @@ impl ControlStore {
             target_sha: target_sha.to_string(),
             source_sha: effort.source_sha.clone(),
         };
-        invalidate_validation_invocations(&transaction, &effort.attempt_id)?;
+        let cause = match rejection {
+            Some(rejection) => crate::control_domain::TargetMoveCause::StaleLandingLease {
+                command_id: rejection.command_id.clone(),
+                expected_target_sha: rejection.expected_target_sha.clone(),
+            },
+            None => crate::control_domain::TargetMoveCause::Observed {
+                previous_target_sha: effort.target_sha.clone(),
+            },
+        };
+        let state =
+            IntegrationEffortState::TargetMovePending(crate::control_domain::TargetMovePending {
+                target_sha: target_sha.to_string(),
+                source_sha: effort.source_sha.clone(),
+                previous: ResumeState::capture(&effort.state)?,
+                cause,
+            });
         let changed = transaction.execute(
-            "UPDATE integration_attempts SET target_base_sha=?1,merge_commit_sha=NULL,validated_commit_sha=NULL,validation_command=NULL,validation_exit_code=NULL,validation_log_path=NULL,signoff_evidence_json=NULL,moved_base_json=?2 WHERE id=?3 AND item_id=?4",
-            params![target_sha,serde_json::to_string(&moved_base)?,effort.attempt_id,effort.item_id],
+            "UPDATE integration_attempts SET moved_base_json=?1 WHERE id=?2 AND item_id=?3",
+            params![
+                serde_json::to_string(&moved_base)?,
+                effort.attempt_id,
+                effort.item_id
+            ],
         )?;
         if changed != 1 {
             anyhow::bail!("target movement lost exact attempt authority");
         }
-        transaction.execute(
-            "DELETE FROM candidate_evidence WHERE effort_id=?1",
-            params![effort_id],
+        update_state_and_count_with_resolution(
+            &transaction,
+            &effort,
+            &state,
+            effort.failed_cycles,
+            rejection,
         )?;
+        let projected = transaction.execute(
+            "UPDATE queue_items SET target_sha=?1,source_sha=?2,updated_at=?3 WHERE id=?4 AND current_attempt_id=?5",
+            params![target_sha,effort.source_sha,now(),effort.item_id,effort.attempt_id],
+        )?;
+        if projected != 1 {
+            anyhow::bail!("pending target movement lost queue projection authority");
+        }
         append_event(
             &transaction,
             &effort,
@@ -2504,7 +3125,28 @@ impl ControlStore {
             false,
         )?;
         transaction.commit()?;
+        fail_after_target_move_commit_for_test(self.path())?;
         Ok(())
+    }
+
+    pub(crate) fn authorize_definite_landing_rejection(
+        &self,
+        effort_id: &str,
+        command_id: &str,
+        expected_target_sha: &str,
+    ) -> Result<DefiniteLandingRejection> {
+        crate::control_domain::require_exact_text(command_id, "landing command identity")?;
+        let effort = self.effort_by_id(effort_id)?;
+        let connection = self.connect(false)?;
+        effort_object_format(&connection, effort_id)?
+            .require_oid(expected_target_sha, "expected landing target SHA")?;
+        let rejection = DefiniteLandingRejection {
+            effort_id: effort_id.to_string(),
+            command_id: command_id.to_string(),
+            expected_target_sha: expected_target_sha.to_string(),
+        };
+        require_target_move_authority(&effort, Some(&rejection))?;
+        Ok(rejection)
     }
 
     pub fn reject_candidate(&self, effort_id: &str, evidence: &str) -> Result<IntegrationEffort> {
@@ -2512,6 +3154,9 @@ impl ControlStore {
         let mut connection = self.connect(true)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let effort = required_effort(&transaction, effort_id)?;
+        if effort.state.contains_external_landing_authority() {
+            anyhow::bail!("external landing authority cannot be replaced by candidate rejection");
+        }
         let cycle_id = match &effort.state {
             IntegrationEffortState::CandidateReady(candidate) => candidate.cycle_id.clone(),
             IntegrationEffortState::Validating(validating) => transaction.query_row(
@@ -2520,11 +3165,6 @@ impl ControlStore {
                 |row| row.get(0),
             )?,
             IntegrationEffortState::Landing(landing) => transaction.query_row(
-                "SELECT cycle_id FROM candidate_evidence WHERE effort_id=?1 AND candidate_sha=?2",
-                params![effort_id, landing.candidate_sha],
-                |row| row.get(0),
-            )?,
-            IntegrationEffortState::LandingUncertain(landing) => transaction.query_row(
                 "SELECT cycle_id FROM candidate_evidence WHERE effort_id=?1 AND candidate_sha=?2",
                 params![effort_id, landing.candidate_sha],
                 |row| row.get(0),
@@ -2630,6 +3270,15 @@ impl ControlStore {
             return Ok(AnswerDisposition::Duplicate);
         }
         let effort = required_effort(&transaction, authoritative_effort_id)?;
+        let operation_state: String = transaction.query_row(
+            "SELECT policy.operation_state_json FROM queue_items item JOIN repository_policies policy ON policy.repo_key=item.repo_key WHERE item.id=?1",
+            [&effort.item_id],
+            |row| row.get(0),
+        )?;
+        serde_json::from_str::<crate::repository_policy::OperationState>(&operation_state)?
+            .require_obligation(&crate::repository_policy::Obligation::QueueItem {
+                id: effort.item_id.clone(),
+            })?;
         let authorized = match responder {
             ResponderIdentity::LocalPeer { uid } => {
                 *uid == daemon_uid
@@ -2703,6 +3352,27 @@ impl ControlStore {
         if !authorized {
             anyhow::bail!("explicit blocker retry is not authorized");
         }
+        let operation_state: String = transaction.query_row(
+            "SELECT policy.operation_state_json FROM queue_items item JOIN repository_policies policy ON policy.repo_key=item.repo_key WHERE item.id=?1",
+            [&effort.item_id],
+            |row| row.get(0),
+        )?;
+        let operation_state: crate::repository_policy::OperationState =
+            serde_json::from_str(&operation_state)
+                .context("decode retry repository operation state")?;
+        match operation_state {
+            crate::repository_policy::OperationState::Enabled => {}
+            crate::repository_policy::OperationState::Draining { obligations }
+                if obligations.contains(&crate::repository_policy::Obligation::QueueItem {
+                    id: effort.item_id.clone(),
+                }) => {}
+            crate::repository_policy::OperationState::Draining { .. } => {
+                anyhow::bail!("retry is not a captured draining obligation")
+            }
+            crate::repository_policy::OperationState::Disabled => {
+                anyhow::bail!("repository is disabled")
+            }
+        }
         let (state, failed_cycles, event_type) = match &effort.state {
             IntegrationEffortState::CycleLimitBlocked(_) => (
                 IntegrationEffortState::AgentReady(AgentReady {
@@ -2761,159 +3431,126 @@ impl ControlStore {
         let mut connection = self.connect(true)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let effort = required_effort(&transaction, effort_id)?;
-        if matches!(
-            effort.state,
-            IntegrationEffortState::LandingUncertain(_) | IntegrationEffortState::Integrated(_)
-        ) {
-            anyhow::bail!("uncertain or integrated effort cannot be cancelled");
+        if item_contains_external_landing_authority(
+            &transaction,
+            &effort.item_id,
+            Some(&effort.state),
+        )? {
+            anyhow::bail!("external landing authority cannot be cancelled");
         }
         if matches!(effort.state, IntegrationEffortState::Cancelled(_)) {
             transaction.commit()?;
             return self.effort_by_id(effort_id);
         }
-        let replacement_creating: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM local_submissions WHERE replaces_item_id=?1 AND state='creating')",
-            params![effort.item_id],
-            |row| row.get(0),
-        )?;
-        if replacement_creating {
-            anyhow::bail!(
-                "item has an incomplete immutable replacement; finish that submission before cancellation"
-            );
-        }
-        let termination = match &effort.state {
-            IntegrationEffortState::AgentLaunching(launching) => {
-                Some(RunnerTerminationAuthority::Launching(launching.clone()))
-            }
-            IntegrationEffortState::AgentRunning(running) => {
-                Some(RunnerTerminationAuthority::Running(running.clone()))
-            }
-            _ => None,
-        };
-        if let Some(termination) = termination {
-            transaction.execute(
-                "INSERT INTO runner_termination_debt(effort_id,authority_json,created_at) VALUES(?1,?2,?3)",
-                params![effort.id, serde_json::to_string(&termination)?, now()],
-            )?;
-        }
-        transaction.execute(
-            "UPDATE integration_cycles SET status='cancelled',finished_at=?1 WHERE effort_id=?2 AND status IN ('starting','running')",
-            params![now(),effort_id],
-        )?;
-        transaction.execute(
-            "UPDATE guidance_requests SET status='cancelled' WHERE effort_id=?1 AND status='open'",
-            params![effort_id],
-        )?;
-        transaction.execute(
-            "UPDATE prompts SET status='cancelled' WHERE item_id=?1 AND status='open'",
-            params![effort.item_id],
-        )?;
-        let attempt_changed = transaction.execute(
-            "UPDATE integration_attempts SET result='cancelled',finished_at=?1 WHERE id=?2 AND result IS NULL",
-            params![now(),effort.attempt_id],
-        )?;
-        if attempt_changed != 1 {
-            anyhow::bail!("cancelled effort attempt is not active");
-        }
-        let submission: Option<(String, String)> = transaction
-            .query_row(
-                "SELECT submission.id,submission.workspace_id FROM queue_items item JOIN local_submissions submission ON submission.id=item.submission_id WHERE item.id=?1 AND item.source_kind='local_submission'",
-                params![effort.item_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        if let Some((submission_id, workspace_id)) = submission {
-            let submission_changed = transaction.execute(
-                "UPDATE local_submissions SET state='cancelled' WHERE id=?1 AND state='queued'",
-                params![submission_id],
-            )?;
-            let workspace_changed = transaction.execute(
-                "UPDATE development_workspaces SET status='active',cleanup_json=json_object('state','pending'),updated_at=?1 WHERE id=?2 AND status='submitted'",
-                params![now(), workspace_id],
-            )?;
-            if submission_changed != 1 || workspace_changed != 1 {
-                anyhow::bail!("cancelled local submission cannot return its workspace to active");
-            }
-        }
-        let state = IntegrationEffortState::Cancelled(crate::control_domain::Cancelled {
-            actor: actor.to_string(),
-            reason: reason.to_string(),
-            cancelled_at: now(),
-        });
-        transaction.execute(
-            "INSERT OR IGNORE INTO terminal_workspace_cleanup_debt(item_id,workspace_json,target_kind,state,reason,observation_count,next_retry_at,alert_event_id,created_at,updated_at) VALUES(?1,?2,'retained','pending',NULL,0,?3,NULL,?3,?3)",
-            params![effort.item_id, serde_json::to_string(&effort.workspace)?, now()],
-        )?;
-        update_state(&transaction, &effort, &state)?;
-        append_event(
-            &transaction,
-            &effort,
-            "cancelled",
-            serde_json::to_value(&state)?,
-            false,
-        )?;
+        cancel_effort_transaction(&transaction, &effort, actor, reason)?;
         transaction.commit()?;
         self.effort_by_id(effort_id)
     }
 
-    pub fn reconcile_cancelled_runner_terminations(&self, startup: bool) -> Result<usize> {
-        let debts = {
+    pub fn reconcile_cancelled_runner_terminations(&self) -> Result<usize> {
+        let effort_ids = {
             let connection = self.connect(false)?;
             let mut statement = connection.prepare(
-                "SELECT debt.effort_id,debt.authority_json,effort.runner_snapshot_json FROM runner_termination_debt debt JOIN integration_efforts effort ON effort.id=debt.effort_id WHERE effort.state='cancelled' ORDER BY debt.created_at,debt.effort_id",
+                "SELECT debt.effort_id FROM runner_termination_debt debt JOIN integration_efforts effort ON effort.id=debt.effort_id WHERE effort.state='cancelled' ORDER BY debt.created_at,debt.effort_id",
             )?;
             let rows = statement
-                .query_map([], |row| {
-                    let authority: String = row.get(1)?;
-                    let runner: String = row.get(2)?;
-                    Ok(RunnerTerminationDebt {
-                        effort_id: row.get(0)?,
-                        authority: serde_json::from_str(&authority).map_err(json_error)?,
-                        runner: serde_json::from_str(&runner).map_err(json_error)?,
-                    })
-                })?
+                .query_map([], |row| row.get::<_, String>(0))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             rows
         };
         let mut reconciled = 0;
-        for debt in &debts {
-            let resolved = match &debt.authority {
-                RunnerTerminationAuthority::Launching(launching) => {
-                    let unit = crate::agent_runner::systemd_unit_state(
-                        &debt.runner.sandbox.systemctl,
-                        &launching.unit_name,
-                    )?;
-                    if matches!(unit, crate::agent_runner::SystemdUnitState::Loaded { .. }) {
-                        crate::agent_runner::stop_systemd_unit(
+        for effort_id in effort_ids {
+            if self.reconcile_cancelled_runner_termination(&effort_id)? {
+                reconciled += 1;
+            }
+        }
+        Ok(reconciled)
+    }
+
+    pub fn reconcile_cancelled_runner_termination(&self, effort_id: &str) -> Result<bool> {
+        let debt = {
+            let connection = self.connect(false)?;
+            connection
+                .query_row(
+                    "SELECT debt.effort_id,debt.authority_json,effort.runner_snapshot_json FROM runner_termination_debt debt JOIN integration_efforts effort ON effort.id=debt.effort_id WHERE debt.effort_id=?1 AND effort.state='cancelled'",
+                    [effort_id],
+                    |row| {
+                        let authority: String = row.get(1)?;
+                        let runner: String = row.get(2)?;
+                        Ok(RunnerTerminationDebt {
+                            effort_id: row.get(0)?,
+                            authority: serde_json::from_str(&authority).map_err(json_error)?,
+                            runner: serde_json::from_str(&runner).map_err(json_error)?,
+                        })
+                    },
+                )
+                .optional()?
+        };
+        let Some(debt) = debt else {
+            return Ok(true);
+        };
+        debt.authority.validate()?;
+        let resolved = match &debt.authority {
+            RunnerTerminationAuthority::Launching(launching) => {
+                if launching.spawn_authority != crate::control_domain::SpawnAuthority::Closed
+                    && crate::agent_runner::exact_process_is_alive(
+                        launching.launcher.pid,
+                        launching.launcher.process_start_ticks,
+                    )?
+                {
+                    if matches!(
+                        crate::agent_runner::systemd_unit_state(
+                            &debt.runner.sandbox.systemctl,
+                            &launching.unit_name,
+                        )?,
+                        crate::agent_runner::SystemdUnitState::Active { .. }
+                    ) {
+                        crate::agent_runner::stop_and_verify_systemd_unit(
                             &debt.runner.sandbox.systemctl,
                             &launching.unit_name,
                         )?;
                     }
-                    !matches!(unit, crate::agent_runner::SystemdUnitState::Missing) || startup
+                    return Ok(false);
                 }
-                RunnerTerminationAuthority::Running(running) => {
-                    crate::agent_runner::terminate_exact_process(
-                        running.pid,
-                        running.process_start_ticks,
-                        running.process_group_id,
-                    )?;
-                    true
-                }
-            };
-            if !resolved {
-                continue;
+                crate::agent_runner::stop_and_verify_systemd_unit(
+                    &debt.runner.sandbox.systemctl,
+                    &launching.unit_name,
+                )?;
+                true
             }
-            let connection = self.connect(true)?;
-            let changed = connection.execute(
-                "DELETE FROM runner_termination_debt WHERE effort_id=?1 AND authority_json=?2 AND EXISTS(SELECT 1 FROM integration_efforts WHERE id=?1 AND state='cancelled')",
-                params![debt.effort_id, serde_json::to_string(&debt.authority)?],
-            )?;
-            if changed != 1 {
-                anyhow::bail!("runner termination debt authority changed during reconciliation");
+            RunnerTerminationAuthority::Service(service) => {
+                crate::agent_runner::stop_exact_runner_service(
+                    &debt.runner.sandbox.systemctl,
+                    &service.unit_name,
+                    &service.control_group,
+                    service.pid,
+                    service.process_start_ticks,
+                )?;
+                true
             }
-            reconciled += 1;
+            RunnerTerminationAuthority::LegacyScope(scope) => {
+                crate::agent_runner::stop_exact_legacy_runner_scope(
+                    &debt.runner.sandbox.systemctl,
+                    &scope.unit_name,
+                    &scope.control_group,
+                    scope.pid,
+                    scope.process_start_ticks,
+                )?;
+                true
+            }
+        };
+        if !resolved {
+            return Ok(false);
         }
-        Ok(reconciled)
+        let connection = self.connect(true)?;
+        let changed = connection.execute(
+            "DELETE FROM runner_termination_debt WHERE effort_id=?1 AND authority_json=?2 AND EXISTS(SELECT 1 FROM integration_efforts WHERE id=?1 AND state='cancelled')",
+            params![debt.effort_id, serde_json::to_string(&debt.authority)?],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("runner termination debt authority changed during reconciliation");
+        }
+        Ok(true)
     }
 
     pub fn record_alert(
@@ -2945,24 +3582,18 @@ impl ControlStore {
         self.authority.verify_configured_connection(&connection)?;
         Ok(connection)
     }
+}
 
-    #[doc(hidden)]
-    pub fn open_test_database(path: &Path) -> Result<Self> {
-        let connection = Connection::open(path)?;
-        connection.pragma_update(None, "foreign_keys", "ON")?;
-        crate::sqlite::initialize_test_schema(&connection)?;
-        let database_id = crate::sqlite::validate_existing_schema_identity(&connection)?;
-        let path = path.canonicalize()?;
-        let metadata = fs::symlink_metadata(&path)?;
-        let authority = ValidatedDatabaseAuthority::from_validated_connection(
-            path,
-            metadata.dev(),
-            metadata.ino(),
-            database_id,
-            &connection,
-        )?;
-        drop(connection);
-        Self::open_validated(authority)
+fn require_terminal_systemd_unit(
+    systemctl: &crate::control_domain::ExecutableIdentity,
+    unit_name: &str,
+) -> Result<()> {
+    match crate::agent_runner::systemd_unit_state(systemctl, unit_name)? {
+        crate::agent_runner::SystemdUnitState::Missing
+        | crate::agent_runner::SystemdUnitState::Inactive { .. } => Ok(()),
+        crate::agent_runner::SystemdUnitState::Active { .. } => {
+            anyhow::bail!("failed runner spawn systemd service is still active")
+        }
     }
 }
 
@@ -2989,10 +3620,179 @@ fn fail_recomposition_projection_for_test(_database_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn stop_recomposition_after_for_test(_boundary: &str) {
+    #[cfg(debug_assertions)]
+    if std::env::var("IQ_TEST_RECOMPOSITION_STOP_AFTER").as_deref() == Ok(_boundary) {
+        std::process::exit(94);
+    }
+}
+
+fn fail_after_target_move_commit_for_test(_database_path: &Path) -> Result<()> {
+    #[cfg(debug_assertions)]
+    {
+        let mut hook = TARGET_MOVE_COMMIT_FAILURE_TEST_HOOK.lock().unwrap();
+        if hook.as_deref() == Some(_database_path) {
+            hook.take();
+            anyhow::bail!("injected failure after durable target-move commit");
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn install_control_schema(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "DROP TRIGGER IF EXISTS integration_effort_legal_transition;
+         DROP TRIGGER IF EXISTS integration_effort_related_state_insert;
+         DROP TRIGGER IF EXISTS integration_effort_related_state_update;
+         DROP TRIGGER IF EXISTS queue_effort_projection_guard;",
+    )?;
     connection.execute_batch(CONTROL_SCHEMA)?;
     connection.execute_batch(CLEANUP_SCHEMA)?;
     connection.execute_batch(CLEANUP_TRIGGERS)?;
+    Ok(())
+}
+
+pub(crate) fn install_schema3_control_identity(connection: &Connection) -> Result<()> {
+    install_control_schema(connection)?;
+    connection.execute_batch("PRAGMA writable_schema=ON")?;
+    connection.execute(
+        "UPDATE sqlite_schema SET sql=replace(replace(replace(replace(replace(replace(sql,?1,''),?2,''),?3,''),?4,''),'$.payload.control_group','$.payload.process_group_id'),\"json_type(state_json,'$.payload.process_group_id')='text'\",\"json_type(state_json,'$.payload.process_group_id')='integer'\") WHERE type='table' AND name='integration_efforts'",
+        rusqlite::params![
+            " AND json_extract(state_json,'$.payload.spawn_authority') IN ('open','surrendered')",
+            "'target_move_pending',",
+            "    WHEN 'target_move_pending' THEN json_type(state_json,'$.payload.target_sha')='text' AND json_type(state_json,'$.payload.source_sha')='text' AND json_type(state_json,'$.payload.previous')='object' AND json_type(state_json,'$.payload.cause')='object'\n",
+            " AND json_type(state_json,'$.payload.launcher.pid')='integer' AND json_extract(state_json,'$.payload.launcher.pid')>0 AND json_type(state_json,'$.payload.launcher.process_start_ticks')='integer' AND json_extract(state_json,'$.payload.launcher.process_start_ticks')>0 AND json_type(state_json,'$.payload.launcher.token')='text'",
+        ],
+    )?;
+    for trigger in [
+        "integration_effort_exact_payload_insert",
+        "integration_effort_exact_payload_update",
+    ] {
+        connection.execute(
+            "UPDATE sqlite_schema SET sql=replace(replace(replace(replace(replace(replace(sql,?1,?2),?3,''),?4,''),?5,?6),?7,''),'control_group','process_group_id') WHERE type='trigger' AND name=?8",
+            rusqlite::params![
+                "WHEN 'agent_launching' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=10",
+                "WHEN 'agent_launching' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=8",
+                ",'spawn_authority'",
+                ",'launcher'",
+                "WHEN 'agent_running' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=13",
+                "WHEN 'agent_running' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=12",
+                "    WHEN 'target_move_pending' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=4 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('target_sha','source_sha','previous','cause'))\n",
+                trigger,
+            ],
+        )?;
+    }
+    connection.execute(
+        "UPDATE sqlite_schema SET sql=replace(replace(sql,?1,''),?2,'') WHERE type='trigger' AND name='integration_effort_legal_transition'",
+        rusqlite::params![
+            "'target_move_pending',",
+            " OR\n  (OLD.state='target_move_pending' AND NEW.state IN ('agent_ready','cancelled'))",
+        ],
+    )?;
+    connection.execute(
+        "UPDATE sqlite_schema SET sql=replace(sql,?1,'') WHERE type='trigger' AND name='integration_effort_related_state_update'",
+        ["  (NEW.state='target_move_pending' AND EXISTS(SELECT 1 FROM candidate_evidence candidate WHERE candidate.effort_id=NEW.id AND candidate.candidate_sha=json_extract(NEW.state_json,'$.payload.previous.payload.candidate_sha'))) OR\n"],
+    )?;
+    connection.execute(
+        "UPDATE sqlite_schema SET sql=replace(sql,?1,'') WHERE type='trigger' AND name='queue_effort_projection_guard'",
+        [",'target_move_pending'"],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn upgrade_schema3_control_identity(connection: &Connection) -> Result<()> {
+    let old = "AND json_type(state_json,'$.payload.protocol_directory')='text'";
+    let launcher_identity = " AND json_type(state_json,'$.payload.launcher.pid')='integer' AND json_extract(state_json,'$.payload.launcher.pid')>0 AND json_type(state_json,'$.payload.launcher.process_start_ticks')='integer' AND json_extract(state_json,'$.payload.launcher.process_start_ticks')>0 AND json_type(state_json,'$.payload.launcher.token')='text'";
+    let new = format!(
+        "AND json_type(state_json,'$.payload.protocol_directory')='text' AND json_extract(state_json,'$.payload.spawn_authority') IN ('open','surrendered'){launcher_identity}"
+    );
+    connection.execute_batch("PRAGMA writable_schema=ON")?;
+    let changed = connection.execute(
+        "UPDATE sqlite_schema SET sql=replace(sql,?1,?2) WHERE type='table' AND name='integration_efforts' AND instr(sql,?1)>0 AND instr(sql,?3)=0",
+        rusqlite::params![old, new, "$.payload.spawn_authority"],
+    )?;
+    if changed != 1 {
+        anyhow::bail!("schema-3 integration effort identity did not upgrade exactly once");
+    }
+    let running = "WHEN 'agent_running' THEN json_type(state_json,'$.payload.cycle_id')='text' AND json_type(state_json,'$.payload.pid')='integer' AND json_type(state_json,'$.payload.process_start_ticks')='integer' AND json_type(state_json,'$.payload.process_group_id')='integer'";
+    let current_running = format!("WHEN 'agent_running' THEN json_type(state_json,'$.payload.cycle_id')='text' AND json_type(state_json,'$.payload.pid')='integer' AND json_type(state_json,'$.payload.process_start_ticks')='integer' AND json_type(state_json,'$.payload.control_group')='text'{launcher_identity}");
+    let changed = connection.execute(
+        "UPDATE sqlite_schema SET sql=replace(sql,?1,?2) WHERE type='table' AND name='integration_efforts' AND instr(sql,?1)>0",
+        rusqlite::params![running, current_running],
+    )?;
+    if changed != 1 {
+        anyhow::bail!("schema-3 running launcher identity did not upgrade exactly once");
+    }
+    for trigger in [
+        "integration_effort_exact_payload_insert",
+        "integration_effort_exact_payload_update",
+    ] {
+        let changed = connection.execute(
+            "UPDATE sqlite_schema SET sql=replace(replace(replace(replace(sql,?1,?2),?3,?4),'process_group_id','control_group'),?5,?6) WHERE type='trigger' AND name=?7",
+            rusqlite::params![
+                "WHEN 'agent_launching' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=8",
+                "WHEN 'agent_launching' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=10",
+                "'protocol_directory','prepared_at'",
+                "'protocol_directory','prepared_at','spawn_authority','launcher'",
+                "WHEN 'agent_running' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=12",
+                "WHEN 'agent_running' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=13",
+                trigger,
+            ],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("schema-3 exact runner payload identity did not upgrade exactly once");
+        }
+    }
+    let state_list = "'landing_uncertain','integrated'";
+    let current_state_list = "'landing_uncertain','target_move_pending','integrated'";
+    let landing_payload = "    WHEN 'landing_uncertain' THEN json_type(state_json,'$.payload.candidate_sha')='text' AND json_type(state_json,'$.payload.expected_target_sha')='text' AND json_type(state_json,'$.payload.command_id')='text'\n";
+    let current_landing_payload = "    WHEN 'landing_uncertain' THEN json_type(state_json,'$.payload.candidate_sha')='text' AND json_type(state_json,'$.payload.expected_target_sha')='text' AND json_type(state_json,'$.payload.command_id')='text'\n    WHEN 'target_move_pending' THEN json_type(state_json,'$.payload.target_sha')='text' AND json_type(state_json,'$.payload.source_sha')='text' AND json_type(state_json,'$.payload.previous')='object' AND json_type(state_json,'$.payload.cause')='object'\n";
+    let changed = connection.execute(
+        "UPDATE sqlite_schema SET sql=replace(replace(sql,?1,?2),?3,?4) WHERE type='table' AND name='integration_efforts' AND instr(sql,?1)>0 AND instr(sql,'target_move_pending')=0",
+        rusqlite::params![
+            state_list,
+            current_state_list,
+            landing_payload,
+            current_landing_payload,
+        ],
+    )?;
+    if changed != 1 {
+        anyhow::bail!("schema-3 target movement identity did not upgrade exactly once");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_schema3_systemd_authority(connection: &Connection) -> Result<()> {
+    let mut efforts = connection.prepare(
+        "SELECT id,json_extract(state_json,'$.payload.cycle_id'),json_extract(state_json,'$.payload.unit_name') FROM integration_efforts WHERE state IN ('agent_launching','agent_running') ORDER BY id",
+    )?;
+    for effort in efforts.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })? {
+        let (effort_id, cycle_id, unit_name) = effort?;
+        crate::control_domain::validate_legacy_systemd_scope_name(&cycle_id, &unit_name)
+            .with_context(|| format!("schema-3 effort {effort_id} has unsafe systemd authority"))?;
+    }
+    let mut debts = connection.prepare(
+        "SELECT effort_id,json_extract(authority_json,'$.payload.cycle_id'),json_extract(authority_json,'$.payload.unit_name') FROM runner_termination_debt ORDER BY effort_id",
+    )?;
+    for debt in debts.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })? {
+        let (effort_id, cycle_id, unit_name) = debt?;
+        crate::control_domain::validate_legacy_systemd_scope_name(&cycle_id, &unit_name)
+            .with_context(|| {
+                format!("schema-3 termination debt {effort_id} has unsafe systemd authority")
+            })?;
+    }
     Ok(())
 }
 
@@ -3153,8 +3953,27 @@ fn validate_workspace_status(status: StoredQueueStatus, workspace: &StoredWorksp
 }
 
 pub(crate) fn validate_control_contents(connection: &Connection) -> Result<()> {
+    validate_runner_termination_authority(connection)?;
     let expected = expected_debt_from_queue(connection)?;
     validate_control_contents_against_queue(connection, &expected)
+}
+
+fn validate_runner_termination_authority(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare(
+        "SELECT effort_id,authority_json FROM runner_termination_debt ORDER BY effort_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (effort_id, authority) = row?;
+        serde_json::from_str::<RunnerTerminationAuthority>(&authority)?
+            .validate()
+            .with_context(|| {
+                format!("runner termination debt {effort_id} has invalid authority")
+            })?;
+    }
+    Ok(())
 }
 
 fn validate_integrity_and_foreign_keys(connection: &Connection) -> Result<()> {
@@ -3528,6 +4347,392 @@ fn required_effort(connection: &Connection, effort_id: &str) -> Result<Integrati
         .with_context(|| format!("integration effort not found: {effort_id}"))
 }
 
+fn item_object_format(
+    connection: &Connection,
+    item_id: &str,
+) -> Result<crate::git_object::GitObjectFormat> {
+    let repository: String = connection.query_row(
+        "SELECT policy.canonical_repository_json FROM queue_items item JOIN repository_policies policy ON policy.repo_key=item.repo_key WHERE item.id=?1",
+        [item_id],
+        |row| row.get(0),
+    )?;
+    Ok(
+        serde_json::from_str::<crate::repository_policy::GitRepository>(&repository)?
+            .object_format(),
+    )
+}
+
+fn effort_object_format(
+    connection: &Connection,
+    effort_id: &str,
+) -> Result<crate::git_object::GitObjectFormat> {
+    let repository: String = connection.query_row(
+        "SELECT policy.canonical_repository_json FROM integration_efforts effort JOIN queue_items item ON item.id=effort.item_id JOIN repository_policies policy ON policy.repo_key=item.repo_key WHERE effort.id=?1",
+        [effort_id],
+        |row| row.get(0),
+    )?;
+    Ok(
+        serde_json::from_str::<crate::repository_policy::GitRepository>(&repository)?
+            .object_format(),
+    )
+}
+
+pub(crate) fn cancel_item_for_migration(
+    connection: &Connection,
+    item_id: &str,
+    runner_authority: Option<&crate::control_domain::LegacyRunnerScopeAuthority>,
+) -> Result<()> {
+    let effort = connection
+        .query_row(
+            "SELECT id,attempt_id,state,state_json,workspace_json FROM integration_efforts WHERE item_id=?1",
+            [item_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((effort_id, attempt_id, state_name, state_json, workspace_json)) = effort {
+        let active_runner = matches!(state_name.as_str(), "agent_launching" | "agent_running");
+        let effort_state = if active_runner {
+            None
+        } else {
+            Some(serde_json::from_str::<IntegrationEffortState>(&state_json)?)
+        };
+        if item_contains_external_landing_authority(connection, item_id, effort_state.as_ref())? {
+            anyhow::bail!("migration cannot cancel external landing authority");
+        }
+        if matches!(effort_state, Some(IntegrationEffortState::Cancelled(_))) {
+            return Ok(());
+        }
+        let termination = if active_runner {
+            let authority = runner_authority.context(
+                "schema-3 active runner cancellation has no explicit termination authority",
+            )?;
+            Some(RunnerTerminationAuthority::LegacyScope(authority.clone()))
+        } else {
+            if runner_authority.is_some() {
+                anyhow::bail!(
+                    "schema-3 item has termination authority without active runner state"
+                );
+            }
+            None
+        };
+        if let Some(termination) = termination {
+            connection.execute(
+                "INSERT INTO runner_termination_debt(effort_id,authority_json,created_at) VALUES(?1,?2,?3)",
+                params![effort_id, serde_json::to_string(&termination)?, now()],
+            )?;
+        }
+        connection.execute(
+            "UPDATE integration_cycles SET status='cancelled',finished_at=?1 WHERE effort_id=?2 AND status IN ('starting','running')",
+            params![now(), effort_id],
+        )?;
+        connection.execute(
+            "UPDATE guidance_requests SET status='cancelled' WHERE effort_id=?1 AND status='open'",
+            [&effort_id],
+        )?;
+        connection.execute(
+            "UPDATE prompts SET status='cancelled' WHERE item_id=?1 AND status='open'",
+            [item_id],
+        )?;
+        let attempt_changed = connection.execute(
+            "UPDATE integration_attempts SET result='cancelled',finished_at=?1 WHERE id=?2 AND result IS NULL",
+            params![now(), attempt_id],
+        )?;
+        if attempt_changed != 1 {
+            anyhow::bail!("cancelled migration effort attempt is not active");
+        }
+        cancel_local_submission(connection, item_id)?;
+        if serde_json::from_str::<WorkspaceIdentity>(&workspace_json).is_ok() {
+            connection.execute(
+                "INSERT OR IGNORE INTO terminal_workspace_cleanup_debt(item_id,workspace_json,target_kind,state,reason,observation_count,next_retry_at,alert_event_id,created_at,updated_at) VALUES(?1,?2,'retained','pending',NULL,0,?3,NULL,?3,?3)",
+                params![item_id, workspace_json, now()],
+            )?;
+        } else {
+            let has_workspace: bool = connection.query_row(
+                "SELECT integration_workspace_path IS NOT NULL OR integration_workspace_rift_id IS NOT NULL OR integration_workspace_source_rift_id IS NOT NULL FROM queue_items WHERE id=?1",
+                [item_id],
+                |row| row.get(0),
+            )?;
+            if has_workspace {
+                anyhow::bail!("schema-3 migration effort has workspace authority but no valid workspace identity");
+            }
+        }
+        let cancelled = IntegrationEffortState::Cancelled(crate::control_domain::Cancelled {
+            actor: "schema3_migration".into(),
+            reason: "repository_policy_incompatible".into(),
+            cancelled_at: now(),
+        });
+        let changed = connection.execute(
+            "UPDATE integration_efforts SET failed_cycles=0,state='cancelled',state_json=?1,blocker_kind=NULL,updated_at=?2 WHERE id=?3 AND state=?4",
+            params![serde_json::to_string(&cancelled)?, now(), effort_id, state_name],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("migration effort state changed concurrently");
+        }
+        let queue_changed = connection.execute(
+            "UPDATE queue_items SET status='cancelled',blocked_phase=NULL,blocked_reason=NULL,blocked_message=NULL,retry_after=NULL,prompt_id=NULL,landing_state_json='{\"state\":\"ready\"}',replacement_json=NULL,updated_at=?1 WHERE id=?2 AND current_attempt_id=?3",
+            params![now(), item_id, attempt_id],
+        )?;
+        if queue_changed != 1 {
+            anyhow::bail!("migration cancellation lost queue attempt authority");
+        }
+        append_event_raw(
+            connection,
+            item_id,
+            Some(&effort_id),
+            "cancelled",
+            serde_json::to_value(cancelled)?,
+            false,
+        )?;
+        return Ok(());
+    }
+
+    if item_contains_external_landing_authority(connection, item_id, None)? {
+        anyhow::bail!("migration cannot cancel external landing authority");
+    }
+
+    let timestamp = now();
+    connection.execute(
+        "UPDATE prompts SET status='cancelled' WHERE item_id=?1 AND status='open'",
+        [item_id],
+    )?;
+    connection.execute(
+        "UPDATE integration_attempts SET result='cancelled',finished_at=?1 WHERE item_id=?2 AND result IS NULL",
+        params![timestamp, item_id],
+    )?;
+    cancel_local_submission(connection, item_id)?;
+    let changed = connection.execute(
+        "UPDATE queue_items SET status='cancelled',blocked_phase=NULL,blocked_reason=NULL,blocked_message=NULL,retry_after=NULL,prompt_id=NULL,replacement_json=NULL,updated_at=?1 WHERE id=?2 AND status NOT IN ('integrated','cancelled')",
+        params![timestamp, item_id],
+    )?;
+    if changed != 1 {
+        anyhow::bail!("migration item cannot transition to cancelled");
+    }
+    Ok(())
+}
+
+fn item_contains_external_landing_authority(
+    connection: &Connection,
+    item_id: &str,
+    effort: Option<&IntegrationEffortState>,
+) -> Result<bool> {
+    let landing: String = connection.query_row(
+        "SELECT landing_state_json FROM queue_items WHERE id=?1",
+        [item_id],
+        |row| row.get(0),
+    )?;
+    let landing: LandingState = serde_json::from_str(&landing)?;
+    Ok(landing.contains_external_landing_authority()
+        || effort.is_some_and(IntegrationEffortState::contains_external_landing_authority))
+}
+
+fn cancel_local_submission(connection: &Connection, item_id: &str) -> Result<()> {
+    let submission: Option<(String, String)> = connection
+        .query_row(
+            "SELECT submission.id,submission.workspace_id FROM queue_admissions admission JOIN local_submissions submission ON submission.id=admission.submission_id WHERE admission.item_id=?1 AND admission.kind='local_submission'",
+            [item_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((submission_id, workspace_id)) = submission {
+        let submission_changed = connection.execute(
+            "UPDATE local_submissions SET state='cancelled' WHERE id=?1 AND state='queued'",
+            [submission_id],
+        )?;
+        let workspace_changed = connection.execute(
+            "UPDATE development_workspaces SET status='active',cleanup_json=json_object('state','pending'),updated_at=?1 WHERE id=?2 AND status='submitted'",
+            params![now(), workspace_id],
+        )?;
+        if submission_changed != 1 || workspace_changed != 1 {
+            anyhow::bail!("cancelled local submission cannot return its workspace to active");
+        }
+    }
+    Ok(())
+}
+
+fn cancel_effort_transaction(
+    connection: &Connection,
+    effort: &IntegrationEffort,
+    actor: &str,
+    reason: &str,
+) -> Result<()> {
+    let termination = match &effort.state {
+        IntegrationEffortState::AgentLaunching(launching) => {
+            let mut launching = launching.clone();
+            launching.spawn_authority = match launching.spawn_authority {
+                crate::control_domain::SpawnAuthority::Open => {
+                    crate::control_domain::SpawnAuthority::CloseRequested
+                }
+                crate::control_domain::SpawnAuthority::Surrendered => {
+                    crate::control_domain::SpawnAuthority::Surrendered
+                }
+                _ => anyhow::bail!("active launch has invalid spawn authority"),
+            };
+            Some(RunnerTerminationAuthority::Launching(launching))
+        }
+        IntegrationEffortState::AgentRunning(running) => Some(RunnerTerminationAuthority::Service(
+            running.termination_authority(),
+        )),
+        _ => None,
+    };
+    if let Some(termination) = termination {
+        connection.execute(
+            "INSERT INTO runner_termination_debt(effort_id,authority_json,created_at) VALUES(?1,?2,?3)",
+            params![effort.id, serde_json::to_string(&termination)?, now()],
+        )?;
+    }
+    connection.execute(
+        "UPDATE integration_cycles SET status='cancelled',finished_at=?1 WHERE effort_id=?2 AND status IN ('starting','running')",
+        params![now(), effort.id],
+    )?;
+    connection.execute(
+        "UPDATE guidance_requests SET status='cancelled' WHERE effort_id=?1 AND status='open'",
+        [&effort.id],
+    )?;
+    connection.execute(
+        "UPDATE prompts SET status='cancelled' WHERE item_id=?1 AND status='open'",
+        [&effort.item_id],
+    )?;
+    let attempt_changed = connection.execute(
+        "UPDATE integration_attempts SET result='cancelled',finished_at=?1 WHERE id=?2 AND result IS NULL",
+        params![now(), effort.attempt_id],
+    )?;
+    if attempt_changed != 1 {
+        anyhow::bail!("cancelled effort attempt is not active");
+    }
+    cancel_local_submission(connection, &effort.item_id)?;
+    let state = IntegrationEffortState::Cancelled(crate::control_domain::Cancelled {
+        actor: actor.to_string(),
+        reason: reason.to_string(),
+        cancelled_at: now(),
+    });
+    connection.execute(
+        "INSERT OR IGNORE INTO terminal_workspace_cleanup_debt(item_id,workspace_json,target_kind,state,reason,observation_count,next_retry_at,alert_event_id,created_at,updated_at) VALUES(?1,?2,'retained','pending',NULL,0,?3,NULL,?3,?3)",
+        params![effort.item_id, serde_json::to_string(&effort.workspace)?, now()],
+    )?;
+    update_state_and_count(connection, effort, &state, 0)?;
+    append_event(
+        connection,
+        effort,
+        "cancelled",
+        serde_json::to_value(&state)?,
+        false,
+    )?;
+    Ok(())
+}
+
+fn close_requested_spawn_authority(
+    connection: &Connection,
+    effort_id: &str,
+    launch_operation_id: &str,
+    authority_lease_id: &str,
+    launcher: &LauncherAuthority,
+) -> Result<bool> {
+    update_cancelled_spawn_authority(
+        connection,
+        effort_id,
+        launch_operation_id,
+        authority_lease_id,
+        launcher,
+        crate::control_domain::SpawnAuthority::CloseRequested,
+    )
+}
+
+fn close_surrendered_spawn_authority(
+    connection: &Connection,
+    effort_id: &str,
+    launch_operation_id: &str,
+    authority_lease_id: &str,
+    launcher: &LauncherAuthority,
+) -> Result<bool> {
+    update_cancelled_spawn_authority(
+        connection,
+        effort_id,
+        launch_operation_id,
+        authority_lease_id,
+        launcher,
+        crate::control_domain::SpawnAuthority::Surrendered,
+    )
+}
+
+fn update_cancelled_spawn_authority(
+    connection: &Connection,
+    effort_id: &str,
+    launch_operation_id: &str,
+    authority_lease_id: &str,
+    launcher: &LauncherAuthority,
+    expected: crate::control_domain::SpawnAuthority,
+) -> Result<bool> {
+    let stored = connection
+        .query_row(
+            "SELECT authority_json FROM runner_termination_debt WHERE effort_id=?1",
+            [effort_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(stored) = stored else {
+        return Ok(false);
+    };
+    let authority: RunnerTerminationAuthority = serde_json::from_str(&stored)?;
+    let RunnerTerminationAuthority::Launching(mut launching) = authority else {
+        return Ok(false);
+    };
+    if launching.launch_operation_id != launch_operation_id
+        || launching.authority_lease_id != authority_lease_id
+        || launching.launcher != *launcher
+        || launching.spawn_authority != expected
+    {
+        return Ok(false);
+    }
+    launching.spawn_authority = crate::control_domain::SpawnAuthority::Closed;
+    let changed = connection.execute(
+        "UPDATE runner_termination_debt SET authority_json=?1 WHERE effort_id=?2 AND authority_json=?3",
+        params![
+            serde_json::to_string(&RunnerTerminationAuthority::Launching(launching))?,
+            effort_id,
+            stored
+        ],
+    )?;
+    if changed != 1 {
+        anyhow::bail!("runner spawn close authority changed concurrently");
+    }
+    Ok(true)
+}
+
+fn require_cancelled_launcher_authority(
+    connection: &Connection,
+    effort_id: &str,
+    launch_operation_id: &str,
+    authority_lease_id: &str,
+    launcher: &LauncherAuthority,
+    expected: crate::control_domain::SpawnAuthority,
+) -> Result<()> {
+    let stored: String = connection.query_row(
+        "SELECT authority_json FROM runner_termination_debt WHERE effort_id=?1",
+        [effort_id],
+        |row| row.get(0),
+    )?;
+    let authority: RunnerTerminationAuthority = serde_json::from_str(&stored)?;
+    let RunnerTerminationAuthority::Launching(launching) = authority else {
+        anyhow::bail!("cancelled launch acknowledgement has no launch authority");
+    };
+    if launching.launch_operation_id != launch_operation_id
+        || launching.authority_lease_id != authority_lease_id
+        || launching.launcher != *launcher
+        || launching.spawn_authority != expected
+    {
+        anyhow::bail!("cancelled launch acknowledgement differs from launcher authority");
+    }
+    Ok(())
+}
+
 fn update_state(
     connection: &Connection,
     effort: &IntegrationEffort,
@@ -3542,7 +4747,35 @@ fn update_state_and_count(
     state: &IntegrationEffortState,
     failed_cycles: u8,
 ) -> Result<()> {
+    update_state_and_count_with_resolution(connection, effort, state, failed_cycles, None)
+}
+
+fn update_state_and_count_with_resolution(
+    connection: &Connection,
+    effort: &IntegrationEffort,
+    state: &IntegrationEffortState,
+    failed_cycles: u8,
+    rejection: Option<&DefiniteLandingRejection>,
+) -> Result<()> {
+    if effort.state.contains_external_landing_authority()
+        && !state.contains_external_landing_authority()
+    {
+        require_target_move_authority(effort, rejection)?;
+    } else if rejection.is_some() {
+        anyhow::bail!("definite landing rejection does not authorize this effort transition");
+    }
     state.validate_for_count(failed_cycles)?;
+    if !matches!(state, IntegrationEffortState::Cancelled(_)) {
+        let operation_state: String = connection.query_row(
+            "SELECT policy.operation_state_json FROM queue_items item JOIN repository_policies policy ON policy.repo_key=item.repo_key WHERE item.id=?1",
+            [&effort.item_id],
+            |row| row.get(0),
+        )?;
+        serde_json::from_str::<crate::repository_policy::OperationState>(&operation_state)?
+            .require_obligation(&crate::repository_policy::Obligation::QueueItem {
+                id: effort.item_id.clone(),
+            })?;
+    }
     let changed = connection.execute(
         "UPDATE integration_efforts SET failed_cycles=?1,state=?2,state_json=?3,blocker_kind=?4,updated_at=?5 WHERE id=?6 AND state=?7",
         params![failed_cycles,state.name(),serde_json::to_string(state)?,state.blocker().map(IntegrationBlocker::kind),now(),effort.id,effort.state.name()],
@@ -3552,6 +4785,52 @@ fn update_state_and_count(
     }
     project_queue_state(connection, effort, state)?;
     Ok(())
+}
+
+fn require_target_move_authority(
+    effort: &IntegrationEffort,
+    rejection: Option<&DefiniteLandingRejection>,
+) -> Result<()> {
+    if !effort.state.contains_external_landing_authority() {
+        if rejection.is_some() {
+            anyhow::bail!("definite landing rejection has no released landing authority");
+        }
+        return Ok(());
+    }
+    let Some(rejection) = rejection else {
+        anyhow::bail!("external landing authority cannot enter target movement");
+    };
+    let IntegrationEffortState::LandingUncertain(landing) = &effort.state else {
+        anyhow::bail!("only direct uncertain landing authority can use definite rejection");
+    };
+    if effort.landing_variant != "direct"
+        || rejection.effort_id != effort.id
+        || rejection.command_id != landing.command_id
+        || rejection.expected_target_sha != landing.expected_target_sha
+    {
+        anyhow::bail!("definite landing rejection differs from released landing authority");
+    }
+    Ok(())
+}
+
+fn target_move_cause_matches(
+    cause: &crate::control_domain::TargetMoveCause,
+    rejection: Option<&DefiniteLandingRejection>,
+) -> bool {
+    match (cause, rejection) {
+        (_, None) => true,
+        (
+            crate::control_domain::TargetMoveCause::StaleLandingLease {
+                command_id,
+                expected_target_sha,
+            },
+            Some(rejection),
+        ) => {
+            command_id == &rejection.command_id
+                && expected_target_sha == &rejection.expected_target_sha
+        }
+        _ => false,
+    }
 }
 
 fn project_queue_state(
@@ -3628,6 +4907,7 @@ fn project_queue_state(
         IntegrationEffortState::Landing(_) | IntegrationEffortState::LandingUncertain(_) => {
             ("integrating", None, None, None)
         }
+        IntegrationEffortState::TargetMovePending(_) => ("integrating", None, None, None),
         IntegrationEffortState::Integrated(_) => unreachable!(),
         IntegrationEffortState::Cancelled(_) => ("cancelled", None, None, None),
     };
@@ -3644,11 +4924,7 @@ fn project_queue_state(
 
 fn legacy_landing_state(state: &IntegrationEffortState) -> Result<String> {
     let landing = match state {
-        IntegrationEffortState::Landing(landing) => serde_json::json!({
-            "state": "uncertain",
-            "candidate_sha": landing.candidate_sha,
-            "expected_target_sha": landing.expected_target_sha,
-        }),
+        IntegrationEffortState::Landing(_) => serde_json::json!({"state": "ready"}),
         IntegrationEffortState::LandingUncertain(landing) => serde_json::json!({
             "state": "uncertain",
             "candidate_sha": landing.candidate_sha,
@@ -3656,11 +4932,7 @@ fn legacy_landing_state(state: &IntegrationEffortState) -> Result<String> {
         }),
         IntegrationEffortState::InfrastructureBlocked(blocked)
         | IntegrationEffortState::ProviderBlocked(blocked) => match &blocked.resume {
-            ResumeState::Landing(landing) => serde_json::json!({
-                "state": "uncertain",
-                "candidate_sha": landing.candidate_sha,
-                "expected_target_sha": landing.expected_target_sha,
-            }),
+            ResumeState::Landing(_) => serde_json::json!({"state": "ready"}),
             ResumeState::LandingUncertain(landing) => serde_json::json!({
                 "state": "uncertain",
                 "candidate_sha": landing.candidate_sha,
@@ -3819,14 +5091,15 @@ fn anyhow_sql_error(error: anyhow::Error) -> rusqlite::Error {
 }
 
 fn now() -> String {
+    #[cfg(debug_assertions)]
+    if let Ok(value) = std::env::var("IQ_TEST_CONTROL_NOW") {
+        return value;
+    }
     Utc::now().to_rfc3339()
 }
 
 fn git_text<const N: usize>(repository: &Path, args: [&str; N]) -> Result<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repository)
-        .output()?;
+    let output = crate::git_command::output(repository, args)?;
     if !output.status.success() {
         anyhow::bail!(
             "candidate Git observation failed: {}",
@@ -3852,7 +5125,7 @@ CREATE TABLE IF NOT EXISTS integration_efforts (
   runner_snapshot_json TEXT NOT NULL CHECK(json_valid(runner_snapshot_json)),
   state_repository_json TEXT NOT NULL CHECK(json_valid(state_repository_json)),
   failed_cycles INTEGER NOT NULL DEFAULT 0 CHECK(failed_cycles BETWEEN 0 AND 10),
-  state TEXT NOT NULL CHECK(state IN ('replacement_pending','agent_ready','agent_launching','agent_running','candidate_building','candidate_ready','validating','guidance_required','infrastructure_blocked','cycle_limit_blocked','provider_blocked','landing','landing_uncertain','integrated','cancelled')),
+  state TEXT NOT NULL CHECK(state IN ('replacement_pending','agent_ready','agent_launching','agent_running','candidate_building','candidate_ready','validating','guidance_required','infrastructure_blocked','cycle_limit_blocked','provider_blocked','landing','landing_uncertain','target_move_pending','integrated','cancelled')),
   state_json TEXT NOT NULL CHECK(json_valid(state_json) AND json_extract(state_json,'$.state') IS state),
   blocker_kind TEXT CHECK(blocker_kind IN ('semantic_guidance','infrastructure','cycle_limit','provider_signoff')),
   created_at TEXT NOT NULL,
@@ -3868,8 +5141,8 @@ CREATE TABLE IF NOT EXISTS integration_efforts (
   CHECK(COALESCE(CASE state
     WHEN 'replacement_pending' THEN failed_cycles=0 AND json_type(state_json,'$.payload.old_attempt_id')='text' AND json_extract(state_json,'$.payload.old_attempt_id')=attempt_id AND json_type(state_json,'$.payload.replaced_at')='text'
     WHEN 'agent_ready' THEN json_type(state_json,'$.payload.next_cycle')='integer' AND json_extract(state_json,'$.payload.next_cycle')>=1
-    WHEN 'agent_launching' THEN json_type(state_json,'$.payload.launch_operation_id')='text' AND json_type(state_json,'$.payload.unit_name')='text' AND json_type(state_json,'$.payload.cycle_id')='text' AND json_type(state_json,'$.payload.cycle_number')='integer' AND json_type(state_json,'$.payload.protocol_directory')='text'
-    WHEN 'agent_running' THEN json_type(state_json,'$.payload.cycle_id')='text' AND json_type(state_json,'$.payload.pid')='integer' AND json_type(state_json,'$.payload.process_start_ticks')='integer' AND json_type(state_json,'$.payload.process_group_id')='integer'
+    WHEN 'agent_launching' THEN json_type(state_json,'$.payload.launch_operation_id')='text' AND json_type(state_json,'$.payload.unit_name')='text' AND json_type(state_json,'$.payload.cycle_id')='text' AND json_type(state_json,'$.payload.cycle_number')='integer' AND json_type(state_json,'$.payload.protocol_directory')='text' AND json_extract(state_json,'$.payload.spawn_authority') IN ('open','surrendered') AND json_type(state_json,'$.payload.launcher.pid')='integer' AND json_extract(state_json,'$.payload.launcher.pid')>0 AND json_type(state_json,'$.payload.launcher.process_start_ticks')='integer' AND json_extract(state_json,'$.payload.launcher.process_start_ticks')>0 AND json_type(state_json,'$.payload.launcher.token')='text'
+    WHEN 'agent_running' THEN json_type(state_json,'$.payload.cycle_id')='text' AND json_type(state_json,'$.payload.pid')='integer' AND json_type(state_json,'$.payload.process_start_ticks')='integer' AND json_type(state_json,'$.payload.control_group')='text' AND json_type(state_json,'$.payload.launcher.pid')='integer' AND json_extract(state_json,'$.payload.launcher.pid')>0 AND json_type(state_json,'$.payload.launcher.process_start_ticks')='integer' AND json_extract(state_json,'$.payload.launcher.process_start_ticks')>0 AND json_type(state_json,'$.payload.launcher.token')='text'
     WHEN 'candidate_building' THEN json_type(state_json,'$.payload.operation_id')='text' AND json_type(state_json,'$.payload.cycle_id')='text' AND json_type(state_json,'$.payload.tree_sha')='text' AND json_type(state_json,'$.payload.parent_shas')='array' AND json_array_length(json_extract(state_json,'$.payload.parent_shas'))>=1 AND json_type(state_json,'$.payload.operation_ref')='text'
     WHEN 'candidate_ready' THEN json_type(state_json,'$.payload.cycle_id')='text' AND json_type(state_json,'$.payload.candidate_sha')='text'
     WHEN 'validating' THEN json_type(state_json,'$.payload.candidate_sha')='text' AND json_extract(state_json,'$.payload.stage') IN ('running','gates')
@@ -3879,6 +5152,7 @@ CREATE TABLE IF NOT EXISTS integration_efforts (
     WHEN 'provider_blocked' THEN json_extract(state_json,'$.payload.blocker.kind')='provider_signoff' AND json_type(state_json,'$.payload.blocker.candidate_sha')='text'
     WHEN 'landing' THEN json_type(state_json,'$.payload.candidate_sha')='text' AND json_type(state_json,'$.payload.expected_target_sha')='text' AND json_type(state_json,'$.payload.lease_id')='text'
     WHEN 'landing_uncertain' THEN json_type(state_json,'$.payload.candidate_sha')='text' AND json_type(state_json,'$.payload.expected_target_sha')='text' AND json_type(state_json,'$.payload.command_id')='text'
+    WHEN 'target_move_pending' THEN json_type(state_json,'$.payload.target_sha')='text' AND json_type(state_json,'$.payload.source_sha')='text' AND json_type(state_json,'$.payload.previous')='object' AND json_type(state_json,'$.payload.cause')='object'
     WHEN 'integrated' THEN json_type(state_json,'$.payload.candidate_sha')='text' AND json_type(state_json,'$.payload.landed_sha')='text' AND json_type(state_json,'$.payload.event_id')='text'
     WHEN 'cancelled' THEN json_type(state_json,'$.payload.actor')='text' AND json_type(state_json,'$.payload.reason')='text' AND json_type(state_json,'$.payload.cancelled_at')='text'
     ELSE 0 END,0))
@@ -4050,7 +5324,8 @@ CREATE TABLE IF NOT EXISTS daemon_leases (
   expires_at TEXT NOT NULL
 );
 
-CREATE TRIGGER IF NOT EXISTS integration_effort_exact_payload_insert
+DROP TRIGGER IF EXISTS integration_effort_exact_payload_insert;
+CREATE TRIGGER integration_effort_exact_payload_insert
 BEFORE INSERT ON integration_efforts
 WHEN json_type(NEW.state_json,'$')!='object'
   OR json_type(NEW.state_json,'$.payload')!='object'
@@ -4059,8 +5334,8 @@ WHEN json_type(NEW.state_json,'$')!='object'
   OR NOT CASE NEW.state
     WHEN 'replacement_pending' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=2 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('old_attempt_id','replaced_at'))
     WHEN 'agent_ready' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=1 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('next_cycle'))
-    WHEN 'agent_launching' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=8 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('launch_operation_id','unit_name','cycle_id','cycle_number','authority_lease_id','input_sha256','protocol_directory','prepared_at'))
-    WHEN 'agent_running' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=12 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('launch_operation_id','unit_name','cycle_id','cycle_number','pid','process_start_ticks','process_group_id','authority_lease_id','sandbox_id','input_sha256','result','started_at'))
+    WHEN 'agent_launching' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=10 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('launch_operation_id','unit_name','cycle_id','cycle_number','authority_lease_id','launcher','input_sha256','protocol_directory','prepared_at','spawn_authority'))
+    WHEN 'agent_running' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=13 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('launch_operation_id','unit_name','cycle_id','cycle_number','pid','process_start_ticks','control_group','authority_lease_id','launcher','sandbox_id','input_sha256','result','started_at'))
     WHEN 'candidate_building' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=13 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('operation_id','cycle_id','staged_tree_sha256','tree_sha','parent_shas','author_name','author_email','author_timestamp','committer_name','committer_email','committer_timestamp','message','operation_ref'))
     WHEN 'candidate_ready' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=4 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('operation_id','cycle_id','candidate_sha','staged_tree_sha256'))
     WHEN 'validating' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=3 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('candidate_sha','policy_digest','stage'))
@@ -4070,6 +5345,7 @@ WHEN json_type(NEW.state_json,'$')!='object'
     WHEN 'provider_blocked' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=2 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('blocker','resume'))
     WHEN 'landing' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=4 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('candidate_sha','expected_target_sha','lease_id','signoff'))
     WHEN 'landing_uncertain' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=4 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('candidate_sha','expected_target_sha','command_id','evidence'))
+    WHEN 'target_move_pending' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=4 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('target_sha','source_sha','previous','cause'))
     WHEN 'integrated' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=4 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('candidate_sha','landed_sha','attempt_id','event_id'))
     WHEN 'cancelled' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=3 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('actor','reason','cancelled_at'))
     ELSE 0 END
@@ -4077,7 +5353,8 @@ BEGIN
   SELECT RAISE(ABORT,'integration effort payload keys are invalid');
 END;
 
-CREATE TRIGGER IF NOT EXISTS integration_effort_exact_payload_update
+DROP TRIGGER IF EXISTS integration_effort_exact_payload_update;
+CREATE TRIGGER integration_effort_exact_payload_update
 BEFORE UPDATE OF state,state_json ON integration_efforts
 WHEN json_type(NEW.state_json,'$')!='object'
   OR json_type(NEW.state_json,'$.payload')!='object'
@@ -4086,8 +5363,8 @@ WHEN json_type(NEW.state_json,'$')!='object'
   OR NOT CASE NEW.state
     WHEN 'replacement_pending' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=2 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('old_attempt_id','replaced_at'))
     WHEN 'agent_ready' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=1 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('next_cycle'))
-    WHEN 'agent_launching' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=8 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('launch_operation_id','unit_name','cycle_id','cycle_number','authority_lease_id','input_sha256','protocol_directory','prepared_at'))
-    WHEN 'agent_running' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=12 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('launch_operation_id','unit_name','cycle_id','cycle_number','pid','process_start_ticks','process_group_id','authority_lease_id','sandbox_id','input_sha256','result','started_at'))
+    WHEN 'agent_launching' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=10 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('launch_operation_id','unit_name','cycle_id','cycle_number','authority_lease_id','launcher','input_sha256','protocol_directory','prepared_at','spawn_authority'))
+    WHEN 'agent_running' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=13 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('launch_operation_id','unit_name','cycle_id','cycle_number','pid','process_start_ticks','control_group','authority_lease_id','launcher','sandbox_id','input_sha256','result','started_at'))
     WHEN 'candidate_building' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=13 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('operation_id','cycle_id','staged_tree_sha256','tree_sha','parent_shas','author_name','author_email','author_timestamp','committer_name','committer_email','committer_timestamp','message','operation_ref'))
     WHEN 'candidate_ready' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=4 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('operation_id','cycle_id','candidate_sha','staged_tree_sha256'))
     WHEN 'validating' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=3 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('candidate_sha','policy_digest','stage'))
@@ -4097,6 +5374,7 @@ WHEN json_type(NEW.state_json,'$')!='object'
     WHEN 'provider_blocked' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=2 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('blocker','resume'))
     WHEN 'landing' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=4 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('candidate_sha','expected_target_sha','lease_id','signoff'))
     WHEN 'landing_uncertain' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=4 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('candidate_sha','expected_target_sha','command_id','evidence'))
+    WHEN 'target_move_pending' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=4 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('target_sha','source_sha','previous','cause'))
     WHEN 'integrated' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=4 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('candidate_sha','landed_sha','attempt_id','event_id'))
     WHEN 'cancelled' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=3 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('actor','reason','cancelled_at'))
     ELSE 0 END
@@ -4112,14 +5390,15 @@ WHEN NEW.state!=OLD.state AND NOT (
   (OLD.state='agent_launching' AND NEW.state IN ('agent_ready','agent_running','infrastructure_blocked','cancelled')) OR
   (OLD.state='agent_running' AND NEW.state IN ('candidate_building','agent_ready','guidance_required','infrastructure_blocked','cycle_limit_blocked','cancelled')) OR
   (OLD.state='candidate_building' AND NEW.state IN ('candidate_ready','agent_ready','infrastructure_blocked','cancelled')) OR
-  (OLD.state='candidate_ready' AND NEW.state IN ('validating','agent_ready','infrastructure_blocked','cancelled')) OR
-  (OLD.state='validating' AND NEW.state IN ('validating','landing','agent_ready','guidance_required','infrastructure_blocked','provider_blocked','cycle_limit_blocked','cancelled')) OR
+  (OLD.state='candidate_ready' AND NEW.state IN ('validating','agent_ready','target_move_pending','infrastructure_blocked','cancelled')) OR
+  (OLD.state='validating' AND NEW.state IN ('validating','landing','agent_ready','target_move_pending','guidance_required','infrastructure_blocked','provider_blocked','cycle_limit_blocked','cancelled')) OR
   (OLD.state='guidance_required' AND NEW.state IN ('agent_ready','cancelled')) OR
   (OLD.state='infrastructure_blocked' AND NEW.state IN ('agent_ready','candidate_building','candidate_ready','validating','landing','landing_uncertain','cancelled')) OR
   (OLD.state='cycle_limit_blocked' AND NEW.state IN ('replacement_pending','agent_ready','cancelled')) OR
   (OLD.state='provider_blocked' AND NEW.state IN ('validating','landing','landing_uncertain','agent_ready','cancelled')) OR
-  (OLD.state='landing' AND NEW.state IN ('landing_uncertain','integrated','agent_ready','provider_blocked','infrastructure_blocked','cancelled')) OR
-  (OLD.state='landing_uncertain' AND NEW.state IN ('integrated','landing','agent_ready','provider_blocked','infrastructure_blocked'))
+  (OLD.state='landing' AND NEW.state IN ('landing_uncertain','target_move_pending','integrated','agent_ready','provider_blocked','infrastructure_blocked','cancelled')) OR
+  (OLD.state='landing_uncertain' AND NEW.state IN ('target_move_pending','integrated','landing','agent_ready','provider_blocked','infrastructure_blocked')) OR
+  (OLD.state='target_move_pending' AND NEW.state IN ('agent_ready','cancelled'))
 )
 BEGIN
   SELECT RAISE(ABORT,'illegal integration_effort transition');
@@ -4142,6 +5421,7 @@ WHEN NOT (
   (NEW.state='agent_running' AND EXISTS(SELECT 1 FROM integration_cycles cycle WHERE cycle.effort_id=NEW.id AND cycle.id=json_extract(NEW.state_json,'$.payload.cycle_id') AND cycle.status='running')) OR
   (NEW.state='candidate_building' AND EXISTS(SELECT 1 FROM integration_cycles cycle WHERE cycle.effort_id=NEW.id AND cycle.id=json_extract(NEW.state_json,'$.payload.cycle_id') AND cycle.status='resolved')) OR
   (NEW.state IN ('candidate_ready','validating','landing','landing_uncertain','provider_blocked','integrated') AND EXISTS(SELECT 1 FROM candidate_evidence candidate WHERE candidate.effort_id=NEW.id AND candidate.candidate_sha=COALESCE(json_extract(NEW.state_json,'$.payload.candidate_sha'),json_extract(NEW.state_json,'$.payload.blocker.candidate_sha')))) OR
+  (NEW.state='target_move_pending' AND EXISTS(SELECT 1 FROM candidate_evidence candidate WHERE candidate.effort_id=NEW.id AND candidate.candidate_sha=json_extract(NEW.state_json,'$.payload.previous.payload.candidate_sha'))) OR
   (NEW.state='guidance_required' AND EXISTS(SELECT 1 FROM guidance_requests request WHERE request.effort_id=NEW.id AND request.status='open')) OR
   NEW.state IN ('replacement_pending','agent_ready','infrastructure_blocked','cycle_limit_blocked','cancelled')
 )
@@ -4164,7 +5444,7 @@ WHEN EXISTS(SELECT 1 FROM integration_efforts WHERE item_id=OLD.id)
         WHEN effort.state='validating' AND json_extract(effort.state_json,'$.payload.stage')='running' THEN 'validating'
         WHEN effort.state='validating' AND json_extract(effort.state_json,'$.payload.stage')='gates' THEN 'integrating'
         WHEN effort.state IN ('guidance_required','infrastructure_blocked','cycle_limit_blocked','provider_blocked') THEN 'blocked'
-        WHEN effort.state IN ('landing','landing_uncertain') THEN 'integrating'
+        WHEN effort.state IN ('landing','landing_uncertain','target_move_pending') THEN 'integrating'
         WHEN effort.state='integrated' THEN 'integrated'
         WHEN effort.state='cancelled' THEN 'cancelled'
       END
@@ -4197,13 +5477,13 @@ WHEN EXISTS(SELECT 1 FROM integration_efforts WHERE item_id=OLD.id)
         ELSE NULL
       END
       AND CASE
-        WHEN effort.state IN ('landing','landing_uncertain') THEN
+        WHEN effort.state='landing_uncertain' THEN
           json_extract(NEW.landing_state_json,'$.state')='uncertain'
           AND (SELECT COUNT(*) FROM json_each(NEW.landing_state_json))=3
           AND json_extract(NEW.landing_state_json,'$.candidate_sha')=json_extract(effort.state_json,'$.payload.candidate_sha')
           AND json_extract(NEW.landing_state_json,'$.expected_target_sha')=json_extract(effort.state_json,'$.payload.expected_target_sha')
         WHEN effort.state IN ('infrastructure_blocked','provider_blocked')
-          AND json_extract(effort.state_json,'$.payload.resume.state') IN ('landing','landing_uncertain') THEN
+          AND json_extract(effort.state_json,'$.payload.resume.state')='landing_uncertain' THEN
           json_extract(NEW.landing_state_json,'$.state')='uncertain'
           AND (SELECT COUNT(*) FROM json_each(NEW.landing_state_json))=3
           AND json_extract(NEW.landing_state_json,'$.candidate_sha')=json_extract(effort.state_json,'$.payload.resume.payload.candidate_sha')
@@ -4254,6 +5534,18 @@ CREATE INDEX IF NOT EXISTS terminal_workspace_cleanup_debt_due ON terminal_works
 "#;
 
 const CLEANUP_TRIGGERS: &str = r#"
+DROP TRIGGER IF EXISTS terminal_cleanup_debt_queue_update;
+DROP TRIGGER IF EXISTS terminal_cleanup_debt_insert_guard;
+DROP TRIGGER IF EXISTS terminal_cleanup_debt_update_guard;
+DROP TRIGGER IF EXISTS terminal_cleanup_debt_exact_target_insert;
+DROP TRIGGER IF EXISTS terminal_cleanup_debt_exact_target_update;
+DROP TRIGGER IF EXISTS terminal_cleanup_debt_alert_insert_guard;
+DROP TRIGGER IF EXISTS terminal_cleanup_debt_alert_update_guard;
+DROP TRIGGER IF EXISTS terminal_cleanup_debt_alert_event_update_guard;
+DROP TRIGGER IF EXISTS terminal_cleanup_debt_alert_event_delete_guard;
+DROP TRIGGER IF EXISTS terminal_cleanup_debt_delete_guard;
+DROP TRIGGER IF EXISTS terminal_cleanup_debt_cleaned;
+
 CREATE TRIGGER terminal_cleanup_debt_queue_update
 BEFORE UPDATE OF status,integration_workspace_path,integration_workspace_rift_id,integration_workspace_source_rift_id,integration_workspace_cleaned_at ON queue_items
 WHEN NEW.status IN ('integrated','cancelled') AND NEW.integration_workspace_cleaned_at IS NULL

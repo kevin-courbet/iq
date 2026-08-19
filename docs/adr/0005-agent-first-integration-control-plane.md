@@ -30,5 +30,5 @@ Whole-conflict `use source` and `use target` prompts are removed from normal int
 - OpenCode needs an OS-enforced sandbox; prompt permissions are not a security boundary.
 - Local API availability and notification availability can fail independently.
 - Notification delivery with an unknown external outcome is not retried automatically.
-- Landing with an uncertain outcome cannot be cancelled before reconciliation proves the outcome.
+- Released landing authority, including authority inside a blocked resume state, cannot be cancelled or replaced before reconciliation proves the outcome.
 - A future runner must implement the same typed protocol and sandbox boundary; it cannot change queue or landing semantics.
