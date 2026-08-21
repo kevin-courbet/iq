@@ -98,15 +98,18 @@ Policy authorization runs before operation arguments are validated.
 
 ## Schema Migration
 
-Normal runtime accepts schema 4 only and rejects schema 3. Migration is explicit and offline:
+Normal runtime accepts schema 5 only. It rejects schemas 3 and 4. Migration is explicit and offline:
 
 ```sh
 iq migrate inspect-git-binding --path /var/lib/iq/repositories/<uuid>/root
 iq --queue-db /var/lib/iq/queues.db migrate schema3 \
   --policy-inventory /etc/iq/schema3-policy-inventory.json
+iq --queue-db /var/lib/iq/queues.db migrate schema4
 ```
 
-Version-2 inventory uses distinct ready-repository and interrupted-provisioning lifecycle variants. Each interrupted lifecycle is explicitly preserved or cancelled; migration never invents a ready root. The inventory contains generated live Git bindings for each lifecycle that has a repository, every active development Rift, and each supplied retained integration workspace. Before database path resolution or copying, migration verifies every canonical and replica provider or local-bare identity. It then takes the exclusive database authority lease, requires one policy assignment for every repository UUID, verifies every binding and expected HEAD/base before backup publication or primary mutation, validates exact schema 3, creates a durable backup, preserves queue/audit/evidence/event/notification/cleanup data, creates exact admissions, and validates all schema-4 authority before commit. Every active MR base comes from inventory. An active admission that is incompatible with the assigned integration policy must be explicitly cancelled. Failure leaves all schema-3 database-family files unchanged and usable. Migration and binding inspection dispatch before normal schema open. There is no runtime compatibility path.
+Version-4 inventory identifies each schema-3 repository and workspace. The schema-3 migration validates these identities before it publishes schema 5.
+
+Schema 4 incorrectly stored Linux device and mount numbers as durable identity. These numbers can change after a reboot. The schema-4 migration removes them from durable Git bindings. IQ keeps them only in process memory to reject path changes. The migration validates all managed identity, Git structure, object format, and commit authority before it commits schema 5.
 
 ## Queue And Control Plane
 

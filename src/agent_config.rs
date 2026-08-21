@@ -497,11 +497,7 @@ impl AuthorizedCommand {
         self
     }
 
-    pub(crate) fn current_dir_descriptor(
-        &mut self,
-        directory: std::sync::Arc<File>,
-        _mount_id: u64,
-    ) -> &mut Self {
+    pub(crate) fn current_dir_descriptor(&mut self, directory: std::sync::Arc<File>) -> &mut Self {
         self.current_directory_descriptor = Some(directory.clone());
         self.retained_files
             .push(RetainedDescriptor { file: directory });
@@ -581,7 +577,7 @@ impl AuthorizedCommand {
         self.retained_files.push(RetainedDescriptor { file });
     }
 
-    pub(crate) fn retain_directory(&mut self, file: std::sync::Arc<File>, _mount_id: u64) {
+    pub(crate) fn retain_directory(&mut self, file: std::sync::Arc<File>) {
         self.retained_files.push(RetainedDescriptor { file });
     }
 }

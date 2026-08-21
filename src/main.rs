@@ -376,11 +376,13 @@ enum MigrationCommand {
         #[arg(long)]
         path: PathBuf,
     },
-    /// Migrate exact schema 3 to schema 4 with a version-3 repository-policy inventory.
+    /// Migrate exact schema 3 to schema 5 with a version-4 repository-policy inventory.
     Schema3 {
         #[arg(long)]
         policy_inventory: PathBuf,
     },
+    /// Migrate exact schema 4 to schema 5 and remove transient mount identities.
+    Schema4,
 }
 
 #[derive(Subcommand, Debug)]
@@ -454,6 +456,9 @@ fn main() -> Result<()> {
             MigrationCommand::Schema3 { policy_inventory } => {
                 let inventory = iq::repository_policy::PolicyInventory::load(policy_inventory)?;
                 print_json(&SqliteQueue::migrate_schema3(&db_path, inventory)?)?;
+            }
+            MigrationCommand::Schema4 => {
+                print_json(&SqliteQueue::migrate_schema4(&db_path)?)?;
             }
             MigrationCommand::InspectGitBinding { path } => {
                 print_json(&iq::git_command::RepositoryBinding::capture(path)?)?;

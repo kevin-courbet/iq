@@ -131,27 +131,77 @@ pub struct RepositoryBinding {
     pub common_dir: PathBuf,
     pub object_format: crate::git_object::GitObjectFormat,
     bare: bool,
-    top_level_device: u64,
-    top_level_inode: u64,
-    top_level_mount_id: u64,
-    git_dir_device: u64,
-    git_dir_inode: u64,
-    git_dir_mount_id: u64,
-    common_dir_device: u64,
-    common_dir_inode: u64,
-    common_dir_mount_id: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Schema4RepositoryBinding {
+    top_level: PathBuf,
+    git_dir: PathBuf,
+    common_dir: PathBuf,
+    object_format: crate::git_object::GitObjectFormat,
+    bare: bool,
+    #[serde(rename = "top_level_device")]
+    _top_level_device: u64,
+    #[serde(rename = "top_level_inode")]
+    _top_level_inode: u64,
+    #[serde(rename = "top_level_mount_id")]
+    _top_level_mount_id: u64,
+    #[serde(rename = "git_dir_device")]
+    _git_dir_device: u64,
+    #[serde(rename = "git_dir_inode")]
+    _git_dir_inode: u64,
+    #[serde(rename = "git_dir_mount_id")]
+    _git_dir_mount_id: u64,
+    #[serde(rename = "common_dir_device")]
+    _common_dir_device: u64,
+    #[serde(rename = "common_dir_inode")]
+    _common_dir_inode: u64,
+    #[serde(rename = "common_dir_mount_id")]
+    _common_dir_mount_id: u64,
 }
 
 pub(crate) struct RepositoryAuthority {
     binding: RepositoryBinding,
     top_level: std::sync::Arc<File>,
+    top_level_mount_id: u64,
     git_dir: std::sync::Arc<File>,
+    git_dir_mount_id: u64,
     common_dir: std::sync::Arc<File>,
+    common_dir_mount_id: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuthorizedRepositoryBinding {
+    binding: RepositoryBinding,
+    top_level: RuntimeDirectoryIdentity,
+    git_dir: RuntimeDirectoryIdentity,
+    common_dir: RuntimeDirectoryIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeDirectoryIdentity {
+    device: u64,
+    inode: u64,
+    mount_id: u64,
 }
 
 impl RepositoryBinding {
     pub fn is_bare(&self) -> bool {
         self.bare
+    }
+
+    pub(crate) fn migrate_schema4(value: serde_json::Value) -> Result<Self> {
+        let stored: Schema4RepositoryBinding = serde_json::from_value(value)?;
+        let binding = Self::capture(&stored.top_level)?;
+        if binding.git_dir != stored.git_dir
+            || binding.common_dir != stored.common_dir
+            || binding.object_format != stored.object_format
+            || binding.bare != stored.bare
+        {
+            anyhow::bail!("live Git repository differs from schema-4 binding");
+        }
+        Ok(binding)
     }
 
     pub fn capture(top_level: &Path) -> Result<Self> {
@@ -162,12 +212,23 @@ impl RepositoryBinding {
         Ok(binding)
     }
 
+    fn recapture_after_authorized_replacement(
+        top_level: &Path,
+    ) -> Result<(Self, RepositoryAuthority)> {
+        let mut binding =
+            Self::capture_filesystem(top_level, crate::git_object::GitObjectFormat::Sha1)?;
+        binding.object_format = detect_object_format_bound(&binding)?;
+        let authority = RepositoryAuthority::open(&binding)?;
+        validate_live_repository_with_authority(&binding, &authority)?;
+        Ok((binding, authority))
+    }
+
     fn capture_filesystem(
         top_level: &Path,
         object_format: crate::git_object::GitObjectFormat,
     ) -> Result<Self> {
         require_verified_cwd(top_level)?;
-        let top_level_metadata = real_directory_metadata(top_level, "Git top-level")?;
+        real_directory_metadata(top_level, "Git top-level")?;
         let dot_git = top_level.join(".git");
         let (git_dir, bare) = match std::fs::symlink_metadata(&dot_git) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
@@ -185,7 +246,7 @@ impl RepositoryBinding {
             }
             Err(error) => return Err(error).context("inspect Git administrative entry"),
         };
-        let git_dir_metadata = real_directory_metadata(&git_dir, "Git directory")?;
+        real_directory_metadata(&git_dir, "Git directory")?;
         let common_file = git_dir.join("commondir");
         let common_dir = match std::fs::symlink_metadata(&common_file) {
             Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
@@ -195,25 +256,13 @@ impl RepositoryBinding {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => git_dir.clone(),
             Err(error) => return Err(error).context("inspect Git commondir entry"),
         };
-        let common_dir_metadata = real_directory_metadata(&common_dir, "Git common directory")?;
-        let top_level_mount_id = path_mount_id(top_level, "Git top-level")?;
-        let git_dir_mount_id = path_mount_id(&git_dir, "Git directory")?;
-        let common_dir_mount_id = path_mount_id(&common_dir, "Git common directory")?;
+        real_directory_metadata(&common_dir, "Git common directory")?;
         let binding = Self {
             top_level: top_level.to_path_buf(),
             git_dir,
             common_dir,
             object_format,
             bare,
-            top_level_device: top_level_metadata.dev(),
-            top_level_inode: top_level_metadata.ino(),
-            top_level_mount_id,
-            git_dir_device: git_dir_metadata.dev(),
-            git_dir_inode: git_dir_metadata.ino(),
-            git_dir_mount_id,
-            common_dir_device: common_dir_metadata.dev(),
-            common_dir_inode: common_dir_metadata.ino(),
-            common_dir_mount_id,
         };
         validate_administrative_layout(&binding, &dot_git)?;
         require_canonical_object_resolution(&binding)?;
@@ -223,25 +272,16 @@ impl RepositoryBinding {
     pub fn verify(&self) -> Result<()> {
         let actual = Self::capture_filesystem(&self.top_level, self.object_format)?;
         if actual != *self {
-            anyhow::bail!("Git repository binding changed after authorization");
+            anyhow::bail!(
+                "Git repository binding changed after authorization: expected {self:?}, observed {actual:?}"
+            );
         }
         Ok(())
     }
 
     pub(crate) fn verify_relocated(&self, top_level: &Path) -> Result<Self> {
         let actual = Self::capture(top_level)?;
-        if self.object_format != actual.object_format
-            || self.bare != actual.bare
-            || self.top_level_device != actual.top_level_device
-            || self.top_level_inode != actual.top_level_inode
-            || self.top_level_mount_id != actual.top_level_mount_id
-            || self.git_dir_device != actual.git_dir_device
-            || self.git_dir_inode != actual.git_dir_inode
-            || self.git_dir_mount_id != actual.git_dir_mount_id
-            || self.common_dir_device != actual.common_dir_device
-            || self.common_dir_inode != actual.common_dir_inode
-            || self.common_dir_mount_id != actual.common_dir_mount_id
-        {
+        if self.object_format != actual.object_format || self.bare != actual.bare {
             anyhow::bail!("relocated Git repository differs from durable binding");
         }
         Ok(actual)
@@ -281,46 +321,55 @@ impl RepositoryBinding {
         }
         Ok(())
     }
-
-    fn bind(&self, command: &mut crate::agent_config::AuthorizedCommand) -> Result<()> {
-        RepositoryAuthority::open(self)?.bind(command)
-    }
 }
 
 impl RepositoryAuthority {
     fn open(binding: &RepositoryBinding) -> Result<Self> {
-        let git_dir = open_directory_authority(
-            &binding.git_dir,
-            binding.git_dir_device,
-            binding.git_dir_inode,
-            binding.git_dir_mount_id,
-            "Git directory",
-        )?;
-        let common_dir = if binding.common_dir == binding.git_dir {
-            git_dir.clone()
+        let (git_dir, git_dir_identity) =
+            open_directory_authority(&binding.git_dir, "Git directory")?;
+        let (common_dir, common_dir_identity) = if binding.common_dir == binding.git_dir {
+            (git_dir.clone(), git_dir_identity)
         } else {
-            open_directory_authority(
-                &binding.common_dir,
-                binding.common_dir_device,
-                binding.common_dir_inode,
-                binding.common_dir_mount_id,
-                "Git common directory",
-            )?
+            open_directory_authority(&binding.common_dir, "Git common directory")?
         };
+        let (top_level, top_level_identity) =
+            open_directory_authority(&binding.top_level, "Git top-level")?;
         let authority = Self {
             binding: binding.clone(),
-            top_level: open_directory_authority(
-                &binding.top_level,
-                binding.top_level_device,
-                binding.top_level_inode,
-                binding.top_level_mount_id,
-                "Git top-level",
-            )?,
+            top_level,
+            top_level_mount_id: top_level_identity.mount_id,
             git_dir,
+            git_dir_mount_id: git_dir_identity.mount_id,
             common_dir,
+            common_dir_mount_id: common_dir_identity.mount_id,
         };
         authority.verify_control_state()?;
         Ok(authority)
+    }
+
+    fn open_bound(binding: &RepositoryBinding) -> Result<Self> {
+        let authority = Self::open(binding)?;
+        let registered = bindings()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Git repository binding registry is poisoned"))?;
+        if let Some(expected) = registered.get(&binding.top_level) {
+            let observed = authority.authorized_binding()?;
+            if *expected != observed {
+                anyhow::bail!(
+                    "Git repository binding changed after authorization: expected {expected:?}, observed {observed:?}"
+                );
+            }
+        }
+        Ok(authority)
+    }
+
+    fn authorized_binding(&self) -> Result<AuthorizedRepositoryBinding> {
+        Ok(AuthorizedRepositoryBinding {
+            binding: self.binding.clone(),
+            top_level: runtime_directory_identity(&self.top_level, self.top_level_mount_id)?,
+            git_dir: runtime_directory_identity(&self.git_dir, self.git_dir_mount_id)?,
+            common_dir: runtime_directory_identity(&self.common_dir, self.common_dir_mount_id)?,
+        })
     }
 
     pub(crate) fn verify_control_state(&self) -> Result<()> {
@@ -419,10 +468,10 @@ impl RepositoryAuthority {
                 format!("/proc/self/fd/{}", self.top_level.as_raw_fd()),
             );
         }
-        command.current_dir_descriptor(self.top_level.clone(), self.binding.top_level_mount_id);
-        command.retain_directory(self.git_dir.clone(), self.binding.git_dir_mount_id);
+        command.current_dir_descriptor(self.top_level.clone());
+        command.retain_directory(self.git_dir.clone());
         if self.common_dir.as_raw_fd() != self.git_dir.as_raw_fd() {
-            command.retain_directory(self.common_dir.clone(), self.binding.common_dir_mount_id);
+            command.retain_directory(self.common_dir.clone());
         }
         Ok(())
     }
@@ -552,6 +601,14 @@ fn validate_administrative_layout(binding: &RepositoryBinding, dot_git: &Path) -
 }
 
 fn validate_live_repository(binding: &RepositoryBinding) -> Result<()> {
+    let authority = RepositoryAuthority::open_bound(binding)?;
+    validate_live_repository_with_authority(binding, &authority)
+}
+
+fn validate_live_repository_with_authority(
+    binding: &RepositoryBinding,
+    authority: &RepositoryAuthority,
+) -> Result<()> {
     let head = read_head(binding)?;
     let mut args = vec![
         "rev-parse",
@@ -565,7 +622,7 @@ fn validate_live_repository(binding: &RepositoryBinding) -> Result<()> {
     }
     let identity_argument_count = args.len();
     args.extend(["--verify", "HEAD^{commit}"]);
-    let with_head = hardened_bound_output(binding, &args)?;
+    let with_head = hardened_output_with_authority(authority, &args)?;
     if with_head.status.success() {
         let lines = output_lines(with_head, "inspect live Git repository")?;
         validate_live_identity(binding, &lines, true)?;
@@ -573,7 +630,7 @@ fn validate_live_repository(binding: &RepositoryBinding) -> Result<()> {
     }
 
     args.truncate(identity_argument_count);
-    let identity = hardened_bound_output(binding, &args)?;
+    let identity = hardened_output_with_authority(authority, &args)?;
     let lines = output_lines(identity, "inspect live Git repository")?;
     validate_live_identity(binding, &lines, false)?;
     match head {
@@ -740,8 +797,17 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    let authority = RepositoryAuthority::open_bound(binding)?;
+    hardened_output_with_authority(&authority, args)
+}
+
+fn hardened_output_with_authority<I, S>(authority: &RepositoryAuthority, args: I) -> Result<Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let mut command = command()?;
-    binding.bind(&mut command)?;
+    authority.bind(&mut command)?;
     command.args(args);
     service_output(&mut command).context("run hardened Git repository introspection")
 }
@@ -793,27 +859,42 @@ fn read_bounded_regular_file(path: &Path, label: &str) -> Result<Vec<u8>> {
 
 fn open_directory_authority(
     path: &Path,
-    expected_device: u64,
-    expected_inode: u64,
-    expected_mount_id: u64,
     label: &str,
-) -> Result<std::sync::Arc<File>> {
+) -> Result<(std::sync::Arc<File>, RuntimeDirectoryIdentity)> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
         .with_context(|| format!("open {label} authority {}", path.display()))?;
     let metadata = file.metadata()?;
+    let mount_id = descriptor_mount_id(&file, label)?;
+    let path_metadata = real_directory_metadata(path, label)?;
     if !metadata.is_dir()
-        || metadata.dev() != expected_device
-        || metadata.ino() != expected_inode
-        || descriptor_mount_id(&file, label)? != expected_mount_id
+        || path_metadata.dev() != metadata.dev()
+        || path_metadata.ino() != metadata.ino()
+        || path_mount_id(path, label)? != mount_id
     {
         anyhow::bail!(
             "Git repository binding changed after authorization: {label} descriptor differs"
         );
     }
-    Ok(std::sync::Arc::new(file))
+    Ok((
+        std::sync::Arc::new(file),
+        RuntimeDirectoryIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mount_id,
+        },
+    ))
+}
+
+fn runtime_directory_identity(file: &File, mount_id: u64) -> Result<RuntimeDirectoryIdentity> {
+    let metadata = file.metadata()?;
+    Ok(RuntimeDirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        mount_id,
+    })
 }
 
 fn read_bounded_regular_file_at(
@@ -966,20 +1047,24 @@ fn resolve_git_path_file(path: &Path, label: &str) -> Result<PathBuf> {
         .with_context(|| format!("resolve Git {label} path"))
 }
 
-fn bindings() -> &'static Mutex<BTreeMap<PathBuf, RepositoryBinding>> {
-    static BINDINGS: OnceLock<Mutex<BTreeMap<PathBuf, RepositoryBinding>>> = OnceLock::new();
+fn bindings() -> &'static Mutex<BTreeMap<PathBuf, AuthorizedRepositoryBinding>> {
+    static BINDINGS: OnceLock<Mutex<BTreeMap<PathBuf, AuthorizedRepositoryBinding>>> =
+        OnceLock::new();
     BINDINGS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 #[doc(hidden)]
 pub fn authorize_current(cwd: &Path) -> Result<RepositoryBinding> {
-    if let Some(binding) = bindings()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("Git repository binding registry is poisoned"))?
-        .get(cwd)
-        .cloned()
-    {
-        binding.verify()?;
+    let existing = {
+        let registered = bindings()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Git repository binding registry is poisoned"))?;
+        registered
+            .get(cwd)
+            .map(|authorized| authorized.binding.clone())
+    };
+    if let Some(binding) = existing {
+        RepositoryAuthority::open_bound(&binding)?;
         require_safe_local_config_bound(&binding)?;
         return Ok(binding);
     }
@@ -989,12 +1074,12 @@ pub fn authorize_current(cwd: &Path) -> Result<RepositoryBinding> {
 }
 
 pub(crate) fn replace_authorized_binding(cwd: &Path) -> Result<RepositoryBinding> {
-    let binding = RepositoryBinding::capture(cwd)?;
-    binding.verify()?;
+    let (binding, authority) = RepositoryBinding::recapture_after_authorized_replacement(cwd)?;
+    let authorized = authority.authorized_binding()?;
     bindings()
         .lock()
         .map_err(|_| anyhow::anyhow!("Git repository binding registry is poisoned"))?
-        .insert(cwd.to_path_buf(), binding.clone());
+        .insert(cwd.to_path_buf(), authorized);
     Ok(binding)
 }
 
@@ -1004,15 +1089,16 @@ pub(crate) fn authorize_binding(binding: &RepositoryBinding) -> Result<()> {
 }
 
 pub(crate) fn register_binding(binding: &RepositoryBinding) -> Result<()> {
+    let authorized = RepositoryAuthority::open(binding)?.authorized_binding()?;
     let mut registered = bindings()
         .lock()
         .map_err(|_| anyhow::anyhow!("Git repository binding registry is poisoned"))?;
     if let Some(expected) = registered.get(&binding.top_level) {
-        if expected != binding {
+        if expected != &authorized {
             anyhow::bail!("Git repository path has a different authorized binding");
         }
     } else {
-        registered.insert(binding.top_level.clone(), binding.clone());
+        registered.insert(binding.top_level.clone(), authorized);
     }
     Ok(())
 }
@@ -1023,7 +1109,7 @@ pub(crate) fn expected_binding(cwd: &Path) -> Result<RepositoryBinding> {
         .map_err(|_| anyhow::anyhow!("Git repository binding registry is poisoned"))?;
     registered
         .get(cwd)
-        .cloned()
+        .map(|authorized| authorized.binding.clone())
         .with_context(|| format!("Git repository {} has no authorized binding", cwd.display()))
 }
 
@@ -1031,9 +1117,18 @@ pub(crate) fn bind_verified(
     command: &mut crate::agent_config::AuthorizedCommand,
     binding: &RepositoryBinding,
 ) -> Result<RepositoryAuthority> {
-    let authority = RepositoryAuthority::open(binding)?;
+    let authority = RepositoryAuthority::open_bound(binding)?;
     authority.bind(command)?;
     Ok(authority)
+}
+
+pub(crate) fn bind_working_directory(
+    command: &mut crate::agent_config::AuthorizedCommand,
+    binding: &RepositoryBinding,
+) -> Result<()> {
+    let authority = RepositoryAuthority::open_bound(binding)?;
+    command.current_dir_descriptor(authority.top_level.clone());
+    Ok(())
 }
 
 pub(crate) fn command() -> Result<crate::agent_config::AuthorizedCommand> {
@@ -1046,7 +1141,7 @@ pub(crate) fn command() -> Result<crate::agent_config::AuthorizedCommand> {
 
 pub(crate) fn command_in(cwd: &Path) -> Result<crate::agent_config::AuthorizedCommand> {
     let binding = expected_binding(cwd)?;
-    let authority = RepositoryAuthority::open(&binding)?;
+    let authority = RepositoryAuthority::open_bound(&binding)?;
     let mut command = command()?;
     authority.bind(&mut command)?;
     Ok(command)
@@ -1054,7 +1149,7 @@ pub(crate) fn command_in(cwd: &Path) -> Result<crate::agent_config::AuthorizedCo
 
 pub(crate) fn administrative_entry_exists(cwd: &Path, name: &str) -> Result<bool> {
     let binding = expected_binding(cwd)?;
-    RepositoryAuthority::open(&binding)?.git_entry_exists(name)
+    RepositoryAuthority::open_bound(&binding)?.git_entry_exists(name)
 }
 
 pub(crate) fn init_repository(
@@ -1267,7 +1362,7 @@ fn open_validated_config_snapshot(
     retain_file_for_spawn(&mut validation_command, validation_file);
     validation_command.env_remove("GIT_CONFIG");
     if let Some(directory) = top_level_descriptor {
-        validation_command.current_dir_descriptor(directory, binding.top_level_mount_id);
+        validation_command.current_dir_descriptor(directory);
     } else {
         validation_command.current_dir(&binding.top_level);
     }

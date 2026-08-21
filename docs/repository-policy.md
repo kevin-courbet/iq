@@ -86,11 +86,11 @@ The schema-3 migration captures obligations from current non-terminal work. New 
 
 ## Migration Inventory
 
-The offline migration accepts only strict inventory version 3:
+The offline migration accepts only strict inventory version 4:
 
 ```json
 {
-  "version": 3,
+  "version": 4,
   "repositories": [
     {
       "repo_key": "<repository-uuid>",
@@ -101,13 +101,7 @@ The offline migration accepts only strict inventory version 3:
           "git_dir": "/absolute/path/to/repository/.git",
           "common_dir": "/absolute/path/to/repository/.git",
           "object_format": "sha1",
-          "bare": false,
-          "top_level_device": 1,
-          "top_level_inode": 2,
-          "git_dir_device": 1,
-          "git_dir_inode": 3,
-          "common_dir_device": 1,
-          "common_dir_inode": 3
+          "bare": false
         }
       },
       "policy": {
@@ -136,7 +130,11 @@ The offline migration accepts only strict inventory version 3:
 }
 ```
 
-Generate each `git_binding` with `iq migrate inspect-git-binding --path <path>`. Do not write binding path or identity fields manually. A ready repository uses the `ready` variant. Each interrupted provisioning lifecycle has its own inventory variant and an explicit `preserve` or `cancel` disposition. Only lifecycle variants with a live Git repository accept and require a binding. Preserve keeps the exact intent and bootstrap request without creating a ready repository. Cancel removes their database authority without deleting filesystem residue. Every active, nonremoved development Rift and every supplied retained integration workspace requires its own verified binding. Migration checks Git's live top-level, git-dir, common-dir, admin files, HEAD/reference state, linked-worktree backlinks, device/inode identity, and expected HEAD or base before backup publication. Unavailable or changed repositories reject migration without primary mutation. Every stored repository UUID must occur exactly once. Canonical transport and target must match schema-3 durable identity. Released local transport is an absolute path; `file://` is also accepted when exact. Item disposition IDs are globally unique exact stored IDs, must belong to their assigned repository, and are not restricted to UUIDs. Every active schema-3 MR requires `admitted_base_sha`. Historical MRs require complete `provider_repository` identity and `admitted_base_sha`; their URL is validated against this inventory and is never authority. An active MR can continue only when its stored source ref is the exact provider-derived MR ref. A legacy effort requires explicit `workspace_identity` or `runner_snapshot` repair when stored JSON or semantic identity is invalid. Paths must be absolute, identities and digests nonempty, limits positive, and executable identity valid. Attempt state is not admission authority. A compatible active item can use `continue`; an incompatible active item must use `cancel`. This is explicit migration input, not runtime compatibility.
+Generate each `git_binding` with `iq migrate inspect-git-binding --path <path>`. Do not write binding fields manually.
+
+Migration checks Git layout, object format, linked-worktree backlinks, and required commits. Device, inode, and mount identity stays in process memory.
+
+Each interrupted lifecycle requires an explicit `preserve` or `cancel` disposition. Unavailable or changed repositories reject migration before primary mutation.
 
 Before migration resolves or copies the database, it verifies every inventory policy effect identity. Accessible canonical and replica identities must match their provider repository ID and object format. Local-bare canonical and replica identities must match the exact path, device, inode, bare state, and object format. An active runner requires explicit unit, cgroup, PID, and process-start authority. Migration checks this authority against systemd and `/proc`. Failure leaves every source database-family file unchanged.
 
@@ -150,7 +148,7 @@ The deployment inventory supplies all repository UUIDs, operation states, canoni
 
 ## Safety
 
-Direct canonical target mutation can start CI or deployment. Replication starts only after canonical landing is durable. Migration uses private random candidate and backup directories with exact ownership manifests. It rejects unowned fixed-name collisions and deletes or quarantines only verified IQ-owned artifacts. Migration creates a durable schema-3 backup before mutation and validates all schema-4 content before commit. A failed migration leaves schema 3 usable; recovery uses the reported backup path. Do not copy user checkouts or IQ-owned roots with `rsync`, `scp`, or manual filesystem operations.
+Direct canonical target mutation can start CI or deployment. Replication starts only after canonical landing is durable. Migration validates all schema-5 content before commit. The schema-3 migration keeps a durable backup. The schema-4 migration also keeps a durable backup. A failed migration leaves the source database usable. Do not copy user checkouts or IQ-owned roots with `rsync`, `scp`, or manual filesystem operations.
 
 Replication uses one CLI/daemon reconciler and a transactional monotonic sequence for each immutable physical destination and target. Wall-clock timestamps do not order debt. A completed later sequence prevents an older retry from writing. Applied and superseded cleanup compare-and-delete only the exact recorded source SHA under the repository binding and lease, then verify that the pin is absent. A mismatch is an invariant error that preserves the pending cleanup state and the drifted pin. IQ first commits `superseded_cleanup_pending`, performs this cleanup, then commits `superseded`. Restart accepts and resumes the cleanup-pending state before other debt for that destination. Old debt always uses that item's exact landed SHA, even when the canonical target advances before observation. IQ publishes and verifies a durable internal source ref before debt becomes pending. The ref survives pinning, pending, applying, uncertain, failed, applied, and supersession cleanup recovery. Pin publication and cleanup are restart-safe.
 

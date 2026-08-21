@@ -345,7 +345,7 @@ fn schema3_absolute_local_bare_transport_migrates_and_opens_for_first_cli_operat
 
 fn inventory(include_mr_base: bool) -> PolicyInventory {
     PolicyInventory {
-        version: 3,
+        version: 4,
         repositories: vec![PolicyAssignment {
             repo_key: REPO_KEY.into(),
             repository: MigrationRepositoryState::Ready { git_binding: None },
@@ -698,7 +698,7 @@ fn run_failed_publication_migration(database: &Path, inventory: &Path, boundary:
 
 fn write_inventory(path: &Path, value: &PolicyInventory) {
     let mut value = value.clone();
-    value.version = 3;
+    value.version = 4;
     let binding =
         iq::git_command::RepositoryBinding::capture(&fixture_owned_root(path.parent().unwrap()))
             .unwrap();
@@ -1558,7 +1558,7 @@ fn schema3_migration_uses_default_database_path_without_normal_schema_open() {
             &Connection::open(database).unwrap(),
             "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'"
         ),
-        "4"
+        "5"
     );
 }
 
@@ -1612,7 +1612,7 @@ fn schema3_migration_requires_exclusive_process_lease_before_backup_or_mutation(
             &Connection::open(&database).unwrap(),
             "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'"
         ),
-        "4"
+        "5"
     );
 }
 
@@ -1645,7 +1645,7 @@ fn schema3_migration_interruption_before_publication_preserves_primary_and_can_r
             &Connection::open(database).unwrap(),
             "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'"
         ),
-        "4"
+        "5"
     );
 }
 
@@ -1670,7 +1670,7 @@ fn schema3_migration_interruption_after_publication_recovers_from_primary_and_ba
             &Connection::open(&database).unwrap(),
             "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'"
         ),
-        "4"
+        "5"
     );
     let recovered = run_migration(&database, &inventory_path);
     assert!(
@@ -1680,7 +1680,7 @@ fn schema3_migration_interruption_after_publication_recovers_from_primary_and_ba
     );
     let report: Value = serde_json::from_slice(&recovered.stdout).unwrap();
     assert_eq!(report["from_schema"], 3);
-    assert_eq!(report["to_schema"], 4);
+    assert_eq!(report["to_schema"], 5);
     assert!(Path::new(report["backup_path"].as_str().unwrap()).is_file());
 }
 
@@ -1725,7 +1725,7 @@ fn schema3_publication_faults_preserve_exact_source_bytes_and_recover() {
                 &Connection::open(&database).unwrap(),
                 "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'"
             ),
-            "4",
+            "5",
             "{boundary}"
         );
         let state: Value = serde_json::from_slice(
@@ -1971,7 +1971,7 @@ fn schema3_migration_reports_published_but_incomplete_when_runner_debt_remains()
     fs::write(
         &systemctl,
         format!(
-            "#!/bin/sh\nversion=$(/usr/bin/sqlite3 '{}' \"SELECT value FROM queue_metadata WHERE key='workspace_schema_version'\")\n[ \"$version\" = 4 ] && exit 1\nexec /usr/bin/systemctl \"$@\"\n",
+            "#!/bin/sh\nversion=$(/usr/bin/sqlite3 '{}' \"SELECT value FROM queue_metadata WHERE key='workspace_schema_version'\")\n[ \"$version\" = 5 ] && exit 1\nexec /usr/bin/systemctl \"$@\"\n",
             database.display()
         ),
     )
@@ -2144,7 +2144,7 @@ fn schema3_cli_migration_uses_frozen_release_fixture_and_preserves_exact_values(
     );
     let report: Value = serde_json::from_slice(&migrated.stdout).unwrap();
     assert_eq!(report["from_schema"], 3);
-    assert_eq!(report["to_schema"], 4);
+    assert_eq!(report["to_schema"], 5);
     assert_eq!(report["repositories"], 1);
     assert_eq!(report["admissions"], 4);
 
@@ -2157,7 +2157,7 @@ fn schema3_cli_migration_uses_frozen_release_fixture_and_preserves_exact_values(
             &connection,
             "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'"
         ),
-        "4"
+        "5"
     );
     assert_eq!(
         text(&connection, "SELECT repo_key FROM registered_repositories"),

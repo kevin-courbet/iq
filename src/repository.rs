@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: &str = "4";
+pub const SCHEMA_VERSION: &str = "5";
 pub const INTERNAL_REMOTE_NAME: &str = "iq-target";
 const POLICY_PATH: &str = ".iq/config.json";
 const MAX_POLICY_BYTES: u64 = 1024 * 1024;

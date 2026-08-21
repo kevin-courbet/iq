@@ -150,7 +150,7 @@ handoff keeps termination debt until process-start acknowledgement or failed
 spawn closes that authority. A missing systemd unit is terminal only after spawn
 authority is closed.
 
-Schema 3 is replaced by schema 4 through one explicit offline migration that
+Schema 3 is replaced by schema 5 through one explicit offline migration that
 preserves repository UUIDs, queue and attempt history, evidence, events,
 notifications, and cleanup obligations. Normal runtime has no compatibility
 path for the old schema or old CLI. Deployment policy and repository inventory
@@ -165,7 +165,7 @@ continuation also requires the exact provider-derived source ref. Migration does
 not fabricate identity sentinels. Invalid JSON or semantic workspace and runner
 identity requires explicit checked repair. Dispositions are globally unique and
 must name an item owned by their policy assignment.
-Version-3 migration inventory models ready repositories and every interrupted
+Version-4 migration inventory models ready repositories and every interrupted
 provisioning lifecycle as distinct variants. Interrupted provisioning is
 explicitly preserved or cancelled and never converted into an invented ready
 root. Operator-generated Git bindings are required for each lifecycle with a
@@ -184,6 +184,12 @@ migration never interprets it as a current `.service` authority.
 Current provisioning persists the same Git binding when Git first exists,
 verifies it on every resume step, and replaces it only through verified root
 relocation. A replacement Git directory cannot continue an interrupted plan.
+
+Schema 4 stored Linux device and mount numbers in durable Git bindings. These
+numbers can change after a reboot. Schema 5 keeps canonical Git layout as
+durable authority. It keeps device, inode, and mount identity only in the active
+process. Managed owner markers, Rift identity, and exact Git SHAs provide the
+durable repository and workspace authority.
 
 Replication debt is FIFO for each immutable physical destination. CLI retry and
 daemon recovery use one reconciler. It publishes and verifies the item's exact

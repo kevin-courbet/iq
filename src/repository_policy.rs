@@ -567,8 +567,8 @@ impl PolicyInventory {
     }
 
     pub fn validate(self) -> Result<Self> {
-        if self.version != 3 {
-            anyhow::bail!("repository policy inventory version must be 3");
+        if self.version != 4 {
+            anyhow::bail!("repository policy inventory version must be 4");
         }
         let mut keys = BTreeSet::new();
         let mut disposition_ids = BTreeSet::new();

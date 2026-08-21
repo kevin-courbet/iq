@@ -1058,6 +1058,9 @@ pub mod sqlite {
             Some("3") => anyhow::bail!(
                 "IQ schema 3 requires explicit offline migration with `iq migrate schema3 --policy-inventory <path>`"
             ),
+            Some("4") => anyhow::bail!(
+                "IQ schema 4 requires explicit offline migration with `iq migrate schema4`"
+            ),
             _ => incompatible_local_state(),
         }
     }
@@ -1321,6 +1324,7 @@ pub mod sqlite {
             database_id: &str,
             source_digest: &str,
             operation_id: &str,
+            source_schema: u32,
         ) -> Result<Self> {
             use std::os::unix::fs::DirBuilderExt;
 
@@ -1329,23 +1333,28 @@ pub mod sqlite {
                 .context("queue database path has no file name")?;
             let mut legacy_name = OsString::from(".");
             legacy_name.push(name);
-            legacy_name.push(".schema3-migration-candidate");
+            legacy_name.push(format!(".schema{source_schema}-migration-candidate"));
             let legacy = path.with_file_name(legacy_name);
             if legacy.exists() {
                 anyhow::bail!(
-                    "unowned fixed-name schema-3 migration candidate exists: {}",
+                    "unowned fixed-name schema-{source_schema} migration candidate exists: {}",
                     legacy.display()
                 );
             }
             let mut candidate_name = OsString::from(".");
             candidate_name.push(name);
-            candidate_name.push(format!(".schema3-migration-{operation_id}.tmp"));
+            candidate_name.push(format!(
+                ".schema{source_schema}-migration-{operation_id}.tmp"
+            ));
             let root = path.with_file_name(candidate_name);
             fs::DirBuilder::new()
                 .mode(0o700)
                 .create(&root)
                 .with_context(|| {
-                    format!("create private schema-3 migration root {}", root.display())
+                    format!(
+                        "create private schema-{source_schema} migration root {}",
+                        root.display()
+                    )
                 })?;
             let metadata = fs::symlink_metadata(&root)?;
             let ownership = MigrationOwnershipManifest {
@@ -1647,6 +1656,132 @@ pub mod sqlite {
         Ok(())
     }
 
+    fn schema4_backup_path(path: &Path) -> PathBuf {
+        let mut backup = path.as_os_str().to_os_string();
+        backup.push(".schema4-backup");
+        PathBuf::from(backup)
+    }
+
+    fn validate_schema4_source(connection: &Connection) -> Result<String> {
+        validate_schema_objects(connection)?;
+        let version: String = connection.query_row(
+            "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        if version != "4" {
+            anyhow::bail!("migration source schema must be 4");
+        }
+        let database_id: String = connection.query_row(
+            "SELECT value FROM queue_metadata WHERE key='database_id'",
+            [],
+            |row| row.get(0),
+        )?;
+        if database_id.is_empty() {
+            anyhow::bail!("migration source database ID must not be empty");
+        }
+        let integrity: String =
+            connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        let foreign_keys: i64 =
+            connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })?;
+        if integrity != "ok" || foreign_keys != 0 {
+            anyhow::bail!("migration source integrity validation failed");
+        }
+        Ok(database_id)
+    }
+
+    fn database_content_sha256(path: &Path) -> Result<String> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        let before = file.metadata()?;
+        if !before.is_file() {
+            anyhow::bail!("database content source is not a regular file");
+        }
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        let after = file.metadata()?;
+        if (
+            before.dev(),
+            before.ino(),
+            before.len(),
+            before.mtime(),
+            before.mtime_nsec(),
+        ) != (
+            after.dev(),
+            after.ino(),
+            after.len(),
+            after.mtime(),
+            after.mtime_nsec(),
+        ) || (before.ctime(), before.ctime_nsec()) != (after.ctime(), after.ctime_nsec())
+        {
+            anyhow::bail!("database changed while computing its content digest");
+        }
+        Ok(format!("{:x}", digest.finalize()))
+    }
+
+    fn ensure_schema4_backup(
+        path: &Path,
+        database_id: &str,
+        expected_source_sha256: Option<&str>,
+    ) -> Result<PathBuf> {
+        let backup = schema4_backup_path(path);
+        match fs::symlink_metadata(&backup) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    anyhow::bail!("schema-4 backup must be a regular file");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let temporary = private_database_temp(&backup)?;
+                let prepared = (|| -> Result<()> {
+                    copy_database_file(path, &temporary)?;
+                    let connection = open_immutable_database(&temporary)?;
+                    if validate_schema4_source(&connection)? != database_id {
+                        anyhow::bail!(
+                            "schema-4 backup candidate has a different database identity"
+                        );
+                    }
+                    drop(connection);
+                    sync_database_file_and_parent(&temporary)
+                })();
+                if let Err(error) = prepared {
+                    remove_database_temp(&temporary);
+                    return Err(error).context("prepare schema-4 backup");
+                }
+                if let Err(error) = publish_database_noreplace(&temporary, &backup) {
+                    remove_database_temp(&temporary);
+                    return Err(error).context("publish schema-4 backup");
+                }
+                File::open(backup.parent().context("schema-4 backup has no parent")?)?
+                    .sync_all()?;
+            }
+            Err(error) => return Err(error).context("inspect schema-4 backup"),
+        }
+        let connection = open_immutable_database(&backup)?;
+        if validate_schema4_source(&connection)? != database_id {
+            anyhow::bail!("schema-4 backup has a different database identity");
+        }
+        drop(connection);
+        if let Some(expected) = expected_source_sha256 {
+            if database_content_sha256(&backup)? != expected {
+                anyhow::bail!("schema-4 backup differs from the current migration source");
+            }
+        }
+        sync_database_file_and_parent(&backup)?;
+        Ok(backup)
+    }
+
     fn validate_and_sync_published_database(path: &Path) -> Result<()> {
         let connection = Connection::open_with_flags(
             path,
@@ -1876,7 +2011,7 @@ pub mod sqlite {
                     completion: reconcile_migrated_runner_termination_debt(&path),
                     database_id,
                     from_schema: 3,
-                    to_schema: 4,
+                    to_schema: 5,
                     repositories,
                     admissions,
                     backup_path,
@@ -1891,6 +2026,7 @@ pub mod sqlite {
                 &database_id,
                 &migration_source_digest,
                 &operation_id,
+                3,
             )?;
             copy_database_file(&path, candidate.path())?;
             let source_after_copy = schema3_source_family(&path)?;
@@ -1946,10 +2082,10 @@ pub mod sqlite {
             let mut ready_repository_keys = std::collections::BTreeSet::new();
             let mut preserved_provisioning_keys = std::collections::BTreeSet::new();
             let mut cancelled_provisioning_keys = std::collections::BTreeSet::new();
-            let mut schema4_repository_bindings = std::collections::BTreeMap::new();
-            let mut schema4_provisioning_lifecycles = std::collections::BTreeMap::new();
-            let mut schema4_workspace_bindings = std::collections::BTreeMap::new();
-            let mut schema4_development_bindings = std::collections::BTreeMap::new();
+            let mut schema5_repository_bindings = std::collections::BTreeMap::new();
+            let mut schema5_provisioning_lifecycles = std::collections::BTreeMap::new();
+            let mut schema5_workspace_bindings = std::collections::BTreeMap::new();
+            let mut schema5_development_bindings = std::collections::BTreeMap::new();
             let mut dispositions = std::collections::BTreeMap::new();
             for assignment in inventory.repositories {
                 let registered = connection
@@ -1997,7 +2133,7 @@ pub mod sqlite {
                                 assignment.repo_key
                             )
                         })?;
-                        schema4_repository_bindings.insert(
+                        schema5_repository_bindings.insert(
                             assignment.repo_key.clone(),
                             serde_json::to_string(binding)?,
                         );
@@ -2052,7 +2188,7 @@ pub mod sqlite {
                                     serde_json::to_value(binding)?,
                                 );
                         }
-                        schema4_provisioning_lifecycles.insert(
+                        schema5_provisioning_lifecycles.insert(
                             assignment.repo_key.clone(),
                             serde_json::to_string(&lifecycle_value)?,
                         );
@@ -2135,7 +2271,7 @@ pub mod sqlite {
                             workspace.workspace_id
                         )
                     })?;
-                    schema4_development_bindings.insert(
+                    schema5_development_bindings.insert(
                         workspace.workspace_id,
                         (workspace.path, serde_json::to_string(binding)?),
                     );
@@ -2179,7 +2315,7 @@ pub mod sqlite {
                                 disposition.item_id
                             )
                         })?;
-                        schema4_workspace_bindings.insert(
+                        schema5_workspace_bindings.insert(
                             disposition.item_id.clone(),
                             (workspace.path.clone(), serde_json::to_string(binding)?),
                         );
@@ -2742,9 +2878,9 @@ pub mod sqlite {
                     "INSERT INTO repository_bootstrap_requests(request_path,storage_root_path,rift_registry_path,repo_key,created_at,updated_at) SELECT request_path,storage_root_path,rift_registry_path,repo_key,created_at,updated_at FROM repository_bootstrap_requests_schema3 WHERE repo_key=?1",
                     [repo_key],
                 )?;
-                let lifecycle = schema4_provisioning_lifecycles
+                let lifecycle = schema5_provisioning_lifecycles
                     .get(repo_key)
-                    .context("preserved provisioning lifecycle has no verified schema-4 state")?;
+                    .context("preserved provisioning lifecycle has no verified schema-5 state")?;
                 transaction.execute(
                     "UPDATE repository_provisioning_intents SET lifecycle_json=?1 WHERE repo_key=?2",
                     params![lifecycle, repo_key],
@@ -2757,7 +2893,7 @@ pub mod sqlite {
                  DROP TABLE repository_bootstrap_requests_schema3;
                  DROP TABLE repository_remote_owners_schema3;",
             )?;
-            for (repo_key, binding) in &schema4_repository_bindings {
+            for (repo_key, binding) in &schema5_repository_bindings {
                 let changed = transaction.execute(
                     "UPDATE registered_repositories SET git_binding_json=?1 WHERE repo_key=?2",
                     params![binding, repo_key],
@@ -2825,7 +2961,7 @@ pub mod sqlite {
                     );
                 }
             }
-            for (item_id, (path, binding)) in &schema4_workspace_bindings {
+            for (item_id, (path, binding)) in &schema5_workspace_bindings {
                 let changed = transaction.execute(
                     "INSERT INTO workspace_git_bindings(owner_kind,owner_id,top_level,binding_json,created_at) SELECT 'integration',?1,CAST(?2 AS BLOB),?3,?4 WHERE EXISTS(SELECT 1 FROM queue_items WHERE id=?1 AND integration_workspace_path=?2 AND integration_workspace_rift_id IS NOT NULL)",
                     params![item_id,path,binding,timestamp],
@@ -2834,7 +2970,7 @@ pub mod sqlite {
                     anyhow::bail!("migration workspace Git binding differs from queue authority");
                 }
             }
-            for (workspace_id, (path, binding)) in &schema4_development_bindings {
+            for (workspace_id, (path, binding)) in &schema5_development_bindings {
                 let changed = transaction.execute(
                     "INSERT INTO workspace_git_bindings(owner_kind,owner_id,top_level,binding_json,created_at) SELECT 'development',?1,CAST(?2 AS BLOB),?3,?4 WHERE EXISTS(SELECT 1 FROM development_workspaces WHERE id=?1 AND CAST(path AS TEXT)=?2 AND rift_id IS NOT NULL AND status!='removed')",
                     params![workspace_id,path,binding,timestamp],
@@ -2884,7 +3020,7 @@ pub mod sqlite {
                 [crate::repository::SCHEMA_VERSION],
             )?;
             validate_schema_objects(&transaction)?;
-            validate_schema4_contents(&transaction)?;
+            validate_schema5_contents(&transaction)?;
             validate_registered_repository_rows(&transaction)?;
             crate::repository::validate_provisioning_rows(&transaction)?;
             crate::control_store::validate_control_contents(&transaction)?;
@@ -2949,7 +3085,7 @@ pub mod sqlite {
             )?;
             configure_connection(&published)?;
             if validate_existing_schema_identity(&published)? != database_id {
-                anyhow::bail!("published schema-4 database identity is invalid");
+                anyhow::bail!("published schema-5 database identity is invalid");
             }
             drop(published);
             fail_schema3_publication_after("validation")?;
@@ -2965,9 +3101,276 @@ pub mod sqlite {
                 completion: reconcile_migrated_runner_termination_debt(&path),
                 database_id,
                 from_schema: 3,
-                to_schema: 4,
+                to_schema: 5,
                 repositories: stored_keys.len(),
                 admissions: admissions.len(),
+                backup_path,
+            })
+        }
+
+        pub fn migrate_schema4(path: &Path) -> Result<MigrationReport> {
+            let path = resolve_queue_database_path_without_creating(path)?;
+            let metadata = fs::symlink_metadata(&path)
+                .with_context(|| format!("inspect schema-4 queue database {}", path.display()))?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                anyhow::bail!("migration source must be a regular queue database");
+            }
+            let exclusive = crate::control_store::DatabaseProcessLease::acquire_exclusive(&path)
+                .context("take exclusive offline migration authority")?;
+            for suffix in ["-journal", "-wal", "-shm"] {
+                let mut sidecar = path.as_os_str().to_os_string();
+                sidecar.push(suffix);
+                if PathBuf::from(sidecar).exists() {
+                    anyhow::bail!(
+                        "schema-4 migration requires a closed database with no sidecar files"
+                    );
+                }
+            }
+
+            let source = open_immutable_database(&path)?;
+            let stored_version: String = source.query_row(
+                "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
+                [],
+                |row| row.get(0),
+            )?;
+            if stored_version == crate::repository::SCHEMA_VERSION {
+                let database_id = validate_existing_schema_identity(&source)?;
+                if !schema4_backup_path(&path).exists() {
+                    anyhow::bail!("schema-5 database has no schema-4 migration backup authority");
+                }
+                let backup_path = ensure_schema4_backup(&path, &database_id, None)?;
+                let repositories = source.query_row(
+                    "SELECT COUNT(*) FROM registered_repositories",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let admissions =
+                    source.query_row("SELECT COUNT(*) FROM queue_admissions", [], |row| {
+                        row.get(0)
+                    })?;
+                drop(source);
+                drop(exclusive);
+                return Ok(MigrationReport {
+                    completion: MigrationCompletion::Complete,
+                    database_id,
+                    from_schema: 4,
+                    to_schema: 5,
+                    repositories,
+                    admissions,
+                    backup_path,
+                });
+            }
+            let database_id = validate_schema4_source(&source)?;
+            let repositories =
+                source.query_row("SELECT COUNT(*) FROM registered_repositories", [], |row| {
+                    row.get(0)
+                })?;
+            let admissions =
+                source.query_row("SELECT COUNT(*) FROM queue_admissions", [], |row| {
+                    row.get(0)
+                })?;
+
+            let registered_bindings = {
+                let mut statement = source.prepare(
+                    "SELECT repo_key,owned_root_path,git_binding_json,source_sha,json_extract(checkout_json,'$.target_sha') FROM registered_repositories ORDER BY repo_key",
+                )?;
+                let bindings = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    })?
+                    .map(|row| -> Result<_> {
+                        let (repo_key, path, stored, source_sha, checkout_sha) = row?;
+                        let path = PathBuf::from(OsString::from_vec(path));
+                        let binding = crate::git_command::RepositoryBinding::migrate_schema4(
+                            serde_json::from_str(&stored)?,
+                        )?;
+                        if binding.top_level != path {
+                            anyhow::bail!(
+                                "schema-4 registered repository binding has a different top-level"
+                            );
+                        }
+                        binding.verify_commit(&source_sha)?;
+                        binding.verify_commit(&checkout_sha)?;
+                        Ok((repo_key, serde_json::to_string(&binding)?))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                bindings
+            };
+            let workspace_bindings = {
+                let mut statement = source.prepare(
+                    "SELECT binding.owner_kind,binding.owner_id,binding.top_level,binding.binding_json,workspace.base_sha,item.target_sha,item.source_sha,item.landed_commit_sha FROM workspace_git_bindings binding LEFT JOIN development_workspaces workspace ON binding.owner_kind='development' AND workspace.id=binding.owner_id LEFT JOIN queue_items item ON binding.owner_kind='integration' AND item.id=binding.owner_id ORDER BY binding.owner_kind,binding.owner_id",
+                )?;
+                let bindings = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                            row.get::<_, Option<String>>(7)?,
+                        ))
+                    })?
+                    .map(|row| -> Result<_> {
+                        let (owner_kind, owner_id, path, stored, base, target, source, landed) =
+                            row?;
+                        let path = PathBuf::from(OsString::from_vec(path));
+                        let binding = crate::git_command::RepositoryBinding::migrate_schema4(
+                            serde_json::from_str(&stored)?,
+                        )?;
+                        if binding.top_level != path {
+                            anyhow::bail!("schema-4 workspace binding has a different top-level");
+                        }
+                        for commit in [base, target, source, landed].into_iter().flatten() {
+                            binding.verify_commit(&commit)?;
+                        }
+                        Ok((owner_kind, owner_id, serde_json::to_string(&binding)?))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                bindings
+            };
+            let provisioning_lifecycles = {
+                let mut statement = source.prepare(
+                    "SELECT repo_key,lifecycle_json,source_sha FROM repository_provisioning_intents ORDER BY repo_key",
+                )?;
+                let lifecycles = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .map(|row| -> Result<_> {
+                        let (repo_key, stored, source_sha) = row?;
+                        let mut lifecycle: serde_json::Value = serde_json::from_str(&stored)?;
+                        let state = lifecycle
+                            .get("state")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string);
+                        if let Some(value) = lifecycle.pointer_mut("/identity/git_binding") {
+                            let binding = crate::git_command::RepositoryBinding::migrate_schema4(
+                                std::mem::take(value),
+                            )?;
+                            if !matches!(
+                                state.as_deref(),
+                                Some("git_initialized" | "remote_configured")
+                            ) {
+                                binding.verify_commit(&source_sha)?;
+                            }
+                            *value = serde_json::to_value(binding)?;
+                        }
+                        Ok((repo_key, serde_json::to_string(&lifecycle)?))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                lifecycles
+            };
+            drop(source);
+            let source_sha256 = database_content_sha256(&path)?;
+            let backup_path = ensure_schema4_backup(&path, &database_id, Some(&source_sha256))?;
+
+            let operation_id = Uuid::new_v4().to_string();
+            let candidate = PrivateDatabaseCandidate::new(
+                &path,
+                &database_id,
+                &source_sha256,
+                &operation_id,
+                4,
+            )?;
+            copy_database_file(&path, candidate.path())?;
+
+            let mut connection = Connection::open_with_flags(
+                candidate.path(),
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?;
+            configure_connection(&connection)?;
+            connection.pragma_update(None, "foreign_keys", "ON")?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(
+                "DROP TRIGGER registered_repository_identity_immutable;
+                 DROP TRIGGER workspace_git_binding_immutable;",
+            )?;
+            for (repo_key, binding) in registered_bindings {
+                if transaction.execute(
+                    "UPDATE registered_repositories SET git_binding_json=?1 WHERE repo_key=?2",
+                    params![binding, repo_key],
+                )? != 1
+                {
+                    anyhow::bail!("schema-4 registered repository changed during migration");
+                }
+            }
+            for (owner_kind, owner_id, binding) in workspace_bindings {
+                if transaction.execute(
+                    "UPDATE workspace_git_bindings SET binding_json=?1 WHERE owner_kind=?2 AND owner_id=?3",
+                    params![binding, owner_kind, owner_id],
+                )? != 1
+                {
+                    anyhow::bail!("schema-4 workspace binding changed during migration");
+                }
+            }
+            for (repo_key, lifecycle) in provisioning_lifecycles {
+                if transaction.execute(
+                    "UPDATE repository_provisioning_intents SET lifecycle_json=?1 WHERE repo_key=?2",
+                    params![lifecycle, repo_key],
+                )? != 1
+                {
+                    anyhow::bail!("schema-4 provisioning lifecycle changed during migration");
+                }
+            }
+            if transaction.execute(
+                "UPDATE queue_metadata SET value=?1 WHERE key='workspace_schema_version' AND value='4'",
+                [crate::repository::SCHEMA_VERSION],
+            )? != 1
+            {
+                anyhow::bail!("schema-4 version changed during migration");
+            }
+            transaction.execute_batch(
+                "CREATE TRIGGER registered_repository_identity_immutable
+                 BEFORE UPDATE OF repo_key,owned_root_path,git_binding_json,root_rift_id,registry_identity,registry_device,registry_inode,development_root_path,development_kind,integration_root_path,integration_kind,created_at ON registered_repositories
+                 BEGIN SELECT RAISE(ABORT,'owned repository identity is immutable'); END;
+
+                 CREATE TRIGGER IF NOT EXISTS workspace_git_binding_immutable
+                 BEFORE UPDATE ON workspace_git_bindings
+                 BEGIN SELECT RAISE(ABORT,'workspace Git binding is immutable'); END;",
+            )?;
+            if validate_existing_schema_identity(&transaction)? != database_id {
+                anyhow::bail!("migrated schema-5 database identity is invalid");
+            }
+            transaction.commit()?;
+            drop(connection);
+            sync_database_file_and_parent(candidate.path())?;
+            exchange_database_files(candidate.path(), &path)?;
+            sync_database_file_and_parent(candidate.path())?;
+            sync_database_file_and_parent(&path)?;
+            let published = open_immutable_database(&path)
+                .and_then(|connection| validate_existing_schema_identity(&connection));
+            if !matches!(&published, Ok(actual) if actual == &database_id) {
+                exchange_database_files(candidate.path(), &path)?;
+                sync_database_file_and_parent(candidate.path())?;
+                sync_database_file_and_parent(&path)?;
+                return Err(published
+                    .err()
+                    .unwrap_or_else(|| anyhow::anyhow!("database identity changed")))
+                .context("published schema-5 database identity is invalid");
+            }
+            candidate.remove();
+            drop(exclusive);
+            Ok(MigrationReport {
+                completion: MigrationCompletion::Complete,
+                database_id,
+                from_schema: 4,
+                to_schema: 5,
+                repositories,
+                admissions,
                 backup_path,
             })
         }
@@ -7889,7 +8292,7 @@ pub mod sqlite {
         Ok(())
     }
 
-    fn validate_schema4_contents(connection: &Connection) -> Result<()> {
+    fn validate_schema5_contents(connection: &Connection) -> Result<()> {
         let invalid: i64 = connection.query_row(
             "SELECT
              (SELECT COUNT(*) FROM registered_repositories repository LEFT JOIN repository_policies policy ON policy.repo_key=repository.repo_key WHERE policy.repo_key IS NULL)+
@@ -7902,7 +8305,7 @@ pub mod sqlite {
             |row| row.get(0),
         )?;
         if invalid != 0 {
-            anyhow::bail!("schema-4 authority content is inconsistent");
+            anyhow::bail!("schema-5 authority content is inconsistent");
         }
         let invalid_supersession: i64 = connection.query_row(
             "SELECT COUNT(*) FROM replication_debt older LEFT JOIN replication_debt newer ON newer.id=older.superseded_by_id WHERE older.outcome IN ('superseded_cleanup_pending','superseded') AND (newer.id IS NULL OR newer.destination_key!=older.destination_key OR newer.target_branch!=older.target_branch OR newer.sequence<=older.sequence OR newer.outcome NOT IN ('succeeded','superseded'))",
@@ -7934,7 +8337,7 @@ pub mod sqlite {
             formats
         };
         validate_stored_object_ids(connection, &object_formats, false)?;
-        let mut schema4_oids = connection.prepare(
+        let mut schema5_oids = connection.prepare(
             "SELECT repo_key,label,oid FROM (
              SELECT item.repo_key,'admission head' AS label,admission.head_sha AS oid FROM queue_admissions admission JOIN queue_items item ON item.id=admission.item_id
              UNION ALL SELECT item.repo_key,'admission base',admission.base_sha FROM queue_admissions admission JOIN queue_items item ON item.id=admission.item_id
@@ -7951,7 +8354,7 @@ pub mod sqlite {
               UNION ALL SELECT debt.repo_key,'private-ref cleanup object',debt.expected_sha FROM private_ref_cleanup_debt debt
               ) WHERE oid IS NOT NULL",
         )?;
-        for row in schema4_oids.query_map([], |row| {
+        for row in schema5_oids.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -8243,9 +8646,9 @@ pub mod sqlite {
         if foreign_keys != 0 || foreign_keys_enabled != 1 {
             return incompatible_local_state();
         }
-        validate_schema4_contents(connection).map_err(|error| {
+        validate_schema5_contents(connection).map_err(|error| {
             anyhow::anyhow!(
-                "IQ local state is incompatible; schema-4 content is invalid: {error:#}"
+                "IQ local state is incompatible; schema-5 content is invalid: {error:#}"
             )
         })?;
         let mut repository_keys = connection.prepare("SELECT repo_key FROM repository_policies")?;
@@ -19367,7 +19770,6 @@ pub mod integrator {
         const POLL_INTERVAL: StdDuration = StdDuration::from_millis(10);
 
         let binding = crate::git_command::expected_binding(cwd)?;
-        binding.verify()?;
         let stdout_path = log_path.with_extension("stdout.tmp");
         let stderr_path = log_path.with_extension("stderr.tmp");
         let log_name = log_path
@@ -19384,15 +19786,12 @@ pub mod integrator {
         let stderr_capture =
             create_file_at(log_directory, stderr_name, "temporary evidence stderr")?;
         let mut process = gated_process(&CommandProgram::SearchPath("/bin/sh"), ["-lc", command])?;
-        process
-            .current_dir(cwd)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        process.stdout(Stdio::piped()).stderr(Stdio::piped());
+        crate::git_command::bind_working_directory(&mut process, &binding)?;
         for (key, value) in environment {
             process.env(key, value);
         }
         crate::git_command::harden_authorized(&mut process);
-        binding.verify()?;
         let mut release = CommandRelease::new();
         if !authorize_start(&mut release)? {
             let mut log = create_file_at(log_directory, log_name, "evidence log")?;
