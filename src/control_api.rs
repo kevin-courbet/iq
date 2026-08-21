@@ -484,42 +484,52 @@ fn handle_connection(
     if let ApiRequest::Watch { cursor, limit } = envelope.request {
         return stream_events(&mut stream, config, store, shutdown, cursor, limit);
     }
-    let result = match envelope.request {
-        ApiRequest::Inbox { limit } => serde_json::to_value(store.inbox(limit)?)?,
-        ApiRequest::Show { item_id } => serde_json::to_value(
-            store
-                .effort_for_item(&item_id)?
-                .with_context(|| format!("item has no effort: {item_id}"))?,
-        )?,
-        ApiRequest::Answer { answer } => {
-            if answer.answer.len() as u64 > config.max_free_text_bytes {
-                anyhow::bail!("answer exceeds configured free-text bound");
+    let result = (|| -> Result<serde_json::Value> {
+        Ok(match envelope.request {
+            ApiRequest::Inbox { limit } => serde_json::to_value(store.inbox(limit)?)?,
+            ApiRequest::Show { item_id } => serde_json::to_value(
+                store
+                    .effort_for_item(&item_id)?
+                    .with_context(|| format!("item has no effort: {item_id}"))?,
+            )?,
+            ApiRequest::Answer { answer } => {
+                if answer.answer.len() as u64 > config.max_free_text_bytes {
+                    anyhow::bail!("answer exceeds configured free-text bound");
+                }
+                serde_json::to_value(store.answer(
+                    &answer,
+                    &ResponderIdentity::LocalPeer { uid: peer },
+                    daemon_uid,
+                )?)?
             }
-            serde_json::to_value(store.answer(
-                &answer,
-                &ResponderIdentity::LocalPeer { uid: peer },
-                daemon_uid,
-            )?)?
-        }
-        ApiRequest::Watch { .. } => unreachable!(),
-        ApiRequest::Retry { item_id } => {
-            let effort = store
-                .effort_for_item(&item_id)?
-                .with_context(|| format!("item has no effort: {item_id}"))?;
-            serde_json::to_value(store.retry_blocked(
-                &effort.id,
-                &ResponderIdentity::LocalPeer { uid: peer },
-                daemon_uid,
-            )?)?
-        }
-    };
-    write_response(
-        &mut stream,
-        &ApiResponse {
+            ApiRequest::Watch { .. } => unreachable!(),
+            ApiRequest::Retry { item_id } => {
+                let effort = store
+                    .effort_for_item(&item_id)?
+                    .with_context(|| format!("item has no effort: {item_id}"))?;
+                serde_json::to_value(store.retry_blocked(
+                    &effort.id,
+                    &ResponderIdentity::LocalPeer { uid: peer },
+                    daemon_uid,
+                )?)?
+            }
+        })
+    })();
+    let response = match result {
+        Ok(result) => ApiResponse {
             version: 1,
             ok: true,
             result,
         },
+        Err(error) => ApiResponse {
+            version: 1,
+            ok: false,
+            result: json!({"kind":"request_error","message":format!("{error:#}")}),
+        },
+    };
+    write_response(
+        &mut stream,
+        &response,
         config.max_response_bytes.min(config.max_client_queue_bytes),
     )
 }
