@@ -8,11 +8,11 @@ Repository policy stores five separate concepts:
 
 - operation state: `enabled`, `draining`, or `disabled`
 - canonical repository: a local bare Git path or an accessible Git repository
-- target branch: `main` or `master`
+- default target branch: `main` or `master`
 - integration policy: `direct` or `merge_request_required`
 - replication policy: no replicas or an exact list of replica destinations
 
-The canonical target is the only source for new workspace bases and the only target that IQ can land. A bootstrap checkout, `origin`, a local branch, the IQ-owned root, and replicas are not authority. The owned root is only a canonical materialization and the independent Rift seed.
+Each job has one immutable target in the canonical repository. The policy branch is the default. A bootstrap checkout, `origin`, a local branch, the IQ-owned root, and replicas are not authority. The owned root is only a canonical materialization and the independent Rift seed.
 
 See [Repository Policy](docs/repository-policy.md) for strict JSON formats and state behavior.
 
@@ -35,13 +35,13 @@ iq repo init \
 Coding agents use only these workspace commands:
 
 ```sh
-iq workspace create --repo-key <repository-uuid> --name feature
+iq workspace create --repo-key <repository-uuid> --name feature [--target-branch release --expected-target-sha <full-sha>]
 iq workspace list --repo-key <repository-uuid>
 iq workspace status <workspace-id>
 iq workspace remove <workspace-id>
 ```
 
-Create resolves the exact current canonical target, fails closed if it cannot resolve or fetch it, reconciles the owned root, creates a direct child Rift, and records the exact base SHA. Existing workspaces keep their recorded base.
+Create resolves the requested target branch or the policy default. IQ validates Git branch rules and stores the full ref. Existing workspaces keep their target and base.
 
 The retained internal integration Rift has separate operator commands:
 
@@ -57,7 +57,7 @@ The old `dev-workspace` command and the old `workspace status/reset` operator pa
 Direct policy permits exact branch admission and immutable local workspace submission:
 
 ```sh
-iq admit direct --repo-key <repository-uuid> --source agent/feature --head <full-sha>
+iq admit direct --repo-key <repository-uuid> --source agent/feature --head <full-sha> [--target-branch release]
 iq submit --workspace <workspace-id>
 ```
 
@@ -70,6 +70,19 @@ iq admit mr https://github.com/owner/repository/pull/123 --repo-key <repository-
 ```
 
 IQ pins provider, canonical repository identity, target branch, MR identity, exact head, and exact current base. IQ queries and validates the admitted MR. IQ never creates an MR. A cross-repository MR fails. Source or target movement makes evidence stale and requires exact recomposition and validation.
+
+IQ computes candidate classification from the mechanical composition tree and the accepted agent tree. Conflicts and agent tree changes are semantic. Semantic candidates require exact authorized review before validation:
+
+```sh
+iq review --config /etc/iq/iq.yaml --external-id <response-id> \
+  --review <review-id> --effort <effort-id> --attempt <attempt-id> \
+  --cycle <cycle-id> --target-ref refs/heads/main \
+  --target-sha <sha> --source-sha <sha> \
+  --candidate-sha <sha> --decision approve
+```
+
+Use `--decision request-changes --text <review-text>` to start another agent cycle. IQ adds the durable review text to that agent input.
+The command returns an exact receipt with the command identity, disposition, and resulting effort state. Exact retries return the original persisted receipt.
 
 Provider landing requires one provider operation that atomically pins both the admitted head and validated base. The current GitHub and GitLab CLI adapters cannot supply that guarantee, so IQ blocks before provider mutation.
 
@@ -98,18 +111,19 @@ Policy authorization runs before operation arguments are validated.
 
 ## Schema Migration
 
-Normal runtime accepts schema 5 only. It rejects schemas 3 and 4. Migration is explicit and offline:
+Normal runtime accepts schema 6 only. It rejects schemas 3, 4, and 5. Migration is explicit and offline:
 
 ```sh
 iq migrate inspect-git-binding --path /var/lib/iq/repositories/<uuid>/root
 iq --queue-db /var/lib/iq/queues.db migrate schema3 \
   --policy-inventory /etc/iq/schema3-policy-inventory.json
 iq --queue-db /var/lib/iq/queues.db migrate schema4
+iq --queue-db /var/lib/iq/queues.db migrate schema5
 ```
 
-Version-4 inventory identifies each schema-3 repository and workspace. The schema-3 migration validates these identities before it publishes schema 5.
+Version-4 inventory identifies each schema-3 repository and workspace. The schema-3 migration validates these identities before it publishes schema 6.
 
-Schema 4 incorrectly stored Linux device and mount numbers as durable identity. These numbers can change after a reboot. The schema-4 migration removes them from durable Git bindings. IQ keeps them only in process memory to reject path changes. The migration validates all managed identity, Git structure, object format, and commit authority before it commits schema 5.
+Schema 4 incorrectly stored Linux device and mount numbers as durable identity. The schema-4 migration removes them, publishes schema 5, and then publishes schema 6. Schema-5 migration assigns full target refs. It records old composition as `migrated_unknown` and requires semantic review. Its backup must match the exact schema-5 source digest and database identity. Landing authority and completed efforts do not change.
 
 ## Queue And Control Plane
 
@@ -125,6 +139,27 @@ iq daemon --config /etc/iq/iq.yaml --system-config /etc/iq/system.yaml
 Cancellation reports success only after IQ confirms that the exact prepared service and complete cgroup terminated. A failure keeps durable termination debt for retry by the command or daemon startup.
 
 The daemon and CLI use shared validated database identity leases. Repository operation leases serialize mutation for one repository without holding an idle global exclusion.
+
+Queue FIFO is strict for each repository and target ref. A blocked target does not block work for a different target.
+
+Sisyphus can probe the enabled direct-integration composition contract through the Unix control API:
+
+```sh
+iq orchestration probe --config /etc/iq/system.yaml \
+  --repo-key <repository-uuid> --protocol sisyphus-backend/v1
+```
+
+The probe is read-only. An active daemon returns a typed `available` or `unavailable` result. Socket and process absence remain transport errors.
+
+An `available` result includes `database_id` and `database_path`. The path is an array of hexadecimal components for the canonical absolute Unix path.
+
+Sisyphus decodes `database_path` and passes it through `--queue-db` to each direct IQ command. It passes `database_id` through `--expected-database-id`.
+
+The `workspace create`, `workspace list`, `workspace status`, `workspace remove`, and `submit` commands require `--expected-database-id`. This requirement also applies to direct manual use.
+
+If `--queue-db` is absent, IQ derives the default path without creating state. The expected database must already exist at that path.
+
+[ADR 0010](docs/adr/0010-exact-job-targets-and-candidate-review.md) records the durable target, candidate-review, Sisyphus database-binding, and Rift executable-authority decisions.
 
 ## Development
 

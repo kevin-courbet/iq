@@ -13,6 +13,7 @@ use iq::control_store::ControlStore;
 use iq::git_object::GitObjectFormat;
 use iq::sqlite::SqliteQueue;
 use sha2::Digest;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -70,6 +71,12 @@ fn sha(byte: char) -> String {
     std::iter::repeat_n(byte, 40).collect()
 }
 
+fn mechanical_composition() -> iq::control_domain::CompositionEvidence {
+    iq::control_domain::CompositionEvidence::Clean {
+        mechanical_tree_sha: sha('4'),
+    }
+}
+
 fn input() -> AgentInput {
     AgentInput {
         version: 2,
@@ -84,7 +91,7 @@ fn input() -> AgentInput {
         },
         repository: RepositoryIdentity {
             repo_key: "00000000-0000-4000-8000-000000000001".into(),
-            target_branch: "main".into(),
+            target_ref: iq::repository::TargetRef::from_branch("main").unwrap(),
             object_format: GitObjectFormat::Sha1,
         },
         source: SourceVariant::RemoteBranch {
@@ -128,6 +135,10 @@ fn protocol_rejects_unknown_fields_and_identity_changes() {
         "checks": []
     });
     assert!(parse_result(&serde_json::to_vec(&wrong_identity).unwrap(), &input).is_err());
+
+    let mut invalid_target = serde_json::to_value(&input).unwrap();
+    invalid_target["repository"]["target_ref"] = serde_json::json!("refs/heads/bad..branch");
+    assert!(serde_json::from_value::<AgentInput>(invalid_target).is_err());
 }
 
 #[test]
@@ -412,6 +423,162 @@ fn unix_socket_api_enforces_private_modes_and_serves_durable_inbox() {
     assert!(response.ok);
     assert_eq!(response.result, serde_json::json!([]));
     thread.join().unwrap();
+}
+
+#[test]
+fn orchestration_probe_reports_stable_availability_without_mutation() {
+    let temp = tempdir().unwrap();
+    let database = temp
+        .path()
+        .join(std::ffi::OsString::from_vec(b"queue-\xff.db".to_vec()));
+    let fixture = RepositoryFixture::new(temp.path(), &database);
+    let config_path = temp.path().join("system.yaml");
+    std::fs::write(&config_path, system_config(&temp.path().join("control"))).unwrap();
+    let control_config = iq::agent_config::SystemConfig::load(&config_path)
+        .unwrap()
+        .control_plane;
+    let repo_key = fixture.repository.key.clone();
+    let database_id = fixture.queue.database_id().unwrap();
+    let database_path = database
+        .canonicalize()
+        .unwrap()
+        .strip_prefix("/")
+        .unwrap()
+        .components()
+        .map(|component| {
+            serde_json::json!({
+                "hex": component
+                    .as_os_str()
+                    .as_bytes()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            })
+        })
+        .collect::<Vec<_>>();
+    let before = std::fs::read(&database).unwrap();
+
+    let available = orchestration_probe_cli(
+        &database,
+        &config_path,
+        &control_config,
+        &repo_key,
+        "sisyphus-backend/v1",
+    );
+    assert!(
+        available.status.success(),
+        "{}",
+        String::from_utf8_lossy(&available.stderr)
+    );
+    let available_json = serde_json::from_slice::<serde_json::Value>(&available.stdout).unwrap();
+    assert_eq!(
+        available_json,
+        serde_json::json!({
+            "outcome": "available",
+            "protocol": "sisyphus-backend/v1",
+            "repo_key": repo_key,
+            "database_id": database_id,
+            "database_path": database_path,
+            "object_format": "sha1",
+            "default_target_branch": "main",
+            "integration_policy": "direct",
+            "workspace_create": true,
+            "local_submit": true,
+            "semantic_review": true,
+            "exact_candidate_landing": true
+        })
+    );
+    let available_outcome =
+        serde_json::from_value::<iq::control_domain::OrchestrationProbeOutcome>(available_json)
+            .unwrap();
+    let iq::control_domain::OrchestrationProbeOutcome::Available {
+        database_path: probed_database_path,
+        ..
+    } = available_outcome
+    else {
+        panic!("orchestration probe did not return available database authority")
+    };
+    assert_eq!(probed_database_path.to_path_buf().unwrap(), database);
+
+    let protocol_mismatch = orchestration_probe_cli(
+        &database,
+        &config_path,
+        &control_config,
+        &fixture.repository.key,
+        "sisyphus-backend/v2",
+    );
+    assert!(protocol_mismatch.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&protocol_mismatch.stdout).unwrap(),
+        serde_json::json!({
+            "outcome": "unavailable",
+            "protocol": "sisyphus-backend/v1",
+            "repo_key": fixture.repository.key,
+            "reason": "protocol_mismatch"
+        })
+    );
+
+    let unknown_repo = "00000000-0000-4000-8000-000000000099";
+    let unknown = orchestration_probe_cli(
+        &database,
+        &config_path,
+        &control_config,
+        unknown_repo,
+        "sisyphus-backend/v1",
+    );
+    assert!(unknown.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&unknown.stdout).unwrap(),
+        serde_json::json!({
+            "outcome": "unavailable",
+            "protocol": "sisyphus-backend/v1",
+            "repo_key": unknown_repo,
+            "reason": "repository_not_found"
+        })
+    );
+    assert_eq!(std::fs::read(&database).unwrap(), before);
+    assert!(!temp.path().join("cli-state").exists());
+
+    let disabled_temp = tempdir().unwrap();
+    let disabled_database = disabled_temp.path().join("queue.db");
+    let disabled_fixture = RepositoryFixture::new(disabled_temp.path(), &disabled_database);
+    disabled_fixture
+        .manager
+        .begin_draining(&disabled_fixture.repository.key)
+        .unwrap();
+    disabled_fixture
+        .manager
+        .disable_drained(&disabled_fixture.repository.key)
+        .unwrap();
+    let disabled_config_path = disabled_temp.path().join("system.yaml");
+    std::fs::write(
+        &disabled_config_path,
+        system_config(&disabled_temp.path().join("control")),
+    )
+    .unwrap();
+    let disabled_control_config = iq::agent_config::SystemConfig::load(&disabled_config_path)
+        .unwrap()
+        .control_plane;
+    let disabled_before = std::fs::read(&disabled_database).unwrap();
+    let disabled = orchestration_probe_cli(
+        &disabled_database,
+        &disabled_config_path,
+        &disabled_control_config,
+        &disabled_fixture.repository.key,
+        "sisyphus-backend/v1",
+    );
+    assert!(disabled.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&disabled.stdout).unwrap(),
+        serde_json::json!({
+            "outcome": "unavailable",
+            "protocol": "sisyphus-backend/v1",
+            "repo_key": disabled_fixture.repository.key,
+            "reason": "repository_disabled"
+        })
+    );
+    assert_eq!(std::fs::read(&disabled_database).unwrap(), disabled_before);
+    assert!(!disabled_temp.path().join("cli-state").exists());
 }
 
 #[test]
@@ -1069,7 +1236,8 @@ fn failed_landing_recomposition_preserves_one_recoverable_uncertain_state() {
         .complete_target_recomposition(
             &effort.id,
             &sha('5'),
-            &serde_json::json!({"target_sha":sha('5')})
+            &serde_json::json!({"target_sha":sha('5')}),
+            &mechanical_composition(),
         )
         .is_err());
 
@@ -1108,6 +1276,7 @@ fn failed_landing_recomposition_preserves_one_recoverable_uncertain_state() {
             &effort.id,
             &sha('5'),
             &serde_json::json!({"target_sha":sha('5')}),
+            &mechanical_composition(),
         )
         .unwrap();
     assert!(matches!(
@@ -1842,12 +2011,25 @@ fn controlled_gitlab_cli_contract_records_one_disposition_and_exact_resume_autho
     stale_effort["effort_id"] = serde_json::json!("unknown-effort");
     let mut unauthorized = exact_answer.clone();
     unauthorized["answer"] = serde_json::json!("unauthorized answer");
+    let stale_review = serde_json::json!({
+        "version": 1,
+        "review_id": "review-1",
+        "effort_id": "unknown-review-effort",
+        "attempt_id": identity.attempt_id,
+        "cycle_id": identity.cycle_id,
+        "target_ref": "refs/heads/main",
+        "target_sha": identity.target_sha,
+        "source_sha": identity.source_sha,
+        "candidate_sha": sha('3'),
+        "decision": "approve"
+    });
     let comments = serde_json::json!([
         {"id": 94, "body": exact_answer.to_string(), "author": null},
         {"id": 95, "body": "not JSON", "author": {"username": "maintainer"}},
         {"id": 96, "body": unknown_version.to_string(), "author": {"username": "maintainer"}},
         {"id": 97, "body": stale_effort.to_string(), "author": {"username": "maintainer"}},
         {"id": 98, "body": unauthorized.to_string(), "author": {"username": "outsider"}},
+        {"id": 100, "body": stale_review.to_string(), "author": {"username": "maintainer"}},
         {"id": 99, "body": exact_answer.to_string(), "author": {"username": "maintainer"}}
     ]);
     std::fs::write(
@@ -1884,6 +2066,7 @@ exit 0
             iq::control_store::AnswerDisposition::Malformed,
             iq::control_store::AnswerDisposition::Stale,
             iq::control_store::AnswerDisposition::Unauthorized,
+            iq::control_store::AnswerDisposition::Stale,
             iq::control_store::AnswerDisposition::Applied,
         ]
     );
@@ -1898,13 +2081,14 @@ exit 0
         IntegrationEffortState::AgentReady(_)
     ));
     assert_eq!(
-        std::fs::read_to_string(log)
+        std::fs::read_to_string(&log)
             .unwrap()
             .lines()
             .filter(|line| line.starts_with("issue create"))
             .count(),
         1
     );
+    SqliteQueue::open(&fixture.database).unwrap();
 }
 
 #[test]
@@ -2035,6 +2219,7 @@ fn controlled_gitlab_cli_contract_reserves_full_issue_once() {
             source_sha: &sha('2'),
             source_variant: "remote_branch",
             landing_variant: "direct",
+            composition: &mechanical_composition(),
             workspace: &workspace,
             runner: &runner_snapshot(),
             state_repository: &repository,
@@ -2175,7 +2360,7 @@ fn exhausted_projection_debt_creates_one_alert_and_one_delivery() {
 }
 
 #[test]
-fn controlled_gitlab_cli_contract_reuses_minimal_blocked_issue() {
+fn controlled_gitlab_cli_contract_reuses_minimal_issue_for_review_input() {
     let _guard = env_lock().lock().unwrap();
     let temp = tempdir().unwrap();
     let database = temp.path().join("queue.db");
@@ -2224,10 +2409,18 @@ fn controlled_gitlab_cli_contract_reuses_minimal_blocked_issue() {
             source_sha: &sha('2'),
             source_variant: "remote_branch",
             landing_variant: "direct",
+            composition: &mechanical_composition(),
             workspace: &workspace,
             runner: &runner_snapshot(),
             state_repository: &repository,
         })
+        .unwrap();
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute(
+            "UPDATE queue_items SET integration_workspace_path=?1,integration_workspace_rift_id=?2,integration_workspace_source_rift_id=?3 WHERE id=?4",
+            rusqlite::params![workspace.path, workspace.rift_id, workspace.source_rift_id, item.id],
+        )
         .unwrap();
     let fake = temp.path().join("glab");
     let log = temp.path().join("glab.log");
@@ -2272,6 +2465,43 @@ fn controlled_gitlab_cli_contract_reuses_minimal_blocked_issue() {
         .unwrap();
     iq::state_repository::project_item(&store, &item.id).unwrap();
     start_cycle(&store, &effort.id, &running_cycle("cycle-1", 1));
+    let intent = iq::control_store::CandidateIntent {
+        operation_id: "minimal-review-builder".into(),
+        cycle_id: "cycle-1".into(),
+        staged_tree_sha256: "a".repeat(64),
+        tree_sha: sha('5'),
+        parents: vec![sha('1'), sha('2')],
+        author_name: "IQ Test".into(),
+        author_email: "iq@example.test".into(),
+        author_timestamp: "2026-01-01T00:00:00Z".into(),
+        committer_name: "IQ Test".into(),
+        committer_email: "iq@example.test".into(),
+        committer_timestamp: "2026-01-01T00:00:00Z".into(),
+        message: "candidate".into(),
+        operation_ref: "refs/iq/candidate-operations/minimal-review-builder".into(),
+    };
+    store.accept_resolved_cycle(&effort.id, &intent).unwrap();
+    store
+        .record_candidate(
+            &effort.id,
+            &iq::control_store::CandidateObservation {
+                operation_id: intent.operation_id,
+                candidate_sha: sha('3'),
+                tree_sha: intent.tree_sha,
+                parent_shas: intent.parents,
+                author_name: intent.author_name,
+                author_email: intent.author_email,
+                author_timestamp: intent.author_timestamp,
+                committer_name: intent.committer_name,
+                committer_email: intent.committer_email,
+                committer_timestamp: intent.committer_timestamp,
+                message: intent.message,
+                operation_ref: intent.operation_ref,
+            },
+        )
+        .unwrap();
+    assert_eq!(store.projection_items(10).unwrap(), vec![item.id.clone()]);
+    iq::state_repository::project_item(&store, &item.id).unwrap();
 
     assert_eq!(
         store
@@ -2282,7 +2512,7 @@ fn controlled_gitlab_cli_contract_reuses_minimal_blocked_issue() {
         "7"
     );
     assert_eq!(
-        std::fs::read_to_string(log)
+        std::fs::read_to_string(&log)
             .unwrap()
             .lines()
             .filter(|line| line.starts_with("issue create"))
@@ -2290,6 +2520,86 @@ fn controlled_gitlab_cli_contract_reuses_minimal_blocked_issue() {
         1
     );
     assert!(store.projection_items(10).unwrap().is_empty());
+
+    let review_effort = store.effort_for_item(&item.id).unwrap().unwrap();
+    let IntegrationEffortState::ReviewRequired(review) = &review_effort.state else {
+        panic!("minimal projection candidate did not require review: {review_effort:?}")
+    };
+    let projection_log = std::fs::read_to_string(&log).unwrap();
+    assert!(projection_log.contains(&review.review_id));
+    assert!(projection_log.contains("\"target_ref\": \"refs/heads/main\""));
+    assert!(projection_log.contains(&review_effort.attempt_id));
+    assert!(projection_log.contains(&review.cycle_id));
+    assert!(projection_log.contains(&review_effort.target_sha));
+    assert!(projection_log.contains(&review_effort.source_sha));
+    assert!(projection_log.contains(&review.candidate_sha));
+    assert_eq!(
+        store
+            .review_candidate(
+                &iq::control_store::CandidateReviewCommand {
+                    external_id: "minimal-review-changes".into(),
+                    review_id: review.review_id.clone(),
+                    effort_id: review_effort.id.clone(),
+                    attempt_id: review_effort.attempt_id.clone(),
+                    cycle_id: review.cycle_id.clone(),
+                    target_ref: iq::repository::TargetRef::from_branch("main").unwrap(),
+                    target_sha: review_effort.target_sha.clone(),
+                    source_sha: review_effort.source_sha.clone(),
+                    candidate_sha: review.candidate_sha.clone(),
+                    decision: iq::control_store::CandidateReviewDecision::RequestChanges {
+                        text: "Revise the candidate.".into(),
+                    },
+                },
+                &iq::control_store::ResponderIdentity::Provider {
+                    actor: "maintainer".into(),
+                },
+                unsafe { libc::geteuid() },
+            )
+            .unwrap()
+            .disposition,
+        iq::control_store::AnswerDisposition::Applied
+    );
+    assert_eq!(store.projection_items(10).unwrap(), vec![item.id.clone()]);
+    iq::state_repository::project_item(&store, &item.id).unwrap();
+    assert!(store.projection_items(10).unwrap().is_empty());
+
+    let revised = enter_candidate_review(&store, &item.id, "cycle-minimal-review-2", 2);
+    let IntegrationEffortState::ReviewRequired(revised_review) = &revised.state else {
+        panic!("revised minimal candidate did not require review: {revised:?}")
+    };
+    assert_eq!(store.projection_items(10).unwrap(), vec![item.id.clone()]);
+    iq::state_repository::project_item(&store, &item.id).unwrap();
+    assert!(store.projection_items(10).unwrap().is_empty());
+    assert_eq!(
+        store
+            .review_candidate(
+                &iq::control_store::CandidateReviewCommand {
+                    external_id: "minimal-review-approved".into(),
+                    review_id: revised_review.review_id.clone(),
+                    effort_id: revised.id.clone(),
+                    attempt_id: revised.attempt_id.clone(),
+                    cycle_id: revised_review.cycle_id.clone(),
+                    target_ref: iq::repository::TargetRef::from_branch("main").unwrap(),
+                    target_sha: revised.target_sha.clone(),
+                    source_sha: revised.source_sha.clone(),
+                    candidate_sha: revised_review.candidate_sha.clone(),
+                    decision: iq::control_store::CandidateReviewDecision::Approve { text: None },
+                },
+                &iq::control_store::ResponderIdentity::Provider {
+                    actor: "maintainer".into(),
+                },
+                unsafe { libc::geteuid() },
+            )
+            .unwrap()
+            .disposition,
+        iq::control_store::AnswerDisposition::Applied
+    );
+    assert_eq!(store.projection_items(10).unwrap(), vec![item.id.clone()]);
+    iq::state_repository::project_item(&store, &item.id).unwrap();
+    assert!(store.projection_items(10).unwrap().is_empty());
+    let projection_log = std::fs::read_to_string(log).unwrap();
+    assert!(projection_log.contains("candidate_changes_requested"));
+    assert!(projection_log.contains("candidate_review_approved"));
 }
 
 #[test]
@@ -3035,6 +3345,40 @@ fn test_control_api_config(
     }
 }
 
+fn orchestration_probe_cli(
+    database: &Path,
+    config_path: &Path,
+    control_config: &iq::agent_config::ControlPlaneConfig,
+    repo_key: &str,
+    protocol: &str,
+) -> std::process::Output {
+    let (_lifetime, server) = ControlApiServer::bind(
+        control_config.clone(),
+        ControlStore::open(database).unwrap(),
+    )
+    .unwrap();
+    let server = std::thread::spawn(move || server.serve_one().unwrap());
+    let output = Command::new(env!("CARGO_BIN_EXE_iq"))
+        .env(
+            "XDG_STATE_HOME",
+            config_path.parent().unwrap().join("cli-state"),
+        )
+        .args([
+            "orchestration",
+            "probe",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--repo-key",
+            repo_key,
+            "--protocol",
+            protocol,
+        ])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    output
+}
+
 fn write_watch_request(stream: &mut UnixStream) {
     use std::io::Write;
     let bytes = serde_json::to_vec(&ApiEnvelope {
@@ -3181,7 +3525,7 @@ fn bare_store_fixture() -> EffortFixture {
     transaction
         .execute(
             "INSERT INTO registered_repositories(repo_key,owned_root_path,git_binding_json,root_rift_id,registry_identity,registry_device,registry_inode,generation,source_sha,checkout_json,development_root_path,integration_root_path,provisioning_json,created_at,updated_at) VALUES(?1,?2,?3,'ROOTRIFT000000000000000001',?4,?5,?6,0,?7,?8,?9,?10,'{\"state\":\"ready\"}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
-            rusqlite::params![repository_key,remote.as_os_str().as_encoded_bytes(),serde_json::to_string(&binding).unwrap(),registry.as_os_str().as_encoded_bytes(),registry_metadata.dev(),registry_metadata.ino(),sha('1'),serde_json::json!({"state":"ready","target_sha":sha('1')}).to_string(),development.as_os_str().as_encoded_bytes(),integration.as_os_str().as_encoded_bytes()],
+            rusqlite::params![repository_key,remote.as_os_str().as_encoded_bytes(),serde_json::to_string(&binding).unwrap(),registry.as_os_str().as_encoded_bytes(),registry_metadata.dev(),registry_metadata.ino(),sha('1'),serde_json::json!({"state":"ready","target_ref":"refs/heads/main","target_sha":sha('1')}).to_string(),development.as_os_str().as_encoded_bytes(),integration.as_os_str().as_encoded_bytes()],
         )
         .unwrap();
     for (kind, root) in [("development", &development), ("integration", &integration)] {
@@ -3197,13 +3541,13 @@ fn bare_store_fixture() -> EffortFixture {
     let connection = rusqlite::Connection::open(&database).unwrap();
     connection
         .execute(
-            "INSERT INTO queue_items(id,repo_key,producer_metadata_json,validation_evidence_json,status,current_attempt_id,created_at,updated_at) VALUES('item-1',?1,'{}','[]','merging','attempt-1','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            "INSERT INTO queue_items(id,repo_key,target_ref,producer_metadata_json,validation_evidence_json,status,current_attempt_id,created_at,updated_at) VALUES('item-1',?1,'refs/heads/main','{}','[]','merging','attempt-1','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
             [repository_key],
         )
         .unwrap();
     connection
         .execute(
-            "INSERT INTO queue_admissions(item_id,kind,source_branch,head_sha,admitted_at) VALUES('item-1','direct','agent/test','1111111111111111111111111111111111111111','2026-01-01T00:00:00Z')",
+            "INSERT INTO queue_admissions(item_id,kind,source_branch,head_sha,target_ref,admitted_at) VALUES('item-1','direct','agent/test','1111111111111111111111111111111111111111','refs/heads/main','2026-01-01T00:00:00Z')",
             [],
         )
         .unwrap();
@@ -3261,6 +3605,7 @@ fn cancellation_winning_effort_creation_race_cannot_restore_merging() {
             source_sha: &sha('2'),
             source_variant: "remote_branch",
             landing_variant: "direct",
+            composition: &mechanical_composition(),
             workspace: &workspace,
             runner: &runner_snapshot(),
             state_repository: &StateRepositorySnapshot::Local,
@@ -3281,6 +3626,379 @@ fn cancellation_winning_effort_creation_race_cannot_restore_merging() {
         iq::core::QueueStatus::Cancelled
     );
     assert!(fixture.store.effort_for_item("item-1").unwrap().is_none());
+}
+
+#[test]
+fn candidate_review_receipts_are_exact_and_restart_safe_at_control_api_boundary() {
+    let fixture = effort_fixture();
+    let effort = enter_candidate_review(&fixture.store, "item-1", "cycle-review", 1);
+    let IntegrationEffortState::ReviewRequired(review) = &effort.state else {
+        panic!("semantic candidate did not require review: {effort:?}")
+    };
+    let review_event = fixture
+        .store
+        .effort_events_after(&effort.id, 0, 100)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.event_type == "review_required")
+        .unwrap();
+    assert_eq!(review_event.effort_id.as_deref(), Some(effort.id.as_str()));
+    assert_eq!(review_event.payload["review_id"], review.review_id);
+    assert_eq!(review_event.payload["attempt_id"], effort.attempt_id);
+    assert_eq!(review_event.payload["cycle_id"], review.cycle_id);
+    assert_eq!(review_event.payload["target_ref"], "refs/heads/main");
+    assert_eq!(review_event.payload["target_sha"], effort.target_sha);
+    assert_eq!(review_event.payload["source_sha"], effort.source_sha);
+    assert_eq!(review_event.payload["candidate_sha"], review.candidate_sha);
+    let command = iq::control_store::CandidateReviewCommand {
+        external_id: "review-applied".into(),
+        review_id: review.review_id.clone(),
+        effort_id: effort.id.clone(),
+        attempt_id: effort.attempt_id.clone(),
+        cycle_id: review.cycle_id.clone(),
+        target_ref: iq::repository::TargetRef::from_branch("main").unwrap(),
+        target_sha: effort.target_sha.clone(),
+        source_sha: effort.source_sha.clone(),
+        candidate_sha: review.candidate_sha.clone(),
+        decision: iq::control_store::CandidateReviewDecision::RequestChanges {
+            text: "Revise the exact candidate.".into(),
+        },
+    };
+
+    let mut stale_target = command.clone();
+    stale_target.external_id = "review-stale-target".into();
+    stale_target.target_ref = iq::repository::TargetRef::from_branch("release").unwrap();
+    stale_target.target_sha = sha('9');
+    let stale_target_receipt = review_receipt_from_api(send_review_api(
+        &fixture.database,
+        fixture.temp.path(),
+        stale_target.clone(),
+    ));
+    assert_review_receipt(
+        &stale_target_receipt,
+        &stale_target,
+        iq::control_store::AnswerDisposition::Stale,
+        None,
+    );
+
+    let mut stale_candidate = command.clone();
+    stale_candidate.external_id = "review-stale-candidate".into();
+    stale_candidate.candidate_sha = sha('8');
+    let stale_candidate_receipt = review_receipt_from_api(send_review_api(
+        &fixture.database,
+        fixture.temp.path(),
+        stale_candidate.clone(),
+    ));
+    assert_review_receipt(
+        &stale_candidate_receipt,
+        &stale_candidate,
+        iq::control_store::AnswerDisposition::Stale,
+        None,
+    );
+
+    let applied = review_receipt_from_api(send_review_api(
+        &fixture.database,
+        fixture.temp.path(),
+        command.clone(),
+    ));
+    assert_review_receipt(
+        &applied,
+        &command,
+        iq::control_store::AnswerDisposition::Applied,
+        Some("agent_ready"),
+    );
+
+    let replay_output = send_review_cli(&fixture.database, fixture.temp.path(), command.clone());
+    assert!(
+        replay_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replay_output.stderr)
+    );
+    let replay =
+        serde_json::from_slice::<iq::control_store::CandidateReviewReceipt>(&replay_output.stdout)
+            .unwrap();
+    assert_eq!(replay, applied);
+
+    let mut changed_content = command.clone();
+    changed_content.decision = iq::control_store::CandidateReviewDecision::RequestChanges {
+        text: "Different content under the same external ID.".into(),
+    };
+    let changed_content_receipt = review_receipt_from_api(send_review_api(
+        &fixture.database,
+        fixture.temp.path(),
+        changed_content.clone(),
+    ));
+    assert_review_receipt(
+        &changed_content_receipt,
+        &changed_content,
+        iq::control_store::AnswerDisposition::Malformed,
+        None,
+    );
+
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let receipt_foreign_keys: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('candidate_review_receipts')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(receipt_foreign_keys, 0);
+    assert!(connection
+        .execute(
+            "DELETE FROM candidate_review_receipts WHERE external_id='review-applied'",
+            [],
+        )
+        .is_err());
+    let receipt_trigger: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='candidate_review_receipt_immutable'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    connection
+        .execute_batch("DROP TRIGGER candidate_review_receipt_immutable")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE candidate_review_receipts SET receipt_json=json_set(receipt_json,'$.decision.text','tampered review text') WHERE external_id='review-applied'",
+            [],
+        )
+        .unwrap();
+    connection.execute_batch(&receipt_trigger).unwrap();
+    drop(connection);
+    let error = match iq::sqlite::SqliteQueue::open(&fixture.database) {
+        Ok(_) => panic!("review receipt with changed text opened successfully"),
+        Err(error) => error,
+    };
+    assert!(
+        format!("{error:#}")
+            .contains("candidate review receipt review-applied is not exact durable authority"),
+        "{error:#}"
+    );
+
+    let provider_fixture = effort_fixture_with_repository(StateRepositorySnapshot::GitlabIssue(
+        IssueRepositorySnapshot {
+            repository: "group/project".into(),
+            visibility: IssueVisibility::Full,
+            allowed_responders: vec!["maintainer".into()],
+        },
+    ));
+    let provider_effort = enter_candidate_review(
+        &provider_fixture.store,
+        "item-1",
+        "cycle-provider-review",
+        1,
+    );
+    let IntegrationEffortState::ReviewRequired(provider_review) = &provider_effort.state else {
+        panic!("provider candidate did not require review: {provider_effort:?}")
+    };
+    let unauthorized_command = iq::control_store::CandidateReviewCommand {
+        external_id: "review-unauthorized".into(),
+        review_id: provider_review.review_id.clone(),
+        effort_id: provider_effort.id.clone(),
+        attempt_id: provider_effort.attempt_id.clone(),
+        cycle_id: provider_review.cycle_id.clone(),
+        target_ref: iq::repository::TargetRef::from_branch("main").unwrap(),
+        target_sha: provider_effort.target_sha.clone(),
+        source_sha: provider_effort.source_sha.clone(),
+        candidate_sha: provider_review.candidate_sha.clone(),
+        decision: iq::control_store::CandidateReviewDecision::Approve { text: None },
+    };
+    let unauthorized = review_receipt_from_api(send_review_api(
+        &provider_fixture.database,
+        provider_fixture.temp.path(),
+        unauthorized_command.clone(),
+    ));
+    assert_review_receipt(
+        &unauthorized,
+        &unauthorized_command,
+        iq::control_store::AnswerDisposition::Unauthorized,
+        None,
+    );
+}
+
+#[test]
+fn schema_open_rejects_missing_candidate_evidence() {
+    let fixture = effort_fixture();
+    enter_candidate_review(&fixture.store, "item-1", "cycle-missing-candidate", 1);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let trigger: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='candidate_evidence_delete_guard'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "DROP TRIGGER candidate_evidence_delete_guard;
+             DELETE FROM candidate_evidence WHERE effort_id IN (SELECT id FROM integration_efforts WHERE item_id='item-1');",
+        )
+        .unwrap();
+    connection.execute_batch(&trigger).unwrap();
+    drop(connection);
+
+    let error = match SqliteQueue::open(&fixture.database) {
+        Ok(_) => panic!("queue with missing candidate evidence opened successfully"),
+        Err(error) => error,
+    };
+    assert!(
+        format!("{error:#}").contains("has no exact candidate review authority"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn schema_open_rejects_missing_candidate_review() {
+    let fixture = effort_fixture();
+    enter_candidate_review(&fixture.store, "item-1", "cycle-missing-review", 1);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let trigger: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='candidate_review_delete_guard'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "DROP TRIGGER candidate_review_delete_guard;
+             DELETE FROM candidate_reviews WHERE effort_id IN (SELECT id FROM integration_efforts WHERE item_id='item-1');",
+        )
+        .unwrap();
+    connection.execute_batch(&trigger).unwrap();
+    drop(connection);
+
+    let error = match SqliteQueue::open(&fixture.database) {
+        Ok(_) => panic!("queue with missing candidate review opened successfully"),
+        Err(error) => error,
+    };
+    assert!(
+        format!("{error:#}").contains("has no exact candidate review authority"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn sqlite_enforces_immutable_and_equal_target_authority() {
+    let fixture = bare_store_fixture();
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+
+    assert!(connection
+        .execute(
+            "UPDATE queue_items SET target_ref='refs/heads/release' WHERE id='item-1'",
+            [],
+        )
+        .is_err());
+    connection
+        .execute(
+            "INSERT INTO development_workspaces(id,repo_key,name,path,branch,target_ref,expected_target_sha,status,cleanup_json,created_at,updated_at) VALUES('workspace-target','00000000-0000-4000-8000-000000000001','target-test',X'2F746D702F7461726765742D74657374','agent/target-test','refs/heads/main','1111111111111111111111111111111111111111','creating','{\"state\":\"pending\"}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+    assert!(connection
+        .execute(
+            "UPDATE development_workspaces SET target_ref='refs/heads/release' WHERE id='workspace-target'",
+            [],
+        )
+        .is_err());
+    assert!(connection
+        .execute(
+            "UPDATE development_workspaces SET expected_target_sha='2222222222222222222222222222222222222222' WHERE id='workspace-target'",
+            [],
+        )
+        .is_err());
+    connection
+        .execute(
+            "INSERT INTO queue_items(id,repo_key,target_ref,producer_metadata_json,validation_evidence_json,status,created_at,updated_at) VALUES('item-target','00000000-0000-4000-8000-000000000001','refs/heads/release','{}','[]','ready','2026-01-01T00:00:01Z','2026-01-01T00:00:01Z')",
+            [],
+        )
+        .unwrap();
+    assert!(connection
+        .execute(
+            "INSERT INTO queue_admissions(item_id,kind,source_branch,head_sha,target_ref,admitted_at) VALUES('item-target','direct','agent/target','2222222222222222222222222222222222222222','refs/heads/main','2026-01-01T00:00:01Z')",
+            [],
+        )
+        .is_err());
+    connection
+        .execute(
+            "INSERT INTO queue_admissions(item_id,kind,source_branch,head_sha,target_ref,admitted_at) VALUES('item-target','direct','agent/target','2222222222222222222222222222222222222222','refs/heads/release','2026-01-01T00:00:01Z')",
+            [],
+        )
+        .unwrap();
+}
+
+#[test]
+fn schema_open_rejects_malformed_durable_target_refs() {
+    let malformed = "refs/heads/bad..branch";
+
+    let fixture = bare_store_fixture();
+    rewrite_immutable_target_ref(
+        &fixture.database,
+        "queue_item_target_ref_immutable",
+        &format!("UPDATE queue_items SET target_ref='{malformed}' WHERE id='item-1'"),
+    );
+    assert_invalid_target_ref(&fixture.database, "stored queue item item-1");
+
+    let fixture = bare_store_fixture();
+    rewrite_immutable_target_ref(
+        &fixture.database,
+        "queue_admission_identity_immutable",
+        &format!("UPDATE queue_admissions SET target_ref='{malformed}' WHERE item_id='item-1'"),
+    );
+    assert_invalid_target_ref(&fixture.database, "stored queue admission item-1");
+
+    let fixture = bare_store_fixture();
+    rusqlite::Connection::open(&fixture.database)
+        .unwrap()
+        .execute(
+            "INSERT INTO development_workspaces(id,repo_key,name,path,branch,target_ref,expected_target_sha,status,cleanup_json,created_at,updated_at) VALUES('workspace-malformed','00000000-0000-4000-8000-000000000001','malformed',X'2F746D702F6D616C666F726D6564','agent/malformed',?1,'1111111111111111111111111111111111111111','creating','{\"state\":\"pending\"}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            [malformed],
+        )
+        .unwrap();
+    assert_invalid_target_ref(
+        &fixture.database,
+        "stored development workspace workspace-malformed",
+    );
+
+    let fixture = bare_store_fixture();
+    rusqlite::Connection::open(&fixture.database)
+        .unwrap()
+        .execute(
+            "INSERT INTO replication_debt(id,item_id,repo_key,canonical_source_sha,destination_key,target_ref,sequence,replica_json,operation,outcome,created_at,updated_at) VALUES('debt-malformed','item-1','00000000-0000-4000-8000-000000000001','1111111111111111111111111111111111111111','malformed-destination',?1,1,'{}','pin_source','pinning','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            [malformed],
+        )
+        .unwrap();
+    assert_invalid_target_ref(&fixture.database, "stored replication debt debt-malformed");
+}
+
+fn rewrite_immutable_target_ref(database: &Path, trigger: &str, update: &str) {
+    let connection = rusqlite::Connection::open(database).unwrap();
+    let trigger_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?1",
+            [trigger],
+            |row| row.get(0),
+        )
+        .unwrap();
+    connection
+        .execute_batch(&format!("DROP TRIGGER {trigger}"))
+        .unwrap();
+    connection.execute_batch(update).unwrap();
+    connection.execute_batch(&trigger_sql).unwrap();
+}
+
+fn assert_invalid_target_ref(database: &Path, expected_authority: &str) {
+    let connection = rusqlite::Connection::open(database).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .unwrap();
+    let error = iq::sqlite::validate_existing_schema_identity(&connection).unwrap_err();
+    let error = format!("{error:#}");
+    assert!(error.contains(expected_authority), "{error}");
+    assert!(error.contains("invalid target ref"), "{error}");
 }
 
 fn effort_fixture() -> EffortFixture {
@@ -3337,6 +4055,7 @@ fn effort_fixture_with_repository_and_runner(
             source_sha: &sha('2'),
             source_variant: "remote_branch",
             landing_variant: "direct",
+            composition: &mechanical_composition(),
             workspace: &workspace,
             runner: &runner,
             state_repository: &state_repository,
@@ -3540,6 +4259,172 @@ fn start_cycle(store: &ControlStore, effort_id: &str, running: &AgentRunning) {
             &running.launcher,
         )
         .unwrap());
+}
+
+fn enter_candidate_review(
+    store: &ControlStore,
+    item_id: &str,
+    cycle_id: &str,
+    cycle_number: u8,
+) -> iq::control_store::IntegrationEffort {
+    let effort = store.effort_for_item(item_id).unwrap().unwrap();
+    let cycle = running_cycle(cycle_id, cycle_number);
+    start_cycle(store, &effort.id, &cycle);
+    let operation_id = format!("builder-{cycle_id}");
+    let intent = iq::control_store::CandidateIntent {
+        operation_id: operation_id.clone(),
+        cycle_id: cycle.cycle_id,
+        staged_tree_sha256: "a".repeat(64),
+        tree_sha: sha('5'),
+        parents: vec![sha('1'), sha('2')],
+        author_name: "IQ Test".into(),
+        author_email: "iq@example.test".into(),
+        author_timestamp: "2026-01-01T00:00:00Z".into(),
+        committer_name: "IQ Test".into(),
+        committer_email: "iq@example.test".into(),
+        committer_timestamp: "2026-01-01T00:00:00Z".into(),
+        message: "candidate".into(),
+        operation_ref: format!("refs/iq/candidate-operations/{operation_id}"),
+    };
+    store.accept_resolved_cycle(&effort.id, &intent).unwrap();
+    store
+        .record_candidate(
+            &effort.id,
+            &iq::control_store::CandidateObservation {
+                operation_id: intent.operation_id,
+                candidate_sha: sha('3'),
+                tree_sha: intent.tree_sha,
+                parent_shas: intent.parents,
+                author_name: intent.author_name,
+                author_email: intent.author_email,
+                author_timestamp: intent.author_timestamp,
+                committer_name: intent.committer_name,
+                committer_email: intent.committer_email,
+                committer_timestamp: intent.committer_timestamp,
+                message: intent.message,
+                operation_ref: intent.operation_ref,
+            },
+        )
+        .unwrap();
+    store.effort_for_item(item_id).unwrap().unwrap()
+}
+
+fn send_review_api(
+    database: &Path,
+    root: &Path,
+    review: iq::control_store::CandidateReviewCommand,
+) -> iq::control_api::ApiResponse {
+    let socket = root.join("review-control/control.sock");
+    let config = iq::agent_config::ControlPlaneConfig {
+        unix_socket: socket.clone(),
+        max_request_bytes: 4096,
+        max_free_text_bytes: 1024,
+        max_response_bytes: 4096,
+        max_concurrent_clients: 2,
+        max_client_queue_bytes: 4096,
+        max_stream_backlog_events: 100,
+        client_idle_seconds: 5,
+    };
+    let (_lifetime, server) =
+        ControlApiServer::bind(config.clone(), ControlStore::open(database).unwrap()).unwrap();
+    let thread = std::thread::spawn(move || server.serve_one().unwrap());
+    let response = request(
+        &socket,
+        &ApiRequest::Review { review },
+        config.max_response_bytes,
+    )
+    .unwrap();
+    thread.join().unwrap();
+    response
+}
+
+fn send_review_cli(
+    database: &Path,
+    root: &Path,
+    review: iq::control_store::CandidateReviewCommand,
+) -> std::process::Output {
+    let control_root = root.join("review-cli-control");
+    let config_path = root.join("review-cli-system.yaml");
+    std::fs::write(&config_path, system_config(&control_root)).unwrap();
+    let control_config = iq::agent_config::SystemConfig::load(&config_path)
+        .unwrap()
+        .control_plane;
+    let (_lifetime, server) =
+        ControlApiServer::bind(control_config, ControlStore::open(database).unwrap()).unwrap();
+    let server = std::thread::spawn(move || server.serve_one().unwrap());
+    let mut command = Command::new(env!("CARGO_BIN_EXE_iq"));
+    command
+        .arg("--queue-db")
+        .arg(database)
+        .arg("review")
+        .arg("--config")
+        .arg(config_path)
+        .arg("--external-id")
+        .arg(&review.external_id)
+        .arg("--review")
+        .arg(&review.review_id)
+        .arg("--effort")
+        .arg(&review.effort_id)
+        .arg("--attempt")
+        .arg(&review.attempt_id)
+        .arg("--cycle")
+        .arg(&review.cycle_id)
+        .arg("--target-ref")
+        .arg(review.target_ref.as_str())
+        .arg("--target-sha")
+        .arg(&review.target_sha)
+        .arg("--source-sha")
+        .arg(&review.source_sha)
+        .arg("--candidate-sha")
+        .arg(&review.candidate_sha);
+    match &review.decision {
+        iq::control_store::CandidateReviewDecision::Approve { text } => {
+            command.arg("--decision").arg("approve");
+            if let Some(text) = text {
+                command.arg("--text").arg(text);
+            }
+        }
+        iq::control_store::CandidateReviewDecision::RequestChanges { text } => {
+            command
+                .arg("--decision")
+                .arg("request-changes")
+                .arg("--text")
+                .arg(text);
+        }
+    }
+    let output = command.output().unwrap();
+    server.join().unwrap();
+    output
+}
+
+fn review_receipt_from_api(
+    response: iq::control_api::ApiResponse,
+) -> iq::control_store::CandidateReviewReceipt {
+    assert!(response.ok, "{response:?}");
+    serde_json::from_value(response.result).unwrap()
+}
+
+fn assert_review_receipt(
+    receipt: &iq::control_store::CandidateReviewReceipt,
+    command: &iq::control_store::CandidateReviewCommand,
+    disposition: iq::control_store::AnswerDisposition,
+    resulting_effort_state: Option<&str>,
+) {
+    assert_eq!(receipt.external_id, command.external_id);
+    assert_eq!(receipt.review_id, command.review_id);
+    assert_eq!(receipt.effort_id, command.effort_id);
+    assert_eq!(receipt.attempt_id, command.attempt_id);
+    assert_eq!(receipt.cycle_id, command.cycle_id);
+    assert_eq!(receipt.target_ref, command.target_ref);
+    assert_eq!(receipt.target_sha, command.target_sha);
+    assert_eq!(receipt.source_sha, command.source_sha);
+    assert_eq!(receipt.candidate_sha, command.candidate_sha);
+    assert_eq!(receipt.decision, command.decision);
+    assert_eq!(receipt.disposition, disposition);
+    assert_eq!(
+        receipt.resulting_effort_state.as_deref(),
+        resulting_effort_state
+    );
 }
 
 fn git<const N: usize>(cwd: &Path, args: [&str; N]) {

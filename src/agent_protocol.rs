@@ -36,7 +36,7 @@ pub struct AgentInput {
 #[serde(deny_unknown_fields)]
 pub struct RepositoryIdentity {
     pub repo_key: String,
-    pub target_branch: String,
+    pub target_ref: crate::repository::TargetRef,
     pub object_format: crate::git_object::GitObjectFormat,
 }
 
@@ -204,7 +204,7 @@ impl AgentInput {
         let object_format = self.repository.object_format;
         validate_identity(&self.identity, object_format)?;
         require_exact_text(&self.repository.repo_key, "repository identity")?;
-        require_exact_text(&self.repository.target_branch, "target branch")?;
+        crate::repository::TargetRef::from_full(self.repository.target_ref.as_str())?;
         object_format.require_oid(&self.base_sha, "base SHA")?;
         match &self.source {
             SourceVariant::RemoteBranch { branch, sha } => {

@@ -4,6 +4,7 @@
 - Date: 2026-08-15
 - Decider: Kevin Courbet
 - Supersedes: ADR 0008 canonical-target and owned-root authority clauses; ADR 0003 landing-policy clauses
+- Superseded in part by: ADR 0010 target-authority clauses
 
 ## Decision
 

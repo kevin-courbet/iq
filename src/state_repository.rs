@@ -70,6 +70,9 @@ impl StateRepository for IssueStateRepository {
                     || matches!(
                         event.event_type.as_str(),
                         "answer_applied"
+                            | "review_required"
+                            | "candidate_review_approved"
+                            | "candidate_changes_requested"
                             | "cycle_limit_retry_authorized"
                             | "infrastructure_retry_authorized"
                             | "provider_retry_authorized"
@@ -81,6 +84,7 @@ impl StateRepository for IssueStateRepository {
             .collect::<Vec<_>>();
         if self.visibility == IssueVisibility::Minimal
             && effort.state.blocker().is_none()
+            && !effort.state.is_provider_input_state()
             && artifact.is_none()
         {
             return Ok(None);
@@ -279,6 +283,61 @@ struct ProviderAnswer {
     answer: String,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderReview {
+    version: u32,
+    review_id: String,
+    effort_id: String,
+    attempt_id: String,
+    cycle_id: String,
+    target_ref: crate::repository::TargetRef,
+    target_sha: String,
+    source_sha: String,
+    candidate_sha: String,
+    decision: ProviderReviewDecision,
+    text: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProviderReviewDecision {
+    Approve,
+    RequestChanges,
+}
+
+impl ProviderReview {
+    fn decision(&self) -> Option<crate::control_store::CandidateReviewDecision> {
+        match (&self.decision, &self.text) {
+            (ProviderReviewDecision::Approve, text) => {
+                Some(crate::control_store::CandidateReviewDecision::Approve { text: text.clone() })
+            }
+            (ProviderReviewDecision::RequestChanges, Some(text)) => Some(
+                crate::control_store::CandidateReviewDecision::RequestChanges {
+                    text: text.clone(),
+                },
+            ),
+            (ProviderReviewDecision::RequestChanges, None) => None,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum ProviderResponse {
+    Answer(ProviderAnswer),
+    Review(ProviderReview),
+}
+
+impl ProviderResponse {
+    fn version(&self) -> u32 {
+        match self {
+            Self::Answer(response) => response.version,
+            Self::Review(response) => response.version,
+        }
+    }
+}
+
 pub fn ingest_answers(
     store: &ControlStore,
     item_id: &str,
@@ -331,8 +390,8 @@ pub fn ingest_answers(
             dispositions.push(crate::control_store::AnswerDisposition::Malformed);
             continue;
         };
-        let answer: ProviderAnswer = match serde_json::from_str(&comment.body) {
-            Ok(answer) => answer,
+        let response: ProviderResponse = match serde_json::from_str(&comment.body) {
+            Ok(response) => response,
             Err(_) => {
                 store.record_provider_comment_receipt(
                     &crate::control_store::ProviderCommentReceipt {
@@ -350,7 +409,7 @@ pub fn ingest_answers(
                 continue;
             }
         };
-        if answer.version != 1 {
+        if response.version() != 1 {
             store.record_provider_comment_receipt(
                 &crate::control_store::ProviderCommentReceipt {
                     provider: provider_name,
@@ -366,27 +425,73 @@ pub fn ingest_answers(
             dispositions.push(crate::control_store::AnswerDisposition::Malformed);
             continue;
         }
-        dispositions.push(store.answer_for_effort(
-            &crate::control_store::AnswerCommand {
-                external_id: crate::control_store::provider_comment_external_id(
-                    provider_name,
-                    &stored.repository,
-                    &stored.artifact_id,
-                    &comment.id,
-                )?,
-                request_id: answer.request_id,
-                effort_id: answer.effort_id,
-                attempt_id: answer.attempt_id,
-                cycle_id: answer.cycle_id,
-                target_sha: answer.target_sha,
-                source_sha: answer.source_sha,
-                candidate_sha: answer.candidate_sha,
-                answer: answer.answer,
-            },
-            &effort.id,
-            &crate::control_store::ResponderIdentity::Provider { actor },
-            unsafe { libc::geteuid() },
-        )?);
+        let external_id = crate::control_store::provider_comment_external_id(
+            provider_name,
+            &stored.repository,
+            &stored.artifact_id,
+            &comment.id,
+        )?;
+        let responder = crate::control_store::ResponderIdentity::Provider { actor };
+        dispositions.push(match response {
+            ProviderResponse::Answer(answer) => store.answer_for_effort(
+                &crate::control_store::AnswerCommand {
+                    external_id,
+                    request_id: answer.request_id,
+                    effort_id: answer.effort_id,
+                    attempt_id: answer.attempt_id,
+                    cycle_id: answer.cycle_id,
+                    target_sha: answer.target_sha,
+                    source_sha: answer.source_sha,
+                    candidate_sha: answer.candidate_sha,
+                    answer: answer.answer,
+                },
+                &effort.id,
+                &responder,
+                unsafe { libc::geteuid() },
+            )?,
+            ProviderResponse::Review(review) => {
+                let Some(decision) = review.decision() else {
+                    store.record_provider_comment_receipt(
+                        &crate::control_store::ProviderCommentReceipt {
+                            provider: provider_name,
+                            repository: &stored.repository,
+                            artifact_id: &stored.artifact_id,
+                            comment_id: &comment.id,
+                            effort_id: &effort.id,
+                            actor: match &responder {
+                                crate::control_store::ResponderIdentity::Provider { actor } => {
+                                    Some(actor)
+                                }
+                                crate::control_store::ResponderIdentity::LocalPeer { .. } => None,
+                            },
+                            body: &comment.body,
+                            disposition: "malformed",
+                        },
+                    )?;
+                    dispositions.push(crate::control_store::AnswerDisposition::Malformed);
+                    continue;
+                };
+                store
+                    .review_candidate_for_effort(
+                        &crate::control_store::CandidateReviewCommand {
+                            external_id,
+                            review_id: review.review_id,
+                            effort_id: review.effort_id,
+                            attempt_id: review.attempt_id,
+                            cycle_id: review.cycle_id,
+                            target_ref: review.target_ref,
+                            target_sha: review.target_sha,
+                            source_sha: review.source_sha,
+                            candidate_sha: review.candidate_sha,
+                            decision,
+                        },
+                        &effort.id,
+                        &responder,
+                        unsafe { libc::geteuid() },
+                    )?
+                    .disposition
+            }
+        });
     }
     Ok(dispositions)
 }

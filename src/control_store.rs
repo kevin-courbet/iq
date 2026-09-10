@@ -76,7 +76,8 @@ pub fn set_target_move_commit_failure_test_hook(database_path: &Path, enabled: b
 
 use crate::control_domain::{
     AgentLaunching, AgentReady, IntegrationBlocker, IntegrationEffortState, LauncherAuthority,
-    ResumeState, RunnerSnapshot, StateRepositorySnapshot, AUTOMATIC_CYCLE_LIMIT,
+    OrchestrationProbeOutcome, OrchestrationUnavailableReason, ResumeState, RunnerSnapshot,
+    StateRepositorySnapshot, AUTOMATIC_CYCLE_LIMIT, SISYPHUS_BACKEND_PROTOCOL,
 };
 use crate::sqlite::{LandingState, WorkspaceIdentity};
 
@@ -532,6 +533,7 @@ pub(crate) struct ValidatedDatabaseAuthority {
 
 struct ValidatedDatabaseIdentity {
     path: PathBuf,
+    encoded_path: crate::control_domain::EncodedAbsolutePath,
     device: u64,
     inode: u64,
     database_id: String,
@@ -547,6 +549,7 @@ impl ValidatedDatabaseAuthority {
         database_id: String,
         connection: &Connection,
     ) -> Result<Self> {
+        let encoded_path = crate::control_domain::EncodedAbsolutePath::from_path(&path)?;
         let workspace_schema_version: String = connection.query_row(
             "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'",
             [],
@@ -557,6 +560,7 @@ impl ValidatedDatabaseAuthority {
         let authority = Self {
             identity: Arc::new(ValidatedDatabaseIdentity {
                 path,
+                encoded_path,
                 device,
                 inode,
                 database_id,
@@ -571,6 +575,18 @@ impl ValidatedDatabaseAuthority {
 
     pub(crate) fn path(&self) -> &Path {
         &self.identity.path
+    }
+
+    pub(crate) fn database_id(&self) -> &str {
+        &self.identity.database_id
+    }
+
+    pub(crate) fn encoded_path(&self) -> &crate::control_domain::EncodedAbsolutePath {
+        &self.identity.encoded_path
+    }
+
+    pub(crate) fn workspace_schema_version(&self) -> &str {
+        &self.identity.workspace_schema_version
     }
 
     pub(crate) fn verify_path(&self) -> Result<()> {
@@ -658,6 +674,7 @@ pub struct IntegrationEffort {
     pub source_sha: String,
     pub source_variant: String,
     pub landing_variant: String,
+    pub composition: crate::control_domain::CompositionEvidence,
     pub workspace: WorkspaceIdentity,
     pub runner: RunnerSnapshot,
     pub state_repository: StateRepositorySnapshot,
@@ -763,6 +780,45 @@ pub struct AnswerCommand {
     pub source_sha: String,
     pub candidate_sha: Option<String>,
     pub answer: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CandidateReviewDecision {
+    Approve { text: Option<String> },
+    RequestChanges { text: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateReviewCommand {
+    pub external_id: String,
+    pub review_id: String,
+    pub effort_id: String,
+    pub attempt_id: String,
+    pub cycle_id: String,
+    pub target_ref: crate::repository::TargetRef,
+    pub target_sha: String,
+    pub source_sha: String,
+    pub candidate_sha: String,
+    pub decision: CandidateReviewDecision,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateReviewReceipt {
+    pub external_id: String,
+    pub review_id: String,
+    pub effort_id: String,
+    pub attempt_id: String,
+    pub cycle_id: String,
+    pub target_ref: crate::repository::TargetRef,
+    pub target_sha: String,
+    pub source_sha: String,
+    pub candidate_sha: String,
+    pub decision: CandidateReviewDecision,
+    pub disposition: AnswerDisposition,
+    pub resulting_effort_state: Option<String>,
 }
 
 pub struct ProviderCommentReceipt<'a> {
@@ -901,6 +957,7 @@ pub struct NewEffort<'a> {
     pub source_sha: &'a str,
     pub source_variant: &'a str,
     pub landing_variant: &'a str,
+    pub composition: &'a crate::control_domain::CompositionEvidence,
     pub workspace: &'a WorkspaceIdentity,
     pub runner: &'a RunnerSnapshot,
     pub state_repository: &'a StateRepositorySnapshot,
@@ -992,7 +1049,7 @@ impl ControlStore {
         let connection = self.connect(false)?;
         connection
             .query_row(
-                "SELECT id,item_id,attempt_id,target_sha,source_sha,source_variant,landing_variant,workspace_json,runner_snapshot_json,state_repository_json,failed_cycles,state_json,created_at,updated_at FROM integration_efforts WHERE item_id=?1",
+                "SELECT id,item_id,attempt_id,target_sha,source_sha,source_variant,landing_variant,composition_json,workspace_json,runner_snapshot_json,state_repository_json,failed_cycles,state_json,created_at,updated_at FROM integration_efforts WHERE item_id=?1",
                 params![item_id],
                 map_effort,
             )
@@ -1237,6 +1294,18 @@ impl ControlStore {
                 text: answer,
             });
         }
+        let mut reviews = connection.prepare(
+            "SELECT id,review_text FROM candidate_reviews WHERE effort_id=?1 AND status='changes_requested' ORDER BY created_at,id",
+        )?;
+        for row in reviews.query_map(params![effort_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (review_id, text) = row?;
+            evidence.push(crate::agent_protocol::BoundedEvidence {
+                kind: format!("candidate_review:{review_id}"),
+                text,
+            });
+        }
         let maximum = usize::try_from(max_entries)?;
         if prior.len().saturating_add(evidence.len()) > maximum {
             anyhow::bail!("durable agent evidence exceeds protocol entry limit");
@@ -1250,6 +1319,7 @@ impl ControlStore {
         let object_format = item_object_format(&transaction, new.item_id)?;
         object_format.require_oid(new.target_sha, "effort target SHA")?;
         object_format.require_oid(new.source_sha, "effort source SHA")?;
+        new.composition.validate(object_format, false)?;
         let (status, current_attempt_id): (String, Option<String>) = transaction.query_row(
             "SELECT status,current_attempt_id FROM queue_items WHERE id=?1",
             [new.item_id],
@@ -1278,7 +1348,7 @@ impl ControlStore {
         }
         if let Some(existing) = transaction
             .query_row(
-                "SELECT id,item_id,attempt_id,target_sha,source_sha,source_variant,landing_variant,workspace_json,runner_snapshot_json,state_repository_json,failed_cycles,state_json,created_at,updated_at FROM integration_efforts WHERE item_id=?1",
+                "SELECT id,item_id,attempt_id,target_sha,source_sha,source_variant,landing_variant,composition_json,workspace_json,runner_snapshot_json,state_repository_json,failed_cycles,state_json,created_at,updated_at FROM integration_efforts WHERE item_id=?1",
                 params![new.item_id],
                 map_effort,
             )
@@ -1303,8 +1373,8 @@ impl ControlStore {
                 )?;
                 let state = IntegrationEffortState::AgentReady(AgentReady { next_cycle });
                 let changed = transaction.execute(
-                    "UPDATE integration_efforts SET attempt_id=?1,target_sha=?2,source_sha=?3,source_variant=?4,landing_variant=?5,workspace_json=?6,runner_snapshot_json=?7,state_repository_json=?8,failed_cycles=0,state='agent_ready',state_json=?9,blocker_kind=NULL,updated_at=?10 WHERE id=?11 AND item_id=?12 AND state='replacement_pending' AND attempt_id=?13",
-                    params![new.attempt_id,new.target_sha,new.source_sha,new.source_variant,new.landing_variant,serde_json::to_string(new.workspace)?,serde_json::to_string(new.runner)?,serde_json::to_string(new.state_repository)?,serde_json::to_string(&state)?,now(),existing.id,new.item_id,pending.old_attempt_id],
+                    "UPDATE integration_efforts SET attempt_id=?1,target_sha=?2,source_sha=?3,source_variant=?4,landing_variant=?5,composition_json=?6,workspace_json=?7,runner_snapshot_json=?8,state_repository_json=?9,failed_cycles=0,state='agent_ready',state_json=?10,blocker_kind=NULL,updated_at=?11 WHERE id=?12 AND item_id=?13 AND state='replacement_pending' AND attempt_id=?14",
+                    params![new.attempt_id,new.target_sha,new.source_sha,new.source_variant,new.landing_variant,serde_json::to_string(new.composition)?,serde_json::to_string(new.workspace)?,serde_json::to_string(new.runner)?,serde_json::to_string(new.state_repository)?,serde_json::to_string(&state)?,now(),existing.id,new.item_id,pending.old_attempt_id],
                 )?;
                 if changed != 1 {
                     anyhow::bail!("replacement effort identity changed before composition");
@@ -1322,7 +1392,8 @@ impl ControlStore {
             }
             if existing.attempt_id != new.attempt_id
                 || existing.target_sha != new.target_sha
-                || existing.source_sha != new.source_sha
+                    || existing.source_sha != new.source_sha
+                    || existing.composition != *new.composition
                 || existing.workspace != *new.workspace
                 || existing.runner != *new.runner
                 || existing.state_repository != *new.state_repository
@@ -1336,8 +1407,8 @@ impl ControlStore {
         let timestamp = now();
         let state = IntegrationEffortState::AgentReady(AgentReady { next_cycle: 1 });
         transaction.execute(
-            "INSERT INTO integration_efforts(id,item_id,attempt_id,target_sha,source_sha,source_variant,landing_variant,workspace_json,runner_snapshot_json,state_repository_json,failed_cycles,state,state_json,blocker_kind,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,'agent_ready',?11,NULL,?12,?12)",
-            params![id,new.item_id,new.attempt_id,new.target_sha,new.source_sha,new.source_variant,new.landing_variant,serde_json::to_string(new.workspace)?,serde_json::to_string(new.runner)?,serde_json::to_string(new.state_repository)?,serde_json::to_string(&state)?,timestamp],
+            "INSERT INTO integration_efforts(id,item_id,attempt_id,target_sha,source_sha,source_variant,landing_variant,composition_json,workspace_json,runner_snapshot_json,state_repository_json,failed_cycles,state,state_json,blocker_kind,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0,'agent_ready',?12,NULL,?13,?13)",
+            params![id,new.item_id,new.attempt_id,new.target_sha,new.source_sha,new.source_variant,new.landing_variant,serde_json::to_string(new.composition)?,serde_json::to_string(new.workspace)?,serde_json::to_string(new.runner)?,serde_json::to_string(new.state_repository)?,serde_json::to_string(&state)?,timestamp],
         )?;
         let effort = required_effort(&transaction, &id)?;
         transaction.execute(
@@ -1366,7 +1437,7 @@ impl ControlStore {
     ) -> Result<bool> {
         let Some(effort) = connection
             .query_row(
-                "SELECT id,item_id,attempt_id,target_sha,source_sha,source_variant,landing_variant,workspace_json,runner_snapshot_json,state_repository_json,failed_cycles,state_json,created_at,updated_at FROM integration_efforts WHERE item_id=?1",
+                "SELECT id,item_id,attempt_id,target_sha,source_sha,source_variant,landing_variant,composition_json,workspace_json,runner_snapshot_json,state_repository_json,failed_cycles,state_json,created_at,updated_at FROM integration_efforts WHERE item_id=?1",
                 params![item_id],
                 map_effort,
             )
@@ -1931,12 +2002,148 @@ impl ControlStore {
         }
         let connection = self.connect(false)?;
         let mut statement = connection.prepare(
-            "SELECT id,item_id,attempt_id,target_sha,source_sha,source_variant,landing_variant,workspace_json,runner_snapshot_json,state_repository_json,failed_cycles,state_json,created_at,updated_at FROM integration_efforts WHERE state NOT IN ('integrated','cancelled') ORDER BY created_at,id LIMIT ?1",
+            "SELECT id,item_id,attempt_id,target_sha,source_sha,source_variant,landing_variant,composition_json,workspace_json,runner_snapshot_json,state_repository_json,failed_cycles,state_json,created_at,updated_at FROM integration_efforts WHERE state NOT IN ('integrated','cancelled') ORDER BY created_at,id LIMIT ?1",
         )?;
         let rows = statement
             .query_map(params![limit], map_effort)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    pub fn probe_orchestration(&self, repo_key: &str, protocol: &str) -> OrchestrationProbeOutcome {
+        if protocol != SISYPHUS_BACKEND_PROTOCOL {
+            return OrchestrationProbeOutcome::unavailable(
+                repo_key,
+                OrchestrationUnavailableReason::ProtocolMismatch,
+            );
+        }
+        if crate::repository::RepoKey::from_stored(repo_key).is_err() {
+            return OrchestrationProbeOutcome::unavailable(
+                repo_key,
+                OrchestrationUnavailableReason::InvalidRepositoryKey,
+            );
+        }
+        if self.authority.workspace_schema_version() != crate::repository::SCHEMA_VERSION {
+            return OrchestrationProbeOutcome::unavailable(
+                repo_key,
+                OrchestrationUnavailableReason::CurrentSchemaRequired,
+            );
+        }
+        let connection = match self.connect(false) {
+            Ok(connection) => connection,
+            Err(_) => {
+                return OrchestrationProbeOutcome::unavailable(
+                    repo_key,
+                    OrchestrationUnavailableReason::StateAuthorityUnavailable,
+                )
+            }
+        };
+        let stored = match connection
+            .query_row(
+                "SELECT policy.operation_state_json,policy.canonical_repository_json,policy.target_branch,policy.integration_policy
+                 FROM registered_repositories repository
+                 JOIN repository_policies policy ON policy.repo_key=repository.repo_key
+                 WHERE repository.repo_key=?1",
+                [repo_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+        {
+            Ok(Some(stored)) => stored,
+            Ok(None) => {
+                return OrchestrationProbeOutcome::unavailable(
+                    repo_key,
+                    OrchestrationUnavailableReason::RepositoryNotFound,
+                )
+            }
+            Err(_) => {
+                return OrchestrationProbeOutcome::unavailable(
+                    repo_key,
+                    OrchestrationUnavailableReason::StateAuthorityUnavailable,
+                )
+            }
+        };
+        let operation_state =
+            match serde_json::from_str::<crate::repository_policy::OperationState>(&stored.0) {
+                Ok(operation_state) => operation_state,
+                Err(_) => {
+                    return OrchestrationProbeOutcome::unavailable(
+                        repo_key,
+                        OrchestrationUnavailableReason::StateAuthorityUnavailable,
+                    )
+                }
+            };
+        match operation_state {
+            crate::repository_policy::OperationState::Enabled => {}
+            crate::repository_policy::OperationState::Draining { .. } => {
+                return OrchestrationProbeOutcome::unavailable(
+                    repo_key,
+                    OrchestrationUnavailableReason::RepositoryDraining,
+                )
+            }
+            crate::repository_policy::OperationState::Disabled => {
+                return OrchestrationProbeOutcome::unavailable(
+                    repo_key,
+                    OrchestrationUnavailableReason::RepositoryDisabled,
+                )
+            }
+        }
+        let canonical_repository =
+            match serde_json::from_str::<crate::repository_policy::GitRepository>(&stored.1)
+                .and_then(|repository| {
+                    repository
+                        .validate("orchestration probe repository")
+                        .map_err(|error| serde_json::Error::io(std::io::Error::other(error)))
+                }) {
+                Ok(repository) => repository,
+                Err(_) => {
+                    return OrchestrationProbeOutcome::unavailable(
+                        repo_key,
+                        OrchestrationUnavailableReason::StateAuthorityUnavailable,
+                    )
+                }
+            };
+        let integration_policy = match stored.3.as_str() {
+            "direct" => crate::repository_policy::IntegrationPolicy::Direct,
+            "merge_request_required" => {
+                return OrchestrationProbeOutcome::unavailable(
+                    repo_key,
+                    OrchestrationUnavailableReason::DirectIntegrationRequired,
+                )
+            }
+            _ => {
+                return OrchestrationProbeOutcome::unavailable(
+                    repo_key,
+                    OrchestrationUnavailableReason::StateAuthorityUnavailable,
+                )
+            }
+        };
+        if crate::repository::validate_target_branch(&stored.2).is_err() {
+            return OrchestrationProbeOutcome::unavailable(
+                repo_key,
+                OrchestrationUnavailableReason::StateAuthorityUnavailable,
+            );
+        }
+        OrchestrationProbeOutcome::Available {
+            protocol: SISYPHUS_BACKEND_PROTOCOL.into(),
+            repo_key: repo_key.into(),
+            database_id: self.authority.database_id().into(),
+            database_path: self.authority.encoded_path().clone(),
+            object_format: canonical_repository.object_format(),
+            default_target_branch: stored.2,
+            integration_policy,
+            workspace_create: true,
+            local_submit: integration_policy == crate::repository_policy::IntegrationPolicy::Direct,
+            semantic_review: true,
+            exact_candidate_landing: true,
+        }
     }
 
     pub fn projection_items(&self, limit: u32) -> Result<Vec<String>> {
@@ -1952,10 +2159,11 @@ impl ControlStore {
              WHERE json_extract(effort.state_repository_json,'$.kind')!='local'
                AND (
                  (debt.effort_id IS NULL AND (
-                   (artifact.effort_id IS NULL AND (
-                     json_extract(effort.state_repository_json,'$.visibility')='full'
-                     OR effort.blocker_kind IS NOT NULL
-                   ))
+                    (artifact.effort_id IS NULL AND (
+                      json_extract(effort.state_repository_json,'$.visibility')='full'
+                      OR effort.blocker_kind IS NOT NULL
+                      OR effort.state='review_required'
+                    ))
                    OR (
                      artifact.effort_id IS NOT NULL
                      AND EXISTS(
@@ -1965,9 +2173,12 @@ impl ControlStore {
                          AND (
                            json_extract(effort.state_repository_json,'$.visibility')='full'
                            OR event.alert=1
-                           OR event.event_type IN (
-                             'answer_applied',
-                             'cycle_limit_retry_authorized',
+                            OR event.event_type IN (
+                               'answer_applied',
+                               'review_required',
+                               'candidate_review_approved',
+                               'candidate_changes_requested',
+                               'cycle_limit_retry_authorized',
                              'infrastructure_retry_authorized',
                              'provider_retry_authorized',
                              'provider_reconciliation_resumed'
@@ -2268,7 +2479,7 @@ impl ControlStore {
         let connection = self.connect(false)?;
         connection
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM answer_receipts WHERE external_id=?1 UNION SELECT 1 FROM provider_comment_receipts WHERE provider=?2 AND repository=?3 AND artifact_id=?4 AND comment_id=?5)",
+                "SELECT EXISTS(SELECT 1 FROM answer_receipts WHERE external_id=?1 UNION SELECT 1 FROM candidate_review_receipts WHERE external_id=?1 UNION SELECT 1 FROM provider_comment_receipts WHERE provider=?2 AND repository=?3 AND artifact_id=?4 AND comment_id=?5)",
                 params![provider_comment_key(provider,repository,artifact_id,comment_id)?,provider,repository,artifact_id,comment_id],
                 |row| row.get(0),
             )
@@ -2303,6 +2514,9 @@ impl ControlStore {
         if running.cycle_id != intent.cycle_id || intent.parents.is_empty() {
             anyhow::bail!("candidate intent does not match accepted cycle");
         }
+        let classification = effort
+            .composition
+            .candidate_classification(intent.tree_sha.as_str());
         let state =
             IntegrationEffortState::CandidateBuilding(crate::control_domain::CandidateBuilding {
                 operation_id: intent.operation_id.clone(),
@@ -2318,6 +2532,7 @@ impl ControlStore {
                 committer_timestamp: intent.committer_timestamp.clone(),
                 message: intent.message.clone(),
                 operation_ref: intent.operation_ref.clone(),
+                classification,
             });
         update_state(&transaction, &effort, &state)?;
         append_event(
@@ -2341,6 +2556,9 @@ impl ControlStore {
         if running.cycle_id != intent.cycle_id || intent.parents.is_empty() {
             anyhow::bail!("resolved result does not match running cycle");
         }
+        let classification = effort
+            .composition
+            .candidate_classification(intent.tree_sha.as_str());
         let changed = transaction.execute(
             "UPDATE integration_cycles SET status='resolved',finished_at=?1 WHERE id=?2 AND status='running'",
             params![now(),running.cycle_id],
@@ -2363,6 +2581,7 @@ impl ControlStore {
                 committer_timestamp: intent.committer_timestamp.clone(),
                 message: intent.message.clone(),
                 operation_ref: intent.operation_ref.clone(),
+                classification,
             });
         update_state(&transaction, &effort, &state)?;
         append_event(
@@ -2384,6 +2603,11 @@ impl ControlStore {
         let mut connection = self.connect(true)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let effort = required_effort(&transaction, effort_id)?;
+        let target_ref = crate::repository::TargetRef::from_full(transaction.query_row(
+            "SELECT target_ref FROM queue_items WHERE id=?1",
+            [&effort.item_id],
+            |row| row.get::<_, String>(0),
+        )?)?;
         let object_format = effort_object_format(&transaction, effort_id)?;
         object_format.require_oid(&observation.candidate_sha, "candidate SHA")?;
         object_format.require_oid(&observation.tree_sha, "candidate tree")?;
@@ -2415,15 +2639,32 @@ impl ControlStore {
         {
             anyhow::bail!("complete candidate Git observation differs from durable builder intent");
         }
-        let state = IntegrationEffortState::CandidateReady(crate::control_domain::CandidateReady {
-            operation_id: observation.operation_id.clone(),
-            cycle_id: building.cycle_id.clone(),
-            candidate_sha: observation.candidate_sha.clone(),
-            staged_tree_sha256: building.staged_tree_sha256.clone(),
-        });
+        let state = match building.classification {
+            crate::control_domain::CandidateClassification::Mechanical => {
+                IntegrationEffortState::CandidateReady(crate::control_domain::CandidateReady {
+                    cycle_id: building.cycle_id.clone(),
+                    candidate_sha: observation.candidate_sha.clone(),
+                    review: crate::control_domain::CandidateReview::Mechanical,
+                })
+            }
+            crate::control_domain::CandidateClassification::Semantic => {
+                let review_id = Uuid::new_v4().to_string();
+                transaction.execute(
+                    "INSERT INTO candidate_reviews(id,effort_id,attempt_id,cycle_id,target_sha,source_sha,candidate_sha,status,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,'required',?8)",
+                    params![review_id,effort.id,effort.attempt_id,building.cycle_id,effort.target_sha,effort.source_sha,observation.candidate_sha,now()],
+                )?;
+                IntegrationEffortState::ReviewRequired(
+                    crate::control_domain::CandidateReviewRequired {
+                        review_id,
+                        cycle_id: building.cycle_id.clone(),
+                        candidate_sha: observation.candidate_sha.clone(),
+                    },
+                )
+            }
+        };
         transaction.execute(
-            "INSERT INTO candidate_evidence(effort_id,cycle_id,candidate_sha,builder_operation_id,created_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(effort_id) DO UPDATE SET cycle_id=excluded.cycle_id,candidate_sha=excluded.candidate_sha,builder_operation_id=excluded.builder_operation_id,created_at=excluded.created_at",
-            params![effort_id,building.cycle_id,observation.candidate_sha,observation.operation_id,now()],
+            "INSERT INTO candidate_evidence(effort_id,cycle_id,candidate_sha,builder_operation_id,classification,created_at) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(effort_id) DO UPDATE SET cycle_id=excluded.cycle_id,candidate_sha=excluded.candidate_sha,builder_operation_id=excluded.builder_operation_id,classification=excluded.classification,created_at=excluded.created_at",
+            params![effort_id,building.cycle_id,observation.candidate_sha,observation.operation_id,match building.classification { crate::control_domain::CandidateClassification::Mechanical => "mechanical", crate::control_domain::CandidateClassification::Semantic => "semantic" },now()],
         )?;
         let moved_base_json: String = transaction.query_row(
             "SELECT moved_base_json FROM integration_attempts WHERE id=?1 AND item_id=?2",
@@ -2457,12 +2698,30 @@ impl ControlStore {
             anyhow::bail!("candidate attempt projection lost exact effort authority");
         }
         update_state(&transaction, &effort, &state)?;
+        let event_payload = match &state {
+            IntegrationEffortState::ReviewRequired(review) => serde_json::json!({
+                "review_id": review.review_id,
+                "attempt_id": effort.attempt_id,
+                "cycle_id": review.cycle_id,
+                "target_ref": target_ref,
+                "target_sha": effort.target_sha,
+                "source_sha": effort.source_sha,
+                "candidate_sha": review.candidate_sha,
+                "classification": building.classification,
+            }),
+            IntegrationEffortState::CandidateReady(ready) => serde_json::json!({
+                "cycle_id": ready.cycle_id,
+                "candidate_sha": ready.candidate_sha,
+                "classification": building.classification,
+            }),
+            _ => unreachable!("candidate publication creates one candidate state"),
+        };
         append_event(
             &transaction,
             &effort,
-            "candidate_ready",
-            serde_json::json!({"candidate_sha":observation.candidate_sha}),
-            false,
+            state.name(),
+            event_payload,
+            matches!(state, IntegrationEffortState::ReviewRequired(_)),
         )?;
         transaction.commit()?;
         Ok(())
@@ -2776,7 +3035,7 @@ impl ControlStore {
             }
         }
         transaction.execute(
-            "UPDATE registered_repositories SET checkout_json=json_object('state','pending','target_sha',?1),updated_at=?2 WHERE repo_key=(SELECT repo_key FROM queue_items WHERE id=?3)",
+            "UPDATE registered_repositories SET checkout_json=json_object('state','pending','target_ref',(SELECT target_ref FROM queue_items WHERE id=?3),'target_sha',?1),updated_at=?2 WHERE repo_key=(SELECT repo_key FROM queue_items WHERE id=?3)",
             params![remote_target_sha,now(),effort.item_id],
         )?;
         if let crate::repository_policy::ReplicationPolicy::Replicate { targets } =
@@ -2785,7 +3044,7 @@ impl ControlStore {
             for replica in targets {
                 let destination_key = replica.destination_identity_key()?;
                 transaction.execute(
-                    "INSERT INTO replication_debt(id,item_id,repo_key,canonical_source_sha,destination_key,target_branch,sequence,replica_json,expected_destination_sha,operation,outcome,application_id,failure,superseded_by_id,created_at,updated_at) SELECT ?1,?2,?3,?4,?5,policy.target_branch,COALESCE((SELECT MAX(existing.sequence) FROM replication_debt existing WHERE existing.destination_key=?5 AND existing.target_branch=policy.target_branch),0)+1,?6,NULL,'pin_source','pinning',NULL,NULL,NULL,?7,?7 FROM repository_policies policy WHERE policy.repo_key=?3",
+                    "INSERT INTO replication_debt(id,item_id,repo_key,canonical_source_sha,destination_key,target_ref,sequence,replica_json,expected_destination_sha,operation,outcome,application_id,failure,superseded_by_id,created_at,updated_at) SELECT ?1,?2,?3,?4,?5,item.target_ref,COALESCE((SELECT MAX(existing.sequence) FROM replication_debt existing WHERE existing.destination_key=?5 AND existing.target_ref=item.target_ref),0)+1,?6,NULL,'pin_source','pinning',NULL,NULL,NULL,?7,?7 FROM queue_items item WHERE item.id=?2 AND item.repo_key=?3",
                     params![Uuid::new_v4().to_string(),effort.item_id,repo_key,landed_sha,destination_key,serde_json::to_string(&replica)?,now()],
                 )?;
             }
@@ -2949,12 +3208,14 @@ impl ControlStore {
         effort_id: &str,
         target_sha: &str,
         conflict: &serde_json::Value,
+        composition: &crate::control_domain::CompositionEvidence,
     ) -> Result<IntegrationEffort> {
         let mut connection = self.connect(true)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let effort = required_effort(&transaction, effort_id)?;
-        effort_object_format(&transaction, effort_id)?
-            .require_oid(target_sha, "replacement target SHA")?;
+        let object_format = effort_object_format(&transaction, effort_id)?;
+        object_format.require_oid(target_sha, "replacement target SHA")?;
+        composition.validate(object_format, false)?;
         let IntegrationEffortState::TargetMovePending(pending) = &effort.state else {
             anyhow::bail!("target recomposition requires durable pending target movement");
         };
@@ -2986,6 +3247,10 @@ impl ControlStore {
             "DELETE FROM candidate_evidence WHERE effort_id=?1",
             params![effort_id],
         )?;
+        transaction.execute(
+            "UPDATE candidate_reviews SET status='superseded',answered_at=?1 WHERE effort_id=?2 AND status='required'",
+            params![now(),effort_id],
+        )?;
         stop_recomposition_after_for_test("candidate_cleared");
         invalidate_validation_invocations(&transaction, &effort.attempt_id)?;
         transaction.execute(
@@ -2996,8 +3261,8 @@ impl ControlStore {
             })?,effort.attempt_id],
         )?;
         transaction.execute(
-            "UPDATE integration_efforts SET target_sha=?1 WHERE id=?2",
-            params![target_sha, effort_id],
+            "UPDATE integration_efforts SET target_sha=?1,composition_json=?2 WHERE id=?3",
+            params![target_sha, serde_json::to_string(composition)?, effort_id],
         )?;
         let state = IntegrationEffortState::AgentReady(AgentReady {
             next_cycle: next_cycle_number(&transaction, effort_id)?,
@@ -3065,7 +3330,8 @@ impl ControlStore {
         require_target_move_authority(&effort, rejection)?;
         if !matches!(
             effort.state,
-            IntegrationEffortState::CandidateReady(_)
+            IntegrationEffortState::ReviewRequired(_)
+                | IntegrationEffortState::CandidateReady(_)
                 | IntegrationEffortState::Validating(_)
                 | IntegrationEffortState::Landing(_)
                 | IntegrationEffortState::LandingUncertain(_)
@@ -3092,6 +3358,30 @@ impl ControlStore {
                 previous: ResumeState::capture(&effort.state)?,
                 cause,
             });
+        if let IntegrationEffortState::ReviewRequired(review) = &effort.state {
+            let superseded = transaction.execute(
+                "UPDATE candidate_reviews SET status='superseded',answered_at=?1 WHERE id=?2 AND effort_id=?3 AND cycle_id=?4 AND candidate_sha=?5 AND status='required'",
+                params![now(),review.review_id,effort.id,review.cycle_id,review.candidate_sha],
+            )?;
+            if superseded != 1 {
+                anyhow::bail!("open candidate review changed before target movement");
+            }
+            let superseded_cycle = transaction.execute(
+                "UPDATE integration_cycles SET status='superseded',finished_at=?1 WHERE id=?2 AND effort_id=?3 AND status='resolved'",
+                params![now(),review.cycle_id,effort.id],
+            )?;
+            if superseded_cycle != 1 {
+                anyhow::bail!("candidate review cycle changed before target movement");
+            }
+            invalidate_validation_invocations(&transaction, &effort.attempt_id)?;
+            let checkout_pending = transaction.execute(
+                "UPDATE registered_repositories SET checkout_json=json_object('state','pending','target_ref',(SELECT target_ref FROM queue_items WHERE id=?1),'target_sha',?2),updated_at=?3 WHERE repo_key=(SELECT repo_key FROM queue_items WHERE id=?1)",
+                params![effort.item_id,target_sha,now()],
+            )?;
+            if checkout_pending != 1 {
+                anyhow::bail!("review target movement lost registered checkout authority");
+            }
+        }
         let changed = transaction.execute(
             "UPDATE integration_attempts SET moved_base_json=?1 WHERE id=?2 AND item_id=?3",
             params![
@@ -3247,6 +3537,176 @@ impl ControlStore {
         daemon_uid: u32,
     ) -> Result<AnswerDisposition> {
         self.answer_for_effort(command, &command.effort_id, responder, daemon_uid)
+    }
+
+    pub fn review_candidate(
+        &self,
+        command: &CandidateReviewCommand,
+        responder: &ResponderIdentity,
+        daemon_uid: u32,
+    ) -> Result<CandidateReviewReceipt> {
+        self.review_candidate_for_effort(command, &command.effort_id, responder, daemon_uid)
+    }
+
+    pub(crate) fn review_candidate_for_effort(
+        &self,
+        command: &CandidateReviewCommand,
+        authoritative_effort_id: &str,
+        responder: &ResponderIdentity,
+        daemon_uid: u32,
+    ) -> Result<CandidateReviewReceipt> {
+        let mut connection = self.connect(true)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let command_json = serde_json::to_string(command)?;
+        let responder_json = serde_json::to_string(responder)?;
+        let existing: Option<(String, String, String)> = transaction
+            .query_row(
+                "SELECT command_json,responder_json,receipt_json FROM candidate_review_receipts WHERE external_id=?1",
+                [&command.external_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((stored_command_json, stored_responder_json, receipt_json)) = existing {
+            if command_json == stored_command_json && responder_json == stored_responder_json {
+                let receipt = serde_json::from_str::<CandidateReviewReceipt>(&receipt_json)?;
+                transaction.commit()?;
+                return Ok(receipt);
+            }
+            let stored_command =
+                serde_json::from_str::<CandidateReviewCommand>(&stored_command_json)?;
+            let disposition = if responder_json != stored_responder_json {
+                AnswerDisposition::Unauthorized
+            } else if candidate_review_command_identity_matches(&stored_command, command) {
+                AnswerDisposition::Malformed
+            } else {
+                AnswerDisposition::Stale
+            };
+            let receipt = candidate_review_receipt(command, disposition, None);
+            transaction.commit()?;
+            return Ok(receipt);
+        }
+        let effort = required_effort(&transaction, authoritative_effort_id)?;
+        let (item_target_ref, canonical_repository_json): (String, String) = transaction
+            .query_row(
+                "SELECT item.target_ref,policy.canonical_repository_json
+             FROM queue_items item
+             JOIN repository_policies policy ON policy.repo_key=item.repo_key
+             WHERE item.id=?1",
+                [&effort.item_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+        let item_target_ref = crate::repository::TargetRef::from_full(item_target_ref)?;
+        let object_format = serde_json::from_str::<crate::repository_policy::GitRepository>(
+            &canonical_repository_json,
+        )?
+        .object_format();
+        let authorized = match responder {
+            ResponderIdentity::LocalPeer { uid } => {
+                *uid == daemon_uid
+                    && matches!(effort.state_repository, StateRepositorySnapshot::Local)
+            }
+            ResponderIdentity::Provider { actor } => effort.state_repository.permits_actor(actor),
+        };
+        let review_text = match &command.decision {
+            CandidateReviewDecision::Approve { text } => text.as_deref(),
+            CandidateReviewDecision::RequestChanges { text } => Some(text.as_str()),
+        };
+        let malformed = candidate_review_command_is_malformed(command, object_format)
+            || review_text.is_some_and(|text| {
+                text.trim().is_empty() || text != text.trim() || text.len() > 16 * 1024
+            });
+        let (disposition, resulting_state) = if !authorized {
+            (
+                AnswerDisposition::Unauthorized,
+                effort.state.name().to_string(),
+            )
+        } else if malformed {
+            (
+                AnswerDisposition::Malformed,
+                effort.state.name().to_string(),
+            )
+        } else {
+            match &effort.state {
+                IntegrationEffortState::ReviewRequired(review)
+                    if effort.id == command.effort_id
+                        && review.review_id == command.review_id
+                        && effort.attempt_id == command.attempt_id
+                        && review.cycle_id == command.cycle_id
+                        && item_target_ref == command.target_ref
+                        && effort.target_sha == command.target_sha
+                        && effort.source_sha == command.source_sha
+                        && review.candidate_sha == command.candidate_sha =>
+                {
+                    let (status, state, event_type) = match &command.decision {
+                        CandidateReviewDecision::Approve { .. } => (
+                            "approved",
+                            IntegrationEffortState::CandidateReady(
+                                crate::control_domain::CandidateReady {
+                                    cycle_id: review.cycle_id.clone(),
+                                    candidate_sha: review.candidate_sha.clone(),
+                                    review: crate::control_domain::CandidateReview::Approved {
+                                        review_id: review.review_id.clone(),
+                                    },
+                                },
+                            ),
+                            "candidate_review_approved",
+                        ),
+                        CandidateReviewDecision::RequestChanges { .. } => (
+                            "changes_requested",
+                            IntegrationEffortState::AgentReady(AgentReady {
+                                next_cycle: next_cycle_number(&transaction, &effort.id)?,
+                            }),
+                            "candidate_changes_requested",
+                        ),
+                    };
+                    let changed = transaction.execute(
+                        "UPDATE candidate_reviews SET status=?1,responder_json=?2,review_text=?3,answered_at=?4 WHERE id=?5 AND effort_id=?6 AND status='required'",
+                        params![status,serde_json::to_string(responder)?,review_text,now(),review.review_id,effort.id],
+                    )?;
+                    if changed != 1 {
+                        anyhow::bail!("required candidate review authority changed");
+                    }
+                    if matches!(
+                        &command.decision,
+                        CandidateReviewDecision::RequestChanges { .. }
+                    ) {
+                        transaction.execute(
+                            "DELETE FROM candidate_evidence WHERE effort_id=?1",
+                            [&effort.id],
+                        )?;
+                        invalidate_validation_invocations(&transaction, &effort.attempt_id)?;
+                        transaction.execute(
+                            "UPDATE integration_attempts SET merge_commit_sha=NULL,validated_commit_sha=NULL,validation_command=NULL,validation_exit_code=NULL,validation_log_path=NULL,signoff_evidence_json=NULL WHERE id=?1 AND item_id=?2",
+                            params![effort.attempt_id,effort.item_id],
+                        )?;
+                    }
+                    update_state(&transaction, &effort, &state)?;
+                    append_event(
+                        &transaction,
+                        &effort,
+                        event_type,
+                        serde_json::json!({"review_id":review.review_id,"candidate_sha":review.candidate_sha,"text":review_text}),
+                        false,
+                    )?;
+                    (AnswerDisposition::Applied, state.name().to_string())
+                }
+                IntegrationEffortState::ReviewRequired(_) => {
+                    (AnswerDisposition::Stale, effort.state.name().to_string())
+                }
+                _ => (AnswerDisposition::Stale, effort.state.name().to_string()),
+            }
+        };
+        let receipt = candidate_review_receipt(
+            command,
+            disposition,
+            (disposition == AnswerDisposition::Applied).then(|| resulting_state.clone()),
+        );
+        transaction.execute(
+            "INSERT INTO candidate_review_receipts(external_id,effort_id,command_json,responder_json,receipt_json,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![command.external_id,command.effort_id,command_json,responder_json,serde_json::to_string(&receipt)?,now()],
+        )?;
+        transaction.commit()?;
+        Ok(receipt)
     }
 
     pub(crate) fn answer_for_effort(
@@ -3652,54 +4112,6 @@ pub(crate) fn install_control_schema(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn install_schema3_control_identity(connection: &Connection) -> Result<()> {
-    install_control_schema(connection)?;
-    connection.execute_batch("PRAGMA writable_schema=ON")?;
-    connection.execute(
-        "UPDATE sqlite_schema SET sql=replace(replace(replace(replace(replace(replace(sql,?1,''),?2,''),?3,''),?4,''),'$.payload.control_group','$.payload.process_group_id'),\"json_type(state_json,'$.payload.process_group_id')='text'\",\"json_type(state_json,'$.payload.process_group_id')='integer'\") WHERE type='table' AND name='integration_efforts'",
-        rusqlite::params![
-            " AND json_extract(state_json,'$.payload.spawn_authority') IN ('open','surrendered')",
-            "'target_move_pending',",
-            "    WHEN 'target_move_pending' THEN json_type(state_json,'$.payload.target_sha')='text' AND json_type(state_json,'$.payload.source_sha')='text' AND json_type(state_json,'$.payload.previous')='object' AND json_type(state_json,'$.payload.cause')='object'\n",
-            " AND json_type(state_json,'$.payload.launcher.pid')='integer' AND json_extract(state_json,'$.payload.launcher.pid')>0 AND json_type(state_json,'$.payload.launcher.process_start_ticks')='integer' AND json_extract(state_json,'$.payload.launcher.process_start_ticks')>0 AND json_type(state_json,'$.payload.launcher.token')='text'",
-        ],
-    )?;
-    for trigger in [
-        "integration_effort_exact_payload_insert",
-        "integration_effort_exact_payload_update",
-    ] {
-        connection.execute(
-            "UPDATE sqlite_schema SET sql=replace(replace(replace(replace(replace(replace(sql,?1,?2),?3,''),?4,''),?5,?6),?7,''),'control_group','process_group_id') WHERE type='trigger' AND name=?8",
-            rusqlite::params![
-                "WHEN 'agent_launching' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=10",
-                "WHEN 'agent_launching' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=8",
-                ",'spawn_authority'",
-                ",'launcher'",
-                "WHEN 'agent_running' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=13",
-                "WHEN 'agent_running' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=12",
-                "    WHEN 'target_move_pending' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=4 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('target_sha','source_sha','previous','cause'))\n",
-                trigger,
-            ],
-        )?;
-    }
-    connection.execute(
-        "UPDATE sqlite_schema SET sql=replace(replace(sql,?1,''),?2,'') WHERE type='trigger' AND name='integration_effort_legal_transition'",
-        rusqlite::params![
-            "'target_move_pending',",
-            " OR\n  (OLD.state='target_move_pending' AND NEW.state IN ('agent_ready','cancelled'))",
-        ],
-    )?;
-    connection.execute(
-        "UPDATE sqlite_schema SET sql=replace(sql,?1,'') WHERE type='trigger' AND name='integration_effort_related_state_update'",
-        ["  (NEW.state='target_move_pending' AND EXISTS(SELECT 1 FROM candidate_evidence candidate WHERE candidate.effort_id=NEW.id AND candidate.candidate_sha=json_extract(NEW.state_json,'$.payload.previous.payload.candidate_sha'))) OR\n"],
-    )?;
-    connection.execute(
-        "UPDATE sqlite_schema SET sql=replace(sql,?1,'') WHERE type='trigger' AND name='queue_effort_projection_guard'",
-        [",'target_move_pending'"],
-    )?;
-    Ok(())
-}
-
 pub(crate) fn upgrade_schema3_control_identity(connection: &Connection) -> Result<()> {
     let old = "AND json_type(state_json,'$.payload.protocol_directory')='text'";
     let launcher_identity = " AND json_type(state_json,'$.payload.launcher.pid')='integer' AND json_extract(state_json,'$.payload.launcher.pid')>0 AND json_type(state_json,'$.payload.launcher.process_start_ticks')='integer' AND json_extract(state_json,'$.payload.launcher.process_start_ticks')>0 AND json_type(state_json,'$.payload.launcher.token')='text'";
@@ -3956,6 +4368,138 @@ pub(crate) fn validate_control_contents(connection: &Connection) -> Result<()> {
     validate_runner_termination_authority(connection)?;
     let expected = expected_debt_from_queue(connection)?;
     validate_control_contents_against_queue(connection, &expected)
+}
+
+pub(crate) fn validate_current_control_contents(connection: &Connection) -> Result<()> {
+    validate_control_contents(connection)?;
+    validate_candidate_review_receipts(connection)?;
+    validate_candidate_review_authority(connection)
+}
+
+fn validate_candidate_review_receipts(connection: &Connection) -> Result<()> {
+    let foreign_keys: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM pragma_foreign_key_list('candidate_review_receipts')",
+        [],
+        |row| row.get(0),
+    )?;
+    if foreign_keys != 0 {
+        anyhow::bail!("candidate review receipt ledger must not have foreign keys");
+    }
+    let mut statement = connection.prepare(
+        "SELECT receipt.external_id,receipt.effort_id,receipt.command_json,receipt.responder_json,receipt.receipt_json
+         FROM candidate_review_receipts receipt
+         ORDER BY receipt.external_id",
+    )?;
+    for row in statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })? {
+        let (external_id, authoritative_effort_id, command_json, responder_json, receipt_json) =
+            row?;
+        let command = serde_json::from_str::<CandidateReviewCommand>(&command_json)?;
+        let responder = serde_json::from_str::<ResponderIdentity>(&responder_json)?;
+        let receipt = serde_json::from_str::<CandidateReviewReceipt>(&receipt_json)?;
+        if serde_json::to_string(&command)? != command_json
+            || serde_json::to_string(&responder)? != responder_json
+            || serde_json::to_string(&receipt)? != receipt_json
+            || command.external_id != external_id
+            || !candidate_review_receipt_matches_command(&receipt, &command)
+            || receipt.disposition == AnswerDisposition::Duplicate
+            || (receipt.disposition == AnswerDisposition::Applied)
+                != receipt.resulting_effort_state.is_some()
+            || !receipt
+                .resulting_effort_state
+                .as_deref()
+                .is_none_or(valid_effort_state_name)
+        {
+            anyhow::bail!("candidate review receipt {external_id} is not exact durable authority");
+        }
+        if authoritative_effort_id != command.effort_id {
+            anyhow::bail!("candidate review receipt {external_id} has conflicting effort identity");
+        }
+    }
+    Ok(())
+}
+
+fn validate_candidate_review_authority(connection: &Connection) -> Result<()> {
+    let invalid: Option<String> = connection
+        .query_row(
+            "WITH authority AS (
+               SELECT effort.id,effort.attempt_id,effort.target_sha,effort.source_sha,
+                      json_extract(effort.composition_json,'$.kind') AS composition_kind,
+                      candidate.cycle_id,candidate.candidate_sha,candidate.classification,
+                      CASE
+                        WHEN effort.state='review_required' THEN 'required'
+                        WHEN effort.state='infrastructure_blocked' AND json_extract(effort.state_json,'$.payload.resume.state')='review_required' THEN 'required'
+                        ELSE 'approved'
+                      END AS authority_kind,
+                      CASE
+                        WHEN effort.state IN ('review_required','candidate_ready','validating','landing','landing_uncertain','integrated') THEN json_extract(effort.state_json,'$.payload.candidate_sha')
+                        WHEN effort.state IN ('infrastructure_blocked','provider_blocked') THEN json_extract(effort.state_json,'$.payload.resume.payload.candidate_sha')
+                      END AS state_candidate_sha,
+                      CASE
+                        WHEN effort.state='review_required' THEN json_extract(effort.state_json,'$.payload.review_id')
+                        WHEN effort.state='candidate_ready' THEN json_extract(effort.state_json,'$.payload.review.review_id')
+                        WHEN effort.state='infrastructure_blocked' AND json_extract(effort.state_json,'$.payload.resume.state')='review_required' THEN json_extract(effort.state_json,'$.payload.resume.payload.review_id')
+                        WHEN effort.state='infrastructure_blocked' AND json_extract(effort.state_json,'$.payload.resume.state')='candidate_ready' THEN json_extract(effort.state_json,'$.payload.resume.payload.review.review_id')
+                      END AS state_review_id,
+                      CASE
+                        WHEN effort.state IN ('review_required','candidate_ready') THEN json_extract(effort.state_json,'$.payload.cycle_id')
+                        WHEN effort.state='infrastructure_blocked' AND json_extract(effort.state_json,'$.payload.resume.state') IN ('review_required','candidate_ready') THEN json_extract(effort.state_json,'$.payload.resume.payload.cycle_id')
+                      END AS state_cycle_id
+               FROM integration_efforts effort
+               LEFT JOIN candidate_evidence candidate ON candidate.effort_id=effort.id
+               WHERE effort.state IN ('review_required','candidate_ready','validating','landing','landing_uncertain','provider_blocked','integrated')
+                  OR (effort.state='infrastructure_blocked' AND json_extract(effort.state_json,'$.payload.resume.state') IN ('review_required','candidate_ready','validating','landing','landing_uncertain'))
+             )
+             SELECT id FROM authority
+             WHERE candidate_sha IS NULL
+                OR state_candidate_sha IS NULL
+                OR candidate_sha!=state_candidate_sha
+                OR (state_cycle_id IS NOT NULL AND cycle_id!=state_cycle_id)
+                OR (authority_kind='required' AND (
+                  classification!='semantic'
+                  OR NOT EXISTS(
+                    SELECT 1 FROM candidate_reviews review
+                    WHERE review.id=state_review_id
+                      AND review.effort_id=authority.id
+                      AND review.attempt_id=authority.attempt_id
+                      AND review.cycle_id=authority.cycle_id
+                      AND review.target_sha=authority.target_sha
+                      AND review.source_sha=authority.source_sha
+                      AND review.candidate_sha=authority.candidate_sha
+                      AND review.status='required'
+                  )
+                ))
+                OR (authority_kind='approved' AND classification='mechanical' AND state_review_id IS NOT NULL)
+                OR (authority_kind='approved' AND classification='semantic'
+                  AND (composition_kind!='migrated_post_release' OR state_review_id IS NOT NULL)
+                  AND NOT EXISTS(
+                    SELECT 1 FROM candidate_reviews review
+                    WHERE review.effort_id=authority.id
+                      AND review.attempt_id=authority.attempt_id
+                      AND review.cycle_id=authority.cycle_id
+                      AND review.target_sha=authority.target_sha
+                      AND review.source_sha=authority.source_sha
+                      AND review.candidate_sha=authority.candidate_sha
+                      AND review.status='approved'
+                      AND (state_review_id IS NULL OR review.id=state_review_id)
+                  )
+                )
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(effort_id) = invalid {
+        anyhow::bail!("integration effort {effort_id} has no exact candidate review authority");
+    }
+    Ok(())
 }
 
 fn validate_runner_termination_authority(connection: &Connection) -> Result<()> {
@@ -4309,11 +4853,12 @@ fn run_database_lease_blocked_test_hook(_database_path: &Path) {
 }
 
 fn map_effort(row: &rusqlite::Row<'_>) -> rusqlite::Result<IntegrationEffort> {
-    let workspace: String = row.get(7)?;
-    let runner: String = row.get(8)?;
-    let state_repository: String = row.get(9)?;
-    let state: String = row.get(11)?;
-    let failed_cycles: u8 = row.get(10)?;
+    let composition: String = row.get(7)?;
+    let workspace: String = row.get(8)?;
+    let runner: String = row.get(9)?;
+    let state_repository: String = row.get(10)?;
+    let state: String = row.get(12)?;
+    let failed_cycles: u8 = row.get(11)?;
     let effort = IntegrationEffort {
         id: row.get(0)?,
         item_id: row.get(1)?,
@@ -4322,13 +4867,14 @@ fn map_effort(row: &rusqlite::Row<'_>) -> rusqlite::Result<IntegrationEffort> {
         source_sha: row.get(4)?,
         source_variant: row.get(5)?,
         landing_variant: row.get(6)?,
+        composition: serde_json::from_str(&composition).map_err(json_error)?,
         workspace: serde_json::from_str(&workspace).map_err(json_error)?,
         runner: serde_json::from_str(&runner).map_err(json_error)?,
         state_repository: serde_json::from_str(&state_repository).map_err(json_error)?,
         failed_cycles,
         state: serde_json::from_str(&state).map_err(json_error)?,
-        created_at: row.get(12)?,
-        updated_at: row.get(13)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
     };
     effort
         .state
@@ -4340,7 +4886,7 @@ fn map_effort(row: &rusqlite::Row<'_>) -> rusqlite::Result<IntegrationEffort> {
 fn required_effort(connection: &Connection, effort_id: &str) -> Result<IntegrationEffort> {
     connection
         .query_row(
-            "SELECT id,item_id,attempt_id,target_sha,source_sha,source_variant,landing_variant,workspace_json,runner_snapshot_json,state_repository_json,failed_cycles,state_json,created_at,updated_at FROM integration_efforts WHERE id=?1",
+            "SELECT id,item_id,attempt_id,target_sha,source_sha,source_variant,landing_variant,composition_json,workspace_json,runner_snapshot_json,state_repository_json,failed_cycles,state_json,created_at,updated_at FROM integration_efforts WHERE id=?1",
             params![effort_id],
             map_effort,
         )
@@ -4381,10 +4927,11 @@ pub(crate) fn cancel_item_for_migration(
     connection: &Connection,
     item_id: &str,
     runner_authority: Option<&crate::control_domain::LegacyRunnerScopeAuthority>,
+    effort_contains_external_landing_authority: bool,
 ) -> Result<()> {
     let effort = connection
         .query_row(
-            "SELECT id,attempt_id,state,state_json,workspace_json FROM integration_efforts WHERE item_id=?1",
+            "SELECT id,attempt_id,state,workspace_json FROM integration_efforts WHERE item_id=?1",
             [item_id],
             |row| {
                 Ok((
@@ -4392,22 +4939,18 @@ pub(crate) fn cancel_item_for_migration(
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
                 ))
             },
         )
         .optional()?;
-    if let Some((effort_id, attempt_id, state_name, state_json, workspace_json)) = effort {
+    if let Some((effort_id, attempt_id, state_name, workspace_json)) = effort {
         let active_runner = matches!(state_name.as_str(), "agent_launching" | "agent_running");
-        let effort_state = if active_runner {
-            None
-        } else {
-            Some(serde_json::from_str::<IntegrationEffortState>(&state_json)?)
-        };
-        if item_contains_external_landing_authority(connection, item_id, effort_state.as_ref())? {
+        if effort_contains_external_landing_authority
+            || item_contains_external_landing_authority(connection, item_id, None)?
+        {
             anyhow::bail!("migration cannot cancel external landing authority");
         }
-        if matches!(effort_state, Some(IntegrationEffortState::Cancelled(_))) {
+        if state_name == "cancelled" {
             return Ok(());
         }
         let termination = if active_runner {
@@ -4436,6 +4979,10 @@ pub(crate) fn cancel_item_for_migration(
         connection.execute(
             "UPDATE guidance_requests SET status='cancelled' WHERE effort_id=?1 AND status='open'",
             [&effort_id],
+        )?;
+        connection.execute(
+            "UPDATE candidate_reviews SET status='cancelled',answered_at=?1 WHERE effort_id=?2 AND status='required'",
+            params![now(),effort_id],
         )?;
         connection.execute(
             "UPDATE prompts SET status='cancelled' WHERE item_id=?1 AND status='open'",
@@ -4595,6 +5142,10 @@ fn cancel_effort_transaction(
     connection.execute(
         "UPDATE guidance_requests SET status='cancelled' WHERE effort_id=?1 AND status='open'",
         [&effort.id],
+    )?;
+    connection.execute(
+        "UPDATE candidate_reviews SET status='cancelled',answered_at=?1 WHERE effort_id=?2 AND status='required'",
+        params![now(),effort.id],
     )?;
     connection.execute(
         "UPDATE prompts SET status='cancelled' WHERE item_id=?1 AND status='open'",
@@ -4854,6 +5405,12 @@ fn project_queue_state(
         | IntegrationEffortState::AgentLaunching(_)
         | IntegrationEffortState::AgentRunning(_)
         | IntegrationEffortState::CandidateBuilding(_) => ("merging", None, None, None),
+        IntegrationEffortState::ReviewRequired(_) => (
+            "blocked",
+            Some("validating"),
+            Some("needs_user_input"),
+            Some("semantic candidate requires exact review".into()),
+        ),
         IntegrationEffortState::CandidateReady(_) => ("merged", None, None, None),
         IntegrationEffortState::Validating(validating) => match validating.stage {
             crate::control_domain::ValidationStage::Running => ("validating", None, None, None),
@@ -4869,6 +5426,7 @@ fn project_queue_state(
             let phase = match blocked.resume {
                 crate::control_domain::ResumeState::AgentReady(_)
                 | crate::control_domain::ResumeState::CandidateBuilding(_) => "merging",
+                crate::control_domain::ResumeState::ReviewRequired(_) => "validating",
                 crate::control_domain::ResumeState::CandidateReady(_)
                 | crate::control_domain::ResumeState::Validating(
                     crate::control_domain::Validating {
@@ -5022,6 +5580,107 @@ fn next_cycle_number(connection: &Connection, effort_id: &str) -> Result<u8> {
     u8::try_from(next).context("integration effort exceeds cycle identity range")
 }
 
+fn candidate_review_command_identity_matches(
+    left: &CandidateReviewCommand,
+    right: &CandidateReviewCommand,
+) -> bool {
+    left.external_id == right.external_id
+        && left.review_id == right.review_id
+        && left.effort_id == right.effort_id
+        && left.attempt_id == right.attempt_id
+        && left.cycle_id == right.cycle_id
+        && left.target_ref == right.target_ref
+        && left.target_sha == right.target_sha
+        && left.source_sha == right.source_sha
+        && left.candidate_sha == right.candidate_sha
+}
+
+fn candidate_review_command_is_malformed(
+    command: &CandidateReviewCommand,
+    object_format: crate::git_object::GitObjectFormat,
+) -> bool {
+    [
+        (&command.external_id, "candidate review external ID"),
+        (&command.review_id, "candidate review ID"),
+        (&command.effort_id, "candidate review effort ID"),
+        (&command.attempt_id, "candidate review attempt ID"),
+        (&command.cycle_id, "candidate review cycle ID"),
+    ]
+    .into_iter()
+    .any(|(value, label)| {
+        value.len() > 1024 || crate::control_domain::require_exact_text(value, label).is_err()
+    }) || command.target_ref.as_str().len() > 1024
+        || object_format
+            .require_oid(&command.target_sha, "candidate review target")
+            .is_err()
+        || object_format
+            .require_oid(&command.source_sha, "candidate review source")
+            .is_err()
+        || object_format
+            .require_oid(&command.candidate_sha, "candidate review candidate")
+            .is_err()
+}
+
+fn candidate_review_receipt(
+    command: &CandidateReviewCommand,
+    disposition: AnswerDisposition,
+    resulting_effort_state: Option<String>,
+) -> CandidateReviewReceipt {
+    CandidateReviewReceipt {
+        external_id: command.external_id.clone(),
+        review_id: command.review_id.clone(),
+        effort_id: command.effort_id.clone(),
+        attempt_id: command.attempt_id.clone(),
+        cycle_id: command.cycle_id.clone(),
+        target_ref: command.target_ref.clone(),
+        target_sha: command.target_sha.clone(),
+        source_sha: command.source_sha.clone(),
+        candidate_sha: command.candidate_sha.clone(),
+        decision: command.decision.clone(),
+        disposition,
+        resulting_effort_state,
+    }
+}
+
+fn candidate_review_receipt_matches_command(
+    receipt: &CandidateReviewReceipt,
+    command: &CandidateReviewCommand,
+) -> bool {
+    receipt.external_id == command.external_id
+        && receipt.review_id == command.review_id
+        && receipt.effort_id == command.effort_id
+        && receipt.attempt_id == command.attempt_id
+        && receipt.cycle_id == command.cycle_id
+        && receipt.target_ref == command.target_ref
+        && receipt.target_sha == command.target_sha
+        && receipt.source_sha == command.source_sha
+        && receipt.candidate_sha == command.candidate_sha
+        && receipt.decision == command.decision
+}
+
+fn valid_effort_state_name(state: &str) -> bool {
+    matches!(
+        state,
+        "replacement_pending"
+            | "agent_ready"
+            | "agent_launching"
+            | "agent_running"
+            | "candidate_building"
+            | "review_required"
+            | "candidate_ready"
+            | "validating"
+            | "guidance_required"
+            | "infrastructure_blocked"
+            | "cycle_limit_blocked"
+            | "provider_blocked"
+            | "landing"
+            | "landing_uncertain"
+            | "target_move_pending"
+            | "integrated"
+            | "cancelled"
+    )
+}
+
 fn answer_disposition(value: AnswerDisposition) -> &'static str {
     match value {
         AnswerDisposition::Applied => "applied",
@@ -5109,7 +5768,7 @@ fn git_text<const N: usize>(repository: &Path, args: [&str; N]) -> Result<String
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
-const CONTROL_SCHEMA: &str = r#"
+pub(crate) const CONTROL_SCHEMA: &str = r#"
 CREATE UNIQUE INDEX IF NOT EXISTS integration_attempt_item_identity
 ON integration_attempts(id,item_id);
 
@@ -5121,11 +5780,12 @@ CREATE TABLE IF NOT EXISTS integration_efforts (
   source_sha TEXT NOT NULL CHECK(length(source_sha) IN (40,64) AND source_sha NOT GLOB '*[^0-9A-Fa-f]*'),
   source_variant TEXT NOT NULL CHECK(source_variant IN ('remote_branch','local_submission')),
   landing_variant TEXT NOT NULL CHECK(landing_variant IN ('direct','provider','squash')),
+  composition_json TEXT NOT NULL CHECK(json_valid(composition_json)),
   workspace_json TEXT NOT NULL CHECK(json_valid(workspace_json)),
   runner_snapshot_json TEXT NOT NULL CHECK(json_valid(runner_snapshot_json)),
   state_repository_json TEXT NOT NULL CHECK(json_valid(state_repository_json)),
   failed_cycles INTEGER NOT NULL DEFAULT 0 CHECK(failed_cycles BETWEEN 0 AND 10),
-  state TEXT NOT NULL CHECK(state IN ('replacement_pending','agent_ready','agent_launching','agent_running','candidate_building','candidate_ready','validating','guidance_required','infrastructure_blocked','cycle_limit_blocked','provider_blocked','landing','landing_uncertain','target_move_pending','integrated','cancelled')),
+  state TEXT NOT NULL CHECK(state IN ('replacement_pending','agent_ready','agent_launching','agent_running','candidate_building','review_required','candidate_ready','validating','guidance_required','infrastructure_blocked','cycle_limit_blocked','provider_blocked','landing','landing_uncertain','target_move_pending','integrated','cancelled')),
   state_json TEXT NOT NULL CHECK(json_valid(state_json) AND json_extract(state_json,'$.state') IS state),
   blocker_kind TEXT CHECK(blocker_kind IN ('semantic_guidance','infrastructure','cycle_limit','provider_signoff')),
   created_at TEXT NOT NULL,
@@ -5144,6 +5804,7 @@ CREATE TABLE IF NOT EXISTS integration_efforts (
     WHEN 'agent_launching' THEN json_type(state_json,'$.payload.launch_operation_id')='text' AND json_type(state_json,'$.payload.unit_name')='text' AND json_type(state_json,'$.payload.cycle_id')='text' AND json_type(state_json,'$.payload.cycle_number')='integer' AND json_type(state_json,'$.payload.protocol_directory')='text' AND json_extract(state_json,'$.payload.spawn_authority') IN ('open','surrendered') AND json_type(state_json,'$.payload.launcher.pid')='integer' AND json_extract(state_json,'$.payload.launcher.pid')>0 AND json_type(state_json,'$.payload.launcher.process_start_ticks')='integer' AND json_extract(state_json,'$.payload.launcher.process_start_ticks')>0 AND json_type(state_json,'$.payload.launcher.token')='text'
     WHEN 'agent_running' THEN json_type(state_json,'$.payload.cycle_id')='text' AND json_type(state_json,'$.payload.pid')='integer' AND json_type(state_json,'$.payload.process_start_ticks')='integer' AND json_type(state_json,'$.payload.control_group')='text' AND json_type(state_json,'$.payload.launcher.pid')='integer' AND json_extract(state_json,'$.payload.launcher.pid')>0 AND json_type(state_json,'$.payload.launcher.process_start_ticks')='integer' AND json_extract(state_json,'$.payload.launcher.process_start_ticks')>0 AND json_type(state_json,'$.payload.launcher.token')='text'
     WHEN 'candidate_building' THEN json_type(state_json,'$.payload.operation_id')='text' AND json_type(state_json,'$.payload.cycle_id')='text' AND json_type(state_json,'$.payload.tree_sha')='text' AND json_type(state_json,'$.payload.parent_shas')='array' AND json_array_length(json_extract(state_json,'$.payload.parent_shas'))>=1 AND json_type(state_json,'$.payload.operation_ref')='text'
+    WHEN 'review_required' THEN json_type(state_json,'$.payload.review_id')='text' AND json_type(state_json,'$.payload.cycle_id')='text' AND json_type(state_json,'$.payload.candidate_sha')='text'
     WHEN 'candidate_ready' THEN json_type(state_json,'$.payload.cycle_id')='text' AND json_type(state_json,'$.payload.candidate_sha')='text'
     WHEN 'validating' THEN json_type(state_json,'$.payload.candidate_sha')='text' AND json_extract(state_json,'$.payload.stage') IN ('running','gates')
     WHEN 'guidance_required' THEN json_extract(state_json,'$.payload.blocker.kind')='semantic_guidance' AND json_extract(state_json,'$.payload.resume.state')='agent_ready'
@@ -5198,9 +5859,117 @@ CREATE TABLE IF NOT EXISTS candidate_evidence (
   cycle_id TEXT NOT NULL,
   candidate_sha TEXT NOT NULL CHECK(length(candidate_sha) IN (40,64) AND candidate_sha NOT GLOB '*[^0-9A-Fa-f]*'),
   builder_operation_id TEXT NOT NULL UNIQUE,
+  classification TEXT NOT NULL CHECK(classification IN ('mechanical','semantic')),
   created_at TEXT NOT NULL,
   FOREIGN KEY(cycle_id,effort_id) REFERENCES integration_cycles(id,effort_id)
 );
+
+CREATE TRIGGER IF NOT EXISTS candidate_evidence_classification_insert
+BEFORE INSERT ON candidate_evidence
+WHEN NOT EXISTS(
+  SELECT 1 FROM integration_efforts effort
+  WHERE effort.id=NEW.effort_id
+    AND effort.state='candidate_building'
+    AND json_extract(effort.state_json,'$.payload.cycle_id')=NEW.cycle_id
+    AND json_extract(effort.state_json,'$.payload.operation_id')=NEW.builder_operation_id
+    AND NEW.classification=CASE
+      WHEN json_extract(effort.composition_json,'$.kind')='clean'
+        AND json_extract(effort.composition_json,'$.mechanical_tree_sha')=json_extract(effort.state_json,'$.payload.tree_sha')
+      THEN 'mechanical'
+      ELSE 'semantic'
+    END
+)
+BEGIN SELECT RAISE(ABORT,'candidate classification differs from composition authority'); END;
+
+CREATE TRIGGER IF NOT EXISTS candidate_evidence_classification_update
+BEFORE UPDATE ON candidate_evidence
+WHEN NOT EXISTS(
+  SELECT 1 FROM integration_efforts effort
+  WHERE effort.id=NEW.effort_id
+    AND effort.state='candidate_building'
+    AND json_extract(effort.state_json,'$.payload.cycle_id')=NEW.cycle_id
+    AND json_extract(effort.state_json,'$.payload.operation_id')=NEW.builder_operation_id
+    AND NEW.classification=CASE
+      WHEN json_extract(effort.composition_json,'$.kind')='clean'
+        AND json_extract(effort.composition_json,'$.mechanical_tree_sha')=json_extract(effort.state_json,'$.payload.tree_sha')
+      THEN 'mechanical'
+      ELSE 'semantic'
+    END
+)
+BEGIN SELECT RAISE(ABORT,'candidate classification differs from composition authority'); END;
+
+CREATE TRIGGER IF NOT EXISTS candidate_evidence_delete_guard
+BEFORE DELETE ON candidate_evidence
+WHEN EXISTS(
+  SELECT 1 FROM integration_efforts effort
+  WHERE effort.id=OLD.effort_id
+    AND effort.state!='target_move_pending'
+    AND NOT EXISTS(SELECT 1 FROM queue_item_purge_authority WHERE item_id=effort.item_id)
+    AND NOT EXISTS(SELECT 1 FROM integration_cycles cycle WHERE cycle.id=OLD.cycle_id AND cycle.effort_id=OLD.effort_id AND cycle.status='failed')
+    AND NOT EXISTS(SELECT 1 FROM candidate_reviews review WHERE review.effort_id=OLD.effort_id AND review.cycle_id=OLD.cycle_id AND review.candidate_sha=OLD.candidate_sha AND review.status='changes_requested')
+)
+BEGIN SELECT RAISE(ABORT,'active candidate evidence is immutable'); END;
+
+CREATE TABLE IF NOT EXISTS candidate_reviews (
+  id TEXT PRIMARY KEY,
+  effort_id TEXT NOT NULL REFERENCES integration_efforts(id) ON DELETE CASCADE,
+  attempt_id TEXT NOT NULL,
+  cycle_id TEXT NOT NULL,
+  target_sha TEXT NOT NULL CHECK(length(target_sha) IN (40,64) AND target_sha NOT GLOB '*[^0-9A-Fa-f]*'),
+  source_sha TEXT NOT NULL CHECK(length(source_sha) IN (40,64) AND source_sha NOT GLOB '*[^0-9A-Fa-f]*'),
+  candidate_sha TEXT NOT NULL CHECK(length(candidate_sha) IN (40,64) AND candidate_sha NOT GLOB '*[^0-9A-Fa-f]*'),
+  status TEXT NOT NULL CHECK(status IN ('required','approved','changes_requested','superseded','cancelled')),
+  responder_json TEXT CHECK(responder_json IS NULL OR json_valid(responder_json)),
+  review_text TEXT,
+  created_at TEXT NOT NULL,
+  answered_at TEXT,
+  FOREIGN KEY(cycle_id,effort_id) REFERENCES integration_cycles(id,effort_id),
+  CHECK((status='required')=(responder_json IS NULL AND review_text IS NULL AND answered_at IS NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS one_required_candidate_review_per_effort ON candidate_reviews(effort_id) WHERE status='required';
+
+CREATE TRIGGER IF NOT EXISTS candidate_review_identity_immutable
+BEFORE UPDATE ON candidate_reviews
+WHEN NEW.id!=OLD.id
+  OR NEW.effort_id!=OLD.effort_id
+  OR NEW.attempt_id!=OLD.attempt_id
+  OR NEW.cycle_id!=OLD.cycle_id
+  OR NEW.target_sha!=OLD.target_sha
+  OR NEW.source_sha!=OLD.source_sha
+  OR NEW.candidate_sha!=OLD.candidate_sha
+  OR OLD.status!='required'
+  OR NEW.status='required'
+BEGIN SELECT RAISE(ABORT,'candidate review identity or terminal result is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS candidate_review_delete_guard
+BEFORE DELETE ON candidate_reviews
+WHEN EXISTS(
+  SELECT 1 FROM integration_efforts effort
+  JOIN candidate_evidence candidate ON candidate.effort_id=effort.id
+  WHERE effort.id=OLD.effort_id
+    AND candidate.cycle_id=OLD.cycle_id
+    AND candidate.candidate_sha=OLD.candidate_sha
+    AND OLD.status IN ('required','approved')
+    AND NOT EXISTS(SELECT 1 FROM queue_item_purge_authority WHERE item_id=effort.item_id)
+)
+BEGIN SELECT RAISE(ABORT,'active candidate review authority is immutable'); END;
+
+CREATE TABLE IF NOT EXISTS candidate_review_receipts (
+  external_id TEXT PRIMARY KEY,
+  effort_id TEXT NOT NULL,
+  command_json TEXT NOT NULL CHECK(json_valid(command_json) AND json_type(command_json)='object'),
+  responder_json TEXT NOT NULL CHECK(json_valid(responder_json)),
+  receipt_json TEXT NOT NULL CHECK(json_valid(receipt_json) AND json_type(receipt_json)='object'),
+  created_at TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS candidate_review_receipt_immutable
+BEFORE UPDATE ON candidate_review_receipts
+BEGIN SELECT RAISE(ABORT,'candidate review receipt is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS candidate_review_receipt_delete_guard
+BEFORE DELETE ON candidate_review_receipts
+BEGIN SELECT RAISE(ABORT,'candidate review receipt is immutable'); END;
 
 CREATE TABLE IF NOT EXISTS durable_events (
   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5336,8 +6105,9 @@ WHEN json_type(NEW.state_json,'$')!='object'
     WHEN 'agent_ready' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=1 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('next_cycle'))
     WHEN 'agent_launching' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=10 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('launch_operation_id','unit_name','cycle_id','cycle_number','authority_lease_id','launcher','input_sha256','protocol_directory','prepared_at','spawn_authority'))
     WHEN 'agent_running' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=13 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('launch_operation_id','unit_name','cycle_id','cycle_number','pid','process_start_ticks','control_group','authority_lease_id','launcher','sandbox_id','input_sha256','result','started_at'))
-    WHEN 'candidate_building' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=13 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('operation_id','cycle_id','staged_tree_sha256','tree_sha','parent_shas','author_name','author_email','author_timestamp','committer_name','committer_email','committer_timestamp','message','operation_ref'))
-    WHEN 'candidate_ready' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=4 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('operation_id','cycle_id','candidate_sha','staged_tree_sha256'))
+    WHEN 'candidate_building' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=14 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('operation_id','cycle_id','staged_tree_sha256','tree_sha','parent_shas','author_name','author_email','author_timestamp','committer_name','committer_email','committer_timestamp','message','operation_ref','classification'))
+    WHEN 'review_required' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=3 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('review_id','cycle_id','candidate_sha'))
+    WHEN 'candidate_ready' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=3 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('cycle_id','candidate_sha','review'))
     WHEN 'validating' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=3 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('candidate_sha','policy_digest','stage'))
     WHEN 'guidance_required' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=2 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('blocker','resume'))
     WHEN 'infrastructure_blocked' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=2 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('blocker','resume'))
@@ -5365,8 +6135,9 @@ WHEN json_type(NEW.state_json,'$')!='object'
     WHEN 'agent_ready' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=1 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('next_cycle'))
     WHEN 'agent_launching' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=10 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('launch_operation_id','unit_name','cycle_id','cycle_number','authority_lease_id','launcher','input_sha256','protocol_directory','prepared_at','spawn_authority'))
     WHEN 'agent_running' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=13 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('launch_operation_id','unit_name','cycle_id','cycle_number','pid','process_start_ticks','control_group','authority_lease_id','launcher','sandbox_id','input_sha256','result','started_at'))
-    WHEN 'candidate_building' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=13 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('operation_id','cycle_id','staged_tree_sha256','tree_sha','parent_shas','author_name','author_email','author_timestamp','committer_name','committer_email','committer_timestamp','message','operation_ref'))
-    WHEN 'candidate_ready' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=4 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('operation_id','cycle_id','candidate_sha','staged_tree_sha256'))
+    WHEN 'candidate_building' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=14 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('operation_id','cycle_id','staged_tree_sha256','tree_sha','parent_shas','author_name','author_email','author_timestamp','committer_name','committer_email','committer_timestamp','message','operation_ref','classification'))
+    WHEN 'review_required' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=3 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('review_id','cycle_id','candidate_sha'))
+    WHEN 'candidate_ready' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=3 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('cycle_id','candidate_sha','review'))
     WHEN 'validating' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=3 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('candidate_sha','policy_digest','stage'))
     WHEN 'guidance_required' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=2 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('blocker','resume'))
     WHEN 'infrastructure_blocked' THEN (SELECT COUNT(*) FROM json_each(NEW.state_json,'$.payload'))=2 AND NOT EXISTS(SELECT 1 FROM json_each(NEW.state_json,'$.payload') WHERE key NOT IN ('blocker','resume'))
@@ -5389,11 +6160,12 @@ WHEN NEW.state!=OLD.state AND NOT (
   (OLD.state='agent_ready' AND NEW.state IN ('agent_launching','infrastructure_blocked','cancelled')) OR
   (OLD.state='agent_launching' AND NEW.state IN ('agent_ready','agent_running','infrastructure_blocked','cancelled')) OR
   (OLD.state='agent_running' AND NEW.state IN ('candidate_building','agent_ready','guidance_required','infrastructure_blocked','cycle_limit_blocked','cancelled')) OR
-  (OLD.state='candidate_building' AND NEW.state IN ('candidate_ready','agent_ready','infrastructure_blocked','cancelled')) OR
+  (OLD.state='candidate_building' AND NEW.state IN ('review_required','candidate_ready','agent_ready','infrastructure_blocked','cancelled')) OR
+  (OLD.state='review_required' AND NEW.state IN ('candidate_ready','agent_ready','target_move_pending','infrastructure_blocked','cancelled')) OR
   (OLD.state='candidate_ready' AND NEW.state IN ('validating','agent_ready','target_move_pending','infrastructure_blocked','cancelled')) OR
   (OLD.state='validating' AND NEW.state IN ('validating','landing','agent_ready','target_move_pending','guidance_required','infrastructure_blocked','provider_blocked','cycle_limit_blocked','cancelled')) OR
   (OLD.state='guidance_required' AND NEW.state IN ('agent_ready','cancelled')) OR
-  (OLD.state='infrastructure_blocked' AND NEW.state IN ('agent_ready','candidate_building','candidate_ready','validating','landing','landing_uncertain','cancelled')) OR
+  (OLD.state='infrastructure_blocked' AND NEW.state IN ('agent_ready','candidate_building','review_required','candidate_ready','validating','landing','landing_uncertain','cancelled')) OR
   (OLD.state='cycle_limit_blocked' AND NEW.state IN ('replacement_pending','agent_ready','cancelled')) OR
   (OLD.state='provider_blocked' AND NEW.state IN ('validating','landing','landing_uncertain','agent_ready','cancelled')) OR
   (OLD.state='landing' AND NEW.state IN ('landing_uncertain','target_move_pending','integrated','agent_ready','provider_blocked','infrastructure_blocked','cancelled')) OR
@@ -5419,8 +6191,40 @@ AFTER UPDATE OF state,state_json ON integration_efforts
 WHEN NOT (
   (NEW.state='agent_launching' AND EXISTS(SELECT 1 FROM integration_cycles cycle WHERE cycle.effort_id=NEW.id AND cycle.id=json_extract(NEW.state_json,'$.payload.cycle_id') AND cycle.status='starting')) OR
   (NEW.state='agent_running' AND EXISTS(SELECT 1 FROM integration_cycles cycle WHERE cycle.effort_id=NEW.id AND cycle.id=json_extract(NEW.state_json,'$.payload.cycle_id') AND cycle.status='running')) OR
-  (NEW.state='candidate_building' AND EXISTS(SELECT 1 FROM integration_cycles cycle WHERE cycle.effort_id=NEW.id AND cycle.id=json_extract(NEW.state_json,'$.payload.cycle_id') AND cycle.status='resolved')) OR
-  (NEW.state IN ('candidate_ready','validating','landing','landing_uncertain','provider_blocked','integrated') AND EXISTS(SELECT 1 FROM candidate_evidence candidate WHERE candidate.effort_id=NEW.id AND candidate.candidate_sha=COALESCE(json_extract(NEW.state_json,'$.payload.candidate_sha'),json_extract(NEW.state_json,'$.payload.blocker.candidate_sha')))) OR
+  (NEW.state='candidate_building'
+    AND EXISTS(SELECT 1 FROM integration_cycles cycle WHERE cycle.effort_id=NEW.id AND cycle.id=json_extract(NEW.state_json,'$.payload.cycle_id') AND cycle.status='resolved')
+    AND json_extract(NEW.state_json,'$.payload.classification')=CASE
+      WHEN json_extract(NEW.composition_json,'$.kind')='clean'
+        AND json_extract(NEW.composition_json,'$.mechanical_tree_sha')=json_extract(NEW.state_json,'$.payload.tree_sha')
+      THEN 'mechanical'
+      ELSE 'semantic'
+    END) OR
+  (NEW.state='review_required'
+    AND EXISTS(SELECT 1 FROM candidate_evidence candidate WHERE candidate.effort_id=NEW.id AND candidate.candidate_sha=json_extract(NEW.state_json,'$.payload.candidate_sha') AND candidate.classification='semantic')
+    AND EXISTS(SELECT 1 FROM candidate_reviews review WHERE review.id=json_extract(NEW.state_json,'$.payload.review_id') AND review.effort_id=NEW.id AND review.attempt_id=NEW.attempt_id AND review.cycle_id=json_extract(NEW.state_json,'$.payload.cycle_id') AND review.target_sha=NEW.target_sha AND review.source_sha=NEW.source_sha AND review.candidate_sha=json_extract(NEW.state_json,'$.payload.candidate_sha') AND review.status='required')) OR
+  (NEW.state='candidate_ready'
+    AND EXISTS(SELECT 1 FROM candidate_evidence candidate WHERE candidate.effort_id=NEW.id AND candidate.candidate_sha=json_extract(NEW.state_json,'$.payload.candidate_sha') AND ((json_extract(NEW.state_json,'$.payload.review.kind')='mechanical' AND candidate.classification='mechanical') OR (json_extract(NEW.state_json,'$.payload.review.kind')='approved' AND candidate.classification='semantic')))
+    AND (json_extract(NEW.state_json,'$.payload.review.kind')='mechanical' OR EXISTS(SELECT 1 FROM candidate_reviews review JOIN candidate_evidence candidate ON candidate.effort_id=review.effort_id WHERE review.id=json_extract(NEW.state_json,'$.payload.review.review_id') AND review.effort_id=NEW.id AND review.attempt_id=NEW.attempt_id AND review.cycle_id=candidate.cycle_id AND review.target_sha=NEW.target_sha AND review.source_sha=NEW.source_sha AND review.candidate_sha=json_extract(NEW.state_json,'$.payload.candidate_sha') AND review.status='approved'))) OR
+  (NEW.state IN ('validating','landing','landing_uncertain','provider_blocked','integrated')
+    AND EXISTS(
+      SELECT 1 FROM candidate_evidence candidate
+      WHERE candidate.effort_id=NEW.id
+        AND candidate.candidate_sha=COALESCE(json_extract(NEW.state_json,'$.payload.candidate_sha'),json_extract(NEW.state_json,'$.payload.blocker.candidate_sha'))
+        AND (
+          candidate.classification='mechanical'
+          OR json_extract(NEW.composition_json,'$.kind')='migrated_post_release'
+          OR EXISTS(
+            SELECT 1 FROM candidate_reviews review
+            WHERE review.effort_id=NEW.id
+              AND review.attempt_id=NEW.attempt_id
+              AND review.cycle_id=candidate.cycle_id
+              AND review.target_sha=NEW.target_sha
+              AND review.source_sha=NEW.source_sha
+              AND review.candidate_sha=candidate.candidate_sha
+              AND review.status='approved'
+          )
+        )
+    )) OR
   (NEW.state='target_move_pending' AND EXISTS(SELECT 1 FROM candidate_evidence candidate WHERE candidate.effort_id=NEW.id AND candidate.candidate_sha=json_extract(NEW.state_json,'$.payload.previous.payload.candidate_sha'))) OR
   (NEW.state='guidance_required' AND EXISTS(SELECT 1 FROM guidance_requests request WHERE request.effort_id=NEW.id AND request.status='open')) OR
   NEW.state IN ('replacement_pending','agent_ready','infrastructure_blocked','cycle_limit_blocked','cancelled')
@@ -5440,6 +6244,7 @@ WHEN EXISTS(SELECT 1 FROM integration_efforts WHERE item_id=OLD.id)
       AND NEW.status=CASE
         WHEN effort.state='replacement_pending' THEN CASE WHEN NEW.current_attempt_id IS NULL OR NEW.current_attempt_id=effort.attempt_id THEN 'ready' ELSE 'merging' END
         WHEN effort.state IN ('agent_ready','agent_launching','agent_running','candidate_building') THEN 'merging'
+        WHEN effort.state='review_required' THEN 'blocked'
         WHEN effort.state='candidate_ready' THEN 'merged'
         WHEN effort.state='validating' AND json_extract(effort.state_json,'$.payload.stage')='running' THEN 'validating'
         WHEN effort.state='validating' AND json_extract(effort.state_json,'$.payload.stage')='gates' THEN 'integrating'
@@ -5449,12 +6254,14 @@ WHEN EXISTS(SELECT 1 FROM integration_efforts WHERE item_id=OLD.id)
         WHEN effort.state='cancelled' THEN 'cancelled'
       END
       AND COALESCE(NEW.blocked_phase,'')=CASE
+        WHEN effort.state='review_required' THEN 'validating'
         WHEN effort.state='guidance_required' THEN 'merging'
         WHEN effort.state='cycle_limit_blocked' THEN 'merging'
         WHEN effort.state='provider_blocked' THEN 'integrating'
         WHEN effort.state='infrastructure_blocked' THEN CASE json_extract(effort.state_json,'$.payload.resume.state')
           WHEN 'agent_ready' THEN 'merging'
           WHEN 'candidate_building' THEN 'merging'
+          WHEN 'review_required' THEN 'validating'
           WHEN 'candidate_ready' THEN 'validating'
           WHEN 'validating' THEN CASE json_extract(effort.state_json,'$.payload.resume.payload.stage')
             WHEN 'running' THEN 'validating'
@@ -5466,6 +6273,7 @@ WHEN EXISTS(SELECT 1 FROM integration_efforts WHERE item_id=OLD.id)
         ELSE ''
       END
       AND COALESCE(NEW.blocked_reason,'')=CASE
+        WHEN effort.state='review_required' THEN 'needs_user_input'
         WHEN effort.state='guidance_required' THEN 'needs_user_input'
         WHEN effort.state='infrastructure_blocked' THEN 'infra'
         WHEN effort.state='cycle_limit_blocked' THEN 'needs_agent_fix'

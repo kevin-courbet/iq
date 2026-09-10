@@ -17,14 +17,18 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::agent_config::ControlPlaneConfig;
-use crate::control_store::{AnswerCommand, ControlStore, ResponderIdentity};
+use crate::control_store::{
+    AnswerCommand, CandidateReviewCommand, CandidateReviewDecision, ControlStore, ResponderIdentity,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ApiRequest {
     Inbox { limit: u32 },
     Show { item_id: String },
+    ProbeOrchestration { repo_key: String, protocol: String },
     Answer { answer: AnswerCommand },
+    Review { review: CandidateReviewCommand },
     Watch { cursor: u64, limit: u32 },
     Retry { item_id: String },
 }
@@ -492,12 +496,29 @@ fn handle_connection(
                     .effort_for_item(&item_id)?
                     .with_context(|| format!("item has no effort: {item_id}"))?,
             )?,
+            ApiRequest::ProbeOrchestration { repo_key, protocol } => {
+                serde_json::to_value(store.probe_orchestration(&repo_key, &protocol))?
+            }
             ApiRequest::Answer { answer } => {
                 if answer.answer.len() as u64 > config.max_free_text_bytes {
                     anyhow::bail!("answer exceeds configured free-text bound");
                 }
                 serde_json::to_value(store.answer(
                     &answer,
+                    &ResponderIdentity::LocalPeer { uid: peer },
+                    daemon_uid,
+                )?)?
+            }
+            ApiRequest::Review { review } => {
+                let text = match &review.decision {
+                    CandidateReviewDecision::Approve { text } => text.as_deref(),
+                    CandidateReviewDecision::RequestChanges { text } => Some(text.as_str()),
+                };
+                if text.is_some_and(|text| text.len() as u64 > config.max_free_text_bytes) {
+                    anyhow::bail!("candidate review exceeds configured free-text bound");
+                }
+                serde_json::to_value(store.review_candidate(
+                    &review,
                     &ResponderIdentity::LocalPeer { uid: peer },
                     daemon_uid,
                 )?)?

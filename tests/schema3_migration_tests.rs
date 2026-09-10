@@ -1558,7 +1558,7 @@ fn schema3_migration_uses_default_database_path_without_normal_schema_open() {
             &Connection::open(database).unwrap(),
             "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'"
         ),
-        "5"
+        "6"
     );
 }
 
@@ -1612,7 +1612,7 @@ fn schema3_migration_requires_exclusive_process_lease_before_backup_or_mutation(
             &Connection::open(&database).unwrap(),
             "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'"
         ),
-        "5"
+        "6"
     );
 }
 
@@ -1645,7 +1645,7 @@ fn schema3_migration_interruption_before_publication_preserves_primary_and_can_r
             &Connection::open(database).unwrap(),
             "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'"
         ),
-        "5"
+        "6"
     );
 }
 
@@ -1670,7 +1670,7 @@ fn schema3_migration_interruption_after_publication_recovers_from_primary_and_ba
             &Connection::open(&database).unwrap(),
             "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'"
         ),
-        "5"
+        "6"
     );
     let recovered = run_migration(&database, &inventory_path);
     assert!(
@@ -1680,7 +1680,7 @@ fn schema3_migration_interruption_after_publication_recovers_from_primary_and_ba
     );
     let report: Value = serde_json::from_slice(&recovered.stdout).unwrap();
     assert_eq!(report["from_schema"], 3);
-    assert_eq!(report["to_schema"], 5);
+    assert_eq!(report["to_schema"], 6);
     assert!(Path::new(report["backup_path"].as_str().unwrap()).is_file());
 }
 
@@ -1725,7 +1725,7 @@ fn schema3_publication_faults_preserve_exact_source_bytes_and_recover() {
                 &Connection::open(&database).unwrap(),
                 "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'"
             ),
-            "5",
+            "6",
             "{boundary}"
         );
         let state: Value = serde_json::from_slice(
@@ -1971,7 +1971,7 @@ fn schema3_migration_reports_published_but_incomplete_when_runner_debt_remains()
     fs::write(
         &systemctl,
         format!(
-            "#!/bin/sh\nversion=$(/usr/bin/sqlite3 '{}' \"SELECT value FROM queue_metadata WHERE key='workspace_schema_version'\")\n[ \"$version\" = 5 ] && exit 1\nexec /usr/bin/systemctl \"$@\"\n",
+            "#!/bin/sh\nversion=$(/usr/bin/sqlite3 '{}' \"SELECT value FROM queue_metadata WHERE key='workspace_schema_version'\")\n[ \"$version\" = 6 ] && exit 1\nexec /usr/bin/systemctl \"$@\"\n",
             database.display()
         ),
     )
@@ -2144,7 +2144,7 @@ fn schema3_cli_migration_uses_frozen_release_fixture_and_preserves_exact_values(
     );
     let report: Value = serde_json::from_slice(&migrated.stdout).unwrap();
     assert_eq!(report["from_schema"], 3);
-    assert_eq!(report["to_schema"], 5);
+    assert_eq!(report["to_schema"], 6);
     assert_eq!(report["repositories"], 1);
     assert_eq!(report["admissions"], 4);
 
@@ -2157,7 +2157,7 @@ fn schema3_cli_migration_uses_frozen_release_fixture_and_preserves_exact_values(
             &connection,
             "SELECT value FROM queue_metadata WHERE key='workspace_schema_version'"
         ),
-        "5"
+        "6"
     );
     assert_eq!(
         text(&connection, "SELECT repo_key FROM registered_repositories"),
@@ -2333,6 +2333,155 @@ fn schema3_cli_migration_uses_frozen_release_fixture_and_preserves_exact_values(
             })
             .unwrap(),
         0
+    );
+}
+
+#[test]
+fn schema3_migration_preserves_mr_target_when_policy_default_differs() {
+    let temporary = tempdir().unwrap();
+    let database = temporary.path().join("queues.db");
+    copy_fixture(&database);
+    // Released schema 3 permits only main or master, so master proves the non-default target path.
+    rewrite_fixture_with_disabled_triggers(
+        &database,
+        &[
+            "registered_repository_identity_immutable",
+            "repository_remote_owner_identity_immutable",
+        ],
+        |connection| {
+            connection
+                .execute(
+                    "UPDATE registered_repositories SET target_branch='master' WHERE repo_key=?1",
+                    [REPO_KEY],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE repository_remote_owners SET target_branch='master' WHERE repo_key=?1",
+                    [REPO_KEY],
+                )
+                .unwrap();
+        },
+    );
+    let inventory_path = temporary.path().join("inventory.json");
+    write_inventory(&inventory_path, &inventory(true));
+
+    let migrated = run_migration(&database, &inventory_path);
+
+    assert!(
+        migrated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&migrated.stderr)
+    );
+    let connection = Connection::open(&database).unwrap();
+    assert_eq!(
+        text(&connection, "SELECT target_branch FROM repository_policies"),
+        "main"
+    );
+    assert_eq!(
+        text(
+            &connection,
+            &format!("SELECT target_ref FROM queue_items WHERE id='{ACTIVE_MR_ID}'")
+        ),
+        "refs/heads/master"
+    );
+    assert_eq!(
+        text(
+            &connection,
+            &format!("SELECT target_ref FROM queue_admissions WHERE item_id='{ACTIVE_MR_ID}'")
+        ),
+        "refs/heads/master"
+    );
+    assert_eq!(
+        text(
+            &connection,
+            "SELECT json_extract(checkout_json,'$.target_ref') FROM registered_repositories"
+        ),
+        "refs/heads/master"
+    );
+}
+
+#[test]
+fn schema3_validation_accepts_frozen_candidate_payload_before_conversion() {
+    let temporary = tempdir().unwrap();
+    let database = temporary.path().join("candidate.db");
+    copy_fixture(&database);
+    let mut connection = Connection::open(&database).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .unwrap();
+    let transaction = connection.transaction().unwrap();
+    transaction.execute(
+        "INSERT INTO integration_cycles(id,effort_id,cycle_number,status,created_at,finished_at) VALUES('cycle-candidate','effort-1',1,'resolved','2026-01-01T00:00:00Z','2026-01-01T00:00:01Z')",
+        [],
+    ).unwrap();
+    transaction.execute(
+        "UPDATE integration_efforts SET state='infrastructure_blocked',state_json=?1,blocker_kind='infrastructure' WHERE id='effort-1'",
+        [serde_json::json!({
+            "state":"infrastructure_blocked",
+            "payload":{
+                "blocker":{
+                    "kind":"infrastructure",
+                    "component":"filesystem",
+                    "operation":"migration fixture",
+                    "cause":{"kind":"unavailable","detail":"fixture"}
+                },
+                "resume":{
+                    "state":"candidate_ready",
+                    "payload":{
+                        "operation_id":"builder-candidate",
+                        "cycle_id":"cycle-candidate",
+                        "candidate_sha":SHA2,
+                        "staged_tree_sha256":"a".repeat(64)
+                    }
+                }
+            }
+        }).to_string()],
+    ).unwrap();
+    transaction.execute(
+        "UPDATE queue_items SET status='blocked',blocked_phase='validating',blocked_reason='infra',blocked_message='fixture',target_sha=?1,source_sha=?2 WHERE id='direct-active'",
+        rusqlite::params![SHA1,SHA2],
+    ).unwrap();
+    transaction.commit().unwrap();
+    drop(connection);
+    let inventory_path = temporary.path().join("inventory.json");
+    write_inventory(&inventory_path, &inventory(true));
+
+    let migrated = run_migration(&database, &inventory_path);
+
+    assert!(
+        migrated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&migrated.stderr)
+    );
+}
+
+#[test]
+fn schema3_validation_rejects_changed_control_authority_object() {
+    let temporary = tempdir().unwrap();
+    let database = temporary.path().join("changed-control.db");
+    copy_fixture(&database);
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch("PRAGMA writable_schema=ON")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sqlite_schema SET sql=replace(sql,'integration effort payload keys are invalid','changed integration effort payload authority') WHERE type='trigger' AND name='integration_effort_exact_payload_insert'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let inventory_path = temporary.path().join("inventory.json");
+    write_inventory(&inventory_path, &inventory(true));
+
+    let rejected = run_migration(&database, &inventory_path);
+
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("not the exact released IQ schema 3"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
     );
 }
 

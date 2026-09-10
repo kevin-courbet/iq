@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-08-12
 - Decider: Kevin Courbet
+- Superseded in part by: ADR 0010 candidate-classification, review, and orchestration-probe clauses
 
 ## Decision
 

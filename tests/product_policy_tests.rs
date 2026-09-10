@@ -212,7 +212,7 @@ fn canonical_policy_beats_stale_bootstrap_and_workspace_lifecycle_is_public() {
         .manager
         .create_workspace(&fixture.repository_key, "lifecycle")
         .unwrap();
-    assert_eq!(workspace.base_sha, canonical_sha);
+    assert_eq!(workspace.expected_target_sha, canonical_sha);
     assert_eq!(git(&workspace.path, &["rev-parse", "HEAD"]), canonical_sha);
     assert_eq!(
         git(&workspace.path, &["rev-parse", "HEAD^{tree}"]),
@@ -398,7 +398,7 @@ fn replica_is_not_used_as_canonical_freshness_authority() {
         .manager
         .create_workspace(&fixture.repository_key, "canonical-source")
         .unwrap();
-    assert_eq!(workspace.base_sha, canonical_sha);
+    assert_eq!(workspace.expected_target_sha, canonical_sha);
     assert_eq!(git(&workspace.path, &["rev-parse", "HEAD"]), canonical_sha);
     assert_eq!(
         std::fs::read_to_string(workspace.path.join("README.md")).unwrap(),
@@ -472,7 +472,7 @@ fn global_git_url_rewrite_is_not_loaded_by_iq_git_operations() {
         None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
     }
     assert_eq!(
-        workspace.base_sha,
+        workspace.expected_target_sha,
         git(&fixture.canonical, &["rev-parse", "main"])
     );
     assert!(!Command::new("/usr/bin/git")
@@ -891,6 +891,182 @@ fn accessible_https_transport_rejects_embedded_credentials() {
 }
 
 #[test]
+fn manager_replays_lost_workspace_and_submission_receipts_with_exact_identity() {
+    let fixture = Fixture::new(false);
+    let target_sha = git(&fixture.canonical, &["rev-parse", "main"]);
+    let workspace = fixture
+        .manager
+        .create_workspace_for_target(&fixture.repository_key, "lost-receipt", "main", &target_sha)
+        .unwrap();
+    let restarted = RepositoryManager::new(fixture.queue.clone());
+
+    assert_eq!(
+        restarted
+            .create_workspace_for_target(
+                &fixture.repository_key,
+                "lost-receipt",
+                "main",
+                &target_sha,
+            )
+            .unwrap(),
+        workspace
+    );
+    let target_error = restarted
+        .create_workspace_for_target(
+            &fixture.repository_key,
+            "lost-receipt",
+            "release",
+            &target_sha,
+        )
+        .unwrap_err();
+    assert!(
+        format!("{target_error:#}").contains("target ref"),
+        "{target_error:#}"
+    );
+    let expected_target_error = restarted
+        .create_workspace_for_target(
+            &fixture.repository_key,
+            "lost-receipt",
+            "main",
+            &"0".repeat(40),
+        )
+        .unwrap_err();
+    assert!(
+        format!("{expected_target_error:#}").contains("expected target SHA differs"),
+        "{expected_target_error:#}"
+    );
+
+    git(&workspace.path, &["config", "user.name", "IQ Test"]);
+    git(
+        &workspace.path,
+        &["config", "user.email", "iq@example.test"],
+    );
+    git(&workspace.path, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(workspace.path.join("receipt.txt"), "lost receipt\n").unwrap();
+    git(&workspace.path, &["add", "receipt.txt"]);
+    git(&workspace.path, &["commit", "-m", "lost receipt"]);
+
+    let submitted = fixture.manager.submit(&workspace.id, None).unwrap();
+    let restarted = RepositoryManager::new(fixture.queue.clone());
+    assert_eq!(restarted.submit(&workspace.id, None).unwrap(), submitted);
+
+    let connection = rusqlite::Connection::open(fixture.queue.path()).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM local_submissions WHERE workspace_id=?1",
+                [&workspace.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM queue_items WHERE id=?1",
+                [&submitted.1.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn manager_returns_a_typed_error_when_the_expected_workspace_target_moves() {
+    let fixture = Fixture::new(false);
+    let expected_target_sha = git(&fixture.canonical, &["rev-parse", "main"]);
+    let mover = fixture._temporary.path().join("expected-target-mover");
+    git(
+        fixture._temporary.path(),
+        &[
+            "clone",
+            fixture.canonical.to_str().unwrap(),
+            mover.to_str().unwrap(),
+        ],
+    );
+    git(&mover, &["config", "user.name", "IQ Test"]);
+    git(&mover, &["config", "user.email", "iq@example.test"]);
+    git(&mover, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(mover.join("moved-target.txt"), "moved\n").unwrap();
+    git(&mover, &["add", "moved-target.txt"]);
+    git(&mover, &["commit", "-m", "move expected target"]);
+    git(&mover, &["push", "origin", "main"]);
+    let observed_target_sha = git(&fixture.canonical, &["rev-parse", "main"]);
+
+    let error = fixture
+        .manager
+        .create_workspace_for_target(
+            &fixture.repository_key,
+            "moved-expected-target",
+            "main",
+            &expected_target_sha,
+        )
+        .unwrap_err();
+    let moved = error
+        .downcast_ref::<iq::composition::WorkspaceTargetMovedError>()
+        .unwrap();
+
+    assert_eq!(moved.target_ref.as_str(), "refs/heads/main");
+    assert_eq!(moved.expected_target_sha, expected_target_sha);
+    assert_eq!(moved.observed_target_sha, observed_target_sha);
+    assert!(fixture
+        .manager
+        .workspaces(Some(&fixture.repository_key))
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn manager_rejects_a_corrupt_finalized_submission_identity() {
+    let fixture = Fixture::new(false);
+    let workspace = fixture
+        .manager
+        .create_workspace(&fixture.repository_key, "corrupt-receipt")
+        .unwrap();
+    git(&workspace.path, &["config", "user.name", "IQ Test"]);
+    git(
+        &workspace.path,
+        &["config", "user.email", "iq@example.test"],
+    );
+    git(&workspace.path, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(workspace.path.join("corrupt.txt"), "candidate\n").unwrap();
+    git(&workspace.path, &["add", "corrupt.txt"]);
+    git(&workspace.path, &["commit", "-m", "candidate"]);
+    let (submission, _) = fixture.manager.submit(&workspace.id, None).unwrap();
+    std::fs::write(workspace.path.join("changed-after-submit.txt"), "changed\n").unwrap();
+
+    let restarted = RepositoryManager::new(fixture.queue.clone());
+    let changed_error = restarted.submit(&workspace.id, None).unwrap_err();
+    assert!(
+        format!("{changed_error:#}").contains("differs from its immutable submission source"),
+        "{changed_error:#}"
+    );
+    std::fs::remove_file(workspace.path.join("changed-after-submit.txt")).unwrap();
+    git(
+        &fixture.owned_root,
+        &["update-ref", &submission.private_ref, &submission.base_sha],
+    );
+
+    let error = restarted.submit(&workspace.id, None).unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("immutable local submission ref differs"),
+        "{error:#}"
+    );
+    let connection = rusqlite::Connection::open(fixture.queue.path()).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM queue_items", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
 fn draining_repository_rejects_workspace_submission_without_creating_intent_or_item() {
     let fixture = Fixture::new(false);
     let workspace = fixture
@@ -936,11 +1112,14 @@ fn draining_repository_rejects_workspace_submission_without_creating_intent_or_i
 fn existing_workspace_creation_intent_finishes_before_canonical_refresh() {
     let fixture = Fixture::new(false);
     let original = git(&fixture.canonical, &["rev-parse", "main"]);
+    let database_id = fixture.queue.database_id().unwrap();
     let interrupted = Command::new(env!("CARGO_BIN_EXE_iq"))
         .env("IQ_TEST_WORKSPACE_CREATION_STOP_AFTER", "rift_created")
         .args([
             "--queue-db",
             fixture.queue.path().to_str().unwrap(),
+            "--expected-database-id",
+            &database_id,
             "workspace",
             "create",
             "--repo-key",
@@ -959,7 +1138,7 @@ fn existing_workspace_creation_intent_finishes_before_canonical_refresh() {
     assert_eq!(intent.status.to_string(), "creating");
     assert!(intent.identity.is_none());
     assert!(intent.path.is_dir());
-    assert_eq!(intent.base_sha, original);
+    assert_eq!(intent.expected_target_sha, original);
 
     let mover = fixture._temporary.path().join("canonical-mover");
     git(
@@ -984,6 +1163,8 @@ fn existing_workspace_creation_intent_finishes_before_canonical_refresh() {
         .args([
             "--queue-db",
             fixture.queue.path().to_str().unwrap(),
+            "--expected-database-id",
+            &database_id,
             "workspace",
             "create",
             "--repo-key",
@@ -1001,7 +1182,7 @@ fn existing_workspace_creation_intent_finishes_before_canonical_refresh() {
     let resumed: iq::sqlite::DevelopmentWorkspace =
         serde_json::from_slice(&resumed.stdout).unwrap();
     assert_eq!(resumed.id, intent.id);
-    assert_eq!(resumed.base_sha, original);
+    assert_eq!(resumed.expected_target_sha, original);
     assert_eq!(git(&fixture.owned_root, &["rev-parse", "HEAD"]), original);
     assert_ne!(original, moved);
 }

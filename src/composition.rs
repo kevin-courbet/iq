@@ -16,8 +16,8 @@ use crate::integrator::{
 };
 use crate::sqlite::{
     CheckoutReconciliationState, CleanupState, DevelopmentWorkspace, DevelopmentWorkspaceStatus,
-    DirectAdmissionRequest, PrivateRefKind, QueueItem, RegisteredRemote, RegisteredRepository,
-    ReplacementState, ResidueDiscardState, SqliteQueue, WorkspaceIdentity,
+    DirectAdmissionRequest, PrivateRefKind, QueueAdmission, QueueItem, RegisteredRemote,
+    RegisteredRepository, ReplacementState, ResidueDiscardState, SqliteQueue, WorkspaceIdentity,
 };
 
 const LEASE_SECONDS: i64 = 30;
@@ -31,6 +31,16 @@ fn stop_composition_target_after(boundary: &str) {
 
 #[cfg(not(debug_assertions))]
 fn stop_composition_target_after(_boundary: &str) {}
+
+#[cfg(debug_assertions)]
+fn stop_local_submission_after(boundary: &str) {
+    if std::env::var("IQ_TEST_LOCAL_SUBMISSION_STOP_AFTER").as_deref() == Ok(boundary) {
+        std::process::exit(89);
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn stop_local_submission_after(_boundary: &str) {}
 
 #[derive(Clone, Debug)]
 pub struct RepositoryInitOptions {
@@ -161,6 +171,32 @@ pub struct DevelopmentWorkspaceObservation {
     pub branch: Option<String>,
     pub head: Option<String>,
     pub clean: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "workspace target moved for {target_ref}: expected {expected_target_sha}, observed {observed_target_sha}"
+)]
+pub struct WorkspaceTargetMovedError {
+    pub target_ref: crate::repository::TargetRef,
+    pub expected_target_sha: String,
+    pub observed_target_sha: String,
+}
+
+fn require_expected_workspace_target(
+    target_ref: &crate::repository::TargetRef,
+    expected_target_sha: &str,
+    observed_target_sha: &str,
+) -> Result<()> {
+    if observed_target_sha != expected_target_sha {
+        return Err(WorkspaceTargetMovedError {
+            target_ref: target_ref.clone(),
+            expected_target_sha: expected_target_sha.to_string(),
+            observed_target_sha: observed_target_sha.to_string(),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 struct RepositoryGuard {
@@ -623,6 +659,14 @@ impl RepositoryManager {
     }
 
     pub fn admit_direct(&self, request: DirectAdmissionRequest) -> Result<QueueItem> {
+        self.admit_direct_for_target(request, None)
+    }
+
+    pub fn admit_direct_for_target(
+        &self,
+        request: DirectAdmissionRequest,
+        requested_target_branch: Option<&str>,
+    ) -> Result<QueueItem> {
         let repository = self.queue.repository(&request.repo_key)?;
         repository.policy.require_new_work()?;
         if repository.policy.integration_policy
@@ -645,11 +689,11 @@ impl RepositoryManager {
             .policy
             .canonical_repository
             .operational_fetch_url();
-        if request.source_branch == repository.target_branch {
-            anyhow::bail!(
-                "source branch must not be target branch {}",
-                repository.target_branch
-            );
+        let target_branch = requested_target_branch.unwrap_or(&repository.target_branch);
+        validate_git_branch(&repository.owned_root_path, target_branch, "target branch")?;
+        let target_ref = crate::repository::TargetRef::from_branch(target_branch)?;
+        if request.source_branch == target_branch {
+            anyhow::bail!("source branch must not be target branch {}", target_branch);
         }
         repository
             .policy
@@ -693,10 +737,13 @@ impl RepositoryManager {
         let state_repository =
             load_project_control_only(&repository.owned_root_path)?.state_repository;
         crate::state_repository::repository(&state_repository)?.verify()?;
-        self.queue.admit_direct(DirectAdmissionRequest {
-            state_repository,
-            ..request
-        })
+        self.queue.admit_direct(
+            DirectAdmissionRequest {
+                state_repository,
+                ..request
+            },
+            &target_ref,
+        )
     }
 
     pub fn admit_merge_request(
@@ -739,9 +786,12 @@ impl RepositoryManager {
         if snapshot.repository != *canonical_provider {
             anyhow::bail!("provider MR repository identity differs from canonical policy");
         }
-        if snapshot.target_branch != repository.target_branch {
-            anyhow::bail!("merge request target branch differs from repository policy");
-        }
+        validate_git_branch(
+            &repository.owned_root_path,
+            &snapshot.target_branch,
+            "merge-request target branch",
+        )?;
+        let target_ref = crate::repository::TargetRef::from_branch(&snapshot.target_branch)?;
         let guard = RepositoryGuard::acquire(
             self.queue.clone(),
             &repository.owned_root_path,
@@ -757,20 +807,20 @@ impl RepositoryManager {
             .policy
             .canonical_repository
             .operational_fetch_url();
-        let target_ref = format!("refs/heads/{}", repository.target_branch);
+        let target_ref_text = target_ref.as_str();
         let observed = guard.run_new_work(
             "git",
             [
                 "ls-remote",
                 "--exit-code",
                 canonical_fetch.as_str(),
-                target_ref.as_str(),
+                target_ref_text,
             ],
             Some(&repository.owned_root_path),
             Duration::from_secs(60),
             "resolve canonical target for MR admission",
         )?;
-        let target_sha = parse_exact_remote_ref(&observed.stdout, &target_ref, object_format)?;
+        let target_sha = parse_exact_remote_ref(&observed.stdout, target_ref_text, object_format)?;
         if snapshot.base_sha != target_sha {
             anyhow::bail!("merge request base differs from exact current canonical target");
         }
@@ -792,7 +842,7 @@ impl RepositoryManager {
                 provider_host: locator.host,
                 repository: locator.repository,
                 repository_id: snapshot.repository.repository_id,
-                target_branch: snapshot.target_branch,
+                target_ref,
                 identity: locator.identity,
                 url: url.to_string(),
                 source_branch,
@@ -826,6 +876,25 @@ impl RepositoryManager {
     }
 
     pub fn create_workspace(&self, repo_key: &str, name: &str) -> Result<DevelopmentWorkspace> {
+        self.create_workspace_checked(repo_key, name, None)
+    }
+
+    pub fn create_workspace_for_target(
+        &self,
+        repo_key: &str,
+        name: &str,
+        target_branch: &str,
+        expected_target_sha: &str,
+    ) -> Result<DevelopmentWorkspace> {
+        self.create_workspace_checked(repo_key, name, Some((target_branch, expected_target_sha)))
+    }
+
+    fn create_workspace_checked(
+        &self,
+        repo_key: &str,
+        name: &str,
+        explicit_target: Option<(&str, &str)>,
+    ) -> Result<DevelopmentWorkspace> {
         let repository = self.queue.repository(repo_key)?;
         let guard = RepositoryGuard::acquire(
             self.queue.clone(),
@@ -833,34 +902,77 @@ impl RepositoryManager {
             repo_key,
             &self.owner_id,
         )?;
-        let manager = self.development_manager(&repository)?;
-        let requested_creation = self
+        let existing = self
             .queue
             .list_development_workspaces(Some(repo_key))?
             .into_iter()
-            .find(|workspace| {
-                workspace.name == name && workspace.status == DevelopmentWorkspaceStatus::Creating
-            })
-            .map(|workspace| workspace.id);
-        self.reconcile_development_workspaces(&guard, &repository, &manager)?;
-        if let Some(existing) = self
-            .queue
-            .list_development_workspaces(Some(repo_key))?
-            .into_iter()
-            .find(|workspace| workspace.name == name)
-        {
+            .find(|workspace| workspace.name == name);
+        if let Some(requested) = existing {
+            let target_branch = explicit_target
+                .map(|(target_branch, _)| target_branch)
+                .unwrap_or(&repository.target_branch);
+            validate_git_branch(&repository.owned_root_path, target_branch, "target branch")?;
+            let target_ref = crate::repository::TargetRef::from_branch(target_branch)?;
+            if requested.target_ref != target_ref {
+                anyhow::bail!("development workspace target ref differs from the requested target");
+            }
+            if let Some((_, expected_target_sha)) = explicit_target {
+                repository
+                    .policy
+                    .canonical_repository
+                    .object_format()
+                    .require_oid(expected_target_sha, "expected workspace target SHA")?;
+                if requested.expected_target_sha != expected_target_sha {
+                    anyhow::bail!(
+                        "development workspace expected target SHA differs from the request"
+                    );
+                }
+            }
+            let manager = self.development_manager(&repository)?;
+            let existing = self.queue.workspace(&requested.id)?;
             if existing.status == DevelopmentWorkspaceStatus::Creating {
                 return self.resume_workspace_creation(&guard, &repository, &manager, existing);
             }
-            if requested_creation.as_deref() == Some(existing.id.as_str()) {
+            if existing.status == DevelopmentWorkspaceStatus::Active
+                && existing.target_ref == target_ref
+            {
                 return Ok(existing);
             }
             anyhow::bail!("development workspace name is already allocated: {name}");
         }
-        let repository = self.queue.repository(repo_key)?;
         repository.policy.require_new_work()?;
         validate_workspace_component(name, "workspace name")?;
-        let base_sha = self.sync_owned_root_locked(&guard, &repository)?;
+        let target_branch = explicit_target
+            .map(|(target_branch, _)| target_branch)
+            .unwrap_or(&repository.target_branch);
+        validate_git_branch(&repository.owned_root_path, target_branch, "target branch")?;
+        let target_ref = crate::repository::TargetRef::from_branch(target_branch)?;
+        if let Some((_, expected_target_sha)) = explicit_target {
+            repository
+                .policy
+                .canonical_repository
+                .object_format()
+                .require_oid(expected_target_sha, "expected workspace target SHA")?;
+        }
+        let observed_target_sha =
+            self.resolve_workspace_target_locked(&guard, &repository, &target_ref)?;
+        if let Some((_, expected_target_sha)) = explicit_target {
+            require_expected_workspace_target(
+                &target_ref,
+                expected_target_sha,
+                &observed_target_sha,
+            )?;
+        }
+        let manager = self.development_manager(&repository)?;
+        self.reconcile_development_workspaces(&guard, &repository, &manager)?;
+        let repository = self.queue.repository(repo_key)?;
+        repository.policy.require_new_work()?;
+        self.sync_owned_root_to_target_locked(
+            &guard,
+            &repository,
+            &target_ref,
+            &observed_target_sha,
+        )?;
         let id = Uuid::new_v4().to_string();
         let branch = format!("iq-{id}-{name}");
         validate_git_branch(
@@ -877,7 +989,8 @@ impl RepositoryManager {
             identity: None,
             path,
             branch,
-            base_sha,
+            target_ref,
+            expected_target_sha: observed_target_sha,
             status: DevelopmentWorkspaceStatus::Creating,
             cleanup: CleanupState::Pending,
             created_at: timestamp.clone(),
@@ -925,6 +1038,17 @@ impl RepositoryManager {
     ) -> Result<(crate::sqlite::LocalSubmission, QueueItem)> {
         let workspace = self.queue.workspace(workspace_id)?;
         let repository = self.queue.repository(&workspace.repo_key)?;
+        if replace.is_none()
+            && matches!(
+                workspace.status,
+                DevelopmentWorkspaceStatus::Submitted
+                    | DevelopmentWorkspaceStatus::CleanupPending
+                    | DevelopmentWorkspaceStatus::CleanupFailed
+                    | DevelopmentWorkspaceStatus::Removed
+            )
+        {
+            return self.replay_finalized_local_submission(&workspace, &repository);
+        }
         repository.policy.require_new_work()?;
         repository.policy.require_workspace_mutation(workspace_id)?;
         if repository.policy.integration_policy
@@ -961,18 +1085,26 @@ impl RepositoryManager {
             self.queue.creating_local_submission(&workspace.id)?
         {
             if submission.repo_key != repository.key
+                || submission.workspace_id != workspace.id
+                || submission.base_sha != workspace.expected_target_sha
+                || submission.private_ref != format!("refs/iq/submissions/{}", submission.id)
+                || submission.staging_ref != format!("refs/iq/staging/{}", submission.id)
                 || submission.replaces_item_id.as_deref() != replace
             {
                 anyhow::bail!("workspace has a different incomplete immutable submission intent");
+            }
+            require_workspace_submission_state(&workspace)?;
+            if git_output(&workspace.path, ["rev-parse", "HEAD"])? != submission.commit_sha {
+                anyhow::bail!("workspace HEAD differs from its incomplete submission source SHA");
             }
             submission
         } else {
             require_workspace_submission_state(&workspace)?;
             let head = git_output(&workspace.path, ["rev-parse", "HEAD"])?;
-            if !is_ancestor(&workspace.path, &workspace.base_sha, &head)? {
+            if !is_ancestor(&workspace.path, &workspace.expected_target_sha, &head)? {
                 anyhow::bail!("development workspace HEAD is not based on its exact recorded base");
             }
-            if head == workspace.base_sha {
+            if head == workspace.expected_target_sha {
                 anyhow::bail!("development workspace has no committed change to submit");
             }
             self.queue.begin_local_submission(
@@ -983,6 +1115,7 @@ impl RepositoryManager {
                 replace,
             )?
         };
+        stop_local_submission_after("intent_recorded");
         let intent_sha = submission.commit_sha.as_str();
         let private_sha =
             resolve_optional_ref(&repository.owned_root_path, &submission.private_ref)?;
@@ -1011,6 +1144,7 @@ impl RepositoryManager {
             {
                 anyhow::bail!("staged local submission does not resolve to exact workspace HEAD");
             }
+            stop_local_submission_after("staging_ref_published");
             let zero_oid = repository
                 .policy
                 .canonical_repository
@@ -1027,6 +1161,7 @@ impl RepositoryManager {
                 "publish immutable local submission",
             )?;
         }
+        stop_local_submission_after("private_ref_published");
         if resolve_optional_ref(&repository.owned_root_path, &submission.staging_ref)?.is_some() {
             guard.git(
                 &repository.owned_root_path,
@@ -1034,6 +1169,7 @@ impl RepositoryManager {
                 "remove local submission staging ref",
             )?;
         }
+        stop_local_submission_after("staging_ref_removed");
         if resolve_optional_ref(&repository.owned_root_path, &submission.private_ref)?.as_deref()
             != Some(intent_sha)
         {
@@ -1051,13 +1187,134 @@ impl RepositoryManager {
             store.cancel(&effort.id, "workspace_submit", "superseded_by_replacement")?;
             guard.ensure()?;
         }
-        self.queue.finalize_local_submission(
+        let finalized = self.queue.finalize_local_submission(
             &repository.key,
             &self.owner_id,
             &submission.id,
             &Value::Object(Default::default()),
             &state_repository,
-        )
+        )?;
+        stop_local_submission_after("finalized");
+        Ok(finalized)
+    }
+
+    fn replay_finalized_local_submission(
+        &self,
+        workspace: &DevelopmentWorkspace,
+        repository: &RegisteredRepository,
+    ) -> Result<(crate::sqlite::LocalSubmission, QueueItem)> {
+        if workspace.repo_key != repository.key
+            || repository.policy.integration_policy
+                != crate::repository_policy::IntegrationPolicy::Direct
+        {
+            anyhow::bail!("submitted workspace repository identity is invalid");
+        }
+        let (submission, item, admission_target_ref) = self
+            .queue
+            .finalized_local_submission_for_workspace(&workspace.id)?;
+        let expected_private_ref = format!("refs/iq/submissions/{}", submission.id);
+        let expected_staging_ref = format!("refs/iq/staging/{}", submission.id);
+        let exact_admission = matches!(
+            &item.admission,
+            QueueAdmission::LocalSubmission {
+                source_branch,
+                head_sha,
+                source_ref,
+                submission_id,
+            } if source_branch == &expected_private_ref
+                && head_sha == &submission.commit_sha
+                && source_ref == &expected_private_ref
+                && submission_id == &submission.id
+        );
+        if submission.repo_key != repository.key
+            || submission.workspace_id != workspace.id
+            || submission.queue_item_id != item.id
+            || submission.base_sha != workspace.expected_target_sha
+            || submission.private_ref != expected_private_ref
+            || submission.staging_ref != expected_staging_ref
+            || item.repo_key != repository.key
+            || item.target_ref != workspace.target_ref
+            || admission_target_ref != workspace.target_ref
+            || item.current_head_sha != submission.commit_sha
+            || !exact_admission
+        {
+            anyhow::bail!("finalized local submission identity differs from its workspace receipt");
+        }
+        let valid_lifecycle = match workspace.status {
+            DevelopmentWorkspaceStatus::Submitted => {
+                submission.state == crate::sqlite::LocalSubmissionState::Queued
+                    && !matches!(
+                        item.status,
+                        crate::core::QueueStatus::Integrated | crate::core::QueueStatus::Cancelled
+                    )
+            }
+            DevelopmentWorkspaceStatus::CleanupPending
+            | DevelopmentWorkspaceStatus::CleanupFailed
+            | DevelopmentWorkspaceStatus::Removed => {
+                submission.state == crate::sqlite::LocalSubmissionState::Integrated
+                    && item.status == crate::core::QueueStatus::Integrated
+            }
+            DevelopmentWorkspaceStatus::Creating | DevelopmentWorkspaceStatus::Active => false,
+        };
+        if !valid_lifecycle {
+            anyhow::bail!(
+                "finalized local submission lifecycle differs from its workspace receipt"
+            );
+        }
+        let identity = workspace
+            .identity
+            .as_ref()
+            .context("submitted workspace has no durable Rift identity")?;
+        let manager = self.development_manager(repository)?;
+        let expected_path = manager.expected_path(&workspace.id)?;
+        if workspace.path != expected_path || Path::new(&identity.path) != expected_path {
+            anyhow::bail!("submitted workspace path differs from its durable Rift identity");
+        }
+        let workspace_exists = entry_exists(&workspace.path)?;
+        if workspace.status == DevelopmentWorkspaceStatus::Removed {
+            if workspace_exists {
+                anyhow::bail!("removed submitted workspace path reappeared");
+            }
+        } else if workspace_exists {
+            if manager.verify_retained(identity)? != workspace.path
+                || git_output(&workspace.path, ["branch", "--show-current"])? != workspace.branch
+                || git_output(&workspace.path, ["rev-parse", "HEAD"])? != submission.commit_sha
+                || !is_clean(&workspace.path)?
+            {
+                anyhow::bail!("submitted workspace differs from its immutable submission source");
+            }
+        } else if workspace.status == DevelopmentWorkspaceStatus::Submitted {
+            anyhow::bail!("submitted development workspace is missing");
+        }
+        if resolve_optional_ref(&repository.owned_root_path, &submission.private_ref)?.as_deref()
+            != Some(submission.commit_sha.as_str())
+        {
+            anyhow::bail!("immutable local submission ref differs from its source SHA");
+        }
+        if resolve_optional_ref(&repository.owned_root_path, &submission.staging_ref)?.is_some() {
+            anyhow::bail!("finalized local submission retains its staging ref");
+        }
+        let receipt_submission = crate::sqlite::LocalSubmission {
+            state: crate::sqlite::LocalSubmissionState::Queued,
+            ..submission
+        };
+        let receipt_item = QueueItem {
+            status: crate::core::QueueStatus::Ready,
+            blocked_phase: None,
+            blocked_reason: None,
+            current_attempt_id: None,
+            workspace: crate::sqlite::WorkspaceState::NotCreated,
+            conflict: None,
+            target_sha: None,
+            source_sha: None,
+            landed_commit_sha: None,
+            producer_metadata: Value::Object(Default::default()),
+            validation_evidence: Value::Object(Default::default()),
+            landing: crate::sqlite::LandingState::Ready,
+            replacement: ReplacementState::None,
+            ..item
+        };
+        Ok((receipt_submission, receipt_item))
     }
 
     pub fn remove_workspace(&self, id: &str) -> Result<DevelopmentWorkspace> {
@@ -1381,7 +1638,7 @@ impl RepositoryManager {
             &queue_id,
             generation,
         )?;
-        self.queue.register_workspace_root(
+        self.queue.verify_workspace_root(
             scope,
             source,
             manager.source_id(),
@@ -1404,60 +1661,17 @@ impl RepositoryManager {
         )
     }
 
-    fn sync_owned_root_locked(
+    fn materialize_checkout_observation_locked(
         &self,
         guard: &RepositoryGuard,
         repository: &RegisteredRepository,
-    ) -> Result<String> {
-        validate_integration_checkout(
-            &repository.owned_root_path,
-            &repository.target_branch,
-            &repository.remote.name,
-        )?;
-        verify_remote_identity(
-            &repository.owned_root_path,
-            &repository.remote,
-            &repository.policy.canonical_repository,
-        )?;
+        target_ref: &crate::repository::TargetRef,
+        target_sha: &str,
+    ) -> Result<()> {
         let canonical_fetch = repository
             .policy
             .canonical_repository
             .operational_fetch_url();
-        let target_sha = if matches!(
-            repository.checkout_reconciliation,
-            CheckoutReconciliationState::Ready(_)
-        ) {
-            let target_full_ref = format!("refs/heads/{}", repository.target_branch);
-            let observed = guard.run_new_work(
-                "git",
-                [
-                    "ls-remote",
-                    "--exit-code",
-                    &canonical_fetch,
-                    &target_full_ref,
-                ],
-                Some(&repository.owned_root_path),
-                Duration::from_secs(60),
-                "resolve exact target before owned-root refresh",
-            )?;
-            let observed_target = parse_exact_remote_ref(
-                &observed.stdout,
-                &target_full_ref,
-                repository.policy.canonical_repository.object_format(),
-            )?;
-            self.queue.update_checkout_reconciliation(
-                &repository.key,
-                &self.owner_id,
-                &CheckoutReconciliationState::pending(
-                    &observed_target,
-                    repository.policy.canonical_repository.object_format(),
-                )?,
-            )?;
-            stop_composition_target_after("observation");
-            observed_target
-        } else {
-            repository.checkout_reconciliation.target_sha().to_string()
-        };
         let private_ref = format!(
             "refs/iq/repository-targets/{}/{}",
             repository.key, target_sha
@@ -1477,16 +1691,17 @@ impl RepositoryManager {
             ["cat-file", "-e", &format!("{target_sha}^{{commit}}")],
             "verify exact owned-root target object",
         )?;
-        let target_ref = format!(
+        let tracking_ref = format!(
             "refs/remotes/{}/{}",
-            repository.remote.name, repository.target_branch
+            repository.remote.name,
+            target_ref.branch()
         );
         guard.git_new_work(
             &repository.owned_root_path,
-            ["update-ref", &target_ref, &target_sha],
+            ["update-ref", &tracking_ref, target_sha],
             "publish exact owned-root target ref",
         )?;
-        let published_sha = git_output(&repository.owned_root_path, ["rev-parse", &target_ref])?;
+        let published_sha = git_output(&repository.owned_root_path, ["rev-parse", &tracking_ref])?;
         if published_sha != target_sha {
             anyhow::bail!("published target differs from durable checkout observation");
         }
@@ -1494,7 +1709,8 @@ impl RepositoryManager {
             &self.queue,
             repository,
             &self.owner_id,
-            &target_sha,
+            target_ref,
+            target_sha,
             |path, target_sha| {
                 guard.git_new_work(
                     path,
@@ -1502,9 +1718,86 @@ impl RepositoryManager {
                     "reset owned root to exact fetched target",
                 )
             },
+        )
+    }
+
+    fn resolve_workspace_target_locked(
+        &self,
+        guard: &RepositoryGuard,
+        repository: &RegisteredRepository,
+        target_ref: &crate::repository::TargetRef,
+    ) -> Result<String> {
+        validate_integration_checkout(
+            &repository.owned_root_path,
+            &repository.target_branch,
+            &repository.remote.name,
         )?;
-        self.reconcile_private_refs_locked(guard, repository)?;
-        Ok(target_sha)
+        verify_remote_identity(
+            &repository.owned_root_path,
+            &repository.remote,
+            &repository.policy.canonical_repository,
+        )?;
+        let canonical_fetch = repository
+            .policy
+            .canonical_repository
+            .operational_fetch_url();
+        let target_full_ref = target_ref.as_str();
+        let arguments = [
+            OsString::from("ls-remote"),
+            OsString::from("--exit-code"),
+            OsString::from(canonical_fetch),
+            OsString::from(target_full_ref),
+        ];
+        let observed = guard.run_new_work(
+            "git",
+            arguments,
+            Some(&repository.owned_root_path),
+            Duration::from_secs(60),
+            "resolve expected workspace target",
+        )?;
+        parse_exact_remote_ref(
+            &observed.stdout,
+            target_full_ref,
+            repository.policy.canonical_repository.object_format(),
+        )
+    }
+
+    fn sync_owned_root_to_target_locked(
+        &self,
+        guard: &RepositoryGuard,
+        repository: &RegisteredRepository,
+        target_ref: &crate::repository::TargetRef,
+        target_sha: &str,
+    ) -> Result<()> {
+        let mut repository = repository.clone();
+        if !matches!(
+            repository.checkout_reconciliation,
+            CheckoutReconciliationState::Ready(_)
+        ) {
+            let stored_target_ref = repository.checkout_reconciliation.target_ref().clone();
+            let stored_target_sha = repository.checkout_reconciliation.target_sha().to_string();
+            self.materialize_checkout_observation_locked(
+                guard,
+                &repository,
+                &stored_target_ref,
+                &stored_target_sha,
+            )?;
+            repository = self.queue.repository(&repository.key)?;
+        }
+        self.queue.update_checkout_reconciliation(
+            &repository.key,
+            &self.owner_id,
+            &CheckoutReconciliationState::pending(
+                target_ref,
+                target_sha,
+                repository.policy.canonical_repository.object_format(),
+            )?,
+        )?;
+        stop_composition_target_after("observation");
+        repository = self.queue.repository(&repository.key)?;
+        self.materialize_checkout_observation_locked(guard, &repository, target_ref, target_sha)?;
+        self.reconcile_private_refs_locked(guard, &repository)?;
+        Ok(())
     }
 
     fn reconcile_owned_root_locked(
@@ -1513,10 +1806,12 @@ impl RepositoryManager {
         repository: &RegisteredRepository,
     ) -> Result<String> {
         let checkout_target = repository.checkout_reconciliation.target_sha();
+        let checkout_target_ref = repository.checkout_reconciliation.target_ref();
         reconcile_registered_checkout(
             &self.queue,
             repository,
             &self.owner_id,
+            checkout_target_ref,
             checkout_target,
             |path, target_sha| {
                 guard.git_new_work(
@@ -1586,7 +1881,7 @@ impl RepositoryManager {
         manager.verify_retained(&identity)?;
         let current_branch = git_output(&workspace.path, ["branch", "--show-current"])?;
         let current_head = git_output(&workspace.path, ["rev-parse", "HEAD"])?;
-        if current_head != workspace.base_sha || !is_clean(&workspace.path)? {
+        if current_head != workspace.expected_target_sha || !is_clean(&workspace.path)? {
             anyhow::bail!("interrupted development workspace has changed; IQ preserves it");
         }
         if current_branch.is_empty() {
@@ -2136,14 +2431,14 @@ where
         &repository.remote,
         &repository.policy.canonical_repository,
     )?;
-    let target_ref = format!("refs/heads/{}", debt.target_branch);
+    let target_ref = debt.target_ref.as_str();
     let replica_fetch_transport = debt.replica.operational_fetch_url();
     let replica_push_transport = debt.replica.operational_push_url();
     let observe_args = vec![
         "ls-remote".into(),
         "--heads".into(),
         replica_fetch_transport.into(),
-        target_ref.clone().into(),
+        target_ref.into(),
     ];
     let observation = run_git(
         debt_id,
@@ -2152,7 +2447,7 @@ where
         "observe exact replica target",
     );
     let actual = match observation.and_then(|output| {
-        parse_optional_remote_ref(&output.stdout, &target_ref, debt.replica.object_format())
+        parse_optional_remote_ref(&output.stdout, target_ref, debt.replica.object_format())
     }) {
         Ok(Some(actual)) => actual,
         Ok(None) => debt.replica.object_format().zero_oid(),
@@ -2232,7 +2527,7 @@ where
         "verify exact replica target",
     );
     match verification.and_then(|output| {
-        parse_optional_remote_ref(&output.stdout, &target_ref, debt.replica.object_format())
+        parse_optional_remote_ref(&output.stdout, target_ref, debt.replica.object_format())
     }) {
         Ok(Some(actual)) if actual == debt.canonical_source_sha => {
             let applied =
@@ -2506,6 +2801,7 @@ pub(crate) fn reconcile_registered_checkout(
     queue: &SqliteQueue,
     repository: &RegisteredRepository,
     owner_id: &str,
+    target_ref: &crate::repository::TargetRef,
     target_sha: &str,
     mut reset: impl FnMut(&Path, &str) -> Result<()>,
 ) -> Result<()> {
@@ -2526,7 +2822,8 @@ pub(crate) fn reconcile_registered_checkout(
     )?;
     let remote_ref = format!(
         "refs/remotes/{}/{}",
-        repository.remote.name, repository.target_branch
+        repository.remote.name,
+        target_ref.branch()
     );
     let fetched_target = git_output(&repository.owned_root_path, ["rev-parse", &remote_ref])?;
     if fetched_target != target_sha {
@@ -2535,13 +2832,17 @@ pub(crate) fn reconcile_registered_checkout(
         );
     }
     let head = git_output(&repository.owned_root_path, ["rev-parse", "HEAD"])?;
-    if repository.checkout_reconciliation.is_ready_for(target_sha) && head == target_sha {
+    if repository.checkout_reconciliation.is_ready_for(target_sha)
+        && repository.checkout_reconciliation.target_ref() == target_ref
+        && head == target_sha
+    {
         return Ok(());
     }
     queue.update_checkout_reconciliation(
         &repository.key,
         owner_id,
         &CheckoutReconciliationState::pending(
+            target_ref,
             target_sha,
             repository.policy.canonical_repository.object_format(),
         )?,
@@ -2562,6 +2863,7 @@ pub(crate) fn reconcile_registered_checkout(
             &repository.key,
             owner_id,
             &CheckoutReconciliationState::ready(
+                target_ref,
                 target_sha,
                 repository.policy.canonical_repository.object_format(),
             )?,
@@ -2571,6 +2873,7 @@ pub(crate) fn reconcile_registered_checkout(
                 &repository.key,
                 owner_id,
                 &CheckoutReconciliationState::failed(
+                    target_ref,
                     target_sha,
                     repository.policy.canonical_repository.object_format(),
                     &format!("{error:#}"),

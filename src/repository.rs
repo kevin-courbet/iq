@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: &str = "5";
+pub const SCHEMA_VERSION: &str = "6";
 pub const INTERNAL_REMOTE_NAME: &str = "iq-target";
 const POLICY_PATH: &str = ".iq/config.json";
 const MAX_POLICY_BYTES: u64 = 1024 * 1024;
@@ -57,6 +57,76 @@ pub fn validate_target_branch(value: &str) -> Result<&str> {
         "main" | "master" => Ok(value),
         _ => anyhow::bail!("IQ target branch must be main or master"),
     }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct TargetRef(String);
+
+impl<'de> Deserialize<'de> for TargetRef {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_full(value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl TargetRef {
+    pub fn from_branch(branch: &str) -> Result<Self> {
+        validate_git_branch_name(branch)?;
+        Self::from_full(format!("refs/heads/{branch}"))
+    }
+
+    pub fn from_full(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        let branch = value
+            .strip_prefix("refs/heads/")
+            .context("target ref must be below refs/heads")?;
+        validate_git_branch_name(branch)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn branch(&self) -> &str {
+        self.0
+            .strip_prefix("refs/heads/")
+            .expect("checked target ref must have the refs/heads prefix")
+    }
+}
+
+impl std::fmt::Display for TargetRef {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+fn validate_git_branch_name(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value == "@"
+        || value.starts_with('-')
+        || value.starts_with('/')
+        || value.ends_with('/')
+        || value.ends_with('.')
+        || value.contains("..")
+        || value.contains("@{")
+        || value.contains("//")
+        || value.bytes().any(|byte| {
+            byte <= b' '
+                || byte == 0x7f
+                || matches!(byte, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+        })
+        || value.split('/').any(|component| {
+            component.is_empty() || component.starts_with('.') || component.ends_with(".lock")
+        })
+    {
+        anyhow::bail!("target branch is not a valid Git branch name");
+    }
+    Ok(())
 }
 
 fn target_ref(target: &str) -> Result<String> {
@@ -1278,7 +1348,8 @@ fn verify_initialized_git(plan: &ProvisionPlan) -> Result<()> {
         OsStr::new("iq-operation.lock"),
         0,
         "repository operation lock",
-    )?;
+    )
+    .context("Git repository binding changed")?;
     let remotes = git_text(&plan.staging_path, ["remote"])?;
     if !remotes.is_empty() && remotes != INTERNAL_REMOTE_NAME {
         anyhow::bail!("owned repository staging checkout has unexpected remotes");
@@ -1644,6 +1715,7 @@ fn persist_ready(
     created_at: &str,
 ) -> Result<()> {
     let git_binding = crate::git_command::authorize_current(&repository.path)?;
+    let target_ref = TargetRef::from_branch(&repository.target)?;
     let transaction = connection.transaction()?;
     let timestamp = chrono::Utc::now().to_rfc3339();
     transaction.execute(
@@ -1652,7 +1724,7 @@ fn persist_ready(
     )?;
     transaction.execute(
         "INSERT INTO registered_repositories(repo_key,owned_root_path,git_binding_json,root_rift_id,registry_identity,registry_device,registry_inode,generation,source_sha,checkout_json,development_root_path,integration_root_path,provisioning_json,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'{\"state\":\"ready\"}',?13,?14)",
-        params![repository.repo_key.as_str(),repository.path.as_os_str().as_bytes(),serde_json::to_string(&git_binding)?,repository.rift.rift_id,repository.rift.registry_identity.as_os_str().as_bytes(),repository.rift.registry_device,repository.rift.registry_inode,repository.rift.generation,repository.source_sha,serde_json::to_string(&crate::sqlite::CheckoutReconciliationState::ready(&repository.source_sha,git_binding.object_format)?)?,repository.children.development.as_os_str().as_bytes(),repository.children.integration.as_os_str().as_bytes(),created_at,timestamp],
+        params![repository.repo_key.as_str(),repository.path.as_os_str().as_bytes(),serde_json::to_string(&git_binding)?,repository.rift.rift_id,repository.rift.registry_identity.as_os_str().as_bytes(),repository.rift.registry_device,repository.rift.registry_inode,repository.rift.generation,repository.source_sha,serde_json::to_string(&crate::sqlite::CheckoutReconciliationState::ready(&target_ref,&repository.source_sha,git_binding.object_format)?)?,repository.children.development.as_os_str().as_bytes(),repository.children.integration.as_os_str().as_bytes(),created_at,timestamp],
     )?;
     for (kind, path) in [
         ("development", &repository.children.development),
@@ -2429,21 +2501,19 @@ pub(crate) fn verify_registered_repository(
         source_sha: head,
     };
     verify_owned_root(&owned, database_id, Some(&repository.registry_identity))?;
-    let target_ref = format!(
-        "refs/remotes/{}/{}",
-        INTERNAL_REMOTE_NAME, repository.target_branch
-    );
-    let remote_sha = git_text(&repository.owned_root_path, ["rev-parse", &target_ref])?;
-    let allowed = if repository
-        .checkout_reconciliation
-        .is_ready_for(&repository.source_sha)
-    {
-        remote_sha == repository.source_sha
-    } else {
-        remote_sha == repository.source_sha || remote_sha == checkout_target
-    };
-    if !allowed {
-        anyhow::bail!("owned repository target ref differs from durable checkout authority");
+    if matches!(
+        repository.checkout_reconciliation,
+        crate::sqlite::CheckoutReconciliationState::Ready(_)
+    ) {
+        let target_ref = format!(
+            "refs/remotes/{}/{}",
+            INTERNAL_REMOTE_NAME,
+            repository.checkout_reconciliation.target_ref().branch()
+        );
+        let remote_sha = git_text(&repository.owned_root_path, ["rev-parse", &target_ref])?;
+        if remote_sha != checkout_target {
+            anyhow::bail!("owned repository target ref differs from durable checkout authority");
+        }
     }
     Ok(())
 }

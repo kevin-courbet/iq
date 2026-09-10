@@ -4,7 +4,11 @@ use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
-use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::FileExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -340,11 +344,39 @@ pub fn verify_executable(identity: &ExecutableIdentity) -> Result<()> {
 }
 
 #[derive(Clone)]
-pub struct ExecutableAuthority {
+pub struct PathExecutable {
     identity: ExecutableIdentity,
 }
 
+#[derive(Clone)]
+pub struct InheritedDescriptorExecutable {
+    identity: InheritedDescriptorIdentity,
+    file: std::sync::Arc<File>,
+}
+
+#[derive(Clone)]
+pub enum ExecutableAuthority {
+    PathExecutable(PathExecutable),
+    InheritedDescriptorExecutable(InheritedDescriptorExecutable),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InheritedDescriptorIdentity {
+    executable: ExecutableIdentity,
+    owner: u32,
+    mode: u32,
+    size: u64,
+    backing: DescriptorBacking,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DescriptorBacking {
+    RegularFile,
+    SealedMemfd { seals: i32 },
+}
+
 static RIFT_EXECUTABLE_AUTHORITY: OnceLock<ExecutableAuthority> = OnceLock::new();
+static RIFT_EXECUTABLE_INITIALIZATION: Mutex<()> = Mutex::new(());
 
 #[cfg(any(test, feature = "test-hooks"))]
 static TEST_RIFT_EXECUTABLE_AUTHORITY: OnceLock<Mutex<Option<ExecutableAuthority>>> =
@@ -359,10 +391,21 @@ pub fn validate_rift_executable_environment() -> Result<()> {
 
 pub fn initialize_rift_executable_authority(path: &Path) -> Result<()> {
     validate_rift_executable_environment()?;
-    require_absolute(path, "Rift executable")?;
-    let authority = open_executable_authority(&executable_identity(path)?)?;
+    let _initialization = RIFT_EXECUTABLE_INITIALIZATION
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Rift executable initialization lock is poisoned"))?;
+    if let Some(existing @ ExecutableAuthority::InheritedDescriptorExecutable(executable)) =
+        RIFT_EXECUTABLE_AUTHORITY.get()
+    {
+        parse_inherited_descriptor_path(path)?;
+        if executable.identity.executable.path != path {
+            anyhow::bail!("Rift executable authority was already initialized differently");
+        }
+        return existing.verify_operation_authority();
+    }
+    let authority = rift_executable_authority_from_argument(path)?;
     if let Some(existing) = RIFT_EXECUTABLE_AUTHORITY.get() {
-        if existing.identity != authority.identity {
+        if !existing.same_identity(&authority) {
             anyhow::bail!("Rift executable authority was already initialized differently");
         }
         return Ok(());
@@ -370,6 +413,174 @@ pub fn initialize_rift_executable_authority(path: &Path) -> Result<()> {
     RIFT_EXECUTABLE_AUTHORITY
         .set(authority)
         .map_err(|_| anyhow::anyhow!("Rift executable authority changed during initialization"))
+}
+
+fn rift_executable_authority_from_argument(path: &Path) -> Result<ExecutableAuthority> {
+    if path.as_os_str().as_bytes().starts_with(b"/proc/") {
+        return open_inherited_descriptor_executable(path);
+    }
+    require_absolute(path, "Rift executable")?;
+    open_executable_authority(&executable_identity(path)?)
+}
+
+#[cfg(target_os = "linux")]
+fn open_inherited_descriptor_executable(path: &Path) -> Result<ExecutableAuthority> {
+    let descriptor = parse_inherited_descriptor_path(path)?;
+    let descriptor_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    if descriptor_flags < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("inspect inherited Rift executable descriptor");
+    }
+    if unsafe {
+        libc::fcntl(
+            descriptor,
+            libc::F_SETFD,
+            descriptor_flags | libc::FD_CLOEXEC,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("protect inherited Rift executable descriptor");
+    }
+    let file = std::sync::Arc::new(unsafe { File::from_raw_fd(descriptor) });
+    let identity = inherited_descriptor_identity(path, &file)?;
+    Ok(ExecutableAuthority::InheritedDescriptorExecutable(
+        InheritedDescriptorExecutable { identity, file },
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_inherited_descriptor_executable(_path: &Path) -> Result<ExecutableAuthority> {
+    anyhow::bail!("inherited Rift executable descriptors require Linux")
+}
+
+fn parse_inherited_descriptor_path(path: &Path) -> Result<RawFd> {
+    const PREFIX: &[u8] = b"/proc/self/fd/";
+    let bytes = path.as_os_str().as_bytes();
+    let descriptor = bytes.strip_prefix(PREFIX).filter(|value| {
+        !value.is_empty()
+            && value.iter().all(u8::is_ascii_digit)
+            && (value.len() == 1 || value[0] != b'0')
+    });
+    let Some(descriptor) = descriptor else {
+        anyhow::bail!("Rift executable proc path must be exactly /proc/self/fd/<n>");
+    };
+    let descriptor = std::str::from_utf8(descriptor)?
+        .parse::<RawFd>()
+        .context("parse inherited Rift executable descriptor")?;
+    if descriptor < 0 {
+        anyhow::bail!("inherited Rift executable descriptor must not be negative");
+    }
+    Ok(descriptor)
+}
+
+#[cfg(target_os = "linux")]
+fn inherited_descriptor_identity(path: &Path, file: &File) -> Result<InheritedDescriptorIdentity> {
+    let descriptor = file.as_raw_fd();
+    let descriptor_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    if descriptor_flags < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("inspect inherited Rift executable descriptor");
+    }
+    if descriptor_flags & libc::FD_CLOEXEC == 0 {
+        anyhow::bail!("inherited Rift executable descriptor lost close-on-exec protection");
+    }
+    let before = file
+        .metadata()
+        .context("inspect inherited Rift executable identity")?;
+    if !before.is_file() || before.len() == 0 || before.permissions().mode() & 0o111 == 0 {
+        anyhow::bail!(
+            "inherited Rift executable descriptor must reference a non-empty executable regular file"
+        );
+    }
+    let status_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if status_flags < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("inspect inherited Rift executable access mode");
+    }
+    if status_flags & libc::O_ACCMODE != libc::O_RDONLY {
+        anyhow::bail!("inherited Rift executable descriptor must be read-only");
+    }
+    let owner = unsafe { libc::geteuid() };
+    if before.uid() != owner {
+        anyhow::bail!("inherited Rift executable descriptor must be owned by the current user");
+    }
+    let target = fs::read_link(path).context("inspect inherited Rift executable target")?;
+    let target = target.as_os_str().as_bytes();
+    let backing = if target.starts_with(b"/memfd:") || target.starts_with(b"memfd:") {
+        let seals = unsafe { libc::fcntl(descriptor, libc::F_GET_SEALS) };
+        if seals < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("inspect inherited Rift executable seals");
+        }
+        let required =
+            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        if seals & required != required {
+            anyhow::bail!("anonymous Rift executable memfd is missing required seals");
+        }
+        DescriptorBacking::SealedMemfd { seals }
+    } else {
+        DescriptorBacking::RegularFile
+    };
+    let sha256 = descriptor_sha256(file, before.len())?;
+    let after = file
+        .metadata()
+        .context("reinspect inherited Rift executable identity")?;
+    if descriptor_metadata_identity(&before) != descriptor_metadata_identity(&after) {
+        anyhow::bail!("inherited Rift executable changed while hashing");
+    }
+    Ok(InheritedDescriptorIdentity {
+        executable: ExecutableIdentity {
+            path: path.to_path_buf(),
+            device: before.dev(),
+            inode: before.ino(),
+            sha256,
+        },
+        owner: before.uid(),
+        mode: before.mode(),
+        size: before.len(),
+        backing,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn inherited_descriptor_identity(
+    _path: &Path,
+    _file: &File,
+) -> Result<InheritedDescriptorIdentity> {
+    anyhow::bail!("inherited Rift executable descriptors require Linux")
+}
+
+fn descriptor_sha256(file: &File, size: u64) -> Result<String> {
+    let mut digest = Sha256::new();
+    let mut offset = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    while offset < size {
+        let count = file
+            .read_at(&mut buffer, offset)
+            .context("hash inherited Rift executable descriptor")?;
+        if count == 0 {
+            anyhow::bail!("inherited Rift executable changed while hashing");
+        }
+        digest.update(&buffer[..count]);
+        offset = offset
+            .checked_add(count as u64)
+            .context("inherited Rift executable size overflow")?;
+    }
+    if offset != size {
+        anyhow::bail!("inherited Rift executable changed while hashing");
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn descriptor_metadata_identity(metadata: &fs::Metadata) -> (u64, u64, u32, u32, u64) {
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.uid(),
+        metadata.mode(),
+        metadata.len(),
+    )
 }
 
 pub(crate) fn rift_executable_authority() -> Result<ExecutableAuthority> {
@@ -531,6 +742,7 @@ impl AuthorizedCommand {
         if self.execution_prepared {
             return Ok(());
         }
+        self.authority.verify_operation_authority()?;
         let retained_files = self.retained_files.clone();
         let current_directory_descriptor = self.current_directory_descriptor.clone();
         unsafe {
@@ -561,16 +773,20 @@ impl AuthorizedCommand {
 
     pub fn output(&mut self) -> Result<std::process::Output> {
         self.prepare_execution()?;
-        self.command
-            .output()
-            .context("execute sealed executable image")
+        let output = self.command.output();
+        self.authority
+            .verify_operation_authority()
+            .context("verify executable authority after command exit")?;
+        output.context("execute sealed executable image")
     }
 
     pub fn status(&mut self) -> Result<std::process::ExitStatus> {
         self.prepare_execution()?;
-        self.command
-            .status()
-            .context("execute sealed executable image")
+        let status = self.command.status();
+        self.authority
+            .verify_operation_authority()
+            .context("verify executable authority after command exit")?;
+        status.context("execute sealed executable image")
     }
 
     pub(crate) fn retain_file(&mut self, file: std::sync::Arc<File>) {
@@ -616,23 +832,55 @@ pub(crate) fn harden_user_systemd_environment(command: &mut AuthorizedCommand) -
 
 impl ExecutableAuthority {
     pub fn identity(&self) -> &ExecutableIdentity {
-        &self.identity
+        match self {
+            Self::PathExecutable(executable) => &executable.identity,
+            Self::InheritedDescriptorExecutable(executable) => &executable.identity.executable,
+        }
     }
 
     pub fn invocation_path(&self) -> PathBuf {
-        self.identity.path.clone()
+        self.identity().path.clone()
     }
 
     pub fn command(&self) -> AuthorizedCommand {
         AuthorizedCommand::new(self.clone())
     }
+
+    pub(crate) fn verify_operation_authority(&self) -> Result<()> {
+        match self {
+            Self::PathExecutable(_) => Ok(()),
+            Self::InheritedDescriptorExecutable(executable) => {
+                let actual = inherited_descriptor_identity(
+                    &executable.identity.executable.path,
+                    &executable.file,
+                )?;
+                if actual != executable.identity {
+                    anyhow::bail!("inherited Rift executable identity changed");
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn same_identity(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::PathExecutable(left), Self::PathExecutable(right)) => {
+                left.identity == right.identity
+            }
+            (
+                Self::InheritedDescriptorExecutable(left),
+                Self::InheritedDescriptorExecutable(right),
+            ) => left.identity == right.identity,
+            _ => false,
+        }
+    }
 }
 
 pub fn open_executable_authority(identity: &ExecutableIdentity) -> Result<ExecutableAuthority> {
     verify_executable(identity)?;
-    Ok(ExecutableAuthority {
+    Ok(ExecutableAuthority::PathExecutable(PathExecutable {
         identity: identity.clone(),
-    })
+    }))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -719,4 +967,77 @@ fn require_absolute(path: &Path, label: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::os::fd::IntoRawFd;
+
+    fn executable_file(path: &Path, content: &[u8]) {
+        fs::write(path, content).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn descriptor_authority(path: &Path) -> (ExecutableAuthority, RawFd) {
+        let file = OpenOptions::new().read(true).open(path).unwrap();
+        let descriptor = file.into_raw_fd();
+        let proc_path = PathBuf::from(format!("/proc/self/fd/{descriptor}"));
+        (
+            open_inherited_descriptor_executable(&proc_path).unwrap(),
+            descriptor,
+        )
+    }
+
+    #[test]
+    fn inherited_descriptor_command_revalidates_content_before_spawn() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("rift");
+        executable_file(&executable, b"first executable image\n");
+        let (authority, _) = descriptor_authority(&executable);
+
+        fs::write(&executable, b"other executable image\n").unwrap();
+
+        let error = authority.command().output().unwrap_err();
+        assert!(format!("{error:#}").contains("identity changed"));
+    }
+
+    #[test]
+    fn inherited_descriptor_command_revalidates_mode_after_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("rift");
+        fs::copy("/bin/chmod", &executable).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let (authority, _) = descriptor_authority(&executable);
+
+        let error = authority
+            .command()
+            .args([OsStr::new("500"), executable.as_os_str()])
+            .output()
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("identity changed"));
+    }
+
+    #[test]
+    fn inherited_descriptor_authority_rejects_a_reused_descriptor() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("rift");
+        let replacement = root.path().join("replacement");
+        executable_file(&executable, b"first executable image\n");
+        executable_file(&replacement, b"replacement executable\n");
+        let (authority, descriptor) = descriptor_authority(&executable);
+        assert_eq!(unsafe { libc::close(descriptor) }, 0);
+        let replacement = OpenOptions::new().read(true).open(replacement).unwrap();
+        let replacement_descriptor = replacement.into_raw_fd();
+        if replacement_descriptor != descriptor {
+            assert_eq!(
+                unsafe { libc::dup2(replacement_descriptor, descriptor) },
+                descriptor
+            );
+            assert_eq!(unsafe { libc::close(replacement_descriptor) }, 0);
+        }
+
+        let error = authority.verify_operation_authority().unwrap_err();
+        assert!(error.to_string().contains("identity changed"));
+    }
 }

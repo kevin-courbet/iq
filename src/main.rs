@@ -21,6 +21,8 @@ struct Cli {
     #[arg(long, global = true)]
     queue_db: Option<PathBuf>,
     #[arg(long, global = true)]
+    expected_database_id: Option<String>,
+    #[arg(long, global = true)]
     rift_executable: Option<PathBuf>,
     #[cfg(debug_assertions)]
     #[arg(long, global = true, hide = true)]
@@ -107,6 +109,37 @@ enum Command {
         candidate_sha: Option<String>,
         #[arg(long)]
         answer: String,
+    },
+    Review {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        external_id: String,
+        #[arg(long)]
+        review: String,
+        #[arg(long)]
+        effort: String,
+        #[arg(long)]
+        attempt: String,
+        #[arg(long)]
+        cycle: String,
+        #[arg(long)]
+        target_ref: String,
+        #[arg(long)]
+        target_sha: String,
+        #[arg(long)]
+        source_sha: String,
+        #[arg(long)]
+        candidate_sha: String,
+        #[arg(long, value_enum)]
+        decision: ReviewDecisionArg,
+        #[arg(long)]
+        text: Option<String>,
+    },
+    /// Inspect daemon capabilities for an external orchestration backend.
+    Orchestration {
+        #[command(subcommand)]
+        command: OrchestrationCommand,
     },
     Cancel {
         item: String,
@@ -227,6 +260,8 @@ enum AdmitCommand {
         #[arg(long)]
         repo_key: String,
         #[arg(long)]
+        target_branch: Option<String>,
+        #[arg(long)]
         source: String,
         #[arg(long)]
         head: String,
@@ -251,6 +286,10 @@ enum WorkspaceCommand {
         repo_key: String,
         #[arg(long)]
         name: String,
+        #[arg(long, requires = "expected_target_sha")]
+        target_branch: Option<String>,
+        #[arg(long, requires = "target_branch")]
+        expected_target_sha: Option<String>,
     },
     /// List coding-agent workspaces.
     List {
@@ -304,6 +343,19 @@ enum NotifyCommand {
     Redeliver { delivery_id: i64 },
 }
 
+#[derive(Subcommand, Debug)]
+enum OrchestrationCommand {
+    /// Probe the read-only Sisyphus composition contract through the daemon.
+    Probe {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        repo_key: String,
+        #[arg(long)]
+        protocol: String,
+    },
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "iq")]
 struct RemoteCli {
@@ -337,6 +389,8 @@ enum RemoteCommand {
 #[derive(Subcommand, Debug)]
 enum RemoteAdmitCommand {
     Direct {
+        #[arg(long)]
+        target_branch: Option<String>,
         #[arg(long)]
         source: String,
         #[arg(long)]
@@ -376,13 +430,15 @@ enum MigrationCommand {
         #[arg(long)]
         path: PathBuf,
     },
-    /// Migrate exact schema 3 to schema 5 with a version-4 repository-policy inventory.
+    /// Migrate exact schema 3 to schema 6 with a version-4 repository-policy inventory.
     Schema3 {
         #[arg(long)]
         policy_inventory: PathBuf,
     },
-    /// Migrate exact schema 4 to schema 5 and remove transient mount identities.
+    /// Migrate exact schema 4 to schema 6 and remove transient mount identities.
     Schema4,
+    /// Migrate exact schema 5 to schema 6 with per-job targets and candidate review.
+    Schema5,
 }
 
 #[derive(Subcommand, Debug)]
@@ -403,6 +459,12 @@ enum EvidencePhaseArg {
     Signoff,
 }
 
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum ReviewDecisionArg {
+    Approve,
+    RequestChanges,
+}
+
 #[derive(Debug, Serialize)]
 struct EvidenceOutput {
     attempt: Attempt,
@@ -419,6 +481,17 @@ struct EvidenceFile {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let expected_database_id = match &cli.command {
+        Command::Workspace { .. } | Command::Submit { .. } => Some(
+            cli.expected_database_id
+                .clone()
+                .context("workspace and submit commands require --expected-database-id")?,
+        ),
+        _ if cli.expected_database_id.is_some() => {
+            anyhow::bail!("--expected-database-id is valid only for workspace and submit commands")
+        }
+        _ => None,
+    };
     iq::agent_config::validate_rift_executable_environment()?;
     if let Some(path) = cli.rift_executable.as_deref() {
         iq::agent_config::initialize_rift_executable_authority(path)?;
@@ -460,6 +533,9 @@ fn main() -> Result<()> {
             MigrationCommand::Schema4 => {
                 print_json(&SqliteQueue::migrate_schema4(&db_path)?)?;
             }
+            MigrationCommand::Schema5 => {
+                print_json(&SqliteQueue::migrate_schema5(&db_path)?)?;
+            }
             MigrationCommand::InspectGitBinding { path } => {
                 print_json(&iq::git_command::RepositoryBinding::capture(path)?)?;
             }
@@ -488,8 +564,36 @@ fn main() -> Result<()> {
         print_json(&manager.init_preflighted(options)?)?;
         return Ok(());
     }
+    if let Command::Orchestration {
+        command:
+            OrchestrationCommand::Probe {
+                config,
+                repo_key,
+                protocol,
+            },
+    } = &cli.command
+    {
+        let system = iq::agent_config::SystemConfig::load(config)?;
+        let response = iq::control_api::request(
+            &system.control_plane.unix_socket,
+            &iq::control_api::ApiRequest::ProbeOrchestration {
+                repo_key: repo_key.clone(),
+                protocol: protocol.clone(),
+            },
+            system.control_plane.max_response_bytes,
+        )?;
+        if !response.ok {
+            anyhow::bail!("orchestration probe request failed: {}", response.result);
+        }
+        let outcome: iq::control_domain::OrchestrationProbeOutcome =
+            serde_json::from_value(response.result)
+                .context("parse orchestration probe response")?;
+        print_json(&outcome)?;
+        return Ok(());
+    }
     let db_path = match cli.queue_db {
         Some(path) => path,
+        None if expected_database_id.is_some() => SqliteQueue::default_db_path_without_open()?,
         None => SqliteQueue::default_db_path()?,
     };
     match cli.command {
@@ -511,10 +615,33 @@ fn main() -> Result<()> {
             )?,
         },
         Command::Workspace { command } => {
-            let manager = RepositoryManager::new(SqliteQueue::open(&db_path)?);
+            let queue = SqliteQueue::open_expected_database_id(
+                &db_path,
+                expected_database_id
+                    .as_deref()
+                    .context("workspace command lost expected database identity")?,
+            )?;
+            let manager = RepositoryManager::new(queue);
             match command {
-                WorkspaceCommand::Create { repo_key, name } => {
-                    print_json(&manager.create_workspace(&repo_key, &name)?)?
+                WorkspaceCommand::Create {
+                    repo_key,
+                    name,
+                    target_branch,
+                    expected_target_sha,
+                } => {
+                    let workspace = match (target_branch.as_deref(), expected_target_sha.as_deref())
+                    {
+                        (None, None) => manager.create_workspace(&repo_key, &name)?,
+                        (Some(target_branch), Some(expected_target_sha)) => manager
+                            .create_workspace_for_target(
+                                &repo_key,
+                                &name,
+                                target_branch,
+                                expected_target_sha,
+                            )?,
+                        _ => unreachable!("clap enforces explicit workspace target identity"),
+                    };
+                    print_json(&workspace)?;
                 }
                 WorkspaceCommand::List { repo_key } => {
                     print_json(&manager.workspaces(repo_key.as_deref())?)?
@@ -534,7 +661,12 @@ fn main() -> Result<()> {
             }
         }
         Command::Submit { workspace, replace } => {
-            let queue = SqliteQueue::open(&db_path)?;
+            let queue = SqliteQueue::open_expected_database_id(
+                &db_path,
+                expected_database_id
+                    .as_deref()
+                    .context("submit command lost expected database identity")?,
+            )?;
             let manager = RepositoryManager::new(queue.clone());
             let (submission, item) = manager.submit(&workspace, replace.as_deref())?;
             iq::state_repository::reserve_full_issue(&queue.validated_control_store()?, &item.id)?;
@@ -572,16 +704,20 @@ fn main() -> Result<()> {
             let item = match command {
                 AdmitCommand::Direct {
                     repo_key,
+                    target_branch,
                     source,
                     head,
                     producer,
-                } => manager.admit_direct(DirectAdmissionRequest {
-                    repo_key,
-                    source_branch: source,
-                    current_head_sha: head,
-                    producer_metadata: json!({ "producer": producer }),
-                    state_repository: iq::control_domain::StateRepositorySnapshot::Local,
-                })?,
+                } => manager.admit_direct_for_target(
+                    DirectAdmissionRequest {
+                        repo_key,
+                        source_branch: source,
+                        current_head_sha: head,
+                        producer_metadata: json!({ "producer": producer }),
+                        state_repository: iq::control_domain::StateRepositorySnapshot::Local,
+                    },
+                    target_branch.as_deref(),
+                )?,
                 AdmitCommand::Mr {
                     url,
                     repo_key,
@@ -666,6 +802,60 @@ fn main() -> Result<()> {
                 },
                 system.control_plane.max_response_bytes,
             )?)?;
+        }
+        Command::Review {
+            config,
+            external_id,
+            review,
+            effort,
+            attempt,
+            cycle,
+            target_ref,
+            target_sha,
+            source_sha,
+            candidate_sha,
+            decision,
+            text,
+        } => {
+            let decision = match decision {
+                ReviewDecisionArg::Approve => {
+                    iq::control_store::CandidateReviewDecision::Approve { text }
+                }
+                ReviewDecisionArg::RequestChanges => {
+                    iq::control_store::CandidateReviewDecision::RequestChanges {
+                        text: text.context("request-changes review requires --text")?,
+                    }
+                }
+            };
+            let system = iq::agent_config::SystemConfig::load(&config)?;
+            let response = iq::control_api::request(
+                &system.control_plane.unix_socket,
+                &iq::control_api::ApiRequest::Review {
+                    review: iq::control_store::CandidateReviewCommand {
+                        external_id,
+                        review_id: review,
+                        effort_id: effort,
+                        attempt_id: attempt,
+                        cycle_id: cycle,
+                        target_ref: iq::repository::TargetRef::from_full(target_ref)?,
+                        target_sha,
+                        source_sha,
+                        candidate_sha,
+                        decision,
+                    },
+                },
+                system.control_plane.max_response_bytes,
+            )?;
+            if !response.ok {
+                anyhow::bail!("candidate review request failed: {}", response.result);
+            }
+            let receipt: iq::control_store::CandidateReviewReceipt =
+                serde_json::from_value(response.result)
+                    .context("parse candidate review receipt")?;
+            print_json(&receipt)?;
+        }
+        Command::Orchestration { .. } => {
+            unreachable!("orchestration probe returns before local database path resolution")
         }
         Command::Cancel { item } => {
             let queue = SqliteQueue::open(&db_path)?;
@@ -871,16 +1061,20 @@ fn run_remote_exec(db_path: PathBuf, repo_key: String) -> Result<()> {
             let manager = RepositoryManager::new(queue.clone());
             let item = match command {
                 RemoteAdmitCommand::Direct {
+                    target_branch,
                     source,
                     head,
                     producer,
-                } => manager.admit_direct(DirectAdmissionRequest {
-                    repo_key,
-                    source_branch: source,
-                    current_head_sha: head,
-                    producer_metadata: json!({ "producer": producer }),
-                    state_repository: iq::control_domain::StateRepositorySnapshot::Local,
-                })?,
+                } => manager.admit_direct_for_target(
+                    DirectAdmissionRequest {
+                        repo_key,
+                        source_branch: source,
+                        current_head_sha: head,
+                        producer_metadata: json!({ "producer": producer }),
+                        state_repository: iq::control_domain::StateRepositorySnapshot::Local,
+                    },
+                    target_branch.as_deref(),
+                )?,
                 RemoteAdmitCommand::Mr { url, producer } => manager.admit_merge_request(
                     &repo_key,
                     &url,

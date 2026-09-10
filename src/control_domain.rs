@@ -1,9 +1,57 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Component, Path, PathBuf};
 
 pub const AUTOMATIC_CYCLE_LIMIT: u8 = 10;
+pub const SISYPHUS_BACKEND_PROTOCOL: &str = "sisyphus-backend/v1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestrationUnavailableReason {
+    ProtocolMismatch,
+    InvalidRepositoryKey,
+    RepositoryNotFound,
+    RepositoryDraining,
+    RepositoryDisabled,
+    DirectIntegrationRequired,
+    CurrentSchemaRequired,
+    StateAuthorityUnavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OrchestrationProbeOutcome {
+    Available {
+        protocol: String,
+        repo_key: String,
+        database_id: String,
+        database_path: EncodedAbsolutePath,
+        object_format: crate::git_object::GitObjectFormat,
+        default_target_branch: String,
+        integration_policy: crate::repository_policy::IntegrationPolicy,
+        workspace_create: bool,
+        local_submit: bool,
+        semantic_review: bool,
+        exact_candidate_landing: bool,
+    },
+    Unavailable {
+        protocol: String,
+        repo_key: String,
+        reason: OrchestrationUnavailableReason,
+    },
+}
+
+impl OrchestrationProbeOutcome {
+    pub(crate) fn unavailable(repo_key: &str, reason: OrchestrationUnavailableReason) -> Self {
+        Self::Unavailable {
+            protocol: SISYPHUS_BACKEND_PROTOCOL.into(),
+            repo_key: repo_key.into(),
+            reason,
+        }
+    }
+}
 
 pub fn validate_cycle_id(cycle_id: &str) -> Result<()> {
     if cycle_id.is_empty()
@@ -246,6 +294,7 @@ pub enum IntegrationEffortState {
     AgentLaunching(AgentLaunching),
     AgentRunning(AgentRunning),
     CandidateBuilding(CandidateBuilding),
+    ReviewRequired(CandidateReviewRequired),
     CandidateReady(CandidateReady),
     Validating(Validating),
     GuidanceRequired(BlockedEffort),
@@ -267,6 +316,7 @@ impl IntegrationEffortState {
             Self::AgentLaunching(_) => "agent_launching",
             Self::AgentRunning(_) => "agent_running",
             Self::CandidateBuilding(_) => "candidate_building",
+            Self::ReviewRequired(_) => "review_required",
             Self::CandidateReady(_) => "candidate_ready",
             Self::Validating(_) => "validating",
             Self::GuidanceRequired(_) => "guidance_required",
@@ -291,8 +341,13 @@ impl IntegrationEffortState {
         }
     }
 
+    pub fn is_provider_input_state(&self) -> bool {
+        matches!(self, Self::GuidanceRequired(_) | Self::ReviewRequired(_))
+    }
+
     pub fn candidate_sha(&self) -> Option<&str> {
         match self {
+            Self::ReviewRequired(value) => Some(&value.candidate_sha),
             Self::CandidateReady(value) => Some(&value.candidate_sha),
             Self::Validating(value) => Some(&value.candidate_sha),
             Self::Landing(value) => Some(&value.candidate_sha),
@@ -320,6 +375,7 @@ impl IntegrationEffortState {
             | Self::AgentLaunching(_)
             | Self::AgentRunning(_)
             | Self::CandidateBuilding(_)
+            | Self::ReviewRequired(_)
             | Self::CandidateReady(_)
             | Self::Validating(_)
             | Self::Landing(_)
@@ -461,6 +517,9 @@ impl IntegrationEffortState {
             }
             Self::CandidateReady(value) => {
                 object_format.require_oid(&value.candidate_sha, "ready candidate")?;
+            }
+            Self::ReviewRequired(value) => {
+                object_format.require_oid(&value.candidate_sha, "candidate awaiting review")?;
             }
             Self::Validating(value) => {
                 object_format.require_oid(&value.candidate_sha, "validating candidate")?;
@@ -676,15 +735,102 @@ pub struct CandidateBuilding {
     pub committer_timestamp: String,
     pub message: String,
     pub operation_ref: String,
+    pub classification: CandidateClassification,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateClassification {
+    Mechanical,
+    Semantic,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CompositionEvidence {
+    Clean { mechanical_tree_sha: String },
+    TargetMoved { mechanical_tree_sha: String },
+    Conflicted { conflict_paths_sha256: String },
+    MigratedUnknown { source_schema: u32 },
+    MigratedPostRelease { source_schema: u32 },
+}
+
+impl CompositionEvidence {
+    pub fn candidate_classification(&self, accepted_tree_sha: &str) -> CandidateClassification {
+        match self {
+            Self::Clean {
+                mechanical_tree_sha,
+            } if mechanical_tree_sha == accepted_tree_sha => CandidateClassification::Mechanical,
+            Self::Clean { .. }
+            | Self::TargetMoved { .. }
+            | Self::Conflicted { .. }
+            | Self::MigratedUnknown { .. }
+            | Self::MigratedPostRelease { .. } => CandidateClassification::Semantic,
+        }
+    }
+
+    pub(crate) fn validate(
+        &self,
+        object_format: crate::git_object::GitObjectFormat,
+        allow_migrated_unknown: bool,
+    ) -> Result<()> {
+        match self {
+            Self::Clean {
+                mechanical_tree_sha,
+            }
+            | Self::TargetMoved {
+                mechanical_tree_sha,
+            } => object_format.require_oid(mechanical_tree_sha, "mechanical composition tree"),
+            Self::Conflicted {
+                conflict_paths_sha256,
+            } if conflict_paths_sha256.len() == 64
+                && conflict_paths_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()) =>
+            {
+                Ok(())
+            }
+            Self::Conflicted { .. } => {
+                anyhow::bail!("conflict-path evidence must be an exact SHA-256 digest")
+            }
+            Self::MigratedUnknown { source_schema }
+                if allow_migrated_unknown && matches!(source_schema, 3 | 5) =>
+            {
+                Ok(())
+            }
+            Self::MigratedPostRelease { source_schema }
+                if allow_migrated_unknown && matches!(source_schema, 3 | 5) =>
+            {
+                Ok(())
+            }
+            Self::MigratedUnknown { .. } | Self::MigratedPostRelease { .. } => {
+                anyhow::bail!("migrated composition evidence is not valid runtime composition")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateReviewRequired {
+    pub review_id: String,
+    pub cycle_id: String,
+    pub candidate_sha: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CandidateReview {
+    Mechanical,
+    Approved { review_id: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateReady {
-    pub operation_id: String,
     pub cycle_id: String,
     pub candidate_sha: String,
-    pub staged_tree_sha256: String,
+    pub review: CandidateReview,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -740,6 +886,7 @@ pub struct BlockedEffort {
 pub enum ResumeState {
     AgentReady(AgentReady),
     CandidateBuilding(CandidateBuilding),
+    ReviewRequired(CandidateReviewRequired),
     CandidateReady(CandidateReady),
     Validating(Validating),
     Landing(Landing),
@@ -749,6 +896,7 @@ pub enum ResumeState {
 impl ResumeState {
     pub(crate) fn candidate_sha(&self) -> Option<&str> {
         match self {
+            Self::ReviewRequired(value) => Some(&value.candidate_sha),
             Self::CandidateReady(value) => Some(&value.candidate_sha),
             Self::Validating(value) => Some(&value.candidate_sha),
             Self::Landing(value) => Some(&value.candidate_sha),
@@ -762,6 +910,7 @@ impl ResumeState {
             Self::LandingUncertain(_) => true,
             Self::AgentReady(_)
             | Self::CandidateBuilding(_)
+            | Self::ReviewRequired(_)
             | Self::CandidateReady(_)
             | Self::Validating(_)
             | Self::Landing(_) => false,
@@ -773,6 +922,9 @@ impl ResumeState {
             IntegrationEffortState::AgentReady(value) => Ok(Self::AgentReady(value.clone())),
             IntegrationEffortState::CandidateBuilding(value) => {
                 Ok(Self::CandidateBuilding(value.clone()))
+            }
+            IntegrationEffortState::ReviewRequired(value) => {
+                Ok(Self::ReviewRequired(value.clone()))
             }
             IntegrationEffortState::CandidateReady(value) => {
                 Ok(Self::CandidateReady(value.clone()))
@@ -792,6 +944,7 @@ impl ResumeState {
             Self::CandidateBuilding(value) => {
                 IntegrationEffortState::CandidateBuilding(value.clone())
             }
+            Self::ReviewRequired(value) => IntegrationEffortState::ReviewRequired(value.clone()),
             Self::CandidateReady(value) => IntegrationEffortState::CandidateReady(value.clone()),
             Self::Validating(value) => IntegrationEffortState::Validating(value.clone()),
             Self::Landing(value) => IntegrationEffortState::Landing(value.clone()),
@@ -806,6 +959,7 @@ impl ResumeState {
             self,
             Self::AgentReady(_)
                 | Self::CandidateBuilding(_)
+                | Self::ReviewRequired(_)
                 | Self::CandidateReady(_)
                 | Self::Validating(_)
                 | Self::Landing(_)
@@ -844,6 +998,9 @@ impl ResumeState {
             }
             Self::CandidateReady(value) => {
                 object_format.require_oid(&value.candidate_sha, "blocked ready candidate")?;
+            }
+            Self::ReviewRequired(value) => {
+                object_format.require_oid(&value.candidate_sha, "blocked review candidate")?;
             }
             Self::Validating(value) => {
                 object_format.require_oid(&value.candidate_sha, "blocked validating candidate")?;
@@ -1089,6 +1246,66 @@ pub struct EncodedPathComponent {
     pub hex: String,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct EncodedAbsolutePath(Vec<EncodedPathComponent>);
+
+impl EncodedAbsolutePath {
+    pub fn from_path(path: &Path) -> Result<Self> {
+        if !path.is_absolute() {
+            anyhow::bail!("encoded absolute path requires an absolute path");
+        }
+        let mut components = Vec::new();
+        for component in path.components() {
+            match component {
+                Component::RootDir => {}
+                Component::Normal(component) => components.push(EncodedPathComponent {
+                    hex: component
+                        .as_bytes()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect(),
+                }),
+                _ => anyhow::bail!("encoded absolute path is not canonical"),
+            }
+        }
+        let encoded = Self::from_components(components)?;
+        if encoded.to_path_buf()?.as_os_str().as_bytes() != path.as_os_str().as_bytes() {
+            anyhow::bail!("encoded absolute path is not canonical");
+        }
+        Ok(encoded)
+    }
+
+    pub fn to_path_buf(&self) -> Result<PathBuf> {
+        let mut path = PathBuf::from("/");
+        for component in &self.0 {
+            let bytes = decode_path_component(component)?;
+            path.push(std::ffi::OsString::from_vec(bytes));
+        }
+        Ok(path)
+    }
+
+    fn from_components(components: Vec<EncodedPathComponent>) -> Result<Self> {
+        if components.is_empty() {
+            anyhow::bail!("encoded absolute path has no components");
+        }
+        for component in &components {
+            decode_path_component(component)?;
+        }
+        Ok(Self(components))
+    }
+}
+
+impl<'de> Deserialize<'de> for EncodedAbsolutePath {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let components = Vec::<EncodedPathComponent>::deserialize(deserializer)?;
+        Self::from_components(components).map_err(serde::de::Error::custom)
+    }
+}
+
 impl EncodedPath {
     pub fn from_bytes(path: &[u8]) -> Result<Self> {
         if path.is_empty() || path.starts_with(b"/") || path.ends_with(b"/") {
@@ -1116,24 +1333,7 @@ impl EncodedPath {
         }
         let mut path = Vec::new();
         for (index, component) in self.0.iter().enumerate() {
-            if component.hex.is_empty()
-                || component.hex.len() % 2 != 0
-                || !component.hex.bytes().all(|byte| byte.is_ascii_hexdigit())
-            {
-                anyhow::bail!("encoded path component is not canonical hexadecimal");
-            }
-            let bytes = (0..component.hex.len())
-                .step_by(2)
-                .map(|offset| u8::from_str_radix(&component.hex[offset..offset + 2], 16))
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            if bytes.is_empty()
-                || bytes == b"."
-                || bytes == b".."
-                || bytes.contains(&0)
-                || bytes.contains(&b'/')
-            {
-                anyhow::bail!("encoded path component is invalid");
-            }
+            let bytes = decode_path_component(component)?;
             if index != 0 {
                 path.push(b'/');
             }
@@ -1141,6 +1341,28 @@ impl EncodedPath {
         }
         Ok(path)
     }
+}
+
+fn decode_path_component(component: &EncodedPathComponent) -> Result<Vec<u8>> {
+    if component.hex.is_empty()
+        || !component.hex.len().is_multiple_of(2)
+        || !component.hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        anyhow::bail!("encoded path component is not canonical hexadecimal");
+    }
+    let bytes = (0..component.hex.len())
+        .step_by(2)
+        .map(|offset| u8::from_str_radix(&component.hex[offset..offset + 2], 16))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if bytes.is_empty()
+        || bytes == b"."
+        || bytes == b".."
+        || bytes.contains(&0)
+        || bytes.contains(&b'/')
+    {
+        anyhow::bail!("encoded path component is invalid");
+    }
+    Ok(bytes)
 }
 
 pub fn require_exact_text<'a>(value: &'a str, label: &str) -> Result<&'a str> {
@@ -1297,12 +1519,12 @@ mod tests {
                 committer_timestamp: "2026-01-01T00:00:00Z".into(),
                 message: "candidate".into(),
                 operation_ref: "refs/iq/candidate-operations/candidate-1".into(),
+                classification: CandidateClassification::Mechanical,
             }),
             IntegrationEffortState::CandidateReady(CandidateReady {
-                operation_id: "candidate-1".into(),
                 cycle_id: "cycle-1".into(),
                 candidate_sha: "3".repeat(40),
-                staged_tree_sha256: "a".repeat(64),
+                review: CandidateReview::Mechanical,
             }),
             IntegrationEffortState::Validating(Validating {
                 candidate_sha: "3".repeat(40),

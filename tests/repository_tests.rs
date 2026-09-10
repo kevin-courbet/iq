@@ -1,22 +1,36 @@
+use iq::composition::RepositoryManager;
 use iq::sqlite::{CheckoutReconciliationState, SqliteQueue};
 mod support;
 use rusqlite::Connection;
 use serde_json::Value;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::Read;
 #[cfg(debug_assertions)]
 use std::io::Seek;
+#[cfg(target_os = "linux")]
+use std::io::Write;
 use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 #[cfg(debug_assertions)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Output, Stdio};
+#[cfg(debug_assertions)]
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use support::{direct_policy, managed_test_tempdir, Command};
 use tempfile::tempdir;
 #[cfg(debug_assertions)]
 use wait_timeout::ChildExt;
+
+#[cfg(debug_assertions)]
+fn registration_race_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+}
 
 fn git(path: &Path, args: &[&str]) -> String {
     let mut command = std::process::Command::new("git");
@@ -47,6 +61,7 @@ struct CliFixture {
     remote: PathBuf,
     bootstrap: PathBuf,
     database: PathBuf,
+    database_id: RefCell<Option<String>>,
     rift_database: PathBuf,
 }
 
@@ -78,6 +93,7 @@ impl CliFixture {
         std::fs::write(bootstrap.join("dirty.txt"), "not committed\n").unwrap();
         Self {
             database: root.join("queues.db"),
+            database_id: RefCell::new(None),
             rift_database: root.join("rift.sqlite"),
             _temporary: temporary,
             root,
@@ -86,7 +102,7 @@ impl CliFixture {
         }
     }
 
-    fn iq_command(&self, args: &[&str]) -> Command {
+    fn iq_command_without_expected_database_id(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_iq"));
         command
             .env("IQ_RIFT_DATABASE", &self.rift_database)
@@ -97,8 +113,51 @@ impl CliFixture {
         command
     }
 
+    fn iq_command_with_expected_database_id(
+        &self,
+        args: &[&str],
+        expected_database_id: &str,
+    ) -> Command {
+        let mut command = self.iq_command_without_expected_database_id(&[]);
+        command
+            .arg("--expected-database-id")
+            .arg(expected_database_id)
+            .args(args);
+        command
+    }
+
+    fn iq_command(&self, args: &[&str]) -> Command {
+        if matches!(args.first(), Some(&"workspace" | &"submit")) {
+            let database_id = self
+                .database_id
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| "test-expected-database-id".into());
+            self.iq_command_with_expected_database_id(args, &database_id)
+        } else {
+            self.iq_command_without_expected_database_id(args)
+        }
+    }
+
     fn iq(&self, args: &[&str]) -> Output {
         self.iq_command(args).output().unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn iq_with_rift_executable(&self, args: &[&str], rift_executable: &Path) -> Output {
+        let mut command =
+            Command::new_with_rift_executable(env!("CARGO_BIN_EXE_iq"), rift_executable);
+        command
+            .env("IQ_RIFT_DATABASE", &self.rift_database)
+            .env("IQ_TEST_MODEL_KEY", "repository-test-model-key")
+            .arg("--queue-db")
+            .arg(&self.database);
+        if matches!(args.first(), Some(&"workspace" | &"submit")) {
+            command
+                .arg("--expected-database-id")
+                .arg(self.database_id.borrow().as_deref().unwrap());
+        }
+        command.args(args).output().unwrap()
     }
 
     #[cfg(debug_assertions)]
@@ -108,7 +167,7 @@ impl CliFixture {
 
     fn init(&self, target: &str) -> Output {
         let policy = self.policy(target);
-        self.iq(&[
+        let output = self.iq(&[
             "repo",
             "init",
             "--path",
@@ -117,13 +176,22 @@ impl CliFixture {
             self.root.to_str().unwrap(),
             "--policy",
             policy.to_str().unwrap(),
-        ])
+        ]);
+        if output.status.success() {
+            *self.database_id.borrow_mut() = Some(
+                SqliteQueue::open(&self.database)
+                    .unwrap()
+                    .database_id()
+                    .unwrap(),
+            );
+        }
+        output
     }
 
     #[cfg(debug_assertions)]
     fn bounded_init(&self, target: &str, context: &str) -> Output {
         let policy = self.policy(target);
-        self.bounded_iq(
+        let output = self.bounded_iq(
             &[
                 "repo",
                 "init",
@@ -135,7 +203,16 @@ impl CliFixture {
                 policy.to_str().unwrap(),
             ],
             context,
-        )
+        );
+        if output.status.success() {
+            *self.database_id.borrow_mut() = Some(
+                SqliteQueue::open(&self.database)
+                    .unwrap()
+                    .database_id()
+                    .unwrap(),
+            );
+        }
+        output
     }
 
     fn policy(&self, target: &str) -> PathBuf {
@@ -154,6 +231,543 @@ fn successful_json(output: Output) -> Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[cfg(target_os = "linux")]
+struct InheritedRiftExecutable {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl InheritedRiftExecutable {
+    fn sealed_memfd(source: &Path) -> Self {
+        let name = std::ffi::CString::new("iq-rift-executable-test").unwrap();
+        let descriptor = unsafe {
+            libc::memfd_create(name.as_ptr(), libc::MFD_ALLOW_SEALING | libc::MFD_CLOEXEC)
+        };
+        assert!(descriptor >= 0, "{}", std::io::Error::last_os_error());
+        let mut writable = unsafe { std::fs::File::from_raw_fd(descriptor) };
+        std::io::copy(&mut std::fs::File::open(source).unwrap(), &mut writable).unwrap();
+        writable.flush().unwrap();
+        assert_eq!(unsafe { libc::fchmod(writable.as_raw_fd(), 0o500) }, 0);
+        let seals =
+            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        assert_eq!(
+            unsafe { libc::fcntl(writable.as_raw_fd(), libc::F_ADD_SEALS, seals) },
+            0
+        );
+        let path = PathBuf::from(format!("/proc/self/fd/{}", writable.as_raw_fd()));
+        let file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+        drop(writable);
+        assert_eq!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) },
+            0
+        );
+        let path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        Self { file, path }
+    }
+
+    fn path(&self) -> &Path {
+        assert!(self.file.metadata().unwrap().is_file());
+        &self.path
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn compile_rift_descriptor_probe(root: &Path) -> PathBuf {
+    let probe = root.join("rift-descriptor-probe");
+    let output = std::process::Command::new("rustc")
+        .env("REAL_RIFT_EXECUTABLE", support::rift_executable_path())
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rift_descriptor_probe.rs"))
+        .arg("-o")
+        .arg(&probe)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    probe
+}
+
+#[cfg(target_os = "linux")]
+fn inherit_descriptor(file: &impl AsRawFd) {
+    assert_eq!(
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) },
+        0
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn invalid_rift_executable_output(path: &Path, queue: &Path) -> Output {
+    Command::new_with_rift_executable(env!("CARGO_BIN_EXE_iq"), path)
+        .arg("--queue-db")
+        .arg(queue)
+        .arg("list")
+        .output()
+        .unwrap()
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn sealed_memfd_rift_executable_supports_workspace_create_list_and_remove_without_descriptor_leak()
+{
+    let fixture = CliFixture::new("main");
+    let repository = successful_json(fixture.init("main"));
+    let repo_key = repository["key"].as_str().unwrap();
+    let probe = compile_rift_descriptor_probe(&fixture.root);
+    let executable = InheritedRiftExecutable::sealed_memfd(&probe);
+
+    let workspace = successful_json(fixture.iq_with_rift_executable(
+        &[
+            "workspace",
+            "create",
+            "--repo-key",
+            repo_key,
+            "--name",
+            "descriptor-authority",
+        ],
+        executable.path(),
+    ));
+    let listed = successful_json(fixture.iq_with_rift_executable(
+        &["workspace", "list", "--repo-key", repo_key],
+        executable.path(),
+    ));
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["id"], workspace["id"]);
+
+    let removed = successful_json(fixture.iq_with_rift_executable(
+        &["workspace", "remove", workspace["id"].as_str().unwrap()],
+        executable.path(),
+    ));
+    assert_eq!(removed["status"], "removed");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn inherited_rift_executable_rejects_non_descriptor_proc_paths_and_closed_descriptors() {
+    let root = managed_test_tempdir(".iq-rift-descriptor-rejection-");
+    let queue = root.path().join("queue.db");
+
+    let arbitrary = invalid_rift_executable_output(Path::new("/proc/self/status"), &queue);
+    assert!(!arbitrary.status.success());
+    assert!(String::from_utf8_lossy(&arbitrary.stderr).contains("/proc/self/fd/<n>"));
+
+    let closed = invalid_rift_executable_output(Path::new("/proc/self/fd/1048575"), &queue);
+    assert!(!closed.status.success());
+    assert!(String::from_utf8_lossy(&closed.stderr).contains("inherited Rift executable"));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn inherited_rift_executable_rejects_pipe_socket_and_directory_descriptors() {
+    let root = managed_test_tempdir(".iq-rift-descriptor-type-");
+    let queue = root.path().join("queue.db");
+    let mut pipe = [0; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+        0
+    );
+    let pipe_read = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
+    let _pipe_write = unsafe { std::fs::File::from_raw_fd(pipe[1]) };
+    inherit_descriptor(&pipe_read);
+    let pipe_path = PathBuf::from(format!("/proc/self/fd/{}", pipe_read.as_raw_fd()));
+    let rejected_pipe = invalid_rift_executable_output(&pipe_path, &queue);
+    assert!(!rejected_pipe.status.success());
+    assert!(String::from_utf8_lossy(&rejected_pipe.stderr).contains("regular file"));
+
+    let sockets = std::os::unix::net::UnixStream::pair().unwrap();
+    inherit_descriptor(&sockets.0);
+    let socket_path = PathBuf::from(format!("/proc/self/fd/{}", sockets.0.as_raw_fd()));
+    let rejected_socket = invalid_rift_executable_output(&socket_path, &queue);
+    assert!(!rejected_socket.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected_socket.stderr).contains("regular file"),
+        "{}",
+        String::from_utf8_lossy(&rejected_socket.stderr)
+    );
+
+    let directory = std::fs::File::open(root.path()).unwrap();
+    inherit_descriptor(&directory);
+    let directory_path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+    let rejected_directory = invalid_rift_executable_output(&directory_path, &queue);
+    assert!(!rejected_directory.status.success());
+    assert!(String::from_utf8_lossy(&rejected_directory.stderr).contains("regular file"));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn inherited_rift_executable_rejects_writable_and_unsealed_memfd_descriptors() {
+    let root = managed_test_tempdir(".iq-rift-descriptor-mode-");
+    let queue = root.path().join("queue.db");
+    let writable_path = root.path().join("writable-rift");
+    std::fs::copy(support::rift_executable_path(), &writable_path).unwrap();
+    std::fs::set_permissions(&writable_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let writable = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&writable_path)
+        .unwrap();
+    inherit_descriptor(&writable);
+    let writable_descriptor = PathBuf::from(format!("/proc/self/fd/{}", writable.as_raw_fd()));
+    let rejected_writable = invalid_rift_executable_output(&writable_descriptor, &queue);
+    assert!(!rejected_writable.status.success());
+    assert!(String::from_utf8_lossy(&rejected_writable.stderr).contains("read-only"));
+
+    let name = std::ffi::CString::new("iq-unsealed-rift-executable-test").unwrap();
+    let descriptor =
+        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_ALLOW_SEALING | libc::MFD_CLOEXEC) };
+    assert!(descriptor >= 0);
+    let mut unsealed_write = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    std::io::copy(
+        &mut std::fs::File::open(support::rift_executable_path()).unwrap(),
+        &mut unsealed_write,
+    )
+    .unwrap();
+    unsealed_write.flush().unwrap();
+    assert_eq!(
+        unsafe { libc::fchmod(unsealed_write.as_raw_fd(), 0o500) },
+        0
+    );
+    let unsealed_write_path =
+        PathBuf::from(format!("/proc/self/fd/{}", unsealed_write.as_raw_fd()));
+    let unsealed = std::fs::OpenOptions::new()
+        .read(true)
+        .open(unsealed_write_path)
+        .unwrap();
+    drop(unsealed_write);
+    inherit_descriptor(&unsealed);
+    let unsealed_path = PathBuf::from(format!("/proc/self/fd/{}", unsealed.as_raw_fd()));
+    let rejected_unsealed = invalid_rift_executable_output(&unsealed_path, &queue);
+    assert!(!rejected_unsealed.status.success());
+    assert!(String::from_utf8_lossy(&rejected_unsealed.stderr).contains("seals"));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn inherited_rift_executable_rejects_a_descriptor_owned_by_another_user() {
+    let root = managed_test_tempdir(".iq-rift-descriptor-owner-");
+    let queue = root.path().join("queue.db");
+    let foreign_path = if unsafe { libc::geteuid() } == 0 {
+        let path = root.path().join("foreign-rift");
+        std::fs::copy(support::rift_executable_path(), &path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let path_bytes = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::chown(path_bytes.as_ptr(), 65534, 65534) }, 0);
+        path
+    } else {
+        PathBuf::from("/bin/true")
+    };
+    let foreign = std::fs::File::open(foreign_path).unwrap();
+    assert_ne!(foreign.metadata().unwrap().uid(), unsafe {
+        libc::geteuid()
+    });
+    inherit_descriptor(&foreign);
+    let foreign_descriptor = PathBuf::from(format!("/proc/self/fd/{}", foreign.as_raw_fd()));
+
+    let rejected = invalid_rift_executable_output(&foreign_descriptor, &queue);
+
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("current user"));
+}
+
+#[test]
+fn expected_database_id_mismatch_precedes_full_content_validation() {
+    let root = managed_test_tempdir(".iq-expected-database-order-");
+    let expected_database = root.path().join("expected.db");
+    let different_database = root.path().join("different.db");
+    let expected_database_id = SqliteQueue::open(&expected_database)
+        .unwrap()
+        .database_id()
+        .unwrap();
+    let different_database_id = SqliteQueue::open(&different_database)
+        .unwrap()
+        .database_id()
+        .unwrap();
+    assert_ne!(expected_database_id, different_database_id);
+    Connection::open(&different_database)
+        .unwrap()
+        .execute_batch("DROP TRIGGER queue_item_target_ref_immutable")
+        .unwrap();
+
+    let rejected = Command::new(env!("CARGO_BIN_EXE_iq"))
+        .arg("--queue-db")
+        .arg(&different_database)
+        .arg("--expected-database-id")
+        .arg(&expected_database_id)
+        .args(["workspace", "list"])
+        .output()
+        .unwrap();
+
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr)
+        .contains("queue database ID does not match --expected-database-id"));
+}
+
+#[test]
+fn expected_database_id_mismatch_precedes_repository_access_for_a_valid_database() {
+    let expected = CliFixture::new("main");
+    successful_json(expected.init("main"));
+    let expected_database_id = expected.database_id.borrow().clone().unwrap();
+    let different = CliFixture::new("main");
+    let repository = successful_json(different.init("main"));
+    let different_database_id = different.database_id.borrow().clone().unwrap();
+    assert_ne!(expected_database_id, different_database_id);
+    let repo_key = repository["key"].as_str().unwrap();
+    let owned_root = PathBuf::from(repository["owned_root_path"].as_str().unwrap());
+    let unavailable_git = owned_root.join(".git-unavailable");
+    std::fs::rename(owned_root.join(".git"), &unavailable_git).unwrap();
+    let unavailable_canonical = different.root.join("remote-unavailable.git");
+    std::fs::rename(&different.remote, &unavailable_canonical).unwrap();
+    let database_before = std::fs::read(&different.database).unwrap();
+    let workspace_path =
+        PathBuf::from(repository["development_root_path"].as_str().unwrap()).join("wrong-database");
+
+    let rejected = different
+        .iq_command_with_expected_database_id(
+            &[
+                "workspace",
+                "create",
+                "--repo-key",
+                repo_key,
+                "--name",
+                "wrong-database",
+            ],
+            &expected_database_id,
+        )
+        .output()
+        .unwrap();
+
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr)
+        .contains("queue database ID does not match --expected-database-id"));
+    assert_eq!(std::fs::read(&different.database).unwrap(), database_before);
+    assert!(!workspace_path.exists());
+    assert!(unavailable_git.is_dir());
+    assert!(unavailable_canonical.is_dir());
+    assert_eq!(
+        Connection::open(&different.database)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM development_workspaces", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn direct_cli_operations_require_exact_database_identity_across_restarts_and_path_replacement() {
+    let fixture = CliFixture::new("main");
+    let repository = successful_json(fixture.init("main"));
+    let repo_key = repository["key"].as_str().unwrap();
+    let database_id = SqliteQueue::open(&fixture.database)
+        .unwrap()
+        .database_id()
+        .unwrap();
+
+    let missing = fixture
+        .iq_command_without_expected_database_id(&["workspace", "list"])
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("--expected-database-id"));
+
+    let absent_parent = fixture.root.join("absent-database-parent");
+    let absent_database = absent_parent.join("queue.db");
+    let absent = Command::new(env!("CARGO_BIN_EXE_iq"))
+        .env("IQ_RIFT_DATABASE", &fixture.rift_database)
+        .arg("--queue-db")
+        .arg(&absent_database)
+        .arg("--expected-database-id")
+        .arg(&database_id)
+        .args(["workspace", "list"])
+        .output()
+        .unwrap();
+    assert!(!absent.status.success());
+    assert!(!absent_parent.exists());
+
+    let wrong_name = "wrong-database-workspace";
+    let before_wrong_id = std::fs::read(&fixture.database).unwrap();
+    let wrong = fixture
+        .iq_command_with_expected_database_id(
+            &[
+                "workspace",
+                "create",
+                "--repo-key",
+                repo_key,
+                "--name",
+                wrong_name,
+            ],
+            "00000000-0000-4000-8000-000000000099",
+        )
+        .output()
+        .unwrap();
+    assert!(!wrong.status.success());
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains("database ID"));
+    assert_eq!(std::fs::read(&fixture.database).unwrap(), before_wrong_id);
+    assert!(
+        RepositoryManager::new(SqliteQueue::open(&fixture.database).unwrap())
+            .workspaces(Some(repo_key))
+            .unwrap()
+            .is_empty()
+    );
+
+    let workspace = successful_json(
+        fixture
+            .iq_command_with_expected_database_id(
+                &[
+                    "workspace",
+                    "create",
+                    "--repo-key",
+                    repo_key,
+                    "--name",
+                    "bound-workspace",
+                ],
+                &database_id,
+            )
+            .output()
+            .unwrap(),
+    );
+    let workspace_id = workspace["id"].as_str().unwrap();
+    let restarted_status = fixture
+        .iq_command_with_expected_database_id(&["workspace", "status", workspace_id], &database_id)
+        .output()
+        .unwrap();
+    successful_json(restarted_status);
+
+    let replacement = fixture.root.join("replacement.db");
+    let replacement_id = SqliteQueue::open(&replacement)
+        .unwrap()
+        .database_id()
+        .unwrap();
+    assert_ne!(replacement_id, database_id);
+    let replacement_bytes = std::fs::read(&replacement).unwrap();
+    let original = fixture.root.join("original.db");
+    std::fs::rename(&fixture.database, &original).unwrap();
+    std::fs::rename(&replacement, &fixture.database).unwrap();
+    let replaced = fixture
+        .iq_command_with_expected_database_id(&["workspace", "status", workspace_id], &database_id)
+        .output()
+        .unwrap();
+    assert!(!replaced.status.success());
+    assert!(String::from_utf8_lossy(&replaced.stderr).contains("database ID"));
+    assert_eq!(std::fs::read(&fixture.database).unwrap(), replacement_bytes);
+
+    std::fs::rename(&fixture.database, &replacement).unwrap();
+    std::fs::rename(&original, &fixture.database).unwrap();
+    let restarted_list = successful_json(
+        fixture
+            .iq_command_with_expected_database_id(
+                &["workspace", "list", "--repo-key", repo_key],
+                &database_id,
+            )
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(restarted_list.as_array().unwrap().len(), 1);
+
+    let workspace_path = PathBuf::from(workspace["path"].as_str().unwrap());
+    git(&workspace_path, &["config", "user.name", "IQ Test"]);
+    git(
+        &workspace_path,
+        &["config", "user.email", "iq@example.test"],
+    );
+    git(&workspace_path, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(workspace_path.join("bound.txt"), "bound\n").unwrap();
+    git(&workspace_path, &["add", "bound.txt"]);
+    git(&workspace_path, &["commit", "-m", "bound submission"]);
+    successful_json(
+        fixture
+            .iq_command_with_expected_database_id(
+                &["submit", "--workspace", workspace_id],
+                &database_id,
+            )
+            .output()
+            .unwrap(),
+    );
+
+    let removable = successful_json(
+        fixture
+            .iq_command_with_expected_database_id(
+                &[
+                    "workspace",
+                    "create",
+                    "--repo-key",
+                    repo_key,
+                    "--name",
+                    "bound-removal",
+                ],
+                &database_id,
+            )
+            .output()
+            .unwrap(),
+    );
+    let removed = successful_json(
+        fixture
+            .iq_command_with_expected_database_id(
+                &["workspace", "remove", removable["id"].as_str().unwrap()],
+                &database_id,
+            )
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(removed["status"], "removed");
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn expected_database_identity_rejects_missing_and_wrong_default_paths_without_filesystem_mutation()
+{
+    let fixture = CliFixture::new("main");
+    successful_json(fixture.init("main"));
+    let expected_database_id = SqliteQueue::open(&fixture.database)
+        .unwrap()
+        .database_id()
+        .unwrap();
+
+    let missing_state = fixture.root.join("missing-default-state");
+    let missing = Command::new(env!("CARGO_BIN_EXE_iq"))
+        .env("XDG_STATE_HOME", &missing_state)
+        .env("IQ_TEST_DATABASE_STOP_AFTER", "open_resynced")
+        .arg("--expected-database-id")
+        .arg(&expected_database_id)
+        .args(["workspace", "list"])
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(!missing_state.exists());
+
+    let wrong_state = fixture.root.join("wrong-default-state");
+    let wrong_database = wrong_state.join("iq/integration-queues/queues.db");
+    let wrong_database_id = SqliteQueue::open(&wrong_database)
+        .unwrap()
+        .database_id()
+        .unwrap();
+    assert_ne!(wrong_database_id, expected_database_id);
+    let wrong_directory = wrong_database.parent().unwrap();
+    let before = directory_bytes(wrong_directory);
+    let wrong = Command::new(env!("CARGO_BIN_EXE_iq"))
+        .env("XDG_STATE_HOME", &wrong_state)
+        .env("IQ_TEST_DATABASE_STOP_AFTER", "open_resynced")
+        .arg("--expected-database-id")
+        .arg(&expected_database_id)
+        .args(["workspace", "list"])
+        .output()
+        .unwrap();
+    assert_eq!(wrong.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains("database ID"));
+    assert_eq!(directory_bytes(wrong_directory), before);
+}
+
+fn move_remote_main(fixture: &CliFixture, path: &str) -> String {
+    git(&fixture.bootstrap, &["switch", "main"]);
+    std::fs::write(fixture.bootstrap.join(path), "moved\n").unwrap();
+    git(&fixture.bootstrap, &["add", path]);
+    git(&fixture.bootstrap, &["commit", "-m", "move remote main"]);
+    git(&fixture.bootstrap, &["push", "origin", "main"]);
+    git(&fixture.remote, &["rev-parse", "refs/heads/main"])
 }
 
 #[cfg(debug_assertions)]
@@ -1870,6 +2484,7 @@ fn main_and_master_register_but_one_remote_cannot_own_both_targets() {
 
 #[test]
 fn concurrent_same_target_registration_at_reservation_barrier_returns_one_repository_identity() {
+    let _race = registration_race_lock();
     let fixture = CliFixture::new("main");
     let barrier = fixture.root.join("reservation-barrier");
     std::fs::create_dir(&barrier).unwrap();
@@ -1992,6 +2607,7 @@ fn concurrent_same_target_registration_at_reservation_barrier_returns_one_reposi
 #[test]
 #[cfg(debug_assertions)]
 fn concurrent_registration_uses_one_winning_storage_root_and_one_fence() {
+    let _race = registration_race_lock();
     let fixture = CliFixture::new("main");
     let barrier = fixture.root.join("different-storage-reservation-barrier");
     std::fs::create_dir(&barrier).unwrap();
@@ -2080,6 +2696,7 @@ fn concurrent_registration_uses_one_winning_storage_root_and_one_fence() {
 #[test]
 #[cfg(debug_assertions)]
 fn concurrent_registration_uses_one_winning_rift_registry() {
+    let _race = registration_race_lock();
     let fixture = CliFixture::new("main");
     let barrier = fixture.root.join("different-registry-reservation-barrier");
     std::fs::create_dir(&barrier).unwrap();
@@ -2279,18 +2896,29 @@ fn noncanonical_rift_registry_path_has_one_durable_identity() {
 
 #[test]
 #[cfg(debug_assertions)]
-fn owned_root_refresh_keeps_durable_observation_until_a_later_refresh() {
+fn owned_root_refresh_reconciles_stored_target_before_requested_target() {
     let fixture = CliFixture::new("main");
     let repository = successful_json(fixture.init("main"));
     let repo_key = repository["key"].as_str().unwrap();
     let owned_root = PathBuf::from(repository["owned_root_path"].as_str().unwrap());
-    let observed_a = git(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+    let database_id = SqliteQueue::open(&fixture.database)
+        .unwrap()
+        .database_id()
+        .unwrap();
+    let main = git(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+    git(
+        &fixture.remote,
+        &["update-ref", "refs/heads/release", &main],
+    );
+    let observed_a = git(&fixture.remote, &["rev-parse", "refs/heads/release"]);
     let interrupted = Command::new(env!("CARGO_BIN_EXE_iq"))
         .env("IQ_RIFT_DATABASE", &fixture.rift_database)
         .env("IQ_TEST_MODEL_KEY", "repository-test-model-key")
         .env("IQ_TEST_COMPOSITION_TARGET_STOP_AFTER", "observation")
         .arg("--queue-db")
         .arg(&fixture.database)
+        .arg("--expected-database-id")
+        .arg(&database_id)
         .args([
             "workspace",
             "create",
@@ -2298,6 +2926,10 @@ fn owned_root_refresh_keeps_durable_observation_until_a_later_refresh() {
             repo_key,
             "--name",
             "observed-a",
+            "--target-branch",
+            "release",
+            "--expected-target-sha",
+            &observed_a,
         ])
         .output()
         .unwrap();
@@ -2314,6 +2946,10 @@ fn owned_root_refresh_keeps_durable_observation_until_a_later_refresh() {
         serde_json::from_str::<Value>(&checkout_json).unwrap()["target_sha"],
         observed_a
     );
+    assert_eq!(
+        serde_json::from_str::<Value>(&checkout_json).unwrap()["target_ref"],
+        "refs/heads/release"
+    );
     drop(connection);
 
     git(&fixture.bootstrap, &["switch", "main"]);
@@ -2323,28 +2959,35 @@ fn owned_root_refresh_keeps_durable_observation_until_a_later_refresh() {
         &fixture.bootstrap,
         &["commit", "-m", "move remote after observation"],
     );
-    git(&fixture.bootstrap, &["push", "origin", "main"]);
-    let observed_b = git(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+    git(&fixture.bootstrap, &["push", "origin", "main:release"]);
+    let observed_b = git(&fixture.remote, &["rev-parse", "refs/heads/release"]);
     assert_ne!(observed_a, observed_b);
 
-    let workspace_a = successful_json(fixture.iq(&[
+    let requested_main = successful_json(fixture.iq(&[
         "workspace",
         "create",
         "--repo-key",
         repo_key,
         "--name",
-        "observed-a",
+        "requested-main",
+        "--target-branch",
+        "main",
+        "--expected-target-sha",
+        &main,
     ]));
     assert_eq!(
-        git(&owned_root, &["rev-parse", "refs/remotes/iq-target/main"]),
+        git(
+            &owned_root,
+            &["rev-parse", "refs/remotes/iq-target/release"]
+        ),
         observed_a
     );
     assert_eq!(
         git(
-            Path::new(workspace_a["path"].as_str().unwrap()),
+            Path::new(requested_main["path"].as_str().unwrap()),
             &["rev-parse", "HEAD"]
         ),
-        observed_a
+        main
     );
     assert!(git(
         &owned_root,
@@ -2372,9 +3015,16 @@ fn owned_root_refresh_keeps_durable_observation_until_a_later_refresh() {
         repo_key,
         "--name",
         "observed-b",
+        "--target-branch",
+        "release",
+        "--expected-target-sha",
+        &observed_b,
     ]));
     assert_eq!(
-        git(&owned_root, &["rev-parse", "refs/remotes/iq-target/main"]),
+        git(
+            &owned_root,
+            &["rev-parse", "refs/remotes/iq-target/release"]
+        ),
         observed_b
     );
     assert_eq!(
@@ -2845,6 +3495,458 @@ fn provisioning_rejects_unsafe_or_unverifiable_policy_entries() {
     let fixture = CliFixture::new("main");
     std::fs::write(fixture.bootstrap.join(".git/index"), "invalid index\n").unwrap();
     assert_policy_rejection_left_no_repository(&fixture);
+}
+
+#[test]
+fn cli_replays_lost_workspace_and_submission_receipts_after_restart() {
+    let fixture = CliFixture::new("main");
+    let repository = successful_json(fixture.init("main"));
+    let repo_key = repository["key"].as_str().unwrap();
+    let expected_target_sha = git(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+    let missing_expected_target = fixture.iq(&[
+        "workspace",
+        "create",
+        "--repo-key",
+        repo_key,
+        "--name",
+        "missing-expected-target",
+        "--target-branch",
+        "main",
+    ]);
+    assert_eq!(missing_expected_target.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&missing_expected_target.stderr).contains("--expected-target-sha")
+    );
+    let create = vec![
+        "workspace",
+        "create",
+        "--repo-key",
+        repo_key,
+        "--name",
+        "lost-receipt",
+        "--target-branch",
+        "main",
+        "--expected-target-sha",
+        &expected_target_sha,
+    ];
+    let workspace = successful_json(fixture.iq(&create));
+    assert_eq!(workspace["target_ref"], "refs/heads/main");
+    assert_eq!(workspace["expected_target_sha"], expected_target_sha);
+
+    assert_eq!(successful_json(fixture.iq(&create)), workspace);
+    let wrong_expected_target = fixture.iq(&[
+        "workspace",
+        "create",
+        "--repo-key",
+        repo_key,
+        "--name",
+        "lost-receipt",
+        "--target-branch",
+        "main",
+        "--expected-target-sha",
+        &"0".repeat(40),
+    ]);
+    assert!(!wrong_expected_target.status.success());
+    assert!(String::from_utf8_lossy(&wrong_expected_target.stderr)
+        .contains("expected target SHA differs"));
+    let wrong_target = fixture.iq(&[
+        "workspace",
+        "create",
+        "--repo-key",
+        repo_key,
+        "--name",
+        "lost-receipt",
+        "--target-branch",
+        "release",
+        "--expected-target-sha",
+        &expected_target_sha,
+    ]);
+    assert!(!wrong_target.status.success());
+    assert!(String::from_utf8_lossy(&wrong_target.stderr).contains("target ref"));
+
+    let workspace_id = workspace["id"].as_str().unwrap();
+    let workspace_path = PathBuf::from(workspace["path"].as_str().unwrap());
+    git(&workspace_path, &["config", "user.name", "IQ Test"]);
+    git(
+        &workspace_path,
+        &["config", "user.email", "iq@example.test"],
+    );
+    git(&workspace_path, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(workspace_path.join("receipt.txt"), "lost receipt\n").unwrap();
+    git(&workspace_path, &["add", "receipt.txt"]);
+    git(&workspace_path, &["commit", "-m", "lost receipt"]);
+
+    let submitted = successful_json(fixture.iq(&["submit", "--workspace", workspace_id]));
+    assert_eq!(
+        successful_json(fixture.iq(&["submit", "--workspace", workspace_id])),
+        submitted
+    );
+    let connection = Connection::open(&fixture.database).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM local_submissions WHERE workspace_id=?1",
+                [workspace_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM queue_items", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn cli_rejects_a_moved_explicit_workspace_target_without_workspace_mutation() {
+    let fixture = CliFixture::new("main");
+    let repository = successful_json(fixture.init("main"));
+    let repo_key = repository["key"].as_str().unwrap();
+    let expected_target_sha = git(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+    let inventory_before = rift_inventory(&fixture.rift_database);
+    let owned_root = PathBuf::from(repository["owned_root_path"].as_str().unwrap());
+    let owned_root_head_before = git(&owned_root, &["rev-parse", "HEAD"]);
+    let checkout_before: String = Connection::open(&fixture.database)
+        .unwrap()
+        .query_row(
+            "SELECT checkout_json FROM registered_repositories WHERE repo_key=?1",
+            [repo_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    git(&fixture.bootstrap, &["switch", "main"]);
+    std::fs::write(fixture.bootstrap.join("moved-target.txt"), "moved\n").unwrap();
+    git(&fixture.bootstrap, &["add", "moved-target.txt"]);
+    git(&fixture.bootstrap, &["commit", "-m", "move target"]);
+    git(&fixture.bootstrap, &["push", "origin", "main"]);
+
+    let rejected = fixture.iq(&[
+        "workspace",
+        "create",
+        "--repo-key",
+        repo_key,
+        "--name",
+        "moved-target",
+        "--target-branch",
+        "main",
+        "--expected-target-sha",
+        &expected_target_sha,
+    ]);
+
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("workspace target moved"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert_eq!(
+        Connection::open(&fixture.database)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM development_workspaces", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+    assert_eq!(rift_inventory(&fixture.rift_database), inventory_before);
+    assert_eq!(
+        git(&owned_root, &["rev-parse", "HEAD"]),
+        owned_root_head_before
+    );
+    assert_eq!(
+        Connection::open(&fixture.database)
+            .unwrap()
+            .query_row(
+                "SELECT checkout_json FROM registered_repositories WHERE repo_key=?1",
+                [repo_key],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        checkout_before
+    );
+}
+
+#[test]
+fn cli_replays_an_active_workspace_after_the_remote_target_moves() {
+    let fixture = CliFixture::new("main");
+    let repository = successful_json(fixture.init("main"));
+    let repo_key = repository["key"].as_str().unwrap();
+    let expected_target_sha = git(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+    let create = [
+        "workspace",
+        "create",
+        "--repo-key",
+        repo_key,
+        "--name",
+        "active-moved-target",
+        "--target-branch",
+        "main",
+        "--expected-target-sha",
+        &expected_target_sha,
+    ];
+    let created = successful_json(fixture.iq(&create));
+    let moved_target_sha = move_remote_main(&fixture, "active-target-moved.txt");
+    assert_ne!(moved_target_sha, expected_target_sha);
+
+    let replayed = successful_json(fixture.iq(&create));
+
+    assert_eq!(replayed, created);
+    let changed = fixture.iq(&[
+        "workspace",
+        "create",
+        "--repo-key",
+        repo_key,
+        "--name",
+        "active-moved-target",
+        "--target-branch",
+        "main",
+        "--expected-target-sha",
+        &moved_target_sha,
+    ]);
+    assert!(!changed.status.success());
+    assert!(String::from_utf8_lossy(&changed.stderr)
+        .contains("expected target SHA differs from the request"));
+    assert_eq!(
+        Connection::open(&fixture.database)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM development_workspaces", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
+    );
+    let status = fixture.iq(&["workspace", "status", created["id"].as_str().unwrap()]);
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let removed =
+        successful_json(fixture.iq(&["workspace", "remove", created["id"].as_str().unwrap()]));
+    assert_eq!(removed["status"], "removed");
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn cli_resumes_a_creating_workspace_after_the_remote_target_moves() {
+    let fixture = CliFixture::new("main");
+    let repository = successful_json(fixture.init("main"));
+    let repo_key = repository["key"].as_str().unwrap();
+    let expected_target_sha = git(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+    let create = [
+        "workspace",
+        "create",
+        "--repo-key",
+        repo_key,
+        "--name",
+        "creating-moved-target",
+        "--target-branch",
+        "main",
+        "--expected-target-sha",
+        &expected_target_sha,
+    ];
+    let interrupted = fixture
+        .iq_command(&create)
+        .env("IQ_TEST_WORKSPACE_CREATION_STOP_AFTER", "rift_created")
+        .output()
+        .unwrap();
+    assert_eq!(interrupted.status.code(), Some(85));
+    let intent = SqliteQueue::open(&fixture.database)
+        .unwrap()
+        .list_development_workspaces(Some(repo_key))
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        intent.status,
+        iq::sqlite::DevelopmentWorkspaceStatus::Creating
+    );
+    let moved_target_sha = move_remote_main(&fixture, "creating-target-moved.txt");
+    assert_ne!(moved_target_sha, expected_target_sha);
+    let draining = fixture.iq(&["repo", "drain", "--repo-key", repo_key]);
+    assert!(
+        draining.status.success(),
+        "{}",
+        String::from_utf8_lossy(&draining.stderr)
+    );
+
+    let resumed = successful_json(fixture.iq(&create));
+
+    assert_eq!(resumed["id"], intent.id);
+    assert_eq!(resumed["target_ref"], intent.target_ref.as_str());
+    assert_eq!(resumed["expected_target_sha"], intent.expected_target_sha);
+    assert_eq!(resumed["status"], "active");
+    let changed = fixture.iq(&[
+        "workspace",
+        "create",
+        "--repo-key",
+        repo_key,
+        "--name",
+        "creating-moved-target",
+        "--target-branch",
+        "main",
+        "--expected-target-sha",
+        &moved_target_sha,
+    ]);
+    assert!(!changed.status.success());
+    assert!(String::from_utf8_lossy(&changed.stderr)
+        .contains("expected target SHA differs from the request"));
+    assert_eq!(
+        SqliteQueue::open(&fixture.database)
+            .unwrap()
+            .list_development_workspaces(Some(repo_key))
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn cli_resumes_each_incomplete_local_submission_boundary() {
+    let fixture = CliFixture::new("main");
+    let repository = successful_json(fixture.init("main"));
+    let repo_key = repository["key"].as_str().unwrap();
+    for boundary in [
+        "intent_recorded",
+        "staging_ref_published",
+        "private_ref_published",
+        "staging_ref_removed",
+        "finalized",
+    ] {
+        let workspace = successful_json(fixture.iq(&[
+            "workspace",
+            "create",
+            "--repo-key",
+            repo_key,
+            "--name",
+            boundary,
+        ]));
+        let workspace_id = workspace["id"].as_str().unwrap();
+        let workspace_path = PathBuf::from(workspace["path"].as_str().unwrap());
+        git(&workspace_path, &["config", "user.name", "IQ Test"]);
+        git(
+            &workspace_path,
+            &["config", "user.email", "iq@example.test"],
+        );
+        git(&workspace_path, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(workspace_path.join("boundary.txt"), format!("{boundary}\n")).unwrap();
+        git(&workspace_path, &["add", "boundary.txt"]);
+        git(&workspace_path, &["commit", "-m", boundary]);
+
+        let interrupted = fixture
+            .iq_command(&["submit", "--workspace", workspace_id])
+            .env("IQ_TEST_LOCAL_SUBMISSION_STOP_AFTER", boundary)
+            .output()
+            .unwrap();
+        assert_eq!(interrupted.status.code(), Some(89), "{boundary}");
+        let resumed = successful_json(fixture.iq(&["submit", "--workspace", workspace_id]));
+        assert_eq!(
+            successful_json(fixture.iq(&["submit", "--workspace", workspace_id])),
+            resumed,
+            "{boundary}"
+        );
+        let connection = Connection::open(&fixture.database).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM local_submissions WHERE workspace_id=?1",
+                    [workspace_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "{boundary}"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM queue_admissions WHERE submission_id=?1",
+                    [resumed[0]["id"].as_str().unwrap()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "{boundary}"
+        );
+    }
+}
+
+#[test]
+fn cli_fails_closed_when_a_submitted_workspace_has_multiple_items() {
+    let fixture = CliFixture::new("main");
+    let repository = successful_json(fixture.init("main"));
+    let repo_key = repository["key"].as_str().unwrap();
+    let workspace = successful_json(fixture.iq(&[
+        "workspace",
+        "create",
+        "--repo-key",
+        repo_key,
+        "--name",
+        "multiple-items",
+    ]));
+    let workspace_id = workspace["id"].as_str().unwrap();
+    let workspace_path = PathBuf::from(workspace["path"].as_str().unwrap());
+    git(&workspace_path, &["config", "user.name", "IQ Test"]);
+    git(
+        &workspace_path,
+        &["config", "user.email", "iq@example.test"],
+    );
+    git(&workspace_path, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(workspace_path.join("multiple.txt"), "candidate\n").unwrap();
+    git(&workspace_path, &["add", "multiple.txt"]);
+    git(&workspace_path, &["commit", "-m", "candidate"]);
+    let submitted = successful_json(fixture.iq(&["submit", "--workspace", workspace_id]));
+    let source_sha = submitted[0]["commit_sha"].as_str().unwrap();
+    let base_sha = submitted[0]["base_sha"].as_str().unwrap();
+    let target_ref = workspace["target_ref"].as_str().unwrap();
+    let connection = Connection::open(&fixture.database).unwrap();
+    connection
+        .execute(
+            "INSERT INTO local_submissions(id,queue_item_id,repo_key,workspace_id,base_sha,commit_sha,private_ref,staging_ref,replaces_item_id,state,created_at) VALUES('second-submission','second-item',?1,?2,?3,?4,'refs/iq/submissions/second-submission','refs/iq/staging/second-submission',NULL,'creating','2026-01-01T00:00:00Z')",
+            rusqlite::params![repo_key, workspace_id, base_sha, source_sha],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO queue_items(id,repo_key,target_ref,producer_metadata_json,validation_evidence_json,status,created_at,updated_at) VALUES('second-item',?1,?2,'{}','{}','ready','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            rusqlite::params![repo_key, target_ref],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO queue_admissions(item_id,kind,source_branch,head_sha,source_ref,submission_id,target_ref,admitted_at) VALUES('second-item','local_submission','refs/iq/submissions/second-submission',?1,'refs/iq/submissions/second-submission','second-submission',?2,'2026-01-01T00:00:00Z')",
+            rusqlite::params![source_sha, target_ref],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE local_submissions SET state='queued' WHERE id='second-submission'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let retried = fixture.iq(&["submit", "--workspace", workspace_id]);
+
+    assert!(!retried.status.success());
+    assert!(
+        String::from_utf8_lossy(&retried.stderr).contains("exactly one local submission identity")
+    );
+    let connection = Connection::open(&fixture.database).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM queue_items", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        2
+    );
 }
 
 #[test]
@@ -3324,6 +4426,10 @@ fn development_generation_crashes_reconcile_pending_marker_and_single_workspace(
         let repository = successful_json(fixture.init("main"));
         let repo_key = repository["key"].as_str().unwrap();
         let owned_root = PathBuf::from(repository["owned_root_path"].as_str().unwrap());
+        let database_id = SqliteQueue::open(&fixture.database)
+            .unwrap()
+            .database_id()
+            .unwrap();
         let inventory_before = rift_inventory(&fixture.rift_database);
         let interrupted = Command::new(env!("CARGO_BIN_EXE_iq"))
             .env("IQ_RIFT_DATABASE", &fixture.rift_database)
@@ -3331,6 +4437,8 @@ fn development_generation_crashes_reconcile_pending_marker_and_single_workspace(
             .env("IQ_TEST_WORKSPACE_GENERATION_STOP_AFTER", boundary)
             .arg("--queue-db")
             .arg(&fixture.database)
+            .arg("--expected-database-id")
+            .arg(&database_id)
             .args([
                 "workspace",
                 "create",

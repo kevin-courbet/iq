@@ -22,14 +22,23 @@ pub struct Command(std::process::Command);
 
 impl Command {
     pub fn new(program: impl AsRef<std::ffi::OsStr>) -> Self {
+        Self::new_with_rift_executable(program, rift_executable_path())
+    }
+
+    pub fn new_with_rift_executable(
+        program: impl AsRef<std::ffi::OsStr>,
+        rift_executable: impl AsRef<std::path::Path>,
+    ) -> Self {
         let executable = if program.as_ref() == std::ffi::OsStr::new("rift") {
-            rift_executable_path().into_os_string()
+            rift_executable.as_ref().as_os_str().to_os_string()
         } else {
             program.as_ref().to_os_string()
         };
         let mut command = std::process::Command::new(executable);
         if program.as_ref() == std::ffi::OsStr::new(env!("CARGO_BIN_EXE_iq")) {
-            command.arg("--rift-executable").arg(rift_executable_path());
+            command
+                .arg("--rift-executable")
+                .arg(rift_executable.as_ref());
         }
         Self(command)
     }
