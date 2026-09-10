@@ -109,25 +109,11 @@ impl SystemConfig {
         if !path.is_absolute() {
             anyhow::bail!("system configuration path must be absolute");
         }
-        let before = fs::symlink_metadata(path)
-            .with_context(|| format!("inspect system configuration {}", path.display()))?;
-        if before.file_type().is_symlink()
-            || !before.is_file()
-            || before.len() > MAX_SYSTEM_CONFIG_BYTES
-        {
-            anyhow::bail!("system configuration must be a bounded regular non-symlink file");
-        }
-        let mut file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)
-            .with_context(|| format!("open system configuration {}", path.display()))?;
-        let opened = file.metadata()?;
-        if (before.dev(), before.ino()) != (opened.dev(), opened.ino()) {
-            anyhow::bail!("system configuration changed while opening");
-        }
-        let mut bytes = Vec::with_capacity(opened.len() as usize);
-        file.read_to_end(&mut bytes)?;
+        let bytes = if path.as_os_str().as_bytes().starts_with(b"/proc/") {
+            read_inherited_system_config(path)?
+        } else {
+            read_system_config_file(path)?
+        };
         let config: Self = serde_yaml::from_slice(&bytes)
             .with_context(|| format!("parse strict system configuration {}", path.display()))?;
         config.validate()
@@ -219,6 +205,110 @@ impl SystemConfig {
             credential_env: self.integration_agent.credential_env.clone(),
         })
     }
+}
+
+fn read_system_config_file(path: &Path) -> Result<Vec<u8>> {
+    let before = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect system configuration {}", path.display()))?;
+    if before.file_type().is_symlink()
+        || !before.is_file()
+        || before.len() > MAX_SYSTEM_CONFIG_BYTES
+    {
+        anyhow::bail!("system configuration must be a bounded regular non-symlink file");
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("open system configuration {}", path.display()))?;
+    let opened = file.metadata()?;
+    if (before.dev(), before.ino()) != (opened.dev(), opened.ino()) {
+        anyhow::bail!("system configuration changed while opening");
+    }
+    let mut bytes = Vec::with_capacity(opened.len() as usize);
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn read_inherited_system_config(path: &Path) -> Result<Vec<u8>> {
+    let descriptor = parse_inherited_descriptor_path(path)?;
+    let descriptor_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    if descriptor_flags < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("inspect inherited system configuration descriptor flags");
+    }
+    if unsafe {
+        libc::fcntl(
+            descriptor,
+            libc::F_SETFD,
+            descriptor_flags | libc::FD_CLOEXEC,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("protect inherited system configuration descriptor");
+    }
+    let duplicate = unsafe { libc::fcntl(descriptor, libc::F_DUPFD_CLOEXEC, 3) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("duplicate inherited system configuration descriptor");
+    }
+    let file = unsafe { File::from_raw_fd(duplicate) };
+    let before = file
+        .metadata()
+        .context("inspect inherited system configuration descriptor")?;
+    if !before.is_file()
+        || before.len() == 0
+        || before.len() > MAX_SYSTEM_CONFIG_BYTES
+        || before.uid() != unsafe { libc::geteuid() }
+        || before.permissions().mode() & 0o222 != 0
+    {
+        anyhow::bail!(
+            "inherited system configuration must be a bounded owner-only read-only regular file"
+        );
+    }
+    let status_flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if status_flags < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("inspect inherited system configuration access mode");
+    }
+    if status_flags & libc::O_ACCMODE != libc::O_RDONLY {
+        anyhow::bail!("inherited system configuration descriptor must be read-only");
+    }
+    let target = fs::read_link(format!("/proc/self/fd/{duplicate}"))
+        .context("inspect inherited system configuration target")?;
+    let target = target.as_os_str().as_bytes();
+    if !target.starts_with(b"/memfd:") && !target.starts_with(b"memfd:") {
+        anyhow::bail!("inherited system configuration must use a sealed anonymous memfd");
+    }
+    let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+    if seals < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("inspect inherited system configuration seals");
+    }
+    let required = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    if seals & required != required {
+        anyhow::bail!("inherited system configuration memfd is missing required seals");
+    }
+    let mut bytes = vec![0_u8; before.len() as usize];
+    file.read_exact_at(&mut bytes, 0)
+        .context("read inherited system configuration descriptor")?;
+    let after = file
+        .metadata()
+        .context("reinspect inherited system configuration descriptor")?;
+    let after_seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+    if descriptor_metadata_identity(&before) != descriptor_metadata_identity(&after)
+        || after_seals != seals
+    {
+        anyhow::bail!("inherited system configuration changed while reading");
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_inherited_system_config(_path: &Path) -> Result<Vec<u8>> {
+    anyhow::bail!("inherited system configuration descriptors require Linux")
 }
 
 pub fn executable_identity(path: &Path) -> Result<ExecutableIdentity> {
@@ -972,6 +1062,8 @@ fn require_absolute(path: &Path, label: &str) -> Result<()> {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use std::ffi::CString;
+    use std::io::Write as _;
     use std::os::fd::IntoRawFd;
 
     fn executable_file(path: &Path, content: &[u8]) {
@@ -987,6 +1079,75 @@ mod tests {
             open_inherited_descriptor_executable(&proc_path).unwrap(),
             descriptor,
         )
+    }
+
+    fn sealed_config_descriptor(content: &[u8]) -> (File, PathBuf) {
+        let name = CString::new("iq-system-config-test").unwrap();
+        let descriptor = unsafe {
+            libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
+        };
+        assert!(descriptor >= 0, "{}", std::io::Error::last_os_error());
+        let mut writer = unsafe { File::from_raw_fd(descriptor) };
+        writer.write_all(content).unwrap();
+        writer
+            .set_permissions(fs::Permissions::from_mode(0o400))
+            .unwrap();
+        let seals =
+            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        assert_eq!(
+            unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_ADD_SEALS, seals) },
+            0
+        );
+        let writer_path = PathBuf::from(format!("/proc/self/fd/{}", writer.as_raw_fd()));
+        let reader = OpenOptions::new().read(true).open(writer_path).unwrap();
+        let descriptor = reader.as_raw_fd();
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
+            0
+        );
+        let path = PathBuf::from(format!("/proc/self/fd/{descriptor}"));
+        (reader, path)
+    }
+
+    #[test]
+    fn system_config_loads_from_a_sealed_inherited_descriptor() {
+        let expected = SystemConfig {
+            integration_agent: IntegrationAgentConfig {
+                runner: RunnerKind::Opencode,
+                executable: PathBuf::from("/bin/true"),
+                agent: "iq-integration".into(),
+                model: "test/model".into(),
+                cycle_timeout_seconds: 60,
+                max_log_bytes: 4096,
+                max_result_bytes: 4096,
+                max_processes: 4,
+                memory_bytes: 64 * 1024 * 1024,
+                cpu_seconds: 60,
+                writable_bytes: 1024 * 1024,
+                open_files: 64,
+                credential_env: "IQ_TEST_MODEL_KEY".into(),
+            },
+            control_plane: ControlPlaneConfig {
+                unix_socket: PathBuf::from("/tmp/iq-test-control.sock"),
+                max_request_bytes: 4096,
+                max_free_text_bytes: 1024,
+                max_response_bytes: 4096,
+                max_concurrent_clients: 2,
+                max_client_queue_bytes: 4096,
+                max_stream_backlog_events: 100,
+                client_idle_seconds: 5,
+            },
+            notifications: NotificationConfig::default(),
+        };
+        let yaml = serde_yaml::to_string(&expected).unwrap();
+        let (descriptor, path) = sealed_config_descriptor(yaml.as_bytes());
+
+        assert_eq!(SystemConfig::load(&path).unwrap(), expected);
+        let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
     }
 
     #[test]
